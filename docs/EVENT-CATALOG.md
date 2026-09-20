@@ -66,6 +66,13 @@
 | `pig.analysis.completed` | llm-gw | fresh-meat / notification / dashboard | pig_id, analysis_json, task | §2.9 |
 | `erp.sale.ingested` | erp-connector | sales-agg | source, batch_id, count, batch_at | §2.10 |
 | `sale.aggregated` | sales-agg | bi-gateway + 其它 dapr app | branch_id, period, kpis | §2.11 |
+| `stocktake.line.added` | stocktake | notification-gateway | header_id, line_id, branch_id | §2.12 |
+| `stocktake.line.updated` | stocktake | notification-gateway | header_id, line_id, branch_id | §2.12 |
+| `stocktake.line.deleted` | stocktake | notification-gateway | header_id, line_id, branch_id | §2.12 |
+| `stocktake.header.submitted` | stocktake | notification-gateway | header_id, branch_id, type | §2.13 |
+| `stocktake.header.approved` | stocktake | notification-gateway | header_id, branch_id, type | §2.13 |
+| `stocktake.plan_item.added` | stocktake | notification-gateway | header_id, items_count | §2.13 |
+| `auth.user.permissions_changed` | auth (userd) | notification-gateway | user_id, tenant_id, changed_scopes, changed_roles | §2.14 |
 
 ---
 
@@ -322,6 +329,100 @@
 }
 ```
 
+### 2.12 stocktake.line.{added,updated,deleted}
+
+**触发时机**:stocktake 服务在 AddLine / UpdateLine / DeleteLine 任一写操作成功后立即发出。
+**订阅方**:notification-gateway(用于实时推送给同一 branch 在线用户)。
+
+```jsonc
+// data (added / updated):
+{
+  "header_id":    "ST20260917001",
+  "line_id":      "uuid",
+  "branch_id":    "S001",
+  "tenant_id":    "T001",
+  "sku_id":       "P-2001",
+  "product_name": "五花肉",
+  "barcode":      "6901234567890",
+  "system_qty":   10.0,              // 账面数量(updated 时为最新值)
+  "actual_qty":   9.5,               // 实盘数量(updated 时为最新值;added 可能为 0)
+  "diff_qty":     -0.5,              // actual - system(后端算好)
+  "unit":         "kg" | "piece",
+  "operator_id":  "user-uuid",
+  "operator_name":"张三",
+  "occurred_at":  "2026-09-17T10:23:45Z"
+}
+
+// data (deleted):
+{
+  "header_id":   "ST20260917001",
+  "line_id":     "uuid",
+  "branch_id":   "S001",
+  "tenant_id":   "T001",
+  "sku_id":      "P-2001",
+  "operator_id": "user-uuid",
+  "occurred_at": "2026-09-17T10:23:45Z"
+}
+```
+
+Flutter 端 `WsEventTypes.stocktakeLineAdded/Updated/Deleted` 与 type 严格对应。
+每个事件 `data.header_id` 用于 routing 到当前 detail controller 的 `headerId`。
+notification-gateway 的 TenantRouter 仅在 `branch_id` 落在 client 的 `effective_branches` 内才投递。
+
+### 2.13 stocktake.header.{submitted,approved} + stocktake.plan_item.added
+
+**触发时机**:
+- `stocktake.header.submitted`:`Submit(header_id)` 成功后(counting → adjusted)
+- `stocktake.header.approved`:`Approve(header_id)` 成功后(adjusted → approved)
+- `stocktake.plan_item.added`:`AddPlanItems(header_id, items)` 每批成功后(批量生成计划项时)
+
+```jsonc
+// data (header.submitted / header.approved):
+{
+  "header_id":   "ST20260917001",
+  "branch_id":   "S001",
+  "tenant_id":   "T001",
+  "type":        "general" | "produce" | "plan" | "recheck",
+  "status":      "counting" | "adjusted" | "approved" | "cancelled",
+  "parent_id":   "ST20260915001",        // 仅 recheck 类型有
+  "operator_id": "user-uuid",
+  "occurred_at": "2026-09-17T18:00:00Z"
+}
+
+// data (plan_item.added):
+{
+  "header_id":     "ST20260917001",
+  "branch_id":     "S001",
+  "tenant_id":     "T001",
+  "items_count":   42,
+  "batch_index":   1,
+  "batch_total":   3,
+  "operator_id":   "user-uuid",
+  "occurred_at":   "2026-09-17T09:55:00Z"
+}
+```
+
+### 2.14 auth.user.permissions_changed
+
+**触发时机**:auth 服务(userd)在 admin 修改某用户的 scope / role 后立即发出。
+**订阅方**:notification-gateway → 推送给该 user 的所有在线客户端 → Flutter `meController.load()` 自动重拉 `/auth/me` → UI 重新评估 PermissionGate。
+
+```jsonc
+// data:
+{
+  "user_id":         "user-uuid",
+  "tenant_id":       "T001",
+  "branch_id":       "S001",
+  "changed_scopes":  ["stocktake:write"],      // 可选:增量提示前端哪些变动了
+  "changed_roles":   ["stocktake_supervisor"], // 可选
+  "snapshot_version": 17,                       // 单调递增;客户端可丢弃 <= 本地版本的事件
+  "changed_at":      "2026-09-17T16:30:00Z"
+}
+```
+
+> 若 `changed_scopes` / `changed_roles` 为空,客户端应触发完整 `meController.load()` 重新拉全量;
+> 若非空,客户端可走增量更新(只 patch 本地 me 的对应字段,见 CLAUDE.md §4)。
+
 ---
 
 ## §3 订阅注册
@@ -358,3 +459,4 @@ r.POST("/events/sale-completed", handleSaleCompleted)
 | 日期 | 修订人 | 内容 |
 |---|---|---|
 | 2026-09-17 | Mavis | 初版,基于 DESIGN §2.3 topic 表展开 schema |
+| 2026-09-19 | Mavis | 新增 §2.12 stocktake.line.{added,updated,deleted} + §2.13 stocktake.header.{submitted,approved} + stocktake.plan_item.added + §2.14 auth.user.permissions_changed;同步 stocktake/service.go 6 个 publish 调用点与 notification-gateway 订阅实现 |

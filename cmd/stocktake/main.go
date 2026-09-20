@@ -29,9 +29,9 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/YunBright/supertrade/internal/stocktake"
 	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/internal/cubehttp"
+	"github.com/YunBright/supertrade/internal/stocktake"
 	"github.com/YunBright/supertrade/internal/stocktake/handler"
 	"github.com/YunBright/supertrade/internal/stocktake/model"
 	"github.com/YunBright/supertrade/internal/stocktake/service"
@@ -43,6 +43,7 @@ import (
 func main() {
 	cmdbootstrap.Run(cmdbootstrap.Options{
 		AppID: "stocktake",
+		Port:  ":8106",
 		OnStart: func() error {
 			return initApp()
 		},
@@ -90,6 +91,16 @@ func initApp() error {
 	if mode == "" {
 		mode = "memory"
 	}
+
+	// 注入 Dapr pub/sub publisher;缺环境变量时禁用广播
+	if os.Getenv("DAPR_ENDPOINT") != "" || os.Getenv("ENABLE_DAPR_PUBLISH") == "1" {
+		pub := service.NewDaprPublisherFromEnv()
+		appSvc.SetPublisher(pub)
+		slog.Info("dapr publisher enabled", "endpoint", os.Getenv("DAPR_ENDPOINT"))
+	} else {
+		slog.Info("dapr publisher disabled (set DAPR_ENDPOINT or ENABLE_DAPR_PUBLISH=1)")
+	}
+
 	slog.Info("stocktake app initialized",
 		"db_driver", "postgres",
 		"cube_client", mode,

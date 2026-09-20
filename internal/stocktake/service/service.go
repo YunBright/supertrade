@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -29,9 +30,11 @@ import (
 //
 // 通过 New(db, cube) 构造,所有方法并发安全。
 type Service struct {
-	db   *gorm.DB
-	cube cubeclient.Client
-	now  func() time.Time // 注入时间,默认 time.Now().UTC()
+	db        *gorm.DB
+	cube      cubeclient.Client
+	publisher Publisher       // nil = 禁用 pub/sub 广播
+	pubLogger *slog.Logger    // 发布日志;默认 slog.Default()
+	now       func() time.Time // 注入时间,默认 time.Now().UTC()
 }
 
 // New 构造 Service。
@@ -39,7 +42,12 @@ type Service struct {
 // db 是 stocktake 服务的 PG 连接(GORM),cube 是 cube-gateway 客户端。
 // cube 为 nil 时,AddLine 等会立即返回 ErrCubeUnavailable(便于测试)。
 func New(db *gorm.DB, cube cubeclient.Client) *Service {
-	return &Service{db: db, cube: cube, now: func() time.Time { return time.Now().UTC() }}
+	return &Service{
+		db:        db,
+		cube:      cube,
+		pubLogger: slog.Default(),
+		now:       func() time.Time { return time.Now().UTC() },
+	}
 }
 
 // SetClock 注入时间(测试用)。nil 恢复 time.Now().UTC()。
@@ -168,7 +176,7 @@ func (s *Service) GetHeaderWithLines(_ context.Context, id string) (*model.Stock
 //
 // 冻结总差异(写入 total_diff_qty / total_diff_amount_yuan 供后续查询);
 // 调整后明细不可改。
-func (s *Service) Submit(_ context.Context, id string) (*model.StocktakeHeader, error) {
+func (s *Service) Submit(ctx context.Context, id string) (*model.StocktakeHeader, error) {
 	h, err := s.GetHeader(context.Background(), id)
 	if err != nil {
 		return nil, err
@@ -191,13 +199,27 @@ func (s *Service) Submit(_ context.Context, id string) (*model.StocktakeHeader, 
 		}).Error; err != nil {
 		return nil, err
 	}
-	return s.GetHeader(context.Background(), id)
+	updated, err := s.GetHeader(context.Background(), id)
+	if err != nil {
+		return nil, err
+	}
+	// §2.13 stocktake.header.submitted
+	s.publish(ctx, TopicStocktakeHeaderSubmitted, &HeaderEventData{
+		HeaderID:    updated.ID,
+		BranchID:    updated.BranchID,
+		Type:        string(updated.Type),
+		Status:      string(updated.Status),
+		ParentID:    stringOrEmpty(updated.ParentHeaderID),
+		OperatorID:  updated.OperatorID,
+		OccurredAt:  now.UTC().Format(time.RFC3339),
+	})
+	return updated, nil
 }
 
 // Approve adjusted → approved(需 auditor_id)。
 //
 // 入参后 Approved 不可改。
-func (s *Service) Approve(_ context.Context, id, auditorID string) (*model.StocktakeHeader, error) {
+func (s *Service) Approve(ctx context.Context, id, auditorID string) (*model.StocktakeHeader, error) {
 	if auditorID == "" {
 		return nil, fmt.Errorf("%w: auditor_id 必填", ErrInvalidStatus)
 	}
@@ -218,7 +240,21 @@ func (s *Service) Approve(_ context.Context, id, auditorID string) (*model.Stock
 		}).Error; err != nil {
 		return nil, err
 	}
-	return s.GetHeader(context.Background(), id)
+	updated, err := s.GetHeader(context.Background(), id)
+	if err != nil {
+		return nil, err
+	}
+	// §2.13 stocktake.header.approved
+	s.publish(ctx, TopicStocktakeHeaderApproved, &HeaderEventData{
+		HeaderID:    updated.ID,
+		BranchID:    updated.BranchID,
+		Type:        string(updated.Type),
+		Status:      string(updated.Status),
+		ParentID:    stringOrEmpty(updated.ParentHeaderID),
+		OperatorID:  auditorID,
+		OccurredAt:  now.UTC().Format(time.RFC3339),
+	})
+	return updated, nil
 }
 
 // ---- Line ----
@@ -366,6 +402,21 @@ func (s *Service) AddLine(ctx context.Context, headerID string, in AddLineInput)
 	if err != nil {
 		return nil, err
 	}
+	// §2.12 stocktake.line.added — DB 提交后再 publish,杜绝幻影事件
+	s.publish(ctx, TopicStocktakeLineAdded, &LineEventData{
+		HeaderID:     h.ID,
+		LineID:       line.ID,
+		BranchID:     h.BranchID,
+		ProductID:    line.ProductID,
+		ProductName:  line.ProductName,
+		SystemQty:    line.BookQty.InexactFloat64(),
+		ActualQty:    line.ActualQty.InexactFloat64(),
+		DiffQty:      line.DiffQty.InexactFloat64(),
+		Unit:         line.Unit,
+		OperatorID:   actorID,
+		OperatorName: actorName,
+		OccurredAt:   now.UTC().Format(time.RFC3339),
+	})
 	return line, nil
 }
 
@@ -496,7 +547,26 @@ func (s *Service) UpdateLine(ctx context.Context, lineID string, in UpdateLineIn
 	if err != nil {
 		return nil, err
 	}
-	return s.getLine(ctx, lineID)
+	updated, err := s.getLine(ctx, lineID)
+	if err != nil {
+		return nil, err
+	}
+	// §2.12 stocktake.line.updated
+	s.publish(ctx, TopicStocktakeLineUpdated, &LineEventData{
+		HeaderID:     h.ID,
+		LineID:       updated.ID,
+		BranchID:     h.BranchID,
+		ProductID:    updated.ProductID,
+		ProductName:  updated.ProductName,
+		SystemQty:    updated.BookQty.InexactFloat64(),
+		ActualQty:    updated.ActualQty.InexactFloat64(),
+		DiffQty:      updated.DiffQty.InexactFloat64(),
+		Unit:         updated.Unit,
+		OperatorID:   actorID,
+		OperatorName: actorName,
+		OccurredAt:   now.UTC().Format(time.RFC3339),
+	})
+	return updated, nil
 }
 
 // DeleteLine 删单条明细(counting 状态才允许)。
@@ -544,7 +614,7 @@ func (s *Service) DeleteLine(ctx context.Context, lineID string, actorID, actorN
 		CreatedAt: now,
 	}
 
-	return s.db.Transaction(func(tx *gorm.DB) error {
+	err = s.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Delete(&line).Error; err != nil {
 			return fmt.Errorf("delete line: %w", err)
 		}
@@ -553,6 +623,20 @@ func (s *Service) DeleteLine(ctx context.Context, lineID string, actorID, actorN
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	// §2.12 stocktake.line.deleted
+	s.publish(ctx, TopicStocktakeLineDeleted, &LineDeletedEventData{
+		HeaderID:     h.ID,
+		LineID:       line.ID,
+		BranchID:     h.BranchID,
+		ProductID:    line.ProductID,
+		OperatorID:   actorID,
+		OperatorName: actorName,
+		OccurredAt:   now.UTC().Format(time.RFC3339),
+	})
+	return nil
 }
 
 // validOpType 校验 OpType 取值。
@@ -562,6 +646,14 @@ func validOpType(t model.LineOpType) bool {
 		return true
 	}
 	return false
+}
+
+// stringOrEmpty 解引用 *string,nil 时返回 ""。
+func stringOrEmpty(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 func (s *Service) getLine(_ context.Context, lineID string) (*model.StocktakeLine, error) {
@@ -1018,6 +1110,14 @@ func (s *Service) AddPlanItems(ctx context.Context, headerID string, in AddPlanI
 	if err != nil {
 		return nil, err
 	}
+	// §2.13 stocktake.plan_item.added
+	s.publish(ctx, TopicStocktakePlanItemAdded, &PlanItemEventData{
+		HeaderID:   h.ID,
+		BranchID:   h.BranchID,
+		ItemsCount: len(out),
+		OperatorID: h.OperatorID,
+		OccurredAt: now.UTC().Format(time.RFC3339),
+	})
 	return out, nil
 }
 

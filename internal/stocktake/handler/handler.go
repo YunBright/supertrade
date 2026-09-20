@@ -1,22 +1,23 @@
 // Package handler 实现 stocktake 服务的 HTTP handler(Gin)。
 //
 // 路径与端点对应 REQUIREMENTS §2.1 / DESIGN §4.5.1:
-//   POST   /stocktake-headers
-//   GET    /stocktake-headers/:id
-//   POST   /stocktake-headers/:id/lines
-//   PUT    /stocktake-lines/:id
-//   DELETE /stocktake-lines/:id
-//   GET    /stocktake-headers/:id/diff-report
-//   POST   /stocktake-headers/:id/submit
-//   POST   /stocktake-headers/:id/approve
+//
+//	POST   /stocktake-headers
+//	GET    /stocktake-headers/:id
+//	POST   /stocktake-headers/:id/lines
+//	PUT    /stocktake-lines/:id
+//	DELETE /stocktake-lines/:id
+//	GET    /stocktake-headers/:id/diff-report
+//	POST   /stocktake-headers/:id/submit
+//	POST   /stocktake-headers/:id/approve
 //
 // 错误映射:
 //
-//   ErrHeaderNotFound / ErrLineNotFound → 404
-//   ErrInvalidStatus / ErrInvalidTransition → 400
-//   ErrCubeUnavailable → 503
-//   ErrProductNotFound / ErrStockNotFound → 400(数据问题)
-//   其它 → 500
+//	ErrHeaderNotFound / ErrLineNotFound → 404
+//	ErrInvalidStatus / ErrInvalidTransition → 400
+//	ErrCubeUnavailable → 503
+//	ErrProductNotFound / ErrStockNotFound → 400(数据问题)
+//	其它 → 500
 package handler
 
 import (
@@ -68,7 +69,7 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.DELETE("/stocktake-lines/:id", h.DeleteLine)
 
 	// 商品搜索 / 扫条码(对齐 scan.html 后端 SearchProducts,REQUIREMENTS §2.1.4.1)
-	r.GET("/api/v1/products/search", h.SearchProducts)
+	r.GET("/products/search", h.SearchProducts)
 }
 
 // ---- 错误响应 ----
@@ -119,8 +120,8 @@ type addLineReq struct {
 	ActualQty  decimal.Decimal `json:"actual_qty" binding:"required"`
 	DiffReason string          `json:"diff_reason"`
 	Remark     string          `json:"remark"`
-	OpType     string          `json:"op_type"`   // create/overwrite/accumulate;default=create
-	Method     string          `json:"method"`    // scan/manual/import;default=manual
+	OpType     string          `json:"op_type"`    // create/overwrite/accumulate;default=create
+	Method     string          `json:"method"`     // scan/manual/import;default=manual
 	ActorName  string          `json:"actor_name"` // 冗余写入 StocktakeLineOperation
 }
 
@@ -128,8 +129,8 @@ type updateLineReq struct {
 	ActualQty  *decimal.Decimal `json:"actual_qty"`
 	DiffReason *string          `json:"diff_reason"`
 	Remark     *string          `json:"remark"`
-	OpType     string           `json:"op_type"`   // overwrite/accumulate/create;default=overwrite
-	Method     string           `json:"method"`    // scan/manual/import;default=manual
+	OpType     string           `json:"op_type"` // overwrite/accumulate/create;default=overwrite
+	Method     string           `json:"method"`  // scan/manual/import;default=manual
 	ActorName  string           `json:"actor_name"`
 }
 
@@ -180,11 +181,11 @@ func (h *Handler) CreateHeader(c *gin.Context) {
 	}
 
 	hdr, err := h.svc.CreateHeader(c.Request.Context(), service.CreateHeaderInput{
-		BranchID:      req.BranchID,
-		CountDate:     countDate,
-		Type:          tt,
-		OperatorID:    cl.Sub,
-		Remark:        req.Remark,
+		BranchID:       req.BranchID,
+		CountDate:      countDate,
+		Type:           tt,
+		OperatorID:     cl.Sub,
+		Remark:         req.Remark,
 		ParentHeaderID: req.ParentHeaderID,
 	})
 	if err != nil {

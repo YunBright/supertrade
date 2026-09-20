@@ -72,10 +72,6 @@ func Run(opts Options) {
 	r.Use(claims.GinMiddleware())
 	r.Use(rbac.RequireAudience(opts.Audience))
 
-	if opts.Register != nil {
-		opts.Register(r)
-	}
-
 	srv := &http.Server{
 		Addr:              opts.Port,
 		Handler:           r,
@@ -90,12 +86,17 @@ func Run(opts Options) {
 		}
 	}()
 
-	// 启动回调(注册外部资源)
+	// 启动回调(注册外部资源)必须在 Register 之前调用,
+	// 以保证 handler 依赖的 DB / 客户端等服务已就绪。
 	if opts.OnStart != nil {
 		if err := opts.OnStart(); err != nil {
 			logger.Error("OnStart failed", "err", err, "app", opts.AppID)
 			os.Exit(1)
 		}
+	}
+
+	if opts.Register != nil {
+		opts.Register(r)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

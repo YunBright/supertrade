@@ -29,7 +29,7 @@ import (
 func main() {
 	cmdbootstrap.Run(cmdbootstrap.Options{
 		AppID: "master-data",
-		Port:  ":8103",
+		Port:  ":8102",
 		OnStart: func() error {
 			cube, err := cubehttp.NewClientFromEnv()
 			if err != nil {
@@ -45,8 +45,7 @@ func main() {
 var appCube cubeclient.Client
 
 func registerRoutes(r *gin.Engine) {
-	api := r.Group("/api/v1")
-	cubehttp.New(appCube).Register(api, cubehttp.RegisterOptions{
+	cubehttp.New(appCube).Register(r, cubehttp.RegisterOptions{
 		Suppliers: true,
 	})
 }

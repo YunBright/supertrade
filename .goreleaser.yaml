@@ -1,0 +1,395 @@
+# .goreleaser configuration for supertrade
+#
+# 生产部署由 F:\go\src\github.com\YunBright\deployer\deploy-supertrade.ps1 驱动。
+# 该脚本的契约(必须严格满足):
+#   - 必须在 <SupertradeDir>/dist/ 下产出 16 个 .tar.gz 归档(每个二进制一个)
+#   - 归档文件名 = <project>_<version>_<OS>_<arch>.tar.gz(被脚本当 leaf 传到 ssh tar -xzf)
+#   - 解压必须能在 <RemoteDir>/apps/<name>/ 下完成,extract 步骤是
+#     `cd <归档所在父目录> && tar -xzf <leaf>`,所以归档内部结构 = 生产 cwd 的内容
+#   - chmod 步骤用正则 `^\s*binary:\s*"?([^"\s#]+)"?` 从本文件提取 binary 名,然后
+#     `find <RemoteDir>/apps -type f \( -name '<binary>' ... \)` 递归 chmod +x
+#   - 因此 `binary: <name>` 必须保留,且二进制在归档顶层就叫 <name>(不能带目录前缀)
+#   - 每个 build 的 `id` 必须等于 `binary`,因为 deploy-supertrade.ps1 用
+#     `goreleaser build --id <name> --clean --snapshot` 按 build id 过滤(注意
+#     `goreleaser build` 接受 --id,但 `goreleaser release` 不接受;因此单服务部署
+#     必须用 build 子命令而不是 release)。脚本会再把 build 出来的二进制手工
+#     tar.gz 包成 apps/<name>/<name>_<ver>_Linux_x86_64.tar.gz。
+#
+# 生产远端目录布局(由 deploy-supertrade.ps1 拼出来):
+#   <RemoteDir>/                          ← 根,不放东西,只作为容器
+#     apps/
+#       catalog/                          ← catalog 的 cwd
+#         catalog                         ← 二进制
+#       inventory/
+#         inventory
+#       master-data/
+#         master-data
+#       stocktake/
+#         stocktake
+#       pos/ pos-gateway/ pricing/ procurement/ sales-agg/
+#       fresh-produce/ fresh-meat/ erp-connector/ bi-gateway/
+#       llm-gw/ notification/ notification-gateway/
+#
+# 端口约定:catalog :8101, inventory :8102, master-data :8103;
+# 其它 13 个 binary 默认监听 :8080(其中 pos/pricing/procurement/sales-agg/
+# fresh-produce/fresh-meat/erp-connector/bi-gateway/llm-gw/notification 当前
+# 只响应 /healthz placeholder;stocktake 需要 POSTGRES_DSN,真正使用 PG;
+# pos-gateway 与 notification-gateway 是真实业务进程)。
+# 远端 :8080 端口冲突由 Dapr sidecar 端口分配 + nginx map 规则解决,
+# 具体路由规则见 .claude/rules/00-app-catalog.md,本脚本不涉及。
+#
+# https://goreleaser.com
+
+project_name: supertrade
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  # 16 个 binary,每个 build 的 id == binary 名。这样 `goreleaser --id stocktake`
+  # 会只构建 stocktake 一个并产出 dist/apps/stocktake/stocktake_<ver>_Linux_x86_64.tar.gz,
+  # 是 deploy-supertrade.ps1 -Service <name> 单服务部署的根基。
+  - main: ./cmd/catalog
+    id: "catalog"
+    binary: "catalog"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./cmd/inventory
+    id: "inventory"
+    binary: "inventory"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./cmd/master-data
+    id: "master-data"
+    binary: "master-data"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./cmd/stocktake
+    id: "stocktake"
+    binary: "stocktake"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./cmd/pos
+    id: "pos"
+    binary: "pos"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./cmd/pos-gateway
+    id: "pos-gateway"
+    binary: "pos-gateway"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./cmd/pricing
+    id: "pricing"
+    binary: "pricing"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./cmd/procurement
+    id: "procurement"
+    binary: "procurement"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./cmd/sales-agg
+    id: "sales-agg"
+    binary: "sales-agg"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./cmd/fresh-produce
+    id: "fresh-produce"
+    binary: "fresh-produce"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./cmd/fresh-meat
+    id: "fresh-meat"
+    binary: "fresh-meat"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./cmd/erp-connector
+    id: "erp-connector"
+    binary: "erp-connector"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./cmd/bi-gateway
+    id: "bi-gateway"
+    binary: "bi-gateway"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./cmd/llm-gw
+    id: "llm-gw"
+    binary: "llm-gw"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./cmd/notification
+    id: "notification"
+    binary: "notification"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./cmd/notification-gateway
+    id: "notification-gateway"
+    binary: "notification-gateway"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+archives:
+  # 16 个 archive,每个 binary 一份,name_template 用 apps/<name>/ 前缀,这样
+  # deploy-supertrade.ps1 自动在远端 <RemoteDir>/apps/<name>/ 下建子目录 + scp + 解压,
+  # 镜像 cube 的 semantic-layers/<family>/ 模式 —— 不同 binary 不互相覆盖同名二进制。
+  # wrap_in_directory: false —— 避免 tarball 内多套一层同名目录,确保解压后
+  #   <name> 直接出现在 <RemoteDir>/apps/<name>/ 下,而不是
+  #   <RemoteDir>/apps/<name>/<name>_<ver>_Linux_x86_64/<name>。
+  # 没有 `files:` 块 —— 与 cube 的 sixun-hbposv7 不同,supertrade 没有 family 级
+  # 共享 schema/config 目录,所以归档只装 binary 本身。
+  - id: "catalog"
+    format: tar.gz
+    builds:
+      - catalog
+    wrap_in_directory: false
+    name_template: 'apps/catalog/catalog_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  - id: "inventory"
+    format: tar.gz
+    builds:
+      - inventory
+    wrap_in_directory: false
+    name_template: 'apps/inventory/inventory_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  - id: "master-data"
+    format: tar.gz
+    builds:
+      - master-data
+    wrap_in_directory: false
+    name_template: 'apps/master-data/master-data_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  - id: "stocktake"
+    format: tar.gz
+    builds:
+      - stocktake
+    wrap_in_directory: false
+    name_template: 'apps/stocktake/stocktake_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  - id: "pos"
+    format: tar.gz
+    builds:
+      - pos
+    wrap_in_directory: false
+    name_template: 'apps/pos/pos_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  - id: "pos-gateway"
+    format: tar.gz
+    builds:
+      - pos-gateway
+    wrap_in_directory: false
+    name_template: 'apps/pos-gateway/pos-gateway_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  - id: "pricing"
+    format: tar.gz
+    builds:
+      - pricing
+    wrap_in_directory: false
+    name_template: 'apps/pricing/pricing_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  - id: "procurement"
+    format: tar.gz
+    builds:
+      - procurement
+    wrap_in_directory: false
+    name_template: 'apps/procurement/procurement_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  - id: "sales-agg"
+    format: tar.gz
+    builds:
+      - sales-agg
+    wrap_in_directory: false
+    name_template: 'apps/sales-agg/sales-agg_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  - id: "fresh-produce"
+    format: tar.gz
+    builds:
+      - fresh-produce
+    wrap_in_directory: false
+    name_template: 'apps/fresh-produce/fresh-produce_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  - id: "fresh-meat"
+    format: tar.gz
+    builds:
+      - fresh-meat
+    wrap_in_directory: false
+    name_template: 'apps/fresh-meat/fresh-meat_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  - id: "erp-connector"
+    format: tar.gz
+    builds:
+      - erp-connector
+    wrap_in_directory: false
+    name_template: 'apps/erp-connector/erp-connector_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  - id: "bi-gateway"
+    format: tar.gz
+    builds:
+      - bi-gateway
+    wrap_in_directory: false
+    name_template: 'apps/bi-gateway/bi-gateway_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  - id: "llm-gw"
+    format: tar.gz
+    builds:
+      - llm-gw
+    wrap_in_directory: false
+    name_template: 'apps/llm-gw/llm-gw_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  - id: "notification"
+    format: tar.gz
+    builds:
+      - notification
+    wrap_in_directory: false
+    name_template: 'apps/notification/notification_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  - id: "notification-gateway"
+    format: tar.gz
+    builds:
+      - notification-gateway
+    wrap_in_directory: false
+    name_template: 'apps/notification-gateway/notification-gateway_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  name_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json

@@ -258,33 +258,23 @@ func atoiDefault(s string, def int) int {
 
 // NewClientFromEnv 按 CUBE_CLIENT_MODE 选 InMemoryClient 或 HTTPCubeClient。
 //
-//   CUBE_CLIENT_MODE=memory  (默认) InMemoryClient(mock 数据,本地 / 测试用)
-//   CUBE_CLIENT_MODE=http    HTTPCubeClient,经 DAPR_ENDPOINT 调 cube-gateway /v1/load
+//	CUBE_CLIENT_MODE=memory  (默认) InMemoryClient(mock 数据,本地 / 测试用)
+//	CUBE_CLIENT_MODE=http    HTTPCubeClient,经 DAPR_ENDPOINT 调 cube-gateway /v1/load
 //
 // 配置项:
-//   DAPR_ENDPOINT = "http://localhost:3500"   // 默认
-//   CUBE_APP_ID   = "cube-gateway"             // 默认
+//
+//	DAPR_ENDPOINT = "http://localhost:3500"   // 默认
+//	CUBE_APP_ID   = "cube-gateway"             // 默认
 //
 // 在 cmd/catalog / cmd/inventory / cmd/master-data 等非 stocktake 服务复用。
 func NewClientFromEnv() (cubeclient.Client, error) {
-	mode := os.Getenv("CUBE_CLIENT_MODE")
-	if mode == "" {
-		mode = "memory"
+	daprEP := os.Getenv("DAPR_ENDPOINT")
+	if daprEP == "" {
+		daprEP = "http://localhost:3001"
 	}
-	switch mode {
-	case "http":
-		daprEP := os.Getenv("DAPR_ENDPOINT")
-		if daprEP == "" {
-			daprEP = "http://localhost:3500"
-		}
-		appID := os.Getenv("CUBE_APP_ID")
-		if appID == "" {
-			appID = "cube-gateway"
-		}
-		return cubeclient.NewHTTPCubeClient(daprEP, appID), nil
-	case "memory", "":
-		return cubeclient.NewInMemoryClient(), nil
-	default:
-		return nil, fmt.Errorf("cubehttp: 未知 CUBE_CLIENT_MODE=%q (expect memory|http)", mode)
+	appID := os.Getenv("CUBE_APP_ID")
+	if appID == "" {
+		appID = "cube-gateway"
 	}
+	return cubeclient.NewHTTPCubeClient(daprEP, appID), nil
 }
