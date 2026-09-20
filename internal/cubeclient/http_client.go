@@ -11,6 +11,17 @@
 // 协议参考:F:\go\src\github.com\YunBright\cube\pkg\cubequery\query.go
 //   请求:{ query: { measures, dimensions, filters, limit } }
 //   响应:{ data: [{ "<model>.<field>": value, ... }] }
+//
+// JWT 透传约定:
+//   cube-gateway 的 dapr-sidecar 配了 middleware.http.bearer,要求请求带 Authorization: Bearer <token>。
+//   stocktake 等 supertrade dapr app 经 dapr service invocation 直连 cube-gateway 时,
+//   dapr 默认**不**透传 Authorization 头(nginx 路径下走 userd-sidecar → cube-gateway-sidecar
+//   才会自动 forward)。所以 stocktake 的 handler 必须从 gin request 提取 JWT,塞进 context,
+//   LoadCubeQuery 从 context 读出,加到 outgoing dapr invocation 上。
+//   调用模式 (在 handler 里):
+//     ctx := authctx.WithBearer(c.Request.Context(), c.Request.Header.Get("Authorization"))
+//     appSvc.SearchProducts(ctx, ...)
+//   LoadCubeQuery 内部自动 ctx.Value(bearerCtxKey) 取出并加 header。
 package cubeclient
 
 import (
@@ -26,6 +37,28 @@ import (
 
 	"github.com/shopspring/decimal"
 )
+
+// bearerCtxKey 是 context.Value 的 key,值是 "Bearer <token>" 完整字符串(可空)。
+//
+// 命名带 package 名("cubeclient/")避免与其他包 ctx key 冲突。
+type bearerCtxKey struct{}
+
+// WithBearer 把 JWT 透传到下游 cube 调用。
+//
+// handler 收到 gin request 时,调用一次 WithBearer 把 Authorization header
+// (含 "Bearer " 前缀)塞进 ctx,后续 cubeclient 调用会自动 forward。
+// 空字符串表示"无 token"(e.g. 内部定时任务),LoadCubeQuery 会跳过 header 注入。
+func WithBearer(ctx context.Context, bearer string) context.Context {
+	return context.WithValue(ctx, bearerCtxKey{}, bearer)
+}
+
+// bearerFromCtx 读 ctx 里的 bearer(没有 → "")。
+func bearerFromCtx(ctx context.Context) string {
+	if v, ok := ctx.Value(bearerCtxKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
 
 // HTTPCubeClient 是 cube-gateway 的 client(dapr service invocation 封装)。
 type HTTPCubeClient struct {
@@ -68,19 +101,20 @@ type CubeFilter struct {
 //
 // 每行 key 形如 "<model>.<field>",例如 "product.id"、"stock.total_quantity"。
 //
+// 请求体是 cube /v1/load 期望的扁平 JSON(measures/dimensions/filters/limit 在顶层,
+// 不是包在 "query" 字段里 — cube 的 cubequery.Parse 直接解析顶层字段)。
+//
 // HTTP 错误映射:
 //   - 404 → ErrCubeNotFound(各 GetX 方法 wrap 成具体 error)
 //   - 其它 ≥400 → 普通 error 含状态码
 func (c *HTTPCubeClient) LoadCubeQuery(ctx context.Context, modelName string, q CubeQuery) ([]map[string]any, error) {
 	body := map[string]any{
-		"query": map[string]any{
-			"measures":   q.Measures,
-			"dimensions": q.Dimensions,
-			"filters":    q.Filters,
-		},
+		"measures":   q.Measures,
+		"dimensions": q.Dimensions,
+		"filters":    q.Filters,
 	}
 	if q.Limit > 0 {
-		body["query"].(map[string]any)["limit"] = q.Limit
+		body["limit"] = q.Limit
 	}
 	b, _ := json.Marshal(body)
 
@@ -90,6 +124,11 @@ func (c *HTTPCubeClient) LoadCubeQuery(ctx context.Context, modelName string, q 
 		return nil, fmt.Errorf("cube http: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// 透传调用方的 JWT (cube-gateway 的 dapr-sidecar bearer middleware 必需要)。
+	// 没设过 WithBearer 时 bearerFromCtx 返 "" → 跳过,行为兼容。
+	if bearer := bearerFromCtx(ctx); bearer != "" {
+		req.Header.Set("Authorization", bearer)
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("cube http: %w", err)
@@ -116,6 +155,7 @@ func (c *HTTPCubeClient) LoadCubeQuery(ctx context.Context, modelName string, q 
 // GetProduct 查 cube product(按 item_no)。
 func (c *HTTPCubeClient) GetProduct(ctx context.Context, productID string) (*ProductDTO, error) {
 	data, err := c.LoadCubeQuery(ctx, "product", CubeQuery{
+		Measures:   []string{"product.count"},
 		Dimensions: []string{"product.id", "product.name", "product.category_id",
 			"product.supplier_id", "product.status"},
 		Filters: []CubeFilter{
@@ -179,38 +219,33 @@ func (c *HTTPCubeClient) GetStock(ctx context.Context, branchID, productID strin
 
 // SearchProductsByBarcode 按 barcode 查商品,合并该门店 stock。
 //
-// 长度策略:
-//   - <5 位:返空(防全表扫)
-//   - ≥13 位:精确(把 barcode 当 item_no 用,cube product schema 本期不含 barcode 字段)
-//   - 5~12 位:cube 不支持后缀模糊 → 返空
+// 把 barcode 当 item_no 精确查(cube product.id = 思迅 item_no,
+// 条码和 item_no 在思迅系统里通常是同一字段)。
+// 长度 < 3 时返空(防全表扫 + 防无效输入)。
 //
 // 注:本期 cube sixun-models/product 不含 barcode dimension,
-// barcode 模糊查询需要 cube 仓库扩展,后续 Phase 跟进。
+// 条码模糊查询需要 cube 仓库扩展,后续 Phase 跟进。
 func (c *HTTPCubeClient) SearchProductsByBarcode(ctx context.Context, barcode, branchID string, limit int) ([]ProductWithStock, error) {
-	if len(barcode) < 5 {
+	if len(barcode) < 3 {
 		return []ProductWithStock{}, nil
 	}
-	if len(barcode) >= 13 {
-		// 把 barcode 当 item_no 精确查
-		p, err := c.GetProduct(ctx, barcode)
-		if err != nil {
-			if errors.Is(err, ErrProductNotFound) {
-				return []ProductWithStock{}, nil
-			}
-			return nil, err
+	// 精确查(把 barcode 当 item_no)
+	p, err := c.GetProduct(ctx, barcode)
+	if err != nil {
+		if errors.Is(err, ErrProductNotFound) {
+			return []ProductWithStock{}, nil
 		}
-		out := []ProductWithStock{{Product: p}}
-		if branchID != "" {
-			s, err := c.GetStock(ctx, branchID, barcode)
-			if err == nil {
-				out[0].Stock = s
-			}
-			// 跨店阻断:stock 不存在不报错(GetStock 已 wrap ErrStockNotFound),只不返 stock 字段
-		}
-		return out, nil
+		return nil, err
 	}
-	// 5~12 位:cube 不支持后缀模糊
-	return []ProductWithStock{}, nil
+	out := []ProductWithStock{{Product: p}}
+	if branchID != "" {
+		s, err := c.GetStock(ctx, branchID, barcode)
+		if err == nil {
+			out[0].Stock = s
+		}
+		// 跨店阻断:stock 不存在不报错(GetStock 已 wrap ErrStockNotFound),只不返 stock 字段
+	}
+	return out, nil
 }
 
 // SearchSuppliers 按 ID 精确 或 name 模糊查供应商。
@@ -219,6 +254,7 @@ func (c *HTTPCubeClient) SearchProductsByBarcode(ctx context.Context, barcode, b
 // 否则走 name contains。
 func (c *HTTPCubeClient) SearchSuppliers(ctx context.Context, query string, limit int) ([]SupplierDTO, error) {
 	cq := CubeQuery{
+		Measures:   []string{"supplier.count"},
 		Dimensions: []string{"supplier.id", "supplier.name", "supplier.type",
 			"supplier.contact", "supplier.phone"},
 	}

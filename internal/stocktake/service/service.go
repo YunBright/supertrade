@@ -12,11 +12,11 @@ package service
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
@@ -309,6 +309,11 @@ func (s *Service) AddLine(ctx context.Context, headerID string, in AddLineInput)
 			return nil, fmt.Errorf("%w: %v", ErrProductNotFound, err)
 		}
 		return nil, fmt.Errorf("cube get product: %w", err)
+	}
+	// 兜底: cube 对 COUNT(*) 查询即使无匹配也返 1 行空记录,这里视为"未找到"。
+	if product.ID == "" {
+		return nil, fmt.Errorf("%w: product_id=%q (cube 返空记录)",
+			ErrProductNotFound, in.ProductID)
 	}
 
 	// 2. 拉 cube stock 快照(跨店阻断)
@@ -718,7 +723,7 @@ type SearchProductsOutput struct {
 //   - supplierViewable=false → 不查 cube supplier、不返 supplier_id / supplier_name
 //
 // 注意:权限通过 invViewable / supplierViewable 参数传入,由 handler 从 claims.Scopes 读出。
-func (s *Service) SearchProducts(_ context.Context, in SearchProductsInput, invViewable, supplierViewable bool) (*SearchProductsOutput, error) {
+func (s *Service) SearchProducts(ctx context.Context, in SearchProductsInput, invViewable, supplierViewable bool) (*SearchProductsOutput, error) {
 	if s.cube == nil {
 		return nil, ErrCubeUnavailable
 	}
@@ -731,7 +736,7 @@ func (s *Service) SearchProducts(_ context.Context, in SearchProductsInput, invV
 		limit = 10
 	}
 
-	rows, err := s.cube.SearchProductsByBarcode(context.Background(), in.Barcode, in.BranchID, limit)
+	rows, err := s.cube.SearchProductsByBarcode(ctx, in.Barcode, in.BranchID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("cube search products: %w", err)
 	}
@@ -748,6 +753,10 @@ func (s *Service) SearchProducts(_ context.Context, in SearchProductsInput, invV
 	}
 	for _, r := range rows {
 		if r.Product == nil {
+			continue
+		}
+		// 兜底: cube 对 COUNT(*) 查询即使无匹配也返 1 行空记录,这里跳过空 ID。
+		if r.Product.ID == "" {
 			continue
 		}
 		row := SearchProductRow{
@@ -895,19 +904,25 @@ func sortReasonAggs(aggs []model.ReasonAgg) {
 	}
 }
 
-// headerIDSeq 是进程内的单调递增 seq,确保同一时刻创建的 header 主键不冲突。
+// generateHeaderID 生成 ST<yyyymmdd><8-hex random>。
 //
-// 测试用固定 clock 时,纳秒时间戳可能两次相同 → unique 冲突;
-// 这里用 atomic counter 永远递增,代替 UnixNano 后 6 位。
-var headerIDSeq atomic.Uint64
-
-// generateHeaderID 生成 ST<yyyymmdd><seq>。
+// 格式保持 ST 开头 + 8 位日期 + 8 位 hex 随机 = 18 字符,远小于 varchar(64)。
+// 随机后缀用 crypto/rand(非 math/rand),保证跨进程、跨重启无碰撞倾向。
 //
-// seq 是进程内 atomic 计数器(永远递增),保证主键唯一;
-// 高并发场景后续可换 DB sequence / UUID。
+// 历史 bug:旧实现 headerIDSeq 是进程内 atomic counter,服务重启后归零 → 同日两次 deploy
+// 必撞 pkey(unique constraint violation)。这里换成随机后缀彻底解决。
+// 同日 ~10k 张单碰撞概率 ~10^-5;若未来真出现同日万级量,再换 crypto/rand 12 位或 UUID。
 func generateHeaderID(now time.Time) string {
-	seq := headerIDSeq.Add(1) % 1_000_000
-	return fmt.Sprintf("ST%s%06d", now.UTC().Format("20060102"), seq)
+	var b [4]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		// crypto/rand 失败概率极低,fallback 用纳秒时间戳后 4 字节。
+		ts := uint64(now.UTC().UnixNano())
+		b[0] = byte(ts >> 24)
+		b[1] = byte(ts >> 16)
+		b[2] = byte(ts >> 8)
+		b[3] = byte(ts)
+	}
+	return fmt.Sprintf("ST%s%08x", now.UTC().Format("20060102"), b)
 }
 
 // ---- Header List (盘点单列表) ----

@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/YunBright/authkit/claims"
+	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/internal/stocktake/model"
 	"github.com/YunBright/supertrade/internal/stocktake/service"
 	"github.com/gin-gonic/gin"
@@ -285,7 +286,9 @@ func (h *Handler) AddLine(c *gin.Context) {
 		return
 	}
 	cl, _ := claims.FromContext(c.Request.Context())
-	line, err := h.svc.AddLine(c.Request.Context(), headerID, service.AddLineInput{
+	// AddLine 会查 cube product + stock,需要把 caller JWT 透传给 cube-gateway sidecar。
+	ctx := cubeclient.WithBearer(c.Request.Context(), c.Request.Header.Get("Authorization"))
+	line, err := h.svc.AddLine(ctx, headerID, service.AddLineInput{
 		ProductID:  req.ProductID,
 		ActualQty:  req.ActualQty,
 		DiffReason: model.DiffReason(req.DiffReason),
@@ -311,6 +314,8 @@ func (h *Handler) UpdateLine(c *gin.Context) {
 		return
 	}
 	cl, _ := claims.FromContext(c.Request.Context())
+	// UpdateLine 也会查 cube 拉最新 book_qty 快照,需要透传 JWT。
+	ctx := cubeclient.WithBearer(c.Request.Context(), c.Request.Header.Get("Authorization"))
 	in := service.UpdateLineInput{
 		ActualQty: req.ActualQty,
 		Remark:    req.Remark,
@@ -323,7 +328,7 @@ func (h *Handler) UpdateLine(c *gin.Context) {
 		dr := model.DiffReason(*req.DiffReason)
 		in.DiffReason = &dr
 	}
-	line, err := h.svc.UpdateLine(c.Request.Context(), id, in)
+	line, err := h.svc.UpdateLine(ctx, id, in)
 	if err != nil {
 		mapErr(c, err)
 		return
@@ -425,7 +430,9 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 	invViewable := hasScope(cl, "inventory:view")
 	supplierViewable := hasScope(cl, "supplier:view")
 
-	out, err := h.svc.SearchProducts(c.Request.Context(), service.SearchProductsInput{
+	// SearchProducts 直接调 cube.SearchProductsByBarcode → cube-gateway,需要透传 JWT。
+	ctx := cubeclient.WithBearer(c.Request.Context(), c.Request.Header.Get("Authorization"))
+	out, err := h.svc.SearchProducts(ctx, service.SearchProductsInput{
 		Barcode:  barcode,
 		BranchID: branchID,
 		Limit:    limit,
