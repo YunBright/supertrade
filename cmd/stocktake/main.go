@@ -87,10 +87,6 @@ func initApp() error {
 	}
 
 	appSvc = service.New(appDB, appCube)
-	mode := os.Getenv("CUBE_CLIENT_MODE")
-	if mode == "" {
-		mode = "memory"
-	}
 
 	// 注入 Dapr pub/sub publisher;缺环境变量时禁用广播
 	if os.Getenv("DAPR_ENDPOINT") != "" || os.Getenv("ENABLE_DAPR_PUBLISH") == "1" {
@@ -103,7 +99,6 @@ func initApp() error {
 
 	slog.Info("stocktake app initialized",
 		"db_driver", "postgres",
-		"cube_client", mode,
 	)
 	return nil
 }

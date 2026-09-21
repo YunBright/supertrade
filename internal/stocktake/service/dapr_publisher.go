@@ -32,21 +32,21 @@ import (
 // 简单、单实例、不带熔断;stocktake 是低 QPS 服务,直接 HTTP 调
 // localhost:3500 即可。
 type DaprPublisher struct {
-	endpoint   string        // dapr sidecar base URL,如 http://localhost:3500
-	pubsub     string        // pubsub component name,默认 "pubsub"
-	httpClient *http.Client  // 短超时
+	endpoint   string       // dapr sidecar base URL,如 http://localhost:3500
+	pubsub     string       // pubsub component name,默认 "pubsub"
+	httpClient *http.Client // 短超时
 }
 
 // NewDaprPublisherFromEnv 从环境变量构造 publisher。
 //
-//   DAPR_ENDPOINT = "http://localhost:3500"
-//   DAPR_PUBSUB   = "pubsub"
+//	DAPR_ENDPOINT = "http://localhost:3500"
+//	DAPR_PUBSUB   = "pubsub"
 //
 // 缺省回退到 sidecar 默认值。
 func NewDaprPublisherFromEnv() *DaprPublisher {
 	ep := os.Getenv("DAPR_ENDPOINT")
 	if ep == "" {
-		ep = "http://localhost:3500"
+		ep = "http://localhost:3001"
 	}
 	ps := os.Getenv("DAPR_PUBSUB")
 	if ps == "" {
