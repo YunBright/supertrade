@@ -17,8 +17,10 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/YunBright/authkit/userinfo"
 	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/internal/stocktake/model"
 	"github.com/google/uuid"
@@ -35,7 +37,27 @@ type Service struct {
 	publisher Publisher       // nil = 禁用 pub/sub 广播
 	pubLogger *slog.Logger    // 发布日志;默认 slog.Default()
 	now       func() time.Time // 注入时间,默认 time.Now().UTC()
+
+	// effective scopes 校验用 userinfo 客户端;nil 时 GetEffectiveScopes 返 ErrUserInfoUnavailable。
+	userInfo *userinfo.Client
+
+	// effective scopes TTL 缓存(user_id → scopes)。受 scopeMu 保护。
+	scopeMu    sync.RWMutex
+	scopeCache map[string]scopeCacheEntry
+	scopeTTL   time.Duration // 默认 60s
 }
+
+// scopeCacheEntry 缓存一条 entry。
+type scopeCacheEntry struct {
+	scopes []string
+	at     time.Time
+}
+
+// defaultScopeTTL 是 effective scopes 缓存的默认 TTL。
+//
+// 选 60s 是经验值:与权限变更窗口匹配(userd 通过 SSE 推送 permissions_changed,
+// 前端重拉 /userd/me;后端缓存 60s 内有效);太短 → userd 调用频繁;太长 → 权限变更延迟生效。
+const defaultScopeTTL = 60 * time.Second
 
 // New 构造 Service。
 //
@@ -43,10 +65,12 @@ type Service struct {
 // cube 为 nil 时,AddLine 等会立即返回 ErrCubeUnavailable(便于测试)。
 func New(db *gorm.DB, cube cubeclient.Client) *Service {
 	return &Service{
-		db:        db,
-		cube:      cube,
-		pubLogger: slog.Default(),
-		now:       func() time.Time { return time.Now().UTC() },
+		db:         db,
+		cube:       cube,
+		pubLogger:  slog.Default(),
+		now:        func() time.Time { return time.Now().UTC() },
+		scopeCache: make(map[string]scopeCacheEntry),
+		scopeTTL:   defaultScopeTTL,
 	}
 }
 
@@ -56,6 +80,25 @@ func (s *Service) SetClock(fn func() time.Time) {
 		fn = func() time.Time { return time.Now().UTC() }
 	}
 	s.now = fn
+}
+
+// SetUserInfo 注入 userinfo 客户端(用于 effective scopes 校验)。
+//
+// 调用方传 nil 等同于"未注入 userd 依赖";GetEffectiveScopes 会返 ErrUserInfoUnavailable。
+// 通常在 main.go initApp() 中 New(svc) 之后调用一次。
+func (s *Service) SetUserInfo(c *userinfo.Client) {
+	s.userInfo = c
+}
+
+// SetScopeTTL 注入 effective scopes 缓存 TTL;≤0 用 defaultScopeTTL。
+// 测试用,生产不应调。
+func (s *Service) SetScopeTTL(ttl time.Duration) {
+	if ttl <= 0 {
+		ttl = defaultScopeTTL
+	}
+	s.scopeMu.Lock()
+	s.scopeTTL = ttl
+	s.scopeMu.Unlock()
 }
 
 // ---- 业务错误(供 handler 映射 HTTP 状态码) ----
@@ -72,6 +115,9 @@ var (
 	ErrPlanItemDuplicated   = errors.New("service: 同一商品已在计划清单中")
 	ErrRecheckRequiresParent = errors.New("service: 复盘点单必须指定 parent_header_id")
 	ErrInvalidOpType        = errors.New("service: 非法的 op_type")
+	// ErrUserInfoUnavailable userd 未注入或调用失败(handler 映射 503)。
+	// 区别于 ErrCubeUnavailable:这里是权限校验依赖不可用。
+	ErrUserInfoUnavailable  = errors.New("service: userd 不可用,无法校验 effective scopes")
 )
 
 // ---- Header ----
@@ -999,6 +1045,72 @@ func (s *Service) ListHeaders(_ context.Context, f ListHeadersFilter, page, page
 	}, nil
 }
 
+// SearchHeadersOutput SearchHeaders 的响应。
+//
+// 嵌入 ListHeadersOutput 以复用 headers/page/page_size/total 字段;
+// 顶层新增 query(原 q 不带修饰,供前端回显)。
+type SearchHeadersOutput struct {
+	ListHeadersOutput
+	Query string `json:"query"`
+}
+
+// SearchHeaders 按 单号前缀 / 备注模糊 搜盘点单(仓管 view 权限调用)。
+//
+// 匹配规则:
+//   - id LIKE 'q%'           单号前缀(单号 ST<yyyyMMdd><hex> 全大写,前缀够用)
+//   - LOWER(remark) LIKE '%q%'  备注大小写无关包含
+// 两者 OR;branchID 为空时不过滤门店。
+//
+// 分页同 ListHeaders(page=1 / page_size=20 / max=100);排序 count_date DESC, id DESC。
+//
+// 校验:query 必填,空 → ErrInvalidStatus(400 bad_request)。
+//
+// 权限校验**不**在本方法内做,由 handler 调 GetEffectiveScopes 拿 userd effective scopes 后判断。
+func (s *Service) SearchHeaders(_ context.Context, query, branchID string, page, pageSize int) (*SearchHeadersOutput, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, fmt.Errorf("%w: q 必填", ErrInvalidStatus)
+	}
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+
+	q := s.db.Model(&model.StocktakeHeader{})
+	if branchID != "" {
+		q = q.Where("branch_id = ?", branchID)
+	}
+	// q 转小写用于 remark 大小写无关匹配;id 仍按原样(单号大写,大小写敏感即可)
+	qLower := strings.ToLower(query)
+	q = q.Where("(id LIKE ? OR LOWER(remark) LIKE ?)", query+"%", "%"+qLower+"%")
+
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		return nil, fmt.Errorf("count search headers: %w", err)
+	}
+
+	var headers []model.StocktakeHeader
+	if err := q.Order("count_date DESC, id DESC").
+		Offset((page - 1) * pageSize).
+		Limit(pageSize).
+		Find(&headers).Error; err != nil {
+		return nil, fmt.Errorf("search headers: %w", err)
+	}
+	return &SearchHeadersOutput{
+		ListHeadersOutput: ListHeadersOutput{
+			Headers:  headers,
+			Page:     page,
+			PageSize: pageSize,
+			Total:    total,
+		},
+		Query: query,
+	}, nil
+}
+
 // ---- Line Operation History (明细操作历史) ----
 
 // ListLineOperations 查盘点单的所有操作历史,按 op_at DESC(最新在前)。
@@ -1147,4 +1259,170 @@ func (s *Service) DeletePlanItem(_ context.Context, headerID, itemID string) err
 		return ErrPlanItemNotFound
 	}
 	return nil
+}
+
+// ---- Branch Default Stocktake (门店默认盘点单) ----
+
+// ErrBranchDefaultNotFound 某店未设置默认盘点单。
+var ErrBranchDefaultNotFound = errors.New("service: 该店未设置默认盘点单")
+
+// SetBranchDefaultStocktake 设置某店的默认盘点单(仓管权限调用)。
+//
+// 业务校验:
+//   - branchID / headerID 必填
+//   - headerID 必须存在
+//   - header.BranchID 必须 == branchID(防止跨店设置)
+//   - header.Status 必须 == counting(默认盘点单必须是录入中的;已冻结/已审的单不应再被推荐)
+//
+// upsert 行为:同一 BranchID 已有记录则覆盖(更新 header_id / updated_by / updated_at);
+// GORM Save 会按主键覆盖,ErrBranchDefaultNotFound 与 ErrInvalidTransition 已在 mapErr 处理。
+func (s *Service) SetBranchDefaultStocktake(_ context.Context, branchID, headerID, operatorID string) (*model.StocktakeBranchDefault, error) {
+	if branchID == "" {
+		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidStatus)
+	}
+	if headerID == "" {
+		return nil, fmt.Errorf("%w: header_id 必填", ErrInvalidStatus)
+	}
+	if operatorID == "" {
+		operatorID = "unknown"
+	}
+
+	h, err := s.GetHeader(context.Background(), headerID)
+	if err != nil {
+		return nil, err
+	}
+	if h.BranchID != branchID {
+		return nil, fmt.Errorf("%w: header.branch_id(%q) ≠ branch_id(%q),禁止跨店设置默认盘点单",
+			ErrInvalidStatus, h.BranchID, branchID)
+	}
+	if h.Status != model.StatusCounting {
+		return nil, fmt.Errorf("%w: 默认盘点单仅允许 counting 状态(当前: %s)",
+			ErrInvalidTransition, h.Status)
+	}
+
+	now := s.now()
+	rec := &model.StocktakeBranchDefault{
+		BranchID:  branchID,
+		HeaderID:  headerID,
+		UpdatedBy: operatorID,
+		UpdatedAt: now,
+	}
+	// Save 按主键覆盖 → upsert 语义;新建/更新统一走这一条路径。
+	if err := s.db.Save(rec).Error; err != nil {
+		return nil, fmt.Errorf("upsert branch default: %w", err)
+	}
+	return rec, nil
+}
+
+// GetBranchDefaultStocktake 查某店的默认盘点单。
+//
+// 未设置时返回 ErrBranchDefaultNotFound(handler 映射为 404)。
+// 若默认盘点单对应的 header 状态非 counting,handler 在返回 payload 时仍透传,
+// 由前端判断并提示仓管重新设置。
+func (s *Service) GetBranchDefaultStocktake(_ context.Context, branchID string) (*model.StocktakeBranchDefault, error) {
+	if branchID == "" {
+		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidStatus)
+	}
+	var rec model.StocktakeBranchDefault
+	if err := s.db.First(&rec, "branch_id = ?", branchID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrBranchDefaultNotFound
+		}
+		return nil, err
+	}
+	return &rec, nil
+}
+
+// ClearBranchDefaultStocktake 清除某店的默认盘点单(可选,主要用于 header 被删除/失效时清理)。
+//
+// 当前未挂端点;保留供 service 内部或后续清理任务调用。
+func (s *Service) ClearBranchDefaultStocktake(_ context.Context, branchID string) error {
+	res := s.db.Where("branch_id = ?", branchID).Delete(&model.StocktakeBranchDefault{})
+	if res.Error != nil {
+		return res.Error
+	}
+	return nil
+}
+
+// ---- Effective Scopes (调 userd 校验权限) ----
+
+// GetEffectiveScopes 拿指定 user 的 effective scopes(走 userd + 本地 TTL 缓存)。
+//
+// 缓存策略:TTL = s.scopeTTL(默认 60s);key = userID。
+// miss 时调 userinfo.Get(ctx, userID),把 User.Scopes(permissions ⨝ role_permissions ⨝ user_roles join)
+// 缓存并返回。命中缓存直接返,不调 userd。
+//
+// 错误:
+//   - userID == ""                → ErrInvalidStatus(400)
+//   - s.userInfo == nil(未注入)    → ErrUserInfoUnavailable(503)
+//   - userinfo.Get 失败 / 网络错    → ErrUserInfoUnavailable(503)
+//
+// 备注:JWT 的 Scopes 只含 4 项静态派生 scope,不是 effective 权限。
+// 见 auth/README.md "判断权限点" 一节;本方法走 userd 拿完整权限集。
+func (s *Service) GetEffectiveScopes(ctx context.Context, userID string) ([]string, error) {
+	if userID == "" {
+		return nil, fmt.Errorf("%w: user_id 必填", ErrInvalidStatus)
+	}
+	if s.userInfo == nil {
+		return nil, ErrUserInfoUnavailable
+	}
+
+	// 缓存查询
+	s.scopeMu.RLock()
+	entry, ok := s.scopeCache[userID]
+	ttl := s.scopeTTL
+	s.scopeMu.RUnlock()
+	if ok && time.Since(entry.at) < ttl {
+		return entry.scopes, nil
+	}
+
+	// miss → 调 userd。串行化避免同一 userID 并发击穿。
+	s.scopeMu.Lock()
+	defer s.scopeMu.Unlock()
+	// double-check(同一 userID 可能在锁等待期间已被别的请求填好)
+	if entry, ok := s.scopeCache[userID]; ok && time.Since(entry.at) < ttl {
+		return entry.scopes, nil
+	}
+
+	u, err := s.userInfo.Get(ctx, userID)
+	if err != nil {
+		// userinfo.ErrUserNotFound 也归为"不可用"——userd 已知该用户不存在,
+		// 直接返空 scopes 让 handler 走 403,而不是把内部错误透出去。
+		s.pubLogger.Warn("userinfo.Get failed",
+			"user_id", userID,
+			"err", err)
+		return nil, ErrUserInfoUnavailable
+	}
+	scopes := append([]string(nil), u.Scopes...) // 拷贝,避免外部修改底层切片
+	s.scopeCache[userID] = scopeCacheEntry{scopes: scopes, at: s.now()}
+	return scopes, nil
+}
+
+// HasEffectiveScope 便捷判定:userID 的 effective scopes 是否包含 scope。
+//
+// 返回 false 的两种情况:
+//   - scope 不在 effective scopes 中
+//   - GetEffectiveScopes 失败(权限校验不可用 → 一律不通过;handler mapErr 映射 503)
+//
+// 与 JWT HasScope 不同:本方法**不**依赖 JWT claim,走 userd 实时权限。
+func (s *Service) HasEffectiveScope(ctx context.Context, userID, scope string) (bool, error) {
+	scopes, err := s.GetEffectiveScopes(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	for _, s := range scopes {
+		if s == scope {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// InvalidateScopeCache 清掉某 user 的 effective scopes 缓存。
+//
+// 当前未挂端点;保留供权限变更(SSE 收到 permissions_changed)时主动失效。
+func (s *Service) InvalidateScopeCache(userID string) {
+	s.scopeMu.Lock()
+	delete(s.scopeCache, userID)
+	s.scopeMu.Unlock()
 }

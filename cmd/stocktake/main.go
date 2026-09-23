@@ -29,6 +29,7 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/YunBright/authkit/userinfo"
 	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/internal/cubehttp"
 	"github.com/YunBright/supertrade/internal/stocktake"
@@ -77,6 +78,7 @@ func initApp() error {
 		&model.StocktakeLine{},
 		&model.StocktakeLineOperation{},
 		&model.StocktakePlanItem{},
+		&model.StocktakeBranchDefault{},
 	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
 	}
@@ -87,6 +89,14 @@ func initApp() error {
 	}
 
 	appSvc = service.New(appDB, appCube)
+
+	// 注入 userinfo 客户端(供 effective scopes 校验)。
+	// 经 dapr sidecar (DAPR_ENDPOINT) 调 userd /internal/users/{id}。
+	// 未注入时 GetEffectiveScopes 返 ErrUserInfoUnavailable(503 userd_unavailable)。
+	ui := userinfo.New("userd",
+		userinfo.WithEndpoint(daprEndpoint()),
+	)
+	appSvc.SetUserInfo(ui)
 
 	// 注入 Dapr pub/sub publisher;缺环境变量时禁用广播
 	if os.Getenv("DAPR_ENDPOINT") != "" || os.Getenv("ENABLE_DAPR_PUBLISH") == "1" {
@@ -101,6 +111,14 @@ func initApp() error {
 		"db_driver", "postgres",
 	)
 	return nil
+}
+
+// daprEndpoint 拿 dapr sidecar 地址;默认 :3500。
+func daprEndpoint() string {
+	if v := os.Getenv("DAPR_ENDPOINT"); v != "" {
+		return v
+	}
+	return "http://localhost:3500"
 }
 
 // initCubeClient 走 cubehttp.NewClientFromEnv(catalog / inventory / master-data 复用)。

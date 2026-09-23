@@ -3,6 +3,8 @@
 // 路径与端点对应 REQUIREMENTS §2.1 / DESIGN §4.5.1:
 //
 //	POST   /stocktake-headers
+//	GET    /stocktake-headers
+//	GET    /stocktake-headers/search            按单号/备注搜索(仓管 view 权限,userd 校验)
 //	GET    /stocktake-headers/:id
 //	POST   /stocktake-headers/:id/lines
 //	PUT    /stocktake-lines/:id
@@ -16,6 +18,7 @@
 //	ErrHeaderNotFound / ErrLineNotFound → 404
 //	ErrInvalidStatus / ErrInvalidTransition → 400
 //	ErrCubeUnavailable → 503
+//	ErrUserInfoUnavailable → 503(userd 不可用,影响 effective scopes 校验)
 //	ErrProductNotFound / ErrStockNotFound → 400(数据问题)
 //	其它 → 500
 package handler
@@ -54,9 +57,18 @@ func New(svc *service.Service) *Handler {
 //   - GET  /stocktake-headers/:id/history      操作历史
 //   - GET  /stocktake-headers/:id/plan-items   计划盘点商品
 //   - POST /stocktake-headers/:id/plan-items   批量加计划商品
+//
+// 门店默认盘点单(2026-09-23):
+//   - GET  /branches/:branch_id/default-stocktake         查当前店默认盘点单(快速进入盘点)
+//   - PUT  /branches/:branch_id/default-stocktake         设置当前店默认盘点单(需 inventory:manage,仓管)
+//
+// 盘点单搜索(2026-09-23):
+//   - GET  /stocktake-headers/search                      按单号/备注搜索(仓管 view 权限,userd 校验)
 func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.POST("/stocktake-headers", h.CreateHeader)
 	r.GET("/stocktake-headers", h.ListHeaders)
+	// 注意:/search 必须注册在 /:id 之前(Gin 静态段优先于 :param,显式前置避免误改时 panic)。
+	r.GET("/stocktake-headers/search", h.SearchHeaders)
 	r.GET("/stocktake-headers/:id", h.GetHeader)
 	r.POST("/stocktake-headers/:id/lines", h.AddLine)
 	r.GET("/stocktake-headers/:id/diff-report", h.DiffReport)
@@ -71,6 +83,132 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 
 	// 商品搜索 / 扫条码(对齐 scan.html 后端 SearchProducts,REQUIREMENTS §2.1.4.1)
 	r.GET("/products/search", h.SearchProducts)
+
+	// 门店默认盘点单(仓管设置,前端快速进入盘点)
+	r.GET("/branches/:branch_id/default-stocktake", h.GetDefaultStocktake)
+	r.PUT("/branches/:branch_id/default-stocktake", h.SetDefaultStocktake)
+}
+
+// SearchHeaders GET /stocktake-headers/search?q=&branch_id=&page=&page_size=
+//
+// 仓管 view 权限(inventory:view)调用,按 单号前缀/备注模糊 搜盘点单。
+//
+// 权限校验走 userd 拿 effective scopes(JWT scopes 仅 4 项静态派生,见 auth/README.md)。
+//
+// branch_id 缺省 → fallback cl.BranchID;分页默认 1/20,最大 100。
+func (h *Handler) SearchHeaders(c *gin.Context) {
+	q := strings.TrimSpace(c.Query("q"))
+	if q == "" {
+		writeError(c, http.StatusBadRequest, "missing_q", "?q= 必填")
+		return
+	}
+
+	cl, ok := claims.FromContext(c.Request.Context())
+	if !ok || cl == nil {
+		writeError(c, http.StatusUnauthorized, "unauthenticated", "缺少已签 token")
+		return
+	}
+
+	// 权限校验:走 userd 拿 effective scopes(不走 JWT 静态 scopes)。
+	hasPerm, err := h.svc.HasEffectiveScope(c.Request.Context(), cl.Sub, "inventory:view")
+	if err != nil {
+		mapErr(c, err) // ErrUserInfoUnavailable → 503 userd_unavailable
+		return
+	}
+	if !hasPerm {
+		writeError(c, http.StatusForbidden, "forbidden", "需要 inventory:view(仓管 view)权限")
+		return
+	}
+
+	// branch_id 缺省 → fallback JWT claims
+	branchID := strings.TrimSpace(c.Query("branch_id"))
+	if branchID == "" {
+		if cl.BranchID == "" {
+			writeError(c, http.StatusBadRequest, "missing_branch_id",
+				"?branch_id= 必填,或 JWT claims 包含 branch_id")
+			return
+		}
+		branchID = cl.BranchID
+	}
+
+	page, _ := strconv.Atoi(c.Query("page"))
+	pageSize, _ := strconv.Atoi(c.Query("page_size"))
+
+	out, err := h.svc.SearchHeaders(c.Request.Context(), q, branchID, page, pageSize)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// SetDefaultStocktake PUT /branches/:branch_id/default-stocktake
+//
+// 仓管设置当前店的默认盘点单(供前端进入盘点页时快速定位)。
+// 请求体:{"header_id":"ST..."};权限:inventory:manage(仓管)。
+//
+// 校验链:
+//  1. claims 含 inventory:manage scope,否则 403
+//  2. header_id 存在,否则 404
+//  3. header.branch_id == :branch_id,否则 400(防跨店)
+//  4. header.status == counting,否则 400(已冻结/已审的不应再被推荐)
+func (h *Handler) SetDefaultStocktake(c *gin.Context) {
+	branchID := strings.TrimSpace(c.Param("branch_id"))
+	if branchID == "" {
+		writeError(c, http.StatusBadRequest, "missing_branch_id", "path :branch_id 必填")
+		return
+	}
+
+	// 权限:仓管 (inventory:manage)
+	cl, ok := claims.FromContext(c.Request.Context())
+	if !ok || cl == nil || !hasScope(cl, "inventory:manage") {
+		writeError(c, http.StatusForbidden, "forbidden", "需要 inventory:manage(仓管)权限")
+		return
+	}
+
+	var req setDefaultStocktakeReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	if strings.TrimSpace(req.HeaderID) == "" {
+		writeError(c, http.StatusBadRequest, "missing_header_id", "header_id 必填")
+		return
+	}
+
+	rec, err := h.svc.SetBranchDefaultStocktake(c.Request.Context(),
+		branchID, req.HeaderID, actorIDFromClaims(cl))
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, rec)
+}
+
+// GetDefaultStocktake GET /branches/:branch_id/default-stocktake
+//
+// 查当前店的默认盘点单;前端进入盘点页时优先调本端点,有记录则直接跳到该盘点单。
+//
+// 响应:默认盘点单的 {branch_id, header_id, updated_by, updated_at}。
+// 未设置时返回 404(not_found)。权限:已登录即可(任何角色都可查,但仅仓管可改)。
+func (h *Handler) GetDefaultStocktake(c *gin.Context) {
+	branchID := strings.TrimSpace(c.Param("branch_id"))
+	if branchID == "" {
+		writeError(c, http.StatusBadRequest, "missing_branch_id", "path :branch_id 必填")
+		return
+	}
+	// 读 claims(确保已登录;cmdbootstrap 已强制 aud 包含 stocktake)
+	if _, ok := claims.FromContext(c.Request.Context()); !ok {
+		writeError(c, http.StatusUnauthorized, "unauthenticated", "缺少已签 token")
+		return
+	}
+
+	rec, err := h.svc.GetBranchDefaultStocktake(c.Request.Context(), branchID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, rec)
 }
 
 // ---- 错误响应 ----
@@ -89,7 +227,8 @@ func mapErr(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, service.ErrHeaderNotFound),
 		errors.Is(err, service.ErrLineNotFound),
-		errors.Is(err, service.ErrPlanItemNotFound):
+		errors.Is(err, service.ErrPlanItemNotFound),
+		errors.Is(err, service.ErrBranchDefaultNotFound):
 		writeError(c, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, service.ErrInvalidStatus),
 		errors.Is(err, service.ErrInvalidTransition),
@@ -101,6 +240,8 @@ func mapErr(c *gin.Context, err error) {
 		writeError(c, http.StatusBadRequest, "bad_request", err.Error())
 	case errors.Is(err, service.ErrCubeUnavailable):
 		writeError(c, http.StatusServiceUnavailable, "cube_unavailable", err.Error())
+	case errors.Is(err, service.ErrUserInfoUnavailable):
+		writeError(c, http.StatusServiceUnavailable, "userd_unavailable", err.Error())
 	default:
 		writeError(c, http.StatusInternalServerError, "internal_error", err.Error())
 	}
@@ -153,6 +294,11 @@ type addPlanItemsReq struct {
 		Barcode     string `json:"barcode"`
 		SortOrder   int    `json:"sort_order"`
 	} `json:"items"`
+}
+
+// setDefaultStocktakeReq PUT /branches/:branch_id/default-stocktake
+type setDefaultStocktakeReq struct {
+	HeaderID string `json:"header_id" binding:"required"`
 }
 
 // ---- Handlers ----

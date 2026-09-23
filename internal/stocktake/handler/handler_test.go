@@ -33,6 +33,7 @@ func buildTestHandler(t *testing.T) *gin.Engine {
 		&model.StocktakeLine{},
 		&model.StocktakeLineOperation{},
 		&model.StocktakePlanItem{},
+		&model.StocktakeBranchDefault{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

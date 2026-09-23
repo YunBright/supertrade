@@ -30,6 +30,7 @@ func setupTestService(t *testing.T) (*service.Service, *cubeclient.InMemoryClien
 		&model.StocktakeLine{},
 		&model.StocktakeLineOperation{},
 		&model.StocktakePlanItem{},
+		&model.StocktakeBranchDefault{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

@@ -228,3 +228,26 @@ type StocktakePlanItem struct {
 
 // TableName 显式表名。
 func (StocktakePlanItem) TableName() string { return "stocktake_plan_items" }
+
+// ---- 门店默认盘点单 (StocktakeBranchDefault) ----
+
+// StocktakeBranchDefault 每店当前默认盘点单(由仓管设置,供前端快速进入盘点)。
+//
+// 一店同时只能有**一个**默认盘点单(单点概念),用 BranchID 作主键,upsert 覆盖。
+//
+// 业务约束:
+//   - 设置时校验 HeaderID 存在 + HeaderID.BranchID == BranchID + Header.Status == counting
+//   - 一旦 header 进入 adjusted / approved,前端在拉取时会感知到并提示重新设置
+//
+// 字段语义:
+//   - UpdatedBy: 设置人 user id(冗余字段,便于审计)
+//   - UpdatedAt: 最近一次设置时间
+type StocktakeBranchDefault struct {
+	BranchID  string    `gorm:"primaryKey;column:branch_id;type:varchar(64)" json:"branch_id"`
+	HeaderID  string    `gorm:"column:header_id;type:varchar(64);not null;index" json:"header_id"`
+	UpdatedBy string    `gorm:"column:updated_by;type:varchar(64);not null" json:"updated_by"`
+	UpdatedAt time.Time `gorm:"column:updated_at;type:timestamptz;not null" json:"updated_at"`
+}
+
+// TableName 显式表名。
+func (StocktakeBranchDefault) TableName() string { return "stocktake_branch_defaults" }
