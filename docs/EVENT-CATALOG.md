@@ -72,7 +72,8 @@
 | `stocktake.header.submitted` | stocktake | notification-gateway | header_id, branch_id, type | §2.13 |
 | `stocktake.header.approved` | stocktake | notification-gateway | header_id, branch_id, type | §2.13 |
 | `stocktake.plan_item.added` | stocktake | notification-gateway | header_id, items_count | §2.13 |
-| `auth.user.permissions_changed` | auth (userd) | notification-gateway | user_id, tenant_id, changed_scopes, changed_roles | §2.14 |
+| `auth.user.access_changed` | auth (userd) | notification-gateway / **stocktake(失效 scope cache)** | user_id, tenant_id, changed_scopes, changed_roles, changed_branches, changed_default_branch, snapshot_version | §2.14 |
+| `cube.source.changed` | cube-router | erp-connector / stocktake / catalog / inventory(失效本地 cache) | branch_id, cube_source_name, enabled | §2.15 |
 
 ---
 
@@ -402,26 +403,55 @@ notification-gateway 的 TenantRouter 仅在 `branch_id` 落在 client 的 `effe
 }
 ```
 
-### 2.14 auth.user.permissions_changed
+### 2.14 auth.user.access_changed
 
-**触发时机**:auth 服务(userd)在 admin 修改某用户的 scope / role 后立即发出。
+**触发时机**:auth 服务(userd)在 admin 修改某用户的 scope / role / branch / default_branch 任一维度后立即发出。
 **订阅方**:notification-gateway → 推送给该 user 的所有在线客户端 → Flutter `meController.load()` 自动重拉 `/auth/me` → UI 重新评估 PermissionGate。
+
+**Phase 3**:`permissions_changed` 与原有的"branch 变更通知"合并为本事件,业务侧一次订阅拿全。
 
 ```jsonc
 // data:
 {
-  "user_id":         "user-uuid",
-  "tenant_id":       "T001",
-  "branch_id":       "S001",
-  "changed_scopes":  ["stocktake:write"],      // 可选:增量提示前端哪些变动了
-  "changed_roles":   ["stocktake_supervisor"], // 可选
-  "snapshot_version": 17,                       // 单调递增;客户端可丢弃 <= 本地版本的事件
-  "changed_at":      "2026-09-17T16:30:00Z"
+  "user_id":              "user-uuid",
+  "tenant_id":            "T001",
+  "branch_id":            "S001",
+  "changed_scopes":       ["stocktake:write"],      // 可选:增量提示前端哪些变动了
+  "changed_roles":        ["stocktake_supervisor"], // 可选
+  "changed_branches":     ["S002", "S003"],         // 可选:含新增 + 撤销
+  "changed_default_branch": true,                   // 可选:true = 默认门店切换
+  "snapshot_version":     17,                       // 单调递增;客户端可丢弃 <= 本地版本的事件
+  "changed_at":           "2026-09-17T16:30:00Z"
 }
 ```
 
-> 若 `changed_scopes` / `changed_roles` 为空,客户端应触发完整 `meController.load()` 重新拉全量;
-> 若非空,客户端可走增量更新(只 patch 本地 me 的对应字段,见 CLAUDE.md §4)。
+> 若 `changed_scopes` / `changed_roles` / `changed_branches` / `changed_default_branch` 全部为空,
+> 客户端应触发完整 `meController.load()` 重新拉全量;
+> 若任一非空,客户端可走增量更新(只 patch 本地 me 的对应字段,见 CLAUDE.md §4)。
+>
+> **2026-09 新增订阅方 stocktake**:stocktake 服务订阅 `auth.user.access_changed`,
+> 调 `service.InvalidateScopeCache(user_id, branch_id)` 清除该 user 在该 branch 下的 scope 缓存,
+> 下次请求会重新从 userd 拉。stocktake `cmd/stocktake/main.go::OnStart` 注册 `/dapr/subscribe`
+> 端点(参考 `internal/notification-gateway/events/dapr_subscription.go`)。
+
+### 2.15 cube.source.changed
+
+**触发时机**:cube-router admin 在 `/admin/branch-cube-sources` 增 / 改 / 删 `branch_cube_sources` 行后立即发出。
+**订阅方**:erp-connector / stocktake / catalog / inventory(失效本地 cache + 重读 cube 路由)。
+
+```jsonc
+// data:
+{
+  "branch_id":        "S001",
+  "cube_source_name": "sixun-hbposv7",      // 旧值(deleted 时为旧名,created 时为空)
+  "new_source_name":  "sixun-hbposv8",      // 新值(created/updated 时有,deleted 时为空)
+  "enabled":          true,
+  "operator_id":      "user-uuid",          // admin 的 JWT sub
+  "occurred_at":      "2026-09-24T15:00:00Z"
+}
+```
+
+订阅方实现:收到事件后,失效本地缓存(若有 cube-source 路由表),下次 `POST /v1/load` 转发前重新调 cube-router 拿路由。
 
 ---
 
@@ -460,3 +490,5 @@ r.POST("/events/sale-completed", handleSaleCompleted)
 |---|---|---|
 | 2026-09-17 | Mavis | 初版,基于 DESIGN §2.3 topic 表展开 schema |
 | 2026-09-19 | Mavis | 新增 §2.12 stocktake.line.{added,updated,deleted} + §2.13 stocktake.header.{submitted,approved} + stocktake.plan_item.added + §2.14 auth.user.permissions_changed;同步 stocktake/service.go 6 个 publish 调用点与 notification-gateway 订阅实现 |
+| 2026-09-23 | Mavis | Phase 3:§2.14 auth.user.permissions_changed → auth.user.access_changed;payload 增加 changed_branches / changed_default_branch;subscribe Topics 与 wsmsg.TypeUserAccessChanged 同步切换 |
+| 2026-09-24 | Tinkler | 修订 8:§1 topic 表新增 cube-router 自有 `cube.source.changed` 事件 + §2.15 payload schema;§2.14 `auth.user.access_changed` 订阅方加 stocktake(失效 scope cache);保留全部 12 占位 cmd(用户指令);保留 go.mod `replace ../authkit` |

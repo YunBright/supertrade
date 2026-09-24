@@ -34,3 +34,39 @@ internal/<x>/http/
 ```
 
 参考：`internal/cubehttp/client.go`（cube-gateway 客户端）、`internal/cubehttp/client_test.go`（mock 模式）。
+
+## cube-router(2026-09 新增,多 cube 实例路由)
+
+`cube-router` 是 cube 多源路由的收口点。stocktake / catalog / inventory / erp-connector /
+bi-gateway 等所有需要 cube 的服务,**把 `POST /v1/load` 转发到 cube-router** 而不是直接到 cube-gateway。
+
+```text
+[业务服务] ─invoke─▶ cube-router (按 X-Branch-ID 查 branch_cube_sources)
+                          │
+                          ├─ branch=S001 → sixun-hbposv7
+                          └─ branch=S002 → sixun-ysx
+                          │
+                          ▼
+                  cube-gateway /v1/load (实际 cube 实例)
+```
+
+**为什么不直接调 cube-gateway**:
+- 同 store 可挂多个 cube app(sixun-hbposv7 / sixun-ysx 等)
+- 不同门店要路由到不同 cube 实例(思迅不同分店可能在不同 cube 后端)
+- 单 cube 实例切换 / 灰度期间不需要业务侧改动
+
+**业务侧接入方式**(client.go 模板):
+
+```go
+// internal/<svc>/cubeclient/  (或直接复用 internal/cubehttp/client.go)
+func NewCubeRouterClient() (Client, error) {
+    daprEP := os.Getenv("DAPR_ENDPOINT")
+    if daprEP == "" { daprEP = "http://localhost:3500" }
+    return &HTTPCubeClient{
+        baseURL: fmt.Sprintf("%s/v1.0/invoke/cube-router/method", daprEP),
+        // X-Branch-ID 由业务侧从 ctx 拿并透传
+    }, nil
+}
+```
+
+参考:`internal/cube-router/handler/proxy.go`、`internal/cube-router/service/router.go`(内存 cache + 60s TTL + singleflight)。

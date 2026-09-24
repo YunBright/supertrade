@@ -58,3 +58,12 @@ location /api/v1/ {
 2. `deployer/README.md` 路径映射表加一行
 3. `deployer/docs/proxy_pass.md` 路径映射注释加一行
 4. `supertrade/.claude/rules/00-app-catalog.md` 表加一行
+
+## 2026-09 已加: cube-router
+
+- `cmd/cube-router` / AppID `cube-router` / 公网前缀 `/api/v1/cube-router/`
+- 业务端点 `POST /v1/load` 经 `X-Branch-ID` 路由到 `branch_cube_sources` 配置的 cube 实例
+- nginx map 必须新增:
+  ```nginx
+  ~^/api/v1/cube-router/  "cube-router";
+  ```

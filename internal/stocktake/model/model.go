@@ -73,8 +73,8 @@ type StocktakeHeader struct {
 	TotalDiffQty        decimal.Decimal `gorm:"column:total_diff_qty;type:decimal(20,4);default:0" json:"total_diff_qty"`
 	TotalDiffAmountYuan decimal.Decimal `gorm:"column:total_diff_amount_yuan;type:decimal(20,4);default:0" json:"total_diff_amount_yuan"`
 	Remark              string          `gorm:"column:remark;type:text" json:"remark,omitempty"`
-	CreatedAt           time.Time       `gorm:"column:created_at;type:timestamptz;not null" json:"created_at"`
-	UpdatedAt           time.Time       `gorm:"column:updated_at;type:timestamptz;not null" json:"updated_at"`
+	CreatedAt           time.Time       `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt           time.Time       `gorm:"column:updated_at;not null" json:"updated_at"`
 	Lines               []StocktakeLine `gorm:"foreignKey:HeaderID;references:ID;constraint:OnDelete:CASCADE" json:"lines,omitempty"`
 }
 
@@ -97,16 +97,16 @@ type StocktakeLine struct {
 	Unit           string          `gorm:"column:unit;type:varchar(32)" json:"unit,omitempty"`
 	Spec           string          `gorm:"column:spec;type:varchar(255)" json:"spec,omitempty"`
 	BookQty        decimal.Decimal `gorm:"column:book_qty;type:decimal(20,4);not null" json:"book_qty"`
-	BookQtyAt      time.Time       `gorm:"column:book_qty_at;type:timestamptz;not null" json:"book_qty_at"`
+	BookQtyAt      time.Time       `gorm:"column:book_qty_at;not null" json:"book_qty_at"`
 	ActualQty      decimal.Decimal `gorm:"column:actual_qty;type:decimal(20,4);not null" json:"actual_qty"`
 	DiffQty        decimal.Decimal `gorm:"column:diff_qty;type:decimal(20,4);not null" json:"diff_qty"`
 	AvgCostYuan    decimal.Decimal `gorm:"column:avg_cost_yuan;type:decimal(20,4);not null" json:"avg_cost_yuan"`
 	DiffAmountYuan decimal.Decimal `gorm:"column:diff_amount_yuan;type:decimal(20,4);not null" json:"diff_amount_yuan"`
 	DiffReason     DiffReason      `gorm:"column:diff_reason;type:varchar(32)" json:"diff_reason,omitempty"`
 	Remark         *string         `gorm:"column:remark;type:text" json:"remark,omitempty"`
-	CreatedAt      time.Time       `gorm:"column:created_at;type:timestamptz;not null" json:"created_at"`
-	UpdatedAt      time.Time       `gorm:"column:updated_at;type:timestamptz;not null" json:"updated_at"`
-	DeletedAt      gorm.DeletedAt  `gorm:"column:deleted_at;type:timestamptz;index" json:"-"`
+	CreatedAt      time.Time       `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt      time.Time       `gorm:"column:updated_at;not null" json:"updated_at"`
+	DeletedAt      gorm.DeletedAt  `gorm:"column:deleted_at;index" json:"-"`
 }
 
 // TableName 显式表名。
@@ -200,10 +200,10 @@ type StocktakeLineOperation struct {
 	PrevQty    decimal.Decimal `gorm:"column:prev_qty;type:decimal(20,4);not null" json:"prev_qty"`
 	NewQty     decimal.Decimal `gorm:"column:new_qty;type:decimal(20,4);not null" json:"new_qty"`
 	QtyDelta   decimal.Decimal `gorm:"column:qty_delta;type:decimal(20,4);not null" json:"qty_delta"`
-	OpAt       time.Time       `gorm:"column:op_at;type:timestamptz;not null;index" json:"op_at"`
+	OpAt       time.Time       `gorm:"column:op_at;not null;index" json:"op_at"`
 	Method     OpMethod        `gorm:"column:method;type:varchar(16);not null" json:"method"`
 	Remark     string          `gorm:"column:remark;type:text" json:"remark,omitempty"`
-	CreatedAt  time.Time       `gorm:"column:created_at;type:timestamptz;not null" json:"created_at"`
+	CreatedAt  time.Time       `gorm:"column:created_at;not null" json:"created_at"`
 }
 
 // TableName 显式表名。
@@ -223,7 +223,7 @@ type StocktakePlanItem struct {
 	Unit        string    `gorm:"column:unit;type:varchar(32)" json:"unit,omitempty"`
 	Barcode     string    `gorm:"column:barcode;type:varchar(64);index" json:"barcode,omitempty"`
 	SortOrder   int       `gorm:"column:sort_order;type:int;not null;default:0" json:"sort_order"`
-	CreatedAt   time.Time `gorm:"column:created_at;type:timestamptz;not null" json:"created_at"`
+	CreatedAt   time.Time `gorm:"column:created_at;not null" json:"created_at"`
 }
 
 // TableName 显式表名。
@@ -246,7 +246,7 @@ type StocktakeBranchDefault struct {
 	BranchID  string    `gorm:"primaryKey;column:branch_id;type:varchar(64)" json:"branch_id"`
 	HeaderID  string    `gorm:"column:header_id;type:varchar(64);not null;index" json:"header_id"`
 	UpdatedBy string    `gorm:"column:updated_by;type:varchar(64);not null" json:"updated_by"`
-	UpdatedAt time.Time `gorm:"column:updated_at;type:timestamptz;not null" json:"updated_at"`
+	UpdatedAt time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
 }
 
 // TableName 显式表名。

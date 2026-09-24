@@ -41,6 +41,38 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 1. 在 `RegisterRoutes` 加一行 + 实现 handler 方法
 2. nginx map **不动**（`<app>` 段没变）
 3. 加 `cmdbootstrap` 自动接的鉴权（`aud` 校验 + claims 解析）之外的业务校验
-4. 在 deployer 仓 `tests/contract/<service>_test.go` 加 e2e 测试
+4. 加新 app 时同步检查 `00-app-catalog.md` 表 + deployer nginx map
+5. 在 deployer 仓 `tests/contract/<service>_test.go` 加 e2e 测试
 
 参考：`internal/stocktake/handler/handler.go:55-72`。
+
+## X-Branch-ID header 是默认上下文（2026-09 重构后）
+
+所有需要 per-branch 数据的业务端点都必须先解析 `X-Branch-ID` header:
+
+- **全局挂 `middleware.XBranchID()`** —— 由各 `cmd/<service>/main.go::registerRoutes` 第一行 `r.Use(middleware.XBranchID())` 注入
+- **handler 取 branch** —— 用 `middleware.BranchFromCtx(c)` 拿 `*uuid.UUID`(或 `branchFromHeader(c) (string, bool)` 适配器)
+- **路径 branch 优先于 header** —— `/stock/:branch_id/:product_id` 用 `c.Param("branch_id")` 而非 header
+- **业务端点鉴权** —— 走 `rbac.RequireScopeWithBranch(scope, branchFn, rbac.HasAnyScopeWithBranch(users))`
+- **库存只读端点** —— 高频读走 `rbac.RequireBranch(branchFromParam, accessibleBranchesFromClaims)`(JWT 静态版,零 userd 调用)
+
+**新增端点示例**(catalog):
+
+```go
+// cmd/catalog/main.go
+func registerRoutes(r *gin.Engine) {
+    users := userinfo.New("userd")
+    r.Use(middleware.XBranchID())  // 全局:把 X-Branch-ID header 注入 ctx
+    handler.New(appSup, appProd, appCube, users, nil).RegisterRoutes(r)
+}
+
+// internal/catalog/handler/handler.go
+func (h *Handler) RegisterRoutes(r gin.IRouter) {
+    resolver := rbac.HasAnyScopeWithBranch(h.users)
+    r.GET("/suppliers",
+        rbac.RequireScopeWithBranch("supplier:view", branchFromHeader, resolver),
+        h.listSuppliers)
+}
+```
+
+参考:`cmd/catalog/main.go`、`internal/catalog/handler/handler.go:82-109`、`internal/cube-router/handler/handler.go:83-101`。

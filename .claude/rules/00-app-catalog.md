@@ -6,7 +6,12 @@ paths: ["**/*.go", "**/*.yaml", "**/*.conf"]
 
 每个 `cmd/<name>/main.go` 的 `AppID` = 公网 URL 里的 `<app>` 段。
 
-## 本仓 15 个 dapr app
+## 本仓 16 个 dapr app
+
+> 2026-09 新增 `cube-router`(按 X-Branch-ID 路由到不同 cube 实例)。
+> 12 个占位 cmd(pos-gateway / pos / pricing / procurement / sales-agg / fresh-produce /
+> fresh-meat / erp-connector / bi-gateway / notification / llm-gw / master-data)保留作为
+> 后续 Sprint 入口,**不删除**(用户指令 2026-09-24)。
 
 | cmd 目录 | AppID | 公网前缀 |
 |---|---|---|
@@ -15,6 +20,7 @@ paths: ["**/*.go", "**/*.yaml", "**/*.conf"]
 | `cmd/stocktake` | `stocktake` | `/api/v1/stocktake/` |
 | `cmd/catalog` | `catalog` | `/api/v1/catalog/` |
 | `cmd/inventory` | `inventory` | `/api/v1/inventory/` |
+| `cmd/cube-router` | `cube-router` | `/api/v1/cube-router/` |
 | `cmd/master-data` | `master-data` | `/api/v1/master-data/` |
 | `cmd/pricing` | `pricing` | `/api/v1/pricing/` |
 | `cmd/procurement` | `procurement` | `/api/v1/procurement/` |

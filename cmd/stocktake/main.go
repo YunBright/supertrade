@@ -37,6 +37,7 @@ import (
 	"github.com/YunBright/supertrade/internal/stocktake/model"
 	"github.com/YunBright/supertrade/internal/stocktake/service"
 	"github.com/YunBright/supertrade/pkg/cmdbootstrap"
+	"github.com/YunBright/supertrade/pkg/middleware"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -130,7 +131,14 @@ func registerRoutes(r *gin.Engine) {
 	if appSvc == nil {
 		panic("stocktake: appSvc 未初始化,可能是 OnStart 失败")
 	}
-	handler.New(appSvc).RegisterRoutes(r)
+	// 全局挂 X-Branch-ID 解析中间件(只读 header,不强求存在;handler 自选 source)。
+	r.Use(middleware.XBranchID())
+	h := handler.New(appSvc)
+	h.RegisterRoutes(r)
+	// Dapr pub/sub 订阅(挂在 engine,不走业务路由组):
+	//   GET  /dapr/subscribe  → 订阅清单
+	//   POST /events/<topic>  → 事件分发(本服务订阅 auth.user.access_changed)
+	h.RegisterSubscribeRoutes(r, slog.Default())
 }
 
 // 静默引用 context(为后续按需扩展预留)

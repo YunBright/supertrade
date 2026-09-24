@@ -34,6 +34,7 @@ import (
 	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/internal/stocktake/model"
 	"github.com/YunBright/supertrade/internal/stocktake/service"
+	"github.com/YunBright/supertrade/pkg/middleware"
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
 )
@@ -109,8 +110,27 @@ func (h *Handler) SearchHeaders(c *gin.Context) {
 		return
 	}
 
-	// 权限校验:走 userd 拿 effective scopes(不走 JWT 静态 scopes)。
-	hasPerm, err := h.svc.HasEffectiveScope(c.Request.Context(), cl.Sub, "inventory:view")
+	// per-branch 守门。SearchHeaders 的 branch 上下文来源优先级:
+	//   ?branch_id= > X-Branch-ID header > cl.DefaultBranchID
+	// X-Branch-ID 由 middleware.BranchFromHeader 注入到 ctx(若装了中间件),
+	// handler 自己拿;缺则退到 cl.DefaultBranchID;再缺则返 400。
+	branchID := strings.TrimSpace(c.Query("branch_id"))
+	if branchID == "" {
+		if hb := middleware.BranchFromCtx(c); hb != nil {
+			branchID = hb.String()
+		}
+	}
+	if branchID == "" {
+		branchID = cl.DefaultBranchID
+	}
+	if branchID == "" {
+		writeError(c, http.StatusBadRequest, "missing_branch_id",
+			"?branch_id= 必填,或 X-Branch-ID header / JWT default_branch_id 至少一项")
+		return
+	}
+
+	// 权限校验:走 userd 拿 per-branch effective scopes(不走 JWT 静态 scopes)。
+	hasPerm, err := h.svc.HasEffectiveScope(c.Request.Context(), cl.Sub, branchID, "inventory:view")
 	if err != nil {
 		mapErr(c, err) // ErrUserInfoUnavailable → 503 userd_unavailable
 		return
@@ -120,16 +140,8 @@ func (h *Handler) SearchHeaders(c *gin.Context) {
 		return
 	}
 
-	// branch_id 缺省 → fallback JWT claims
-	branchID := strings.TrimSpace(c.Query("branch_id"))
-	if branchID == "" {
-		if cl.BranchID == "" {
-			writeError(c, http.StatusBadRequest, "missing_branch_id",
-				"?branch_id= 必填,或 JWT claims 包含 branch_id")
-			return
-		}
-		branchID = cl.BranchID
-	}
+	// branchID 已在权限校验前解析(优先 ?branch_id= > X-Branch-ID header > JWT default_branch_id),
+	// 这里直接用。
 
 	page, _ := strconv.Atoi(c.Query("page"))
 	pageSize, _ := strconv.Atoi(c.Query("page_size"))
@@ -158,11 +170,12 @@ func (h *Handler) SetDefaultStocktake(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "missing_branch_id", "path :branch_id 必填")
 		return
 	}
-
-	// 权限:仓管 (inventory:manage)
 	cl, ok := claims.FromContext(c.Request.Context())
-	if !ok || cl == nil || !hasScope(cl, "inventory:manage") {
-		writeError(c, http.StatusForbidden, "forbidden", "需要 inventory:manage(仓管)权限")
+	if !ok || cl == nil {
+		writeError(c, http.StatusUnauthorized, "unauthenticated", "缺少已签 token")
+		return
+	}
+	if !h.requireScope(c, branchID, "inventory:manage") {
 		return
 	}
 
@@ -190,16 +203,14 @@ func (h *Handler) SetDefaultStocktake(c *gin.Context) {
 // 查当前店的默认盘点单;前端进入盘点页时优先调本端点,有记录则直接跳到该盘点单。
 //
 // 响应:默认盘点单的 {branch_id, header_id, updated_by, updated_at}。
-// 未设置时返回 404(not_found)。权限:已登录即可(任何角色都可查,但仅仓管可改)。
+// 未设置时返回 404(not_found)。权限:inventory:view(查看权限)。
 func (h *Handler) GetDefaultStocktake(c *gin.Context) {
 	branchID := strings.TrimSpace(c.Param("branch_id"))
 	if branchID == "" {
 		writeError(c, http.StatusBadRequest, "missing_branch_id", "path :branch_id 必填")
 		return
 	}
-	// 读 claims(确保已登录;cmdbootstrap 已强制 aud 包含 stocktake)
-	if _, ok := claims.FromContext(c.Request.Context()); !ok {
-		writeError(c, http.StatusUnauthorized, "unauthenticated", "缺少已签 token")
+	if !h.requireScope(c, branchID, "inventory:view") {
 		return
 	}
 
@@ -311,6 +322,9 @@ func (h *Handler) CreateHeader(c *gin.Context) {
 		return
 	}
 	cl := claims.MustFromContext(c.Request.Context())
+	if !h.requireScope(c, req.BranchID, "inventory:manage") {
+		return
+	}
 
 	tt := model.StocktakeType(req.Type)
 	if tt == "" {
@@ -346,11 +360,22 @@ func (h *Handler) CreateHeader(c *gin.Context) {
 //
 // 过滤:branch_id / status / type / operator_id / count_date(YYYY-MM-DD)
 // 分页:page (default 1) / page_size (default 20, max 100)
+//
+// 权限:inventory:view(per-branch;从 ?branch_id= / X-Branch-ID / claims.DefaultBranchID 取)。
 func (h *Handler) ListHeaders(c *gin.Context) {
+	cl, ok := claims.FromContext(c.Request.Context())
+	if !ok || cl == nil {
+		writeError(c, http.StatusUnauthorized, "unauthenticated", "缺少已签 token")
+		return
+	}
+	branchID := branchFromRequest(c, cl)
+	if branchID != "" && !h.requireScope(c, branchID, "inventory:view") {
+		return
+	}
 	page, _ := strconv.Atoi(c.Query("page"))
 	pageSize, _ := strconv.Atoi(c.Query("page_size"))
 	out, err := h.svc.ListHeaders(c.Request.Context(), service.ListHeadersFilter{
-		BranchID:   c.Query("branch_id"),
+		BranchID:   branchID,
 		Status:     model.StocktakeStatus(c.Query("status")),
 		Type:       model.StocktakeType(c.Query("type")),
 		OperatorID: c.Query("operator_id"),
@@ -364,11 +389,16 @@ func (h *Handler) ListHeaders(c *gin.Context) {
 }
 
 // GetHeader GET /stocktake-headers/:id
+//
+// 先查 header 取 branch_id,再用该 branch 守门(inventory:view);保证 caller 必须有权访问 header 所在门店。
 func (h *Handler) GetHeader(c *gin.Context) {
 	id := c.Param("id")
 	hdr, err := h.svc.GetHeaderWithLines(c.Request.Context(), id)
 	if err != nil {
 		mapErr(c, err)
+		return
+	}
+	if !h.requireScope(c, hdr.BranchID, "inventory:view") {
 		return
 	}
 	c.JSON(http.StatusOK, hdr)
@@ -377,6 +407,14 @@ func (h *Handler) GetHeader(c *gin.Context) {
 // ListHistory GET /stocktake-headers/:id/history?limit=50
 func (h *Handler) ListHistory(c *gin.Context) {
 	headerID := c.Param("id")
+	hdr, err := h.svc.GetHeader(c.Request.Context(), headerID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	if !h.requireScope(c, hdr.BranchID, "inventory:view") {
+		return
+	}
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	ops, err := h.svc.ListLineOperations(c.Request.Context(), headerID, limit)
 	if err != nil {
@@ -389,6 +427,14 @@ func (h *Handler) ListHistory(c *gin.Context) {
 // GetPlanItems GET /stocktake-headers/:id/plan-items
 func (h *Handler) GetPlanItems(c *gin.Context) {
 	headerID := c.Param("id")
+	hdr, err := h.svc.GetHeader(c.Request.Context(), headerID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	if !h.requireScope(c, hdr.BranchID, "inventory:view") {
+		return
+	}
 	items, err := h.svc.GetPlanItems(c.Request.Context(), headerID)
 	if err != nil {
 		mapErr(c, err)
@@ -400,6 +446,14 @@ func (h *Handler) GetPlanItems(c *gin.Context) {
 // AddPlanItems POST /stocktake-headers/:id/plan-items
 func (h *Handler) AddPlanItems(c *gin.Context) {
 	headerID := c.Param("id")
+	hdr, err := h.svc.GetHeader(c.Request.Context(), headerID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	if !h.requireScope(c, hdr.BranchID, "inventory:manage") {
+		return
+	}
 	var req addPlanItemsReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
@@ -426,6 +480,14 @@ func (h *Handler) AddPlanItems(c *gin.Context) {
 // AddLine POST /stocktake-headers/:id/lines
 func (h *Handler) AddLine(c *gin.Context) {
 	headerID := c.Param("id")
+	hdr, err := h.svc.GetHeader(c.Request.Context(), headerID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	if !h.requireScope(c, hdr.BranchID, "inventory:manage") {
+		return
+	}
 	var req addLineReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
@@ -454,6 +516,16 @@ func (h *Handler) AddLine(c *gin.Context) {
 // UpdateLine PUT /stocktake-lines/:id
 func (h *Handler) UpdateLine(c *gin.Context) {
 	id := c.Param("id")
+	// 先拿 line,推出 header → branch 守门;UpdateLine 的 service 层接受 lineID 自身,
+	// handler 这里多查一次 header 以保证 scope check 落在正确 branch。
+	hdr, err := h.svc.GetHeaderByLineID(c.Request.Context(), id)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	if !h.requireScope(c, hdr, "inventory:manage") {
+		return
+	}
 	var req updateLineReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
@@ -487,6 +559,14 @@ func (h *Handler) UpdateLine(c *gin.Context) {
 // 可选 body:{actor_name?, method?};不传则从 claims 推断。
 func (h *Handler) DeleteLine(c *gin.Context) {
 	id := c.Param("id")
+	hdr, err := h.svc.GetHeaderByLineID(c.Request.Context(), id)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	if !h.requireScope(c, hdr, "inventory:manage") {
+		return
+	}
 	var req deleteLineReq
 	_ = c.ShouldBindJSON(&req) // body 可选,空 body 不报错
 	cl, _ := claims.FromContext(c.Request.Context())
@@ -507,6 +587,14 @@ func (h *Handler) DeleteLine(c *gin.Context) {
 // DiffReport GET /stocktake-headers/:id/diff-report
 func (h *Handler) DiffReport(c *gin.Context) {
 	id := c.Param("id")
+	hdr, err := h.svc.GetHeader(c.Request.Context(), id)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	if !h.requireScope(c, hdr.BranchID, "inventory:view") {
+		return
+	}
 	rep, err := h.svc.ComputeDiffReport(c.Request.Context(), id)
 	if err != nil {
 		mapErr(c, err)
@@ -518,28 +606,44 @@ func (h *Handler) DiffReport(c *gin.Context) {
 // Submit POST /stocktake-headers/:id/submit
 func (h *Handler) Submit(c *gin.Context) {
 	id := c.Param("id")
-	hdr, err := h.svc.Submit(c.Request.Context(), id)
+	hdr, err := h.svc.GetHeader(c.Request.Context(), id)
 	if err != nil {
 		mapErr(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, hdr)
+	if !h.requireScope(c, hdr.BranchID, "inventory:manage") {
+		return
+	}
+	hdr2, err := h.svc.Submit(c.Request.Context(), id)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, hdr2)
 }
 
 // Approve POST /stocktake-headers/:id/approve
 func (h *Handler) Approve(c *gin.Context) {
 	id := c.Param("id")
+	hdr, err := h.svc.GetHeader(c.Request.Context(), id)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	if !h.requireScope(c, hdr.BranchID, "inventory:approve") {
+		return
+	}
 	var req approveReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
 		return
 	}
-	hdr, err := h.svc.Approve(c.Request.Context(), id, req.AuditorID)
+	hdr2, err := h.svc.Approve(c.Request.Context(), id, req.AuditorID)
 	if err != nil {
 		mapErr(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, hdr)
+	c.JSON(http.StatusOK, hdr2)
 }
 
 // SearchProducts GET /api/v1/products/search
@@ -562,19 +666,32 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 	if branchID == "" {
 		// 默认取自 JWT claims
 		cl, ok := claims.FromContext(c.Request.Context())
-		if !ok || cl.BranchID == "" {
+		if !ok || cl.DefaultBranchID == "" {
 			writeError(c, http.StatusBadRequest, "missing_branch_id",
-				"?branch_id= 必填,或 JWT claims 包含 branch_id")
+				"?branch_id= 必填,或 JWT claims 包含 default_branch_id")
 			return
 		}
-		branchID = cl.BranchID
+		branchID = cl.DefaultBranchID
 	}
 	limit, _ := strconv.Atoi(c.Query("limit"))
 
-	// 读 claims scopes
+	// per-branch 守门 —— 走 userinfo.GetBranchPermissions(userd 实时权限)。
+	// JWT 静态 scopes 字段空,不能直接信任;以 userd 矩阵为准。
 	cl, _ := claims.FromContext(c.Request.Context())
-	invViewable := hasScope(cl, "inventory:view")
-	supplierViewable := hasScope(cl, "supplier:view")
+	if cl == nil {
+		writeError(c, http.StatusUnauthorized, "unauthenticated", "缺少已签 token")
+		return
+	}
+	invViewable, err := h.svc.HasEffectiveScope(c.Request.Context(), cl.Sub, branchID, "inventory:view")
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	supplierViewable, err := h.svc.HasEffectiveScope(c.Request.Context(), cl.Sub, branchID, "supplier:view")
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
 
 	// SearchProducts 直接调 cube.SearchProductsByBarcode → cube-gateway,需要透传 JWT。
 	ctx := cubeclient.WithBearer(c.Request.Context(), c.Request.Header.Get("Authorization"))
@@ -588,14 +705,6 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, out)
-}
-
-// hasScope 检查 JWT claims 是否包含某 scope(空 claims → false)。
-func hasScope(cl *claims.Claims, scope string) bool {
-	if cl == nil {
-		return false
-	}
-	return cl.HasScope(scope)
 }
 
 // actorIDFromClaims 拿 user id 作审计 actor;空 claims → "unknown"。
@@ -618,4 +727,58 @@ func defaultActorName(cl *claims.Claims, fallback string) string {
 		return cl.Sub
 	}
 	return "unknown"
+}
+
+// requireScope 在 handler 顶部做 per-branch 守门。
+//
+// 决策矩阵:
+//   - claims 缺失                    → 401 unauthenticated
+//   - branchID 空(handler 未取到)     → 400 branch_required
+//   - svc.HasEffectiveScope 返 error → mapErr(503 userd_unavailable / 400 等)
+//   - scope 不在该 branch 下         → 403 forbidden
+//   - 命中                            → 返 true(handler 继续)
+//
+// 与 authkit/rbac.RequireScopeWithBranch 的区别:handler 内调用,因为多数 stocktake
+// 端点的 branch 来源不固定(body 字段 / path param / header / claims 默认),中间件
+// 抽不出统一的 BranchContextFn;在 handler 内拿稳后再校验更清晰。
+func (h *Handler) requireScope(c *gin.Context, branchID, scope string) bool {
+	cl, ok := claims.FromContext(c.Request.Context())
+	if !ok || cl == nil {
+		writeError(c, http.StatusUnauthorized, "unauthenticated", "缺少已签 token")
+		return false
+	}
+	if branchID == "" {
+		writeError(c, http.StatusBadRequest, "branch_required",
+			"请求未指定目标 branch_id(从 X-Branch-ID / ?branch_id= / body / header 推导失败)")
+		return false
+	}
+	allowed, err := h.svc.HasEffectiveScope(c.Request.Context(), cl.Sub, branchID, scope)
+	if err != nil {
+		mapErr(c, err)
+		return false
+	}
+	if !allowed {
+		writeError(c, http.StatusForbidden, "forbidden",
+			"用户在该 branch 下无 "+scope+" scope")
+		return false
+	}
+	return true
+}
+
+// branchFromRequest 综合 X-Branch-ID middleware 注入 + ?branch_id= + claims.DefaultBranchID 三层。
+//
+// 调用场景:SearchHeaders / ListHeaders 等 branch 由"操作上下文"决定的端点。
+// 路径/资源型端点(GetHeader / AddLine / SetDefaultStocktake 等)从路径 /
+// 已查到的 header.BranchID 取 branchID,不走本 helper。
+func branchFromRequest(c *gin.Context, cl *claims.Claims) string {
+	if hb := middleware.BranchFromCtx(c); hb != nil {
+		return hb.String()
+	}
+	if q := strings.TrimSpace(c.Query("branch_id")); q != "" {
+		return q
+	}
+	if cl != nil && cl.DefaultBranchID != "" {
+		return cl.DefaultBranchID
+	}
+	return ""
 }

@@ -81,8 +81,8 @@ const (
 	// §2.13 stocktake 计划项事件
 	TypeStocktakePlanItemAdded = "stocktake.plan_item.added"
 
-	// §2.14 权限变更事件
-	TypeUserPermissionsChanged = "auth.user.permissions_changed"
+	// §2.14 访问维度变更事件(scopes / roles / branches / default_branch 合并)
+	TypeUserAccessChanged = "auth.user.access_changed"
 )
 
 // 错误码（与 Flutter WsErrorCodes 对齐）。

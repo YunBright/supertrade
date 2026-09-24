@@ -44,6 +44,7 @@ var appCube cubeclient.Client
 
 func registerRoutes(r *gin.Engine) {
 	cubehttp.New(appCube).Register(r, cubehttp.RegisterOptions{
-		Stock: true,
+		Stock:         true,
+		RequireBranch: true, // /stock/:branch_id/:product_id 走 claims.AccessibleBranches 守门
 	})
 }

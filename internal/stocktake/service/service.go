@@ -55,7 +55,7 @@ type scopeCacheEntry struct {
 
 // defaultScopeTTL 是 effective scopes 缓存的默认 TTL。
 //
-// 选 60s 是经验值:与权限变更窗口匹配(userd 通过 SSE 推送 permissions_changed,
+// 选 60s 是经验值:与权限变更窗口匹配(userd 通过 SSE 推送 access_changed,
 // 前端重拉 /userd/me;后端缓存 60s 内有效);太短 → userd 调用频繁;太长 → 权限变更延迟生效。
 const defaultScopeTTL = 60 * time.Second
 
@@ -216,6 +216,25 @@ func (s *Service) GetHeaderWithLines(_ context.Context, id string) (*model.Stock
 	}
 	h.Lines = lines
 	return h, nil
+}
+
+// GetHeaderByLineID 拿某 line 所属 header 的 branchID(handler 守门用)。
+//
+// 错误:line 不存在 → ErrLineNotFound;header 不存在 → ErrHeaderNotFound。
+// 不返回 line / header 自身,只返 branchID(避免 handler 误把 DB 对象写出去)。
+func (s *Service) GetHeaderByLineID(ctx context.Context, lineID string) (string, error) {
+	var line model.StocktakeLine
+	if err := s.db.First(&line, "id = ?", lineID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return "", ErrLineNotFound
+		}
+		return "", err
+	}
+	h, err := s.GetHeader(ctx, line.HeaderID)
+	if err != nil {
+		return "", err
+	}
+	return h.BranchID, nil
 }
 
 // Submit counting → adjusted。
@@ -1346,67 +1365,123 @@ func (s *Service) ClearBranchDefaultStocktake(_ context.Context, branchID string
 
 // ---- Effective Scopes (调 userd 校验权限) ----
 
-// GetEffectiveScopes 拿指定 user 的 effective scopes(走 userd + 本地 TTL 缓存)。
+// InvalidateScopeCache 清掉某 user 在某 branch 下的 effective scopes 缓存。
 //
-// 缓存策略:TTL = s.scopeTTL(默认 60s);key = userID。
-// miss 时调 userinfo.Get(ctx, userID),把 User.Scopes(permissions ⨝ role_permissions ⨝ user_roles join)
-// 缓存并返回。命中缓存直接返,不调 userd。
+// 当前未挂端点;保留供权限变更(订阅 access_changed 事件)时主动失效。
+// branchID 必填 —— 每个 (user, branch) 是独立的缓存条目。
+func (s *Service) InvalidateScopeCache(userID string, branchID string) {
+	if userID == "" || branchID == "" {
+		return
+	}
+	s.scopeMu.Lock()
+	defer s.scopeMu.Unlock()
+	delete(s.scopeCache, scopeCacheKey(userID, branchID))
+}
+
+// scopeCacheKey 把 (userID, branchID) 编为 cache key。
+//
+// branchID 必填:每个 per-branch 守门必传;空串视为调用方 bug(由 GetEffectiveScopes
+// 校验返 ErrInvalidStatus,不会落到 cache)。
+func scopeCacheKey(userID, branchID string) string {
+	return userID + "|" + branchID
+}
+
+// GetEffectiveScopes 拿用户在某 branch 下的 effective scopes(per-branch 三元权限)。
+//
+// 缓存策略:key = (userID, branchID),TTL 沿用 s.scopeTTL(默认 60s)。
+//
+// 调用方:stocktake handler 在 per-branch 守门场景必传 branchID(从 X-Branch-ID 或 ?branch_id=
+// 取)。branchID 必填(走 userinfo.GetBranchPermissions 单 branch 行);空则视为调用方
+// bug,返 ErrInvalidStatus(400)。
 //
 // 错误:
-//   - userID == ""                → ErrInvalidStatus(400)
+//   - userID == "" / branchID == "" → ErrInvalidStatus(400)
 //   - s.userInfo == nil(未注入)    → ErrUserInfoUnavailable(503)
-//   - userinfo.Get 失败 / 网络错    → ErrUserInfoUnavailable(503)
+//   - userinfo.GetBranchPermissions 失败 / 网络错 → ErrUserInfoUnavailable(503)
 //
-// 备注:JWT 的 Scopes 只含 4 项静态派生 scope,不是 effective 权限。
-// 见 auth/README.md "判断权限点" 一节;本方法走 userd 拿完整权限集。
-func (s *Service) GetEffectiveScopes(ctx context.Context, userID string) ([]string, error) {
+// 实现:走 userinfo.GetBranchPermissions(userd /internal/users/:id/permissions?branch_id=...),
+// 保留 user × branch × scope 三元关系。三元权限(user × branch × scope)的统一判定入口。
+func (s *Service) GetEffectiveScopes(ctx context.Context, userID, branchID string) ([]string, error) {
 	if userID == "" {
 		return nil, fmt.Errorf("%w: user_id 必填", ErrInvalidStatus)
+	}
+	if branchID == "" {
+		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidStatus)
 	}
 	if s.userInfo == nil {
 		return nil, ErrUserInfoUnavailable
 	}
 
+	key := scopeCacheKey(userID, branchID)
+
 	// 缓存查询
 	s.scopeMu.RLock()
-	entry, ok := s.scopeCache[userID]
+	entry, ok := s.scopeCache[key]
 	ttl := s.scopeTTL
 	s.scopeMu.RUnlock()
 	if ok && time.Since(entry.at) < ttl {
 		return entry.scopes, nil
 	}
 
-	// miss → 调 userd。串行化避免同一 userID 并发击穿。
+	// miss → 调 userd。串行化避免同一 (userID, branchID) 并发击穿。
 	s.scopeMu.Lock()
 	defer s.scopeMu.Unlock()
-	// double-check(同一 userID 可能在锁等待期间已被别的请求填好)
-	if entry, ok := s.scopeCache[userID]; ok && time.Since(entry.at) < ttl {
+	// double-check(同一 key 可能在锁等待期间已被别的请求填好)
+	if entry, ok := s.scopeCache[key]; ok && time.Since(entry.at) < ttl {
 		return entry.scopes, nil
 	}
 
-	u, err := s.userInfo.Get(ctx, userID)
+	p, err := s.userInfo.GetBranchPermissions(ctx, userID, branchID)
 	if err != nil {
-		// userinfo.ErrUserNotFound 也归为"不可用"——userd 已知该用户不存在,
-		// 直接返空 scopes 让 handler 走 403,而不是把内部错误透出去。
-		s.pubLogger.Warn("userinfo.Get failed",
-			"user_id", userID,
-			"err", err)
+		// ErrPermissionsUnavailable 视作 userd 没部署新端点 —— 降级返 nil 让 handler
+		// 走 403(而不是把 userd 部署状态当 503 透出去)。
+		if errors.Is(err, userinfo.ErrPermissionsUnavailable) {
+			s.pubLogger.Warn("userinfo.GetBranchPermissions 404 (userd 未提供 permissions 端点)",
+				"user_id", userID, "branch_id", branchID)
+			return nil, ErrUserInfoUnavailable
+		}
+		s.pubLogger.Warn("userinfo.GetBranchPermissions failed",
+			"user_id", userID, "branch_id", branchID, "err", err)
 		return nil, ErrUserInfoUnavailable
 	}
-	scopes := append([]string(nil), u.Scopes...) // 拷贝,避免外部修改底层切片
-	s.scopeCache[userID] = scopeCacheEntry{scopes: scopes, at: s.now()}
+
+	// branchID 必填 → 只取该 branch 单行;没找到则返空(走 403)。
+	scopes := pickBranchScopes(p, branchID)
+	scopes = append([]string(nil), scopes...) // 拷贝,避免外部修改底层切片
+	s.scopeCache[key] = scopeCacheEntry{scopes: scopes, at: s.now()}
 	return scopes, nil
 }
 
-// HasEffectiveScope 便捷判定:userID 的 effective scopes 是否包含 scope。
+// pickBranchScopes 从 BranchPermissions 矩阵里挑出目标 branch 行的 scopes。
+//
+// branchID 必填(由 GetEffectiveScopes 校验);非合法 UUID 返 nil;未命中返 nil。
+// 返空让 handler 走 403 —— 这与 auth handler.go::getUserPermissionsInternal 的设计一致
+// (不 403 因为 accessControl 已 gate caller 身份;此处 gate 由 stocktake handler 自己做)。
+func pickBranchScopes(p *userinfo.BranchPermissions, branchID string) []string {
+	if p == nil || len(p.Branches) == 0 {
+		return nil
+	}
+	target, err := uuid.Parse(branchID)
+	if err != nil {
+		return nil
+	}
+	for _, row := range p.Branches {
+		if row.BranchID == target {
+			return row.Scopes
+		}
+	}
+	return nil
+}
+
+// HasEffectiveScope 便捷判定:user 在某 branch 下的 effective scopes 是否包含 scope。
 //
 // 返回 false 的两种情况:
 //   - scope 不在 effective scopes 中
 //   - GetEffectiveScopes 失败(权限校验不可用 → 一律不通过;handler mapErr 映射 503)
 //
-// 与 JWT HasScope 不同:本方法**不**依赖 JWT claim,走 userd 实时权限。
-func (s *Service) HasEffectiveScope(ctx context.Context, userID, scope string) (bool, error) {
-	scopes, err := s.GetEffectiveScopes(ctx, userID)
+// 三元权限(user × branch × scope)下的统一判定入口;branchID 必填。
+func (s *Service) HasEffectiveScope(ctx context.Context, userID, branchID, scope string) (bool, error) {
+	scopes, err := s.GetEffectiveScopes(ctx, userID, branchID)
 	if err != nil {
 		return false, err
 	}
@@ -1416,13 +1491,4 @@ func (s *Service) HasEffectiveScope(ctx context.Context, userID, scope string) (
 		}
 	}
 	return false, nil
-}
-
-// InvalidateScopeCache 清掉某 user 的 effective scopes 缓存。
-//
-// 当前未挂端点;保留供权限变更(SSE 收到 permissions_changed)时主动失效。
-func (s *Service) InvalidateScopeCache(userID string) {
-	s.scopeMu.Lock()
-	delete(s.scopeCache, userID)
-	s.scopeMu.Unlock()
 }

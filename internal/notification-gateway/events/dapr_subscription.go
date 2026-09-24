@@ -28,9 +28,13 @@ import (
 //   - stocktake.line.added / updated / deleted   → §2.12
 //   - stocktake.header.submitted / approved      → §2.13
 //   - stocktake.plan_item.added                  → §2.13
-//   - auth.user.permissions_changed              → §2.14
+//   - auth.user.access_changed                   → §2.14
 //
 // Topic 命名约定：<domain>.<entity>.<verb>（小写 + 点号），与 CloudEvents type 对齐。
+//
+// Phase 3:auth.user.permissions_changed 合并为 auth.user.access_changed(payload
+// 同时含 changed_scopes / changed_roles / changed_branches / changed_default_branch
+// / snapshot_version)。订阅清单必须同步切换,否则前端收不到事件。
 var Topics = []string{
 	"stocktake.line.added",
 	"stocktake.line.updated",
@@ -38,7 +42,7 @@ var Topics = []string{
 	"stocktake.header.submitted",
 	"stocktake.header.approved",
 	"stocktake.plan_item.added",
-	"auth.user.permissions_changed",
+	"auth.user.access_changed",
 }
 
 // Subscription 是 /dapr/subscribe 返回结构。
@@ -120,7 +124,7 @@ func (h *Handler) dispatch(c *gin.Context, topic string) {
 		uid := envelopeUserID(env)
 		if uid == "" {
 			h.metrics.EventsSkipped.Add(1)
-			h.logger.Warn("events: auth.user.* missing user_id", "topic", topic)
+			h.logger.Warn("events: auth.user.access_changed missing user_id", "topic", topic)
 			c.Status(http.StatusNoContent)
 			return
 		}

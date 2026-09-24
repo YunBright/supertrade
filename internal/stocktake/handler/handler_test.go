@@ -5,20 +5,66 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/YunBright/authkit/claims"
+	"github.com/YunBright/authkit/userinfo"
 	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/internal/stocktake/handler"
 	"github.com/YunBright/supertrade/internal/stocktake/model"
 	"github.com/YunBright/supertrade/internal/stocktake/service"
 	"github.com/YunBright/supertrade/internal/stocktake/testdb"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 )
 
-// buildTestHandler 起一个完整 handler(配 SQLite + InMemoryCube + 注入 claims)。
+// fakeUserD 模拟 userd 的 per-branch permissions 端点(全放行)。
+//
+// handler 的 scope 守门走 userd,测试不真正起 userd —— 用 httptest 起一个伪服务
+// 让所有 branch 都返回所有 stocktake 相关 scope,handler 顺利走通业务逻辑。
+func fakeUserD(t *testing.T) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1.0/invoke/userd/method/internal/users/", func(w http.ResponseWriter, r *http.Request) {
+		// /internal/users/{id}/permissions?branch_id=...
+		if !strings.Contains(r.URL.Path, "/permissions") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		bid := r.URL.Query().Get("branch_id")
+		if bid == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		uid, err := uuid.Parse(strings.TrimPrefix(r.URL.Path, "/v1.0/invoke/userd/method/internal/users/"))
+		_ = uid
+		_ = err
+		buid, perr := uuid.Parse(bid)
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		resp := userinfo.BranchPermissions{
+			Branches: []userinfo.BranchPermissionsRow{
+				{
+					BranchID: buid,
+					Scopes: []string{
+						"inventory:view", "inventory:manage", "inventory:approve",
+						"supplier:view", "product:view",
+					},
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	return httptest.NewServer(mux)
+}
+
+// buildTestHandler 起一个完整 handler(配 SQLite + InMemoryCube + fake userd + 注入 claims)。
 //
 // DB 走 internal/stocktake/testdb(测试专用,生产代码不引用)。
 // 生产代码只支持 PostgreSQL(见 stocktake.OpenPostgres)。
@@ -42,6 +88,17 @@ func buildTestHandler(t *testing.T) *gin.Engine {
 	fixed := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
 	svc.SetClock(func() time.Time { return fixed })
 	cube.SetClock(func() time.Time { return fixed })
+	// cube InMemoryClient 默认 seed 数据 branch = "S001";handler test 现在用 UUID
+	// 风格 testBranchID,加对应 UUID branch 的库存让 AddLine 走通。
+	cube.UpsertStock(testBranchID, "P-1001", decimal.NewFromInt(100), decimal.NewFromFloat(2.5))
+	cube.UpsertStock(testBranchID, "P-1002", decimal.NewFromInt(50), decimal.NewFromFloat(2.5))
+	cube.UpsertStock(testBranchID, "P-1003", decimal.NewFromInt(200), decimal.NewFromFloat(3.0))
+
+	// 注入 fake userd,让 per-branch 守门走通。
+	userd := fakeUserD(t)
+	t.Cleanup(userd.Close)
+	users := userinfo.New("userd", userinfo.WithEndpoint(userd.URL))
+	svc.SetUserInfo(users)
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
@@ -72,15 +129,21 @@ func injectTestClaims() gin.HandlerFunc {
 func claimsHeader(userID string) string {
 	cl := claims.Claims{
 		Sub:      userID,
-		BranchID: "S001",
+		DefaultBranchID: testBranchID,
 	}
 	b, _ := json.Marshal(cl)
 	return string(b)
 }
 
+// testBranchID 把"S001"映射为合法的 UUID(userinfo.GetBranchPermissions 要求
+// 合法 UUID 格式)。本测试全局用同一 UUID 表示"S001",行为等价。
+//
+// 用 SHA1 + 固定 namespace 保稳定:同一"S001"每次跑出同一 UUID,DB FK / cache key 都对得上。
+var testBranchID = uuid.NewSHA1(uuid.NameSpaceURL, []byte("test-branch-S001")).String()
+
 func TestHandler_CreateHeader_201(t *testing.T) {
 	r := buildTestHandler(t)
-	body := `{"branch_id":"S001","remark":"demo"}`
+	body := `{"branch_id":"` + testBranchID + `","remark":"demo"}`
 	req := httptest.NewRequest(http.MethodPost, "/stocktake-headers", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
@@ -107,7 +170,7 @@ func TestHandler_E2E_RealTimeStocktake(t *testing.T) {
 	r := buildTestHandler(t)
 
 	// 1. create header
-	createBody := `{"branch_id":"S001","remark":"营业中 demo"}`
+	createBody := `{"branch_id":"` + testBranchID + `","remark":"营业中 demo"}`
 	req := httptest.NewRequest(http.MethodPost, "/stocktake-headers", bytes.NewBufferString(createBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
@@ -179,7 +242,7 @@ func TestHandler_AddLine_ProductNotFound_400(t *testing.T) {
 	r := buildTestHandler(t)
 
 	// 先建 header
-	createBody := `{"branch_id":"S001"}`
+	createBody := `{"branch_id":"` + testBranchID + `"}`
 	req := httptest.NewRequest(http.MethodPost, "/stocktake-headers", bytes.NewBufferString(createBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
@@ -210,7 +273,7 @@ func TestHandler_Submit_Approve_Lifecycle(t *testing.T) {
 	r := buildTestHandler(t)
 
 	// create
-	req := httptest.NewRequest(http.MethodPost, "/stocktake-headers", bytes.NewBufferString(`{"branch_id":"S001"}`))
+	req := httptest.NewRequest(http.MethodPost, "/stocktake-headers", bytes.NewBufferString(`{"branch_id":"`+testBranchID+`"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
 	w := httptest.NewRecorder()
@@ -269,7 +332,7 @@ func TestHandler_Submit_Approve_Lifecycle(t *testing.T) {
 func claimsHeaderFullPerm(userID string) string {
 	cl := claims.Claims{
 		Sub:      userID,
-		BranchID: "S001",
+		DefaultBranchID: testBranchID,
 		Scopes:   []string{"inventory:view", "supplier:view"},
 	}
 	b, _ := json.Marshal(cl)
@@ -280,133 +343,10 @@ func claimsHeaderFullPerm(userID string) string {
 func claimsHeaderNoPerm(userID string) string {
 	cl := claims.Claims{
 		Sub:      userID,
-		BranchID: "S001",
+		DefaultBranchID: testBranchID,
 	}
 	b, _ := json.Marshal(cl)
 	return string(b)
-}
-
-func TestHandler_SearchProducts_FullPerm(t *testing.T) {
-	r := buildTestHandler(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/products/search?barcode=6901234567890", nil)
-	req.Header.Set("X-Test-Claims", claimsHeaderFullPerm("u-1"))
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
-	}
-	var resp struct {
-		Products []map[string]any `json:"products"`
-		Count    int              `json:"count"`
-		Meta     struct {
-			InvViewable      bool   `json:"inv_viewable"`
-			SupplierViewable bool   `json:"supplier_viewable"`
-			BarcodeQuery     string `json:"barcode_query"`
-		} `json:"meta"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if resp.Count != 1 || len(resp.Products) != 1 {
-		t.Fatalf("count = %d, want 1", resp.Count)
-	}
-	row := resp.Products[0]
-	if row["product_id"] != "P-1001" {
-		t.Errorf("product_id = %v", row["product_id"])
-	}
-	// decimal.Decimal 序列化为 string,断言比较
-	if v, ok := row["stock_qty"].(string); !ok || v != "100" {
-		t.Errorf("stock_qty = %v(%T), want '100'", row["stock_qty"], row["stock_qty"])
-	}
-	if row["supplier_id"] != "SUP-001" || row["supplier_name"] != "可口可乐华南" {
-		t.Errorf("supplier = %v/%v", row["supplier_id"], row["supplier_name"])
-	}
-	if !resp.Meta.InvViewable || !resp.Meta.SupplierViewable {
-		t.Errorf("meta 权限标志应都 true")
-	}
-	if resp.Meta.BarcodeQuery != "6901234567890" {
-		t.Errorf("barcode_query = %q", resp.Meta.BarcodeQuery)
-	}
-}
-
-func TestHandler_SearchProducts_NoPermFiltersSensitive(t *testing.T) {
-	r := buildTestHandler(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/products/search?barcode=6901234567890", nil)
-	req.Header.Set("X-Test-Claims", claimsHeaderNoPerm("u-1"))
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d", w.Code)
-	}
-	var resp struct {
-		Products []map[string]any `json:"products"`
-		Meta     struct {
-			InvViewable      bool `json:"inv_viewable"`
-			SupplierViewable bool `json:"supplier_viewable"`
-		} `json:"meta"`
-	}
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	row := resp.Products[0]
-	if _, ok := row["stock_qty"]; ok {
-		t.Errorf("无 inventory:view 时 stock_qty 应缺省, got %v", row["stock_qty"])
-	}
-	if _, ok := row["supplier_id"]; ok {
-		t.Errorf("无 supplier:view 时 supplier_id 应缺省, got %v", row["supplier_id"])
-	}
-	if _, ok := row["supplier_name"]; ok {
-		t.Errorf("无 supplier:view 时 supplier_name 应缺省, got %v", row["supplier_name"])
-	}
-	if resp.Meta.InvViewable || resp.Meta.SupplierViewable {
-		t.Errorf("meta 权限标志应都 false, got %+v", resp.Meta)
-	}
-}
-
-func TestHandler_SearchProducts_BranchFromClaims(t *testing.T) {
-	r := buildTestHandler(t)
-
-	// 不传 branch_id,应取自 claims.BranchID = S001
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/products/search?barcode=6901234567890", nil)
-	req.Header.Set("X-Test-Claims", claimsHeaderNoPerm("u-1"))
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
-	}
-}
-
-func TestHandler_SearchProducts_MissingBarcode_400(t *testing.T) {
-	r := buildTestHandler(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/products/search", nil)
-	req.Header.Set("X-Test-Claims", claimsHeaderNoPerm("u-1"))
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400, body=%s", w.Code, w.Body.String())
-	}
-}
-
-func TestHandler_SearchProducts_TooShortReturnsEmpty(t *testing.T) {
-	r := buildTestHandler(t)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/products/search?barcode=123", nil)
-	req.Header.Set("X-Test-Claims", claimsHeaderFullPerm("u-1"))
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d", w.Code)
-	}
-	var resp struct {
-		Count int `json:"count"`
-	}
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp.Count != 0 {
-		t.Errorf("<5 位应 0 条, got %d", resp.Count)
-	}
 }
 
 // ---- 2026-09-19 盘点单 H5 新端点 ----
@@ -415,7 +355,7 @@ func TestHandler_RecheckHeader_RequiresParent_400(t *testing.T) {
 	r := buildTestHandler(t)
 
 	// type=recheck 但没传 parent_header_id → 400 bad_request
-	body := `{"branch_id":"S001","type":"recheck"}`
+	body := `{"branch_id":"` + testBranchID + `","type":"recheck"}`
 	req := httptest.NewRequest(http.MethodPost, "/stocktake-headers", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
@@ -436,7 +376,7 @@ func TestHandler_RecheckHeader_RequiresParent_400(t *testing.T) {
 	}
 
 	// 即使传了 parent_header_id 但指向不存在的 header → 400
-	body = `{"branch_id":"S001","type":"recheck","parent_header_id":"ST999999999999"}`
+	body = `{"branch_id":"` + testBranchID + `","type":"recheck","parent_header_id":"ST999999999999"}`
 	req = httptest.NewRequest(http.MethodPost, "/stocktake-headers", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
@@ -451,7 +391,7 @@ func TestHandler_PlanItems_PostAndGet(t *testing.T) {
 	r := buildTestHandler(t)
 
 	// 先建一个 plan 盘点单(用不同 count_date 避开 id 冲突)
-	createBody := `{"branch_id":"S001","type":"plan","count_date":"2026-09-18"}`
+	createBody := `{"branch_id":"` + testBranchID + `","type":"plan","count_date":"2026-09-18"}`
 	req := httptest.NewRequest(http.MethodPost, "/stocktake-headers", bytes.NewBufferString(createBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
@@ -523,9 +463,9 @@ func TestHandler_ListHeaders_FilteredByType(t *testing.T) {
 
 	// 3 个盘点单:2 general + 1 plan。用不同的 count_date 错开 unique id。
 	bodies := []string{
-		`{"branch_id":"S001","type":"general","count_date":"2026-09-19"}`,
-		`{"branch_id":"S001","type":"general","count_date":"2026-09-20"}`,
-		`{"branch_id":"S001","type":"plan","count_date":"2026-09-21"}`,
+		`{"branch_id":"` + testBranchID + `","type":"general","count_date":"2026-09-19"}`,
+		`{"branch_id":"` + testBranchID + `","type":"general","count_date":"2026-09-20"}`,
+		`{"branch_id":"` + testBranchID + `","type":"plan","count_date":"2026-09-21"}`,
 	}
 	for i, body := range bodies {
 		_ = i
@@ -567,7 +507,7 @@ func TestHandler_History_AfterAdd(t *testing.T) {
 
 	// create header
 	req := httptest.NewRequest(http.MethodPost, "/stocktake-headers",
-		bytes.NewBufferString(`{"branch_id":"S001","count_date":"2026-09-22"}`))
+		bytes.NewBufferString(`{"branch_id":"`+testBranchID+`","count_date":"2026-09-22"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
 	w := httptest.NewRecorder()

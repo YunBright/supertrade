@@ -12,7 +12,7 @@ import (
 // 关键约束：
 //   - tenant_id 不匹配 → 永远不投递
 //   - branch_id 必须落在 client 的"有效门店列表"内（home + additional）
-//   - 用户级事件（如 auth.user.permissions_changed）只投递到该 user
+//   - 用户级事件（如 auth.user.access_changed）只投递到该 user
 //   - tenant_admin 类 scope 拥有者跨门店事件无需校验 branch
 //
 // 事件 payload 约定：所有 stocktake.* / 业务事件 data 含 branch_id 字段。

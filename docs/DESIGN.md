@@ -21,7 +21,7 @@
 
 ---
 
-## §1 微服务拆分(15 个 dapr app)
+## §1 微服务拆分(16 个 dapr app)
 
 ```
                       ┌──────────────────────────────────────────┐
@@ -63,8 +63,8 @@
 | # | dapr app-id | 职责 | 主要数据 | 关键依赖 |
 |---|---|---|---|---|
 | 1 | **pos-gateway** | BFF,前端对接,聚合调用 | 路由 | Dapr invoke |
-| 2 | **catalog** | **代理 cube `product` / `category` 读取,本系统不维护 SKU**(REQUIREMENTS §7.5) | — | cube-gateway |
-| 3 | **inventory** | **代理 cube `stock` 读取,本系统不维护库存**(REQUIREMENTS §7.5) | — | cube-gateway |
+| 2 | **catalog** | **本地 suppliers/products 表(带 branch_id)+ cube 兜底**(REQUIREMENTS §7.5) | suppliers, products(本地) | cube-gateway(兜底), userd(scope) |
+| 3 | **inventory** | **代理 cube `stock` 读取,本系统不维护库存**(REQUIREMENTS §7.5) | — | cube-gateway(经 cube-router) |
 | 4 | **procurement** | 采购订单、收货、退货、账期(本系统自营) | purchase_orders, grns | cube-gateway(查 SKU/供应商) |
 | 5 | **pos** | 销售开单、收款、改价、退货、班次(本系统自营) | sales_orders, sale_lines, payments | cube-gateway(查 SKU) |
 | 6 | **pricing** | 售价/促销/会员/改价审批(本系统自营) | price_lists, promotions | cube-gateway |
@@ -74,9 +74,10 @@
 | 10 | **erp-connector** | 拉 cube /v1/load(REQUIREMENTS §5) | erp_sales_raw, sync_logs | cube-gateway |
 | 11 | **sales-agg** | 聚合 POS + erp-connector,供 BI / 跨服务拉 | sales_view | pos pub/sub, erp-connector |
 | 12 | **llm-gw** | LLM 路由 + prompt 模板 + 缓存 + 降级 | llm_call_logs | 智谱 / DeepSeek |
-| 13 | **master-data** | 门店/员工/班次(**供应商/客户走 cube 转发**) | stores, employees | cube-gateway |
+| 13 | **master-data** | 门店/员工/班次(**供应商/客户走 catalog 本地表**) | stores, employees | cube-gateway |
 | 14 | **bi-gateway** | BI 出口,调 cube-gateway + 本系统聚合 | — | cube-gateway |
 | 15 | **notification** | 企微 / 钉钉 / 短信通知 | notification_logs | — |
+| 16 | **cube-router** ⭐ | **按 X-Branch-ID 路由 POST /v1/load 到正确 cube 实例(sixun-hbposv7 / sixun-ysx)** | branch_cube_sources | dapr invoke → cube 实例, userd(scope) |
 
 > **身份/权限不归本系统**:`auth` 项目的 userd 提供 JWT 签发 + 用户/角色/权限 CRUD;
 > 本系统每个 dapr app 通过 `authkit` 中间件鉴权。**不写 iam 服务**。
@@ -85,15 +86,16 @@
 
 | 数据 | 归属 | 服务 |
 |---|---|---|
-| SKU / 商品 | cube-gateway 转发 | `catalog.GET /products` |
-| 实时库存 | cube-gateway 转发 | `inventory.GET /stock` |
-| 供应商 / 客户 | cube-gateway 转发 | `master-data.GET /suppliers` |
+| **SKU / 商品** | **catalog 本地表 + cube 兜底** | `catalog.GET /products/search` 等 |
+| 实时库存 | cube-gateway 经 cube-router 转发 | `inventory.GET /stock/:branch_id/:product_id` |
+| **供应商 / 客户** | **catalog 本地表 suppliers(type=0/1)+ cube 兜底** | `catalog.GET /suppliers` 等 |
 | 销售明细(思迅) | erp-connector 定期拉 → `erp_sales_raw` | `erp-connector`(订阅 `erp.sale.ingested`) |
 | **盘点表 + 盘点明细** | **本系统自维护** | `stocktake`(本期重点) |
 | POS 开单(本系统) | 本系统自维护 | `pos` |
 | 采购收货(本系统) | 本系统自维护 | `procurement` |
 | 蔬果 / 生肉特有表 | 本系统自维护 | `fresh-produce` / `fresh-meat` |
 | 门店 / 员工 / 班次 | 本系统自维护 | `master-data` |
+| **branch ↔ cube 映射** | **本系统自维护** | **cube-router / admin / branch-cube-sources** |
 
 ---
 
@@ -150,34 +152,50 @@ bi-gateway ─invoke─▶ cube-gateway (BI 走 cube 自家的,不经本系统 c
 
 ## §3 auth + authkit 集成
 
-### 3.1 本系统每个 dapr app 的 handler 链
+### 3.1 本系统每个 dapr app 的 handler 链(2026-09 重构后)
+
+每个 dapr app 的请求链(由 `pkg/cmdbootstrap` + `pkg/middleware` + `authkit/rbac` 组合):
 
 ```go
-// cmd/catalog/main.go 示意
+// cmd/catalog/main.go 示意(2026-09 重构后)
 import (
     "github.com/YunBright/authkit/claims"
     "github.com/YunBright/authkit/rbac"
     "github.com/YunBright/authkit/userinfo"
+    "github.com/YunBright/supertrade/pkg/middleware"
 )
 
-r := gin.New()
-r.Use(claims.GinMiddleware())           // 1. 解析 claims 到 ctx(Dapr sidecar 已验签)
-r.Use(rbac.RequireAudience("catalog"))  // 2. aud 必须包含本服务
-
-products := r.Group("/products")
-products.GET("/:id",
-    rbac.RequireScope("catalog.read"),
-    catalogHandler.Get,
-)
-products.POST("/",
-    rbac.RequireScope("catalog.write"),
-    catalogHandler.Create,
-)
-
-// 跨服务查用户
 users := userinfo.New("userd")
-u, _ := users.Get(ctx, "user-uuid")
+r := gin.New()
+r.Use(claims.GinMiddleware())              // 1. 解析 claims 到 ctx(Dapr sidecar 已验签)
+r.Use(rbac.RequireAudience("catalog"))     // 2. aud 必须包含本服务
+r.Use(middleware.XBranchID())              // 3. 解析 X-Branch-ID header 到 ctx(全局挂)
+
+// 三元权限中间件:每个业务端点都挂
+suppliers := r.Group("/suppliers")
+suppliers.GET("",
+    rbac.RequireScopeWithBranch("supplier:view",
+        middleware.BranchFromCtx,                  // branchFn
+        rbac.HasAnyScopeWithBranch(users)),        // userinfo per-branch 矩阵
+    supplierHandler.List,
+)
+suppliers.POST("",
+    rbac.RequireScopeWithBranch("supplier:manage",
+        middleware.BranchFromCtx,
+        rbac.HasAnyScopeWithBranch(users)),
+    supplierHandler.Create,
+)
 ```
+
+**关键变化(2026-09 重构后)**:
+- ❌ **移除** `rbac.RequireScope("catalog.read")` 这类 JWT-static scope 中间件
+  (auth 在 2026-09-23 把 JWT `scopes` 字段清空,static helper 永远 false)
+- ✅ **新增** `rbac.RequireScopeWithBranch(scope, branchFn, resolver)` —— 三元 `user × branch × scope`
+- ✅ **新增** `rbac.HasAnyScopeWithBranch(users *userinfo.Client)` resolver 适配器
+  (内部调 `users.GetBranchPermissions(ctx, sub, branchID)` 读 userd per-branch 矩阵)
+- ✅ **统一** branch 来源:`pkg/middleware.XBranchID()` 把 `X-Branch-ID` header 注入 ctx
+  (catalog / cube-router / stocktake 大多数端点统一走 header;path `:branch_id` 用 `c.Param`,
+   body `branch_id` 用 `ShouldBindJSON` 后字段)
 
 ### 3.2 分店隔离(数据级权限)
 
@@ -221,9 +239,15 @@ if errors.Is(err, userinfo.ErrPermissionsUnavailable) {
 
 > 调用方应缓存 `(userID, tenantID) → Scopes` 以减少 userd 压力。
 
-### 3.4 待 authkit 后续迭代(现已无须阻塞)
+### 3.4 authkit 集成清单(2026-09-24 已全部合并)
 
-REQUIREMENTS §1.4 列的 3 项 P1/P2 需求已全部合并到 authkit。本系统侧按 §3.2 / §3.3 直接调用。
+REQUIREMENTS §1.4 列的 6 项 authkit 需求已全部合并:
+- `rbac.RequireBranch(branchFn, allowedFn)` —— 静态版(高频 / JWT snapshot)
+- `rbac.RequireScopeWithBranch(scope, branchFn, resolver)` —— 三元权限核心(走 userd per-branch)
+- `rbac.HasAnyScopeWithBranch(users)` —— resolver 适配器
+- `userinfo.GetBranchPermissions(ctx, uid, branchID)` —— per-branch 矩阵
+- `claims.GetEffectiveBranches()` / `IsAllowedBranch()` —— JWT snapshot helpers
+- `auth.user.access_changed` 合并事件 —— 权限失效广播,前端订阅重新签 token
 
 ---
 

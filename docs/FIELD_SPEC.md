@@ -32,31 +32,71 @@
 > 来源:`F:\go\src\github.com\YunBright\supertrade` 各 dapr app 内 GORM 模型。
 > 下列清单是**目标 schema**(target);它们跟 cube source 的对应关系见 §3。
 
-### 1.1 catalog(商品目录代理,dapr app `catalog`)
+### 1.1 catalog(商品 / 供应商,dapr app `catalog`)
 
-**本期定位**:不维护本地商品表,**只代理 cube-gateway `/v1/load` 返回 product 维度数据**。
+**本期定位(2026-09 重构后)**:
+- **本地维护** `catalog.suppliers` 表(带 `branch_id`,复合主键 `(id, branch_id)`)—— 本系统数据
+- **本地维护** `catalog.products` 表(带 `branch_id`)—— schema 占位,业务 CRUD 暂未实装,search 接口过渡期走 cube 兜底
+- **不再代理** cube `product` / `category` 转发;cube 转发**仅在 `products/search` 本地表无数据时作为兜底**(`CUBE_CLIENT_MODE=http` + cube-router)
 
-`GET /products` 请求/响应字段(`data[]` 各元素)来自 cube `product` model:
+`catalog.suppliers`(本地表):
 
-| 字段 | 类型 | 单位 | 来源 |
+| 字段 | 类型 | 单位 | 说明 |
 |---|---|---|---|
-| `id` | string | - | cube `product.id` |
-| `name` | string | - | cube `product.name` |
-| `category_id` | string | - | cube `product.category_id` |
-| `supplier_id` | string | - | cube `product.supplier_id` |
-| `status` | string | - | cube `product.status` |
-| `created_at` | datetime | - | cube `product.created_at` |
-| `barcode` | string | - | **本期 = item_no**(cube sixun-models/product 无 barcode 字段;对齐 collect-ai 业务字段) |
+| `id` | string | - | 供应商 PK(同 ID 可在不同门店出现) |
+| `branch_id` | string | - | 门店;复合主键 `(id, branch_id)` |
+| `name` | string | - | 供应商名 |
+| `type` | string | - | `"0"`=供应商 / `"1"`=客户 |
+| `contact` | string | - | 联系人 |
+| `phone` | string | - | 电话(索引 `(branch_id, phone)`) |
+| `email` | string | - | |
+| `address` | string | - | |
+| `status` | string | - | `active` / `inactive`(索引 `(branch_id, status)`) |
+| `created_by` / `updated_by` | string | - | JWT `sub` |
+| `created_at` / `updated_at` | datetime | - | |
+| `deleted_at` | datetime | - | 软删(GORM `gorm.DeletedAt`) |
 
-> cube `product` 不含 `barcode / spec / unit / origin / brand / shelf_life_days` 等扩展字段;
-> 这些字段**只在本系统展示时按需从思迅数据库单独查**(本期不实现,
-> 留 entry point 在 catalog 服务后续扩展)。
+`catalog.products`(本地表,业务 CRUD 占位):
+
+| 字段 | 类型 | 单位 | 说明 |
+|---|---|---|---|
+| `id` | string | - | 复合主键 `(id, branch_id)`,= cube `product.id` = 思迅 `item_no` |
+| `branch_id` | string | - | 门店 |
+| `name` | string | - | 商品名(索引 `(branch_id, name)`) |
+| `category_id` | string | - | 分类(索引 `(branch_id, category_id)`) |
+| `supplier_id` | string | - | 主供应商 |
+| `barcode` | string | - | 条码(索引 `(branch_id, barcode)`,本期 = item_no) |
+| `unit` / `spec` | string | - | 基本单位 / 规格 |
+| `status` | string | - | `active` / `inactive` |
+| `created_by` / `updated_by` / `created_at` / `updated_at` / `deleted_at` | - | - | 同 supplier |
+
+### 1.1.1 `GET /products/search` 响应字段(catalog 本期实装)
+
+响应结构(沿用 §2.1.4.1 接口契约):
+
+| 字段 | 类型 | 权限过滤 | 说明 |
+|---|---|---|---|
+| `barcode` | string | - | 商品条码(本期 = item_no) |
+| `product_id` | string | - | = cube `product.id` |
+| `product_name` | string | - | cube `product.name` |
+| `category` | string | - | cube `category.name` |
+| `brand` | string | - | 扩展字段(本期 mock) |
+| `unit` | string | - | 基本单位 |
+| `price` | decimal | - | 零售价(本期 mock) |
+| `stock_qty` | decimal | `inventory:view` | cube `stock.total_quantity`(经 cube-router) |
+| `avg_cost_yuan` | decimal | `inventory:view` | cube `stock.avg_cost` |
+| `supplier_id` | string | `supplier:view` | 主供应商 ID |
+| `supplier_name` | string | `supplier:view` | cube `supplier.name` |
+
+权限过滤规则:`rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver)` 中间件负责 per-branch 校验;
+`stock_qty` / `avg_cost_yuan` 字段额外需要 `inventory:view` scope;
+`supplier_id` / `supplier_name` 字段额外需要 `supplier:view` scope。
 
 ### 1.2 inventory(实时库存代理,dapr app `inventory`)
 
-**本期定位**:不维护本地库存表,**只代理 cube-gateway `/v1/load` 返回 stock 维度数据**。
+**本期定位**:不维护本地库存表,**只代理 cube-gateway `/v1/load` 返回 stock 维度数据**(经 cube-router 多源路由)。
 
-`GET /stock` 请求/响应字段来自 cube `stock` model:
+`GET /stock/:branch_id/:product_id` 请求/响应字段来自 cube `stock` model:
 
 | 字段 | 类型 | 单位 | 来源 |
 |---|---|---|---|
@@ -68,6 +108,29 @@
 
 > 注:思迅源已含完整批次 / 保质期 / 出入库流水信息,本系统只取汇总的
 > `(product, branch) → quantity` 维度,本系统**不建 `inventory.batches` 表**。
+
+### 1.2.1 cube-router(cube 多源路由,dapr app `cube-router`)
+
+**本期定位(2026-09 新增)**:按 X-Branch-ID 路由 `POST /v1/load` 到正确 cube 实例,统一收口 stocktake / catalog / inventory / erp-connector / bi-gateway 等所有需要 cube 的服务。
+
+`branch_cube_sources`(本地表):
+
+| 字段 | 类型 | 单位 | 说明 |
+|---|---|---|---|
+| `branch_id` | string | - | PK —— 门店 ID |
+| `cube_source_name` | string | - | cube 实例 app-id(如 `sixun-hbposv7` / `sixun-ysx`);索引 `idx_cube_source` |
+| `enabled` | bool | - | 是否启用,默认 `true` |
+| `created_by` / `updated_by` | string | - | admin 用户的 JWT `sub` |
+| `created_at` / `updated_at` | datetime | - | |
+
+**路由逻辑**(`POST /v1/load` handler):
+
+1. `rbac.RequireScopeWithBranch("cube:read", branchFromHeader, resolver)` 中间件验三元权限
+2. 从 ctx 拿 `branch_id` → 查 `branch_cube_sources`(内存 cache + 60s TTL + singleflight)
+3. 拿不到 / `enabled=false` → 503 `cube_source_not_configured` / `cube_source_disabled`
+4. 拿 `cube_source_name` → 用预热的 `map[cube_source_name]*HTTPCubeClient` 选 client
+5. 透传 request body 和 JWT → 转发到 `http://localhost:3500/v1.0/invoke/<cube-source-name>/method/v1/load`
+6. 透传 response body
 
 ### 1.3 pos(销售单据,dapr app `pos`)
 
@@ -215,7 +278,7 @@
 
 | 服务 | 本期关键表 / 字段 |
 |---|---|
-| `master-data` | `stores` / `employees`(本地维护);供应商/客户走 cube `supplier` 转发,不维护本地表 |
+| `master-data` | `stores` / `employees`(本地维护);供应商/客户已搬到 **catalog 本地表**(`catalog.suppliers`),master-data 不再转发 |
 | `pricing` | `price_lists` / `promotions`(本地维护,本系统自营 POS 用) |
 | `sales-agg` | `sales_view_minute` / `sales_view_daily`(本地宽表,聚合 POS + erp-connector) |
 | `erp-connector` | `erp_sales_raw` / `sync_logs`(拉 cube 数据落库,供 sales-agg) |

@@ -68,11 +68,15 @@ func (c *Client) TenantID() string {
 }
 
 // BranchID 当前 home 门店。
+//
+// Phase 3:对齐 authkit/claims 的字段名 —— claims 结构上只有 DefaultBranchID
+// (JWT 里的 default_branch_id claim);这里保持方法名 BranchID 不变以免
+// 调用方大改,但内部读 DefaultBranchID。
 func (c *Client) BranchID() string {
 	if c.claims == nil {
 		return ""
 	}
-	return c.claims.BranchID
+	return c.claims.DefaultBranchID
 }
 
 // Claims 浅拷贝（仅用于路由判定；不要写）。
@@ -81,11 +85,17 @@ func (c *Client) Claims() *claims.Claims {
 }
 
 // EffectiveBranches home + additional,去重。
+//
+// Phase 3:authkit/claims 没有 GetEffectiveBranches() 方法 —— 这里直接读
+// AccessibleBranches 切片(JWT 里的 accessible_branches claim);若想拿到含
+// default 的并集,调用方自己 append BranchID()。
 func (c *Client) EffectiveBranches() []string {
 	if c.claims == nil {
 		return nil
 	}
-	return c.claims.GetEffectiveBranches()
+	out := make([]string, len(c.claims.AccessibleBranches))
+	copy(out, c.claims.AccessibleBranches)
+	return out
 }
 
 // HasScope 判定 scope。

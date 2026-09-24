@@ -34,18 +34,44 @@
 | 跨服务查用户信息 | `authkit/userinfo.New("userd")` | 走 dapr invocation |
 | 验签 | **dapr middleware.http.bearer**(sidecar 验签) | 各 dapr app **不重验签** |
 
-### 1.2 权限模型(本项目约束)
+### 1.2 权限模型(本项目约束,2026-09 重构后)
 
-每个业务接口必须满足:`RequireAudience(<self>)` + `RequireScope(<scope>)`
-,其中 `scope` 是单据级操作动词(如 `purchase.create`、`stocktake.write`)。
+**三元权限模型**:每个业务接口必须满足 `user × branch × scope`:
+
+- `user` —— JWT `sub`(dapr sidecar 已验签)
+- `branch` —— 当前操作的门店,从 **`X-Branch-ID` header** 统一解析(由 `pkg/middleware.XBranchID()` 注入 ctx)
+- `scope` —— 业务操作动词,采用 `<resource>:<verb>` 命名(≤64 字符),如 `inventory:view` / `inventory:manage` / `supplier:view` / `product:view` / `cube:read`
+
+**`JWT.scopes` 字段已废弃**:auth 在 2026-09-23 改为 `defaultScopes = []`,
+所有 `cl.HasScope(...)` / JWT-static scope helper 永远返 false;**不再使用**。
+业务侧必须走 `userinfo.GetBranchPermissions(uid, branchID)` 读 per-branch scope 矩阵
+(userd 实时返回,缓存到内存 + 失效订阅 `auth.user.access_changed`)。
+
+**统一鉴权中间件**:`authkit/rbac.RequireScopeWithBranch(scope, branchFn, resolver)`,
+配套 `authkit/rbac.HasAnyScopeWithBranch(users)` resolver 适配器。
+决策矩阵:
+- branchFn 取不到 → `400 branch_required`
+- resolver 返 error → `503 userd_unavailable`
+- resolver 返 false → `403 forbidden`
+- 命中 → `c.Next()`
+
 公开接口(`/healthz`、登录回调)不走 dapr bearer 中间件。
 
 ### 1.3 数据级权限(分店隔离)
 
 业务接口必须按 `branch_id` 过滤:用户仅可访问其所属分店的数据。
-**`authkit` 现有中间件无此能力**——需要在 `authkit` 新增 `rbac.RequireBranch(...)`
-或在本系统 `pkg/workspace` 包内提供 `BranchGuard(ctx, branchID) error`。
-本系统侧实现不阻塞业务开发**,先用本地 helper 落地,后续推 authkit 上游。
+**`authkit` 已提供两套中间件**(本系统直接使用,不二次实现):
+
+| 中间件 | 适用场景 | 来源 |
+|---|---|---|
+| `rbac.RequireBranch(branchFn, allowedFn)` | path `:branch_id` 与 `claims.AccessibleBranches` 比对(高频 / 静态缓存) | `authkit/rbac/rbac.go` |
+| `rbac.RequireScopeWithBranch(scope, branchFn, resolver)` | 在指定 branch 下校验动态 scope(`userinfo.GetBranchPermissions` 查) | `authkit/rbac/scope_branch.go`(2026-09 加) |
+
+**branch 来源优先级**(`branchFn` 由各服务按业务语义实现):
+- path `:branch_id` —— `/stock/:branch_id/:product_id` / `/branches/:branch_id/...`
+- X-Branch-ID header —— catalog / cube-router / stocktake 大多数端点
+- body `branch_id` —— `POST /stocktake-headers` 用 body 字段
+- 关联实体的 branch —— `stocktake_lines` 通过 header→hdr→line 反查
 
 ### 1.4 待推 authkit 的开发需求(已落地)
 
@@ -54,6 +80,10 @@
 | `rbac.RequireBranch(branchFn, allowedFn)` 中间件 | P1 | ✅ 已合并 | `F:\go\src\github.com\YunBright\authkit\rbac\rbac.go` |
 | `claims.Claims.BranchID` + `AdditionalBranches` + `GetEffectiveBranches()` / `IsAllowedBranch()` | P2 | ✅ 已合并 | `F:\go\src\github.com\YunBright\authkit\claims\claims.go` |
 | `userinfo.GetEffectivePermissions(ctx, userID, tenantID)` + `EffectivePermissions` 类型 | P2 | ✅ 已合并 | `F:\go\src\github.com\YunBright\authkit\userinfo\userinfo.go` |
+| `rbac.RequireScopeWithBranch(scope, branchFn, resolver)` 三元权限中间件 | P0 | ✅ 已合并(2026-09) | `F:\go\src\github.com\YunBright\authkit\rbac\scope_branch.go` |
+| `rbac.HasAnyScopeWithBranch(users *userinfo.Client) ScopeResolver` resolver 适配器 | P0 | ✅ 已合并(2026-09) | 同上 |
+| `userinfo.GetBranchPermissions(ctx, userID, branchID)` per-branch 矩阵 | P0 | ✅ 已合并 | `F:\go\src\github.com\YunBright\authkit\userinfo\userinfo.go` |
+| `auth.user.access_changed` 合并事件取代 `permissions_changed` | P0 | ✅ 已合并 | auth 仓 userd |
 
 > **依赖关系**:supertrade 通过 `replace github.com/YunBright/authkit => ../authkit`(go.mod)
 > 引用本地开发版;authkit 后续打 tag 后切换为 `require ...@vX.Y.Z`。
@@ -67,12 +97,14 @@
 | 模块 | 子功能 | 关键单据 | 主服务 |
 |---|---|---|---|
 | 库存 | 入库 / 出库 / 调拨 / 报损 / 批次 / 保质期 / 库存查询 | inventory batches + stock_moves | inventory |
+| **商品目录** | **本地 supplier / product 表(suppliers/products)+ cube 兜底** | **suppliers / products(本地)** + cube | **catalog** |
 | 销售 | 开单 / 挂单 / 改价 / 优惠 / 抹零 / 退货 / 反结账 / 班次结账 | pos sales_orders + sale_lines + payments | pos |
 | 采购 | 询价 / 订货 / 收货 / 退货 / 供应商对账 / 账期 | procurement purchase_orders + grns | procurement |
 | 盘点 | 全盘 / 抽盘 / 差异调整 | stocktake tasks | stocktake |
 | 定价 | 基础价 / 促销价 / 会员价 / 时段价 / 限购 + 改价审批 | pricing price_lists + promotions | pricing |
-| 主数据 | 门店 / 员工 / 班次 / 供应商 / 客户 | master-data tables | master-data |
+| 主数据 | 门店 / 员工 / 班次(供应商 / 客户已在 catalog 维护) | master-data tables | master-data |
 | 报表 | 销售 / 毛利 / 库存 / 损耗 / 供应商对账 | 走 cube | bi-gateway + sales-agg |
+| **Cube 多源路由** | **按 X-Branch-ID 路由到不同 cube 实例(sixun-hbposv7 / sixun-ysx)** | **branch_cube_sources** | **cube-router** |
 
 **字段定义统一走**:`docs/FIELD_SPEC.md` §1
 
@@ -191,8 +223,13 @@
 #### 2.1.4.1 商品搜索接口契约(`/api/v1/products/search`)
 
 > 本期新增 —— 跟 scan.html 后端(`collect-ai` `SearchProducts`)字段对齐,前端**可零改动接入**。
+>
+> **归属变更**:该端点已从 stocktake 迁移到 **catalog 服务**(`cmd/catalog/main.go`),
+> 权限守门由 stocktake handler 内部 `hasScope` JWT-static helper 改为 catalog 的
+> `rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver)` 中间件。
+> stocktake 仍保留 `/products/search` 转发逻辑(走 cube-router 兜底),但客户端应优先调 catalog。
 
-**端点**:`GET /api/v1/products/search?barcode=xxx&branch_id=S001&limit=10`
+**端点**:`GET /api/v1/catalog/products/search?barcode=xxx`(branch 由 `X-Branch-ID` header 传入)
 
 **业务字段**(响应中的 `products[]` 每个元素):
 
@@ -491,11 +528,11 @@
 
 | 数据 | 思迅是否有 | 本系统 PG 是否建表 | 数据模型字段定义 | 谁提供真实数据 |
 |---|---|---|---|---|
-| SKU / 商品(`product`) | ✅ cube product model | ❌ **不建** | FIELD_SPEC §1.1(类型契约) | cube-gateway `/v1/load` |
-| 分类(`category`) | ✅ cube category model | ❌ **不建** | FIELD_SPEC §1.1 同上 | cube-gateway |
-| 供应商(`supplier`,type=0) | ✅ cube supplier model | ❌ **不建** | FIELD_SPEC §1.1 同上 | cube-gateway |
-| 客户(`supplier`,type=1) | ✅ cube supplier model | ❌ **不建** | FIELD_SPEC §1.1 同上 | cube-gateway |
-| 实时库存(`stock`) | ✅ cube stock model | ❌ **不建** | FIELD_SPEC §1.2 同上 | cube-gateway |
+| **SKU / 商品(`product`)** | ✅ cube product model | ✅ **catalog.products(本地,带 branch_id)** | FIELD_SPEC §1.1(类型契约) | catalog 本地表 + cube 兜底(cube-router 转发) |
+| 分类(`category`) | ✅ cube category model | ❌ **不建** | FIELD_SPEC §1.1 同上 | cube-gateway(`/v1/load` 经 cube-router 转发) |
+| **供应商(`supplier`,type=0)** | ✅ cube supplier model | ✅ **catalog.suppliers(本地,带 branch_id)** | FIELD_SPEC §1.1 同上 | catalog 本地表 + cube 兜底 |
+| **客户(`supplier`,type=1)** | ✅ cube supplier model | ✅ **catalog.suppliers(本地,type=1)** | FIELD_SPEC §1.1 同上 | catalog 本地表 + cube 兜底 |
+| 实时库存(`stock`) | ✅ cube stock model | ❌ **不建** | FIELD_SPEC §1.2 同上 | cube-gateway(`/v1/load` 经 cube-router 按 X-Branch-ID 路由) |
 | 销售明细(`sale_detail`) | ✅ cube sale_detail model | ❌ **不建** | FIELD_SPEC §3.2(mapping) | erp-connector 拉后落 `erp_sales_raw` |
 | **门店 / 员工 / 班次** | ❌ cube 无 | ✅ **建** | FIELD_SPEC §1.8 | master-data 服务 |
 | **盘点表 / 盘点明细** | ❌ cube 无 | ✅ **建** | FIELD_SPEC §1.7 | stocktake 服务 |
@@ -590,3 +627,4 @@ type ProductDTO struct {
 | 2026-09-17 | Mavis | 修订 4:加 §2.1 盘点管理(stocktake 表 + 差异表)+ §7.5 本期数据归属原则(只读 cube + 转发,SKU/库存/供应商从 cube 转) |
 | 2026-09-17 | Mavis | 修订 5:stocktake 实时盘点(营业中)+ §7.5 强化"product 表不建 PG 但数据模型存在" + 盘点单不跨店 |
 | 2026-09-17 | Mavis | 修订 6:`/api/v1/products/search` 接口契约(对齐 scan.html 后端 SearchProducts)+ barcode 权限过滤 + barcode 长度策略 |
+| 2026-09-24 | Tinkler | 修订 7:branch 重构(REQUIREMENTS §1.2 三元权限 `user × branch × scope` + `rbac.RequireScopeWithBranch`);§1.3 数据级权限改用 authkit 两套中间件;§1.4 加 `RequireScopeWithBranch` / `HasAnyScopeWithBranch` / `GetBranchPermissions` 三条已合并;§2 模块表加 catalog / cube-router 行列(supplier + product 迁 catalog,加 cube-router 行);§2.1.4.1 `/products/search` 归属 catalog + 中间件守门;§7.5 数据归属表 suppliers/products 改 catalog 本地表,stock 走 cube-router;保留全部 12 占位 cmd(用户指令"不用删除占位");go.mod 保留 `replace ../authkit` |
