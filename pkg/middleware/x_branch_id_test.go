@@ -14,7 +14,6 @@ import (
 )
 
 func init() {
-	// gin 在 test 模式下不打印路由信息
 	gin.SetMode(gin.TestMode)
 }
 
@@ -24,17 +23,17 @@ func newRouter(mw ...gin.HandlerFunc) *gin.Engine {
 	r := gin.New()
 	r.Use(mw...)
 	r.GET("/probe", func(c *gin.Context) {
-		id := middleware.BranchFromCtx(c)
-		if id == nil {
-			c.JSON(http.StatusOK, gin.H{"branch_id": nil})
+		bs := middleware.BranchFromCtx(c)
+		if len(bs) == 0 {
+			c.JSON(http.StatusOK, gin.H{"branch_ids": nil})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"branch_id": id.String()})
+		c.JSON(http.StatusOK, gin.H{"branch_ids": bs})
 	})
 	return r
 }
 
-func TestXBranchID_ValidUUID(t *testing.T) {
+func TestXBranchID_SingleUUID(t *testing.T) {
 	want := uuid.New().String()
 	r := newRouter(middleware.XBranchID())
 
@@ -47,11 +46,41 @@ func TestXBranchID_ValidUUID(t *testing.T) {
 
 	var body map[string]any
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
-	assert.Equal(t, want, body["branch_id"], "ctx 中的 branch_id 应等于 header")
+	assert.Equal(t, []any{want}, body["branch_ids"], "ctx 应是 [uuid]")
+}
+
+func TestXBranchID_MultiBranch(t *testing.T) {
+	// 多店用户 `X-Branch-ID: 01,02` → 应被解析为 ["01","02"]。
+	r := newRouter(middleware.XBranchID())
+
+	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	req.Header.Set("X-Branch-ID", "01,02")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.Equal(t, []any{"01", "02"}, body["branch_ids"])
+}
+
+func TestXBranchID_Star(t *testing.T) {
+	// `*` 表示全部 accessible branches → 应被原值透传。
+	r := newRouter(middleware.XBranchID())
+
+	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	req.Header.Set("X-Branch-ID", "*")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.Equal(t, []any{"*"}, body["branch_ids"])
 }
 
 func TestXBranchID_MissingHeader(t *testing.T) {
-	// 未传 header → 不阻断,handler 拿 nil(branch_id=null)。
+	// 未传 header → 不阻断,handler 拿到 nil/空切片。
 	r := newRouter(middleware.XBranchID())
 
 	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
@@ -62,17 +91,17 @@ func TestXBranchID_MissingHeader(t *testing.T) {
 
 	var body map[string]any
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
-	assert.Nil(t, body["branch_id"], "未设 header 时 BranchFromCtx 应返 nil")
+	assert.Nil(t, body["branch_ids"], "未设 header 时 BranchFromCtx 应返 nil")
 }
 
-func TestXBranchID_InvalidUUID(t *testing.T) {
-	// 非合法 UUID → 400 bad_request,handler 不应被调用。
+func TestXBranchID_InvalidUUIDPassesThrough(t *testing.T) {
+	// 2026-09 简化:中间件不再 400;非合法 UUID 也按字面值透传(handler 自己解析)。
 	handlerCalled := false
 	r := gin.New()
 	r.Use(middleware.XBranchID())
 	r.GET("/probe", func(c *gin.Context) {
 		handlerCalled = true
-		c.Status(http.StatusOK)
+		c.JSON(http.StatusOK, gin.H{"branch_ids": middleware.BranchFromCtx(c)})
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
@@ -80,14 +109,12 @@ func TestXBranchID_InvalidUUID(t *testing.T) {
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
 
-	require.Equal(t, http.StatusBadRequest, rr.Code,
-		"非法 UUID header 应 400: %s", rr.Body.String())
-	assert.False(t, handlerCalled, "handler 不应被调用")
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.True(t, handlerCalled, "handler 应被调用(中间件不拦)")
 
 	var body map[string]any
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
-	assert.Equal(t, "bad_request", body["code"])
-	assert.Contains(t, body["message"], "X-Branch-ID")
+	assert.Equal(t, []any{"not-a-uuid"}, body["branch_ids"], "字面值透传")
 }
 
 func TestXBranchID_WhitespacePadded(t *testing.T) {
@@ -105,7 +132,22 @@ func TestXBranchID_WhitespacePadded(t *testing.T) {
 
 	var body map[string]any
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
-	assert.Equal(t, raw, body["branch_id"])
+	assert.Equal(t, []any{raw}, body["branch_ids"])
+}
+
+func TestXBranchID_WhitespaceBetweenBranches(t *testing.T) {
+	// 多店 + 空白: "01, 02 , 03" → ["01","02","03"]。
+	r := newRouter(middleware.XBranchID())
+
+	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	req.Header.Set("X-Branch-ID", "01, 02 , 03")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.Equal(t, []any{"01", "02", "03"}, body["branch_ids"])
 }
 
 func TestXBranchID_AllWhitespaceHeader(t *testing.T) {
@@ -121,13 +163,13 @@ func TestXBranchID_AllWhitespaceHeader(t *testing.T) {
 
 	var body map[string]any
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
-	assert.Nil(t, body["branch_id"], "全空白视为未传,BranchFromCtx 应返 nil")
+	assert.Nil(t, body["branch_ids"], "全空白视为未传,BranchFromCtx 应返 nil")
 }
 
 func TestBranchFromCtx_NilOnMissingKey(t *testing.T) {
 	// 不挂 XBranchID 中间件,直接调 BranchFromCtx → 应返 nil 不 panic。
 	r := gin.New()
-	var got *uuid.UUID
+	var got []string
 	r.GET("/probe", func(c *gin.Context) {
 		got = middleware.BranchFromCtx(c)
 		c.Status(http.StatusOK)
@@ -154,5 +196,83 @@ func TestBranchFromHeader_Alias(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code)
 	var body map[string]any
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
-	assert.Equal(t, want, body["branch_id"], "BranchFromHeader 别名应与 XBranchID 等价")
+	assert.Equal(t, []any{want}, body["branch_ids"], "BranchFromHeader 别名应与 XBranchID 等价")
+}
+
+// TestRequireBranch_MissingHeader 验证强制要求中间件。
+func TestRequireBranch_MissingHeader(t *testing.T) {
+	handlerCalled := false
+	r := gin.New()
+	r.Use(middleware.RequireBranch())
+	r.GET("/probe", func(c *gin.Context) {
+		handlerCalled = true
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusBadRequest, rr.Code,
+		"未传 header 应 400: %s", rr.Body.String())
+	assert.False(t, handlerCalled, "handler 不应被调用")
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
+	assert.Equal(t, "missing_branch_id", body["code"])
+}
+
+// TestRequireBranch_PresentHeader 通过。
+//
+// 注意:RequireBranch 假设 XBranchID 已经在它之前跑过(handler 标准用法是
+// r.Use(middleware.XBranchID()) 全局挂,各端点再单独加 RequireBranch())。
+func TestRequireBranch_PresentHeader(t *testing.T) {
+	handlerCalled := false
+	r := gin.New()
+	r.Use(middleware.XBranchID(), middleware.RequireBranch())
+	r.GET("/probe", func(c *gin.Context) {
+		handlerCalled = true
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	req.Header.Set("X-Branch-ID", "01")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.True(t, handlerCalled, "有 header 时 handler 应被调用")
+}
+
+// TestSingleBranchFromCtx 验证便捷 accessor。
+func TestSingleBranchFromCtx(t *testing.T) {
+	r := gin.New()
+	r.Use(middleware.XBranchID())
+	var got string
+	r.GET("/probe", func(c *gin.Context) {
+		got = middleware.SingleBranchFromCtx(c)
+		c.Status(http.StatusOK)
+	})
+
+	// 单店
+	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	req.Header.Set("X-Branch-ID", "abc")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	assert.Equal(t, "abc", got)
+
+	// 多店 → 只返第一项
+	got = ""
+	req = httptest.NewRequest(http.MethodGet, "/probe", nil)
+	req.Header.Set("X-Branch-ID", "x,y")
+	rr = httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	assert.Equal(t, "x", got)
+
+	// 未传 → ""
+	got = "sentinel"
+	req = httptest.NewRequest(http.MethodGet, "/probe", nil)
+	rr = httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	assert.Equal(t, "", got)
 }

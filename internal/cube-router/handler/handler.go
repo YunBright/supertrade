@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	dapr "github.com/dapr/go-sdk/client"
 	"github.com/YunBright/authkit/claims"
 	"github.com/YunBright/authkit/rbac"
 	"github.com/YunBright/authkit/userinfo"
@@ -32,46 +33,51 @@ import (
 
 // Handler 是 cube-router 的 HTTP handler。
 //
-// 持有 svc(业务逻辑)+ logger(可选)+ daprEndpoint(Dapr sidecar 地址,用于拼
-// 出 cube instance 的 invocation URL)+ users(userd 客户端,scope 守门用)。
+// 持有 svc(业务逻辑)+ daprClient(dapr/go-sdk gRPC client,转发到 cube instance)
+// + users(userd 客户端,scope 守门用)+ logger。
+//
+// 2026-09 PR 5 重构:删 daprEndpoint 字段;改 daprClient (dapr.Client 接口),
+// 由 caller 在 OnStart 期 dapr.NewClient() 构造,handler 调
+// daprClient.InvokeMethodWithContent 完成转发,不再手拼 URL。
 type Handler struct {
-	svc          *service.Service
-	users        *userinfo.Client
-	daprEndpoint string // 默认 "http://localhost:3500"
-	logger       *slog.Logger
+	svc        *service.Service
+	users      *userinfo.Client
+	daprClient dapr.Client
+	logger     *slog.Logger
 }
 
 // New 构造 Handler。
 //
-// daprEndpoint 默认 "http://localhost:3500",由 caller 用 DAPR_ENDPOINT 注入。
+// daprClient 由 caller 用 dapr.NewClient() 注入(SDK 自动从 DAPR_GRPC_PORT 拿
+// sidecar 地址,默认 :50001)。
 // users 用于 /v1/load 的 cube:read per-branch 守门;传 nil 时该端点返 503
 // userd_unavailable(避免绕过 scope 校验)。
 // logger == nil → 用 slog.Default()。
-func New(svc *service.Service, users *userinfo.Client, daprEndpoint string, logger *slog.Logger) *Handler {
-	if daprEndpoint == "" {
-		daprEndpoint = "http://localhost:3500"
-	}
+func New(svc *service.Service, users *userinfo.Client, daprClient dapr.Client, logger *slog.Logger) *Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Handler{
-		svc:          svc,
-		users:        users,
-		daprEndpoint: daprEndpoint,
-		logger:       logger,
+		svc:        svc,
+		users:      users,
+		daprClient: daprClient,
+		logger:     logger,
 	}
 }
 
-// branchFromHeaderFromMiddleware 把 middleware.XBranchID 注入的 *uuid.UUID
-// 转成 string(供 rbac.RequireScopeWithBranch 的 BranchContextFn 用)。
+// branchFromHeaderFromMiddleware 把 middleware.XBranchID 注入的 []string
+// 取第一项转 string(供 rbac.RequireScopeWithBranch 的 BranchContextFn 用)。
 //
-// nil(未传 header)→ 返 ("", false) → 中间件按 400 branch_required 拒。
+// 多店 header(`*` / `01,02`)时只取第一项;cube-router 是单 cube 实例路由,
+// 多店场景走 stocktake / inventory 各自的聚合端点。
+//
+// ""(header 未传)→ 返 ("", false) → RequireScopeWithBranch 按 400 branch_required 拒。
 func branchFromHeaderFromMiddleware(c *gin.Context) (string, bool) {
-	id := middleware.BranchFromCtx(c)
-	if id == nil {
+	b := middleware.SingleBranchFromCtx(c)
+	if b == "" {
 		return "", false
 	}
-	return id.String(), true
+	return b, true
 }
 
 // RegisterRoutes 把所有路由挂到 r(nginx 已剥过 /api/v1/cube-router/)。

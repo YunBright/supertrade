@@ -23,9 +23,8 @@ import (
 
 // Publisher 是 Dapr pub/sub 发布的最小抽象。
 //
-// 生产实现(cmd/stocktake/main.go)HTTP POST 到 dapr sidecar:
-//   POST http://localhost:3500/v1.0/publish/pubsub/<topic>
-//   Body:  { "data": <payload>, "datacontenttype": "application/json", "type": "<topic>" }
+// 生产实现(cmd/stocktake/main.go)走 dapr/go-sdk:cli.PublishEvent(ctx, pubsub, topic, data)。
+// SDK 自动包 CloudEvents 1.0 envelope 并通过 sidecar 转发(2026-09 切到 SDK,不走 HTTP POST)。
 // 测试可注入 in-memory recorder 验证 publish 调用次数。
 type Publisher interface {
 	Publish(ctx context.Context, topic string, data any) error

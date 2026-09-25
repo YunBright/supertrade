@@ -96,7 +96,7 @@
 
 **本期定位**:不维护本地库存表,**只代理 cube-gateway `/v1/load` 返回 stock 维度数据**(经 cube-router 多源路由)。
 
-`GET /stock/:branch_id/:product_id` 请求/响应字段来自 cube `stock` model:
+`GET /stock/:product_id` 请求/响应字段来自 cube `stock` model(branch 从 `X-Branch-ID` header 取):
 
 | 字段 | 类型 | 单位 | 来源 |
 |---|---|---|---|
@@ -128,8 +128,8 @@
 1. `rbac.RequireScopeWithBranch("cube:read", branchFromHeader, resolver)` 中间件验三元权限
 2. 从 ctx 拿 `branch_id` → 查 `branch_cube_sources`(内存 cache + 60s TTL + singleflight)
 3. 拿不到 / `enabled=false` → 503 `cube_source_not_configured` / `cube_source_disabled`
-4. 拿 `cube_source_name` → 用预热的 `map[cube_source_name]*HTTPCubeClient` 选 client
-5. 透传 request body 和 JWT → 转发到 `http://localhost:3500/v1.0/invoke/<cube-source-name>/method/v1/load`
+4. 拿 `cube_source_name` → 走 `dapr.Client.InvokeMethodWithContent(ctx, cubeSourceName, "v1/load", "POST", ...)` 转发
+5. JWT 透传:`metadata.AppendToOutgoingContext(ctx, "authorization", bearer)` → sidecar 转 outgoing HTTP Authorization
 6. 透传 response body
 
 ### 1.3 pos(销售单据,dapr app `pos`)

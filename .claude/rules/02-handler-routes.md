@@ -48,13 +48,26 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 
 ## X-Branch-ID header 是默认上下文（2026-09 重构后）
 
-所有需要 per-branch 数据的业务端点都必须先解析 `X-Branch-ID` header:
+**所有 path 不带 `:branch_id` —— branch 全部从 `X-Branch-ID` header 取**。
+原 `/stock/:branch_id/:product_id` 已并为 `/stock/:product_id`,
+原 `/branches/:branch_id/default-stocktake` 已并为 `/default-stocktake`。
 
 - **全局挂 `middleware.XBranchID()`** —— 由各 `cmd/<service>/main.go::registerRoutes` 第一行 `r.Use(middleware.XBranchID())` 注入
-- **handler 取 branch** —— 用 `middleware.BranchFromCtx(c)` 拿 `*uuid.UUID`(或 `branchFromHeader(c) (string, bool)` 适配器)
-- **路径 branch 优先于 header** —— `/stock/:branch_id/:product_id` 用 `c.Param("branch_id")` 而非 header
+- **middleware 不强制 header 存在** —— 透传 + 解析,handler 决定要不要 400
+- **handler 取 branch** —— 单店 `middleware.SingleBranchFromCtx(c)`;多店迭代 `middleware.BranchFromCtx(c)`(`*` / `01,02`)
+- **强制要求的端点** —— handler 自挂 `middleware.RequireBranch()`,或自己 `if x == "" { 400 }`
 - **业务端点鉴权** —— 走 `rbac.RequireScopeWithBranch(scope, branchFn, rbac.HasAnyScopeWithBranch(users))`
-- **库存只读端点** —— 高频读走 `rbac.RequireBranch(branchFromParam, accessibleBranchesFromClaims)`(JWT 静态版,零 userd 调用)
+- **库存只读端点** —— 高频读走 `rbac.RequireBranch(branchFromHeader, accessibleBranchesFromClaims)`(JWT 静态版,零 userd 调用)
+
+**多店 header 语义**(字面值透传):
+
+| header | 含义 | 调用方处理 |
+|---|---|---|
+| `<uuid>` | 单店操作 | 单 UUID,直接用 |
+| `01,02` | 多店并行操作(逗号分隔) | 迭代各 branch 跑 |
+| `*` | 全部 accessible branches | 调 `claims.AccessibleBranches` 展开 |
+
+`middleware` 不解析 `*` / 逗号 — 由下游 server(userd / catalog / cube-router)按业务语义展开。
 
 **新增端点示例**(catalog):
 
@@ -73,6 +86,13 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
         rbac.RequireScopeWithBranch("supplier:view", branchFromHeader, resolver),
         h.listSuppliers)
 }
+
+// internal/cubehttp/handler.go —— 高频只读走 JWT 静态校验
+r.GET("/stock/:product_id",
+    rbac.RequireBranch(branchFromHeader, accessibleBranchesFromClaims),
+    h.getStock,
+)
 ```
 
-参考:`cmd/catalog/main.go`、`internal/catalog/handler/handler.go:82-109`、`internal/cube-router/handler/handler.go:83-101`。
+参考:`cmd/catalog/main.go`、`internal/catalog/handler/handler.go:82-109`、
+`internal/cube-router/handler/handler.go:83-101`、`internal/cubehttp/handler.go:55-66`。

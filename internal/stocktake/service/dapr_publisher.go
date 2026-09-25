@@ -1,89 +1,54 @@
 // Package service - dapr_publisher.go
 //
-// DaprPublisher 实现 service.Publisher,通过 HTTP POST 把事件发给
-// dapr sidecar 的 publish API:
+// DaprPublisher 实现 service.Publisher,经 dapr/go-sdk 的 client.PublishEvent
+// 把事件发给 pubsub component(默认 Redis Streams;notification-gateway 通过
+// /dapr/subscribe 订阅)。
 //
-//	POST {DAPR_ENDPOINT}/v1.0/publish/pubsub/<topic>
-//	Body: { "data": <payload>, "datacontenttype": "application/json",
-//	        "type": "<topic>", "id": "<uuid>" }
+// 2026-09 切到 dapr/go-sdk:不再读 DAPR_ENDPOINT,SDK 自动从 DAPR_GRPC_PORT
+// (默认 :50001) 拿 sidecar 地址;sidecar 自动跨主机寻址 + 跨 app-id 转发。
 //
-// Dapr sidecar 会把消息封装成 CloudEvents 1.0 envelope 并发布到 pubsub
-// 组件(默认 Redis Streams);notification-gateway 通过 /dapr/subscribe
-// 自动订阅这些 topic。
-//
-// 失败处理:任何非 2xx 响应都返回 error;service.publish() 会 log 但不
-// 阻塞业务;dapr sidecar 内部也会做重试(默认指数退避 3 次)。
+// 失败处理:
+//   - dapr.NewClient() 失败 → 启动期 fail-fast(用户决策,2026-09-24):
+//     stocktake 必须有 publisher 才能消费 auth.user.access_changed,静默禁用
+//     会导致 scope 缓存不一致,应早暴露。
+//   - Publish 失败 → 返 error,service.publish 内部 log;dapr sidecar 内部
+//     重试机制独立。
 package service
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"fmt"
-	"net/http"
 	"os"
-	"time"
 
-	"github.com/google/uuid"
+	dapr "github.com/dapr/go-sdk/client"
 )
 
-// DaprPublisher service.Publisher 的 dapr-sidecar 实现。
+// DaprPublisher service.Publisher 的 dapr-sdk 实现。
 //
-// 简单、单实例、不带熔断;stocktake 是低 QPS 服务,直接 HTTP 调
-// localhost:3500 即可。
+// 持有 dapr.Client (gRPC SDK 接口) + pubsub component name。
 type DaprPublisher struct {
-	endpoint   string       // dapr sidecar base URL,如 http://localhost:3500
-	pubsub     string       // pubsub component name,默认 "pubsub"
-	httpClient *http.Client // 短超时
+	client dapr.Client
+	pubsub string // pubsub component name,默认 "pubsub"
 }
 
-// NewDaprPublisherFromEnv 从环境变量构造 publisher。
+// NewDaprPublisherFromEnv 构造 publisher(失败则返 error,caller 应启动失败)。
 //
-//	DAPR_ENDPOINT = "http://localhost:3500"
-//	DAPR_PUBSUB   = "pubsub"
+//	DAPR_PUBSUB = "pubsub"   // 默认
 //
-// 缺省回退到 sidecar 默认值。
-func NewDaprPublisherFromEnv() *DaprPublisher {
-	ep := os.Getenv("DAPR_ENDPOINT")
-	if ep == "" {
-		ep = "http://localhost:3001"
+// dapr.NewClient() 自动从 DAPR_GRPC_PORT 拿 sidecar 地址(默认 :50001),
+// 无需 DAPR_ENDPOINT 环境变量。
+func NewDaprPublisherFromEnv() (*DaprPublisher, error) {
+	cli, err := dapr.NewClient()
+	if err != nil {
+		return nil, err
 	}
 	ps := os.Getenv("DAPR_PUBSUB")
 	if ps == "" {
 		ps = "pubsub"
 	}
-	return &DaprPublisher{
-		endpoint:   ep,
-		pubsub:     ps,
-		httpClient: &http.Client{Timeout: 3 * time.Second},
-	}
+	return &DaprPublisher{client: cli, pubsub: ps}, nil
 }
 
-// Publish 把 data 序列化为 JSON,POST 到 dapr sidecar。
+// Publish 把 data 发到 pubsub/topic。SDK 自动包 CloudEvents 1.0 envelope。
 func (p *DaprPublisher) Publish(ctx context.Context, topic string, data any) error {
-	body := map[string]any{
-		"data":            data,
-		"datacontenttype": "application/json",
-		"type":            topic,
-		"id":              uuid.NewString(),
-	}
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("marshal publish body: %w", err)
-	}
-	url := fmt.Sprintf("%s/v1.0/publish/%s/%s", p.endpoint, p.pubsub, topic)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
-	if err != nil {
-		return fmt.Errorf("new request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := p.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("publish %s: %w", topic, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("publish %s: status=%d", topic, resp.StatusCode)
-	}
-	return nil
+	return p.client.PublishEvent(ctx, p.pubsub, topic, data)
 }

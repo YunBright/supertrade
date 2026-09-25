@@ -64,15 +64,18 @@ func New(suppliers *service.SupplierService, products *service.ProductService, c
 	}
 }
 
-// branchFromHeader 把 middleware.XBranchID 注入的 *uuid.UUID 转 string。
+// branchFromHeader 拿当前请求的 X-Branch-ID header(单店场景)。
 //
-// nil(未传 header)→ 返 ("", false) → 中间件按 400 branch_required 拒。
+// 多店 header(`*` / `01,02`)时只取第一项;catalog 端点是单店 CRUD,多店场景
+// 由 stocktake / inventory 等聚合端点自己处理,不在此 helper 解决。
+//
+// ""(header 未传)→ 返 ("", false) → RequireScopeWithBranch 按 400 branch_required 拒。
 func branchFromHeader(c *gin.Context) (string, bool) {
-	id := middleware.BranchFromCtx(c)
-	if id == nil {
+	b := middleware.SingleBranchFromCtx(c)
+	if b == "" {
 		return "", false
 	}
-	return id.String(), true
+	return b, true
 }
 
 // RegisterRoutes 把所有路由挂到 r(nginx 已剥过 /api/v1/catalog/)。

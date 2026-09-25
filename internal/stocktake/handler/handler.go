@@ -60,8 +60,8 @@ func New(svc *service.Service) *Handler {
 //   - POST /stocktake-headers/:id/plan-items   批量加计划商品
 //
 // 门店默认盘点单(2026-09-23):
-//   - GET  /branches/:branch_id/default-stocktake         查当前店默认盘点单(快速进入盘点)
-//   - PUT  /branches/:branch_id/default-stocktake         设置当前店默认盘点单(需 inventory:manage,仓管)
+//   - GET  /default-stocktake                            查当前店默认盘点单(快速进入盘点,branch 走 X-Branch-ID header)
+//   - PUT  /default-stocktake                            设置当前店默认盘点单(需 inventory:manage,仓管;branch 走 header)
 //
 // 盘点单搜索(2026-09-23):
 //   - GET  /stocktake-headers/search                      按单号/备注搜索(仓管 view 权限,userd 校验)
@@ -86,8 +86,8 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/products/search", h.SearchProducts)
 
 	// 门店默认盘点单(仓管设置,前端快速进入盘点)
-	r.GET("/branches/:branch_id/default-stocktake", h.GetDefaultStocktake)
-	r.PUT("/branches/:branch_id/default-stocktake", h.SetDefaultStocktake)
+	r.GET("/default-stocktake", h.GetDefaultStocktake)
+	r.PUT("/default-stocktake", h.SetDefaultStocktake)
 }
 
 // SearchHeaders GET /stocktake-headers/search?q=&branch_id=&page=&page_size=
@@ -110,22 +110,14 @@ func (h *Handler) SearchHeaders(c *gin.Context) {
 		return
 	}
 
-	// per-branch 守门。SearchHeaders 的 branch 上下文来源优先级:
-	//   ?branch_id= > X-Branch-ID header > cl.DefaultBranchID
-	// X-Branch-ID 由 middleware.BranchFromHeader 注入到 ctx(若装了中间件),
-	// handler 自己拿;缺则退到 cl.DefaultBranchID;再缺则返 400。
-	branchID := strings.TrimSpace(c.Query("branch_id"))
-	if branchID == "" {
-		if hb := middleware.BranchFromCtx(c); hb != nil {
-			branchID = hb.String()
-		}
-	}
-	if branchID == "" {
-		branchID = cl.DefaultBranchID
-	}
+	// per-branch 守门。branch 上下文唯一来源是 X-Branch-ID header
+	// (middleware.XBranchID 注入 ctx;cmd/stocktake/main.go 已全局挂)。
+	// 不再 fallback 到 ?branch_id= query / JWT default_branch_id —— 旧
+	// shim,与项目约定(.claude/rules/02-handler-routes.md)冲突。
+	branchID := middleware.SingleBranchFromCtx(c)
 	if branchID == "" {
 		writeError(c, http.StatusBadRequest, "missing_branch_id",
-			"?branch_id= 必填,或 X-Branch-ID header / JWT default_branch_id 至少一项")
+			"X-Branch-ID header 必填(per-branch 端点的 branch 上下文唯一来源)")
 		return
 	}
 
@@ -154,20 +146,22 @@ func (h *Handler) SearchHeaders(c *gin.Context) {
 	c.JSON(http.StatusOK, out)
 }
 
-// SetDefaultStocktake PUT /branches/:branch_id/default-stocktake
+// SetDefaultStocktake PUT /default-stocktake
 //
 // 仓管设置当前店的默认盘点单(供前端进入盘点页时快速定位)。
 // 请求体:{"header_id":"ST..."};权限:inventory:manage(仓管)。
+// branch 从 X-Branch-ID header 取(handler 强制要求)。
 //
 // 校验链:
-//  1. claims 含 inventory:manage scope,否则 403
-//  2. header_id 存在,否则 404
-//  3. header.branch_id == :branch_id,否则 400(防跨店)
-//  4. header.status == counting,否则 400(已冻结/已审的不应再被推荐)
+//  1. X-Branch-ID header 非空,否则 400
+//  2. claims 含 inventory:manage scope 在该 branch 下,否则 403
+//  3. header_id 存在,否则 404
+//  4. header.branch_id == header branch,否则 400(防跨店)
+//  5. header.status == counting,否则 400(已冻结/已审的不应再被推荐)
 func (h *Handler) SetDefaultStocktake(c *gin.Context) {
-	branchID := strings.TrimSpace(c.Param("branch_id"))
+	branchID := strings.TrimSpace(c.Request.Header.Get("X-Branch-ID"))
 	if branchID == "" {
-		writeError(c, http.StatusBadRequest, "missing_branch_id", "path :branch_id 必填")
+		writeError(c, http.StatusBadRequest, "missing_branch_id", "X-Branch-ID header 必填")
 		return
 	}
 	cl, ok := claims.FromContext(c.Request.Context())
@@ -198,16 +192,17 @@ func (h *Handler) SetDefaultStocktake(c *gin.Context) {
 	c.JSON(http.StatusOK, rec)
 }
 
-// GetDefaultStocktake GET /branches/:branch_id/default-stocktake
+// GetDefaultStocktake GET /default-stocktake
 //
 // 查当前店的默认盘点单;前端进入盘点页时优先调本端点,有记录则直接跳到该盘点单。
+// branch 从 X-Branch-ID header 取。
 //
 // 响应:默认盘点单的 {branch_id, header_id, updated_by, updated_at}。
 // 未设置时返回 404(not_found)。权限:inventory:view(查看权限)。
 func (h *Handler) GetDefaultStocktake(c *gin.Context) {
-	branchID := strings.TrimSpace(c.Param("branch_id"))
+	branchID := strings.TrimSpace(c.Request.Header.Get("X-Branch-ID"))
 	if branchID == "" {
-		writeError(c, http.StatusBadRequest, "missing_branch_id", "path :branch_id 必填")
+		writeError(c, http.StatusBadRequest, "missing_branch_id", "X-Branch-ID header 必填")
 		return
 	}
 	if !h.requireScope(c, branchID, "inventory:view") {
@@ -307,7 +302,7 @@ type addPlanItemsReq struct {
 	} `json:"items"`
 }
 
-// setDefaultStocktakeReq PUT /branches/:branch_id/default-stocktake
+// setDefaultStocktakeReq PUT /default-stocktake
 type setDefaultStocktakeReq struct {
 	HeaderID string `json:"header_id" binding:"required"`
 }
@@ -361,15 +356,22 @@ func (h *Handler) CreateHeader(c *gin.Context) {
 // 过滤:branch_id / status / type / operator_id / count_date(YYYY-MM-DD)
 // 分页:page (default 1) / page_size (default 20, max 100)
 //
-// 权限:inventory:view(per-branch;从 ?branch_id= / X-Branch-ID / claims.DefaultBranchID 取)。
+// 权限:inventory:view(per-branch;branch 从 X-Branch-ID header 取,
+// middleware.XBranchID 已注入 ctx)。未传 X-Branch-ID → 400 missing_branch_id,
+// 不再 fallback 到 ?branch_id= / claims.DefaultBranchID。
 func (h *Handler) ListHeaders(c *gin.Context) {
 	cl, ok := claims.FromContext(c.Request.Context())
 	if !ok || cl == nil {
 		writeError(c, http.StatusUnauthorized, "unauthenticated", "缺少已签 token")
 		return
 	}
-	branchID := branchFromRequest(c, cl)
-	if branchID != "" && !h.requireScope(c, branchID, "inventory:view") {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if branchID == "" {
+		writeError(c, http.StatusBadRequest, "missing_branch_id",
+			"X-Branch-ID header 必填(per-branch 端点的 branch 上下文唯一来源)")
+		return
+	}
+	if !h.requireScope(c, branchID, "inventory:view") {
 		return
 	}
 	page, _ := strconv.Atoi(c.Query("page"))
@@ -494,8 +496,9 @@ func (h *Handler) AddLine(c *gin.Context) {
 		return
 	}
 	cl, _ := claims.FromContext(c.Request.Context())
-	// AddLine 会查 cube product + stock,需要把 caller JWT 透传给 cube-gateway sidecar。
+	// AddLine 会查 cube product + stock,需要把 caller JWT + X-Branch-ID 透传给 cube-gateway sidecar。
 	ctx := cubeclient.WithBearer(c.Request.Context(), c.Request.Header.Get("Authorization"))
+	ctx = cubeclient.WithBranchID(ctx, c.Request.Header.Get("X-Branch-ID"))
 	line, err := h.svc.AddLine(ctx, headerID, service.AddLineInput{
 		ProductID:  req.ProductID,
 		ActualQty:  req.ActualQty,
@@ -532,8 +535,9 @@ func (h *Handler) UpdateLine(c *gin.Context) {
 		return
 	}
 	cl, _ := claims.FromContext(c.Request.Context())
-	// UpdateLine 也会查 cube 拉最新 book_qty 快照,需要透传 JWT。
+	// UpdateLine 也会查 cube 拉最新 book_qty 快照,需要透传 JWT + X-Branch-ID。
 	ctx := cubeclient.WithBearer(c.Request.Context(), c.Request.Header.Get("Authorization"))
+	ctx = cubeclient.WithBranchID(ctx, c.Request.Header.Get("X-Branch-ID"))
 	in := service.UpdateLineInput{
 		ActualQty: req.ActualQty,
 		Remark:    req.Remark,
@@ -650,7 +654,7 @@ func (h *Handler) Approve(c *gin.Context) {
 //
 // 跟 collect-ai SearchProducts 契约对齐(REQUIREMENTS §2.1.4.1):
 //   - ?barcode=xxx   必填
-//   - ?branch_id=xxx 必填(用于合并 stock_qty;默认取自 claims.BranchID,前端也可覆盖)
+//   - X-Branch-ID 必填 header(用于合并 stock_qty;前端进盘点页时带上)
 //   - ?limit=N       可选,默认 10
 //
 // 权限过滤(读自 claims.Scopes):
@@ -662,16 +666,11 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "missing_barcode", "?barcode= 必填")
 		return
 	}
-	branchID := strings.TrimSpace(c.Query("branch_id"))
+	branchID := middleware.SingleBranchFromCtx(c)
 	if branchID == "" {
-		// 默认取自 JWT claims
-		cl, ok := claims.FromContext(c.Request.Context())
-		if !ok || cl.DefaultBranchID == "" {
-			writeError(c, http.StatusBadRequest, "missing_branch_id",
-				"?branch_id= 必填,或 JWT claims 包含 default_branch_id")
-			return
-		}
-		branchID = cl.DefaultBranchID
+		writeError(c, http.StatusBadRequest, "missing_branch_id",
+			"X-Branch-ID header 必填(per-branch 端点的 branch 上下文唯一来源)")
+		return
 	}
 	limit, _ := strconv.Atoi(c.Query("limit"))
 
@@ -693,8 +692,9 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 		return
 	}
 
-	// SearchProducts 直接调 cube.SearchProductsByBarcode → cube-gateway,需要透传 JWT。
+	// SearchProducts 直接调 cube.SearchProductsByBarcode → cube-gateway,需要透传 JWT + X-Branch-ID。
 	ctx := cubeclient.WithBearer(c.Request.Context(), c.Request.Header.Get("Authorization"))
+	ctx = cubeclient.WithBranchID(ctx, c.Request.Header.Get("X-Branch-ID"))
 	out, err := h.svc.SearchProducts(ctx, service.SearchProductsInput{
 		Barcode:  barcode,
 		BranchID: branchID,
@@ -765,20 +765,8 @@ func (h *Handler) requireScope(c *gin.Context, branchID, scope string) bool {
 	return true
 }
 
-// branchFromRequest 综合 X-Branch-ID middleware 注入 + ?branch_id= + claims.DefaultBranchID 三层。
-//
-// 调用场景:SearchHeaders / ListHeaders 等 branch 由"操作上下文"决定的端点。
-// 路径/资源型端点(GetHeader / AddLine / SetDefaultStocktake 等)从路径 /
-// 已查到的 header.BranchID 取 branchID,不走本 helper。
-func branchFromRequest(c *gin.Context, cl *claims.Claims) string {
-	if hb := middleware.BranchFromCtx(c); hb != nil {
-		return hb.String()
-	}
-	if q := strings.TrimSpace(c.Query("branch_id")); q != "" {
-		return q
-	}
-	if cl != nil && cl.DefaultBranchID != "" {
-		return cl.DefaultBranchID
-	}
-	return ""
-}
+// branchFromRequest 已删除(2026-09 重构):
+//   旧实现叠了 X-Branch-ID middleware + ?branch_id= + claims.DefaultBranchID 三层
+//   fallback,与 .claude/rules/02-handler-routes.md 冲突("branch 唯一来源 X-Branch-ID header")。
+//   现所有 per-branch 端点直接调 middleware.SingleBranchFromCtx(c),无 fallback。
+//   保留此 doc 块作 deprecation 提示;handler.go 不再有任何引用。

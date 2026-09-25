@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1454,19 +1455,16 @@ func (s *Service) GetEffectiveScopes(ctx context.Context, userID, branchID strin
 
 // pickBranchScopes 从 BranchPermissions 矩阵里挑出目标 branch 行的 scopes。
 //
-// branchID 必填(由 GetEffectiveScopes 校验);非合法 UUID 返 nil;未命中返 nil。
+// migration 009 起:BranchID 是 string(自编码,如 "B001" / "01" / "S001"),
+// 不再调 uuid.Parse。branchID 必填(由 GetEffectiveScopes 校验);未命中返 nil。
 // 返空让 handler 走 403 —— 这与 auth handler.go::getUserPermissionsInternal 的设计一致
 // (不 403 因为 accessControl 已 gate caller 身份;此处 gate 由 stocktake handler 自己做)。
 func pickBranchScopes(p *userinfo.BranchPermissions, branchID string) []string {
 	if p == nil || len(p.Branches) == 0 {
 		return nil
 	}
-	target, err := uuid.Parse(branchID)
-	if err != nil {
-		return nil
-	}
 	for _, row := range p.Branches {
-		if row.BranchID == target {
+		if row.BranchID == branchID {
 			return row.Scopes
 		}
 	}
@@ -1491,4 +1489,129 @@ func (s *Service) HasEffectiveScope(ctx context.Context, userID, branchID, scope
 		}
 	}
 	return false, nil
+}
+
+// GetEffectiveScopesMulti migration 009 多店版本:从 BranchPermissions 矩阵的
+// 多个 branch 行 union 出 scopes 集合。
+//
+// 入参语义:
+//   - branchIDs == nil/空 → 退化到 GetEffectiveScopes 全矩阵模式(由 GetEffectiveScopesMulti 自行 fallback);
+//   - branchIDs 非空 → 仅对该列表内的 branch 取 scopes,union 后去重。
+//
+// 缓存策略:与 GetEffectiveScopes 共享 scopeCache;key 是
+// (userID, "<sorted-branch-list>"),避免同一 union 被 cache miss 两次。
+//
+// 错误:
+//   - 与 GetEffectiveScopes 同语义。
+func (s *Service) GetEffectiveScopesMulti(ctx context.Context, userID string, branchIDs []string) ([]string, error) {
+	if userID == "" {
+		return nil, fmt.Errorf("%w: user_id 必填", ErrInvalidStatus)
+	}
+	if s.userInfo == nil {
+		return nil, ErrUserInfoUnavailable
+	}
+	if len(branchIDs) == 0 {
+		// 退化路径:全矩阵 → 复用一个固定 sentinel key,行为等同 GetEffectiveScopes 全矩阵。
+		return s.GetEffectiveScopes(ctx, userID, "")
+	}
+	// 去重 + 排序 → 同一 union 不论调用顺序,cache key 一致。
+	uniq := dedupSortedStrings(branchIDs)
+	key := scopeCacheKeyMulti(userID, uniq)
+
+	s.scopeMu.RLock()
+	entry, ok := s.scopeCache[key]
+	ttl := s.scopeTTL
+	s.scopeMu.RUnlock()
+	if ok && time.Since(entry.at) < ttl {
+		return entry.scopes, nil
+	}
+
+	s.scopeMu.Lock()
+	defer s.scopeMu.Unlock()
+	if entry, ok := s.scopeCache[key]; ok && time.Since(entry.at) < ttl {
+		return entry.scopes, nil
+	}
+
+	// migration 009:走 userinfo.GetBranchPermissionsMulti([]string 入参),
+	// 自动展开为重复 ?branch_id=A&branch_id=B query。
+	p, err := s.userInfo.GetBranchPermissionsMulti(ctx, userID, uniq)
+	if err != nil {
+		if errors.Is(err, userinfo.ErrPermissionsUnavailable) {
+			s.pubLogger.Warn("userinfo.GetBranchPermissionsMulti 404 (userd 未提供 permissions 端点)",
+				"user_id", userID, "branch_ids", uniq)
+			return nil, ErrUserInfoUnavailable
+		}
+		s.pubLogger.Warn("userinfo.GetBranchPermissionsMulti failed",
+			"user_id", userID, "branch_ids", uniq, "err", err)
+		return nil, ErrUserInfoUnavailable
+	}
+
+	// 仅 union 入参列出的 branch 的 scopes(矩阵里可能有别的 branch 行,我们要忽略)
+	wantSet := make(map[string]struct{}, len(uniq))
+	for _, b := range uniq {
+		wantSet[b] = struct{}{}
+	}
+	seen := make(map[string]struct{})
+	var union []string
+	for _, row := range p.Branches {
+		if _, ok := wantSet[row.BranchID]; !ok {
+			continue
+		}
+		for _, sc := range row.Scopes {
+			if _, dup := seen[sc]; dup {
+				continue
+			}
+			seen[sc] = struct{}{}
+			union = append(union, sc)
+		}
+	}
+	out := append([]string(nil), union...) // 拷贝
+	s.scopeCache[key] = scopeCacheEntry{scopes: out, at: s.now()}
+	return out, nil
+}
+
+// HasEffectiveScopeMulti 多店便捷判定:任一 branch 包含 scope 即 true。
+//
+// 与 GetEffectiveScopesMulti 共用 cache;任一调用方拿到的 scopes 都是 union 后去重。
+func (s *Service) HasEffectiveScopeMulti(ctx context.Context, userID string, branchIDs []string, scope string) (bool, error) {
+	scopes, err := s.GetEffectiveScopesMulti(ctx, userID, branchIDs)
+	if err != nil {
+		return false, err
+	}
+	for _, s := range scopes {
+		if s == scope {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// dedupSortedStrings 去重 + 排序(稳定输出,保证 cache key 一致)。
+func dedupSortedStrings(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// scopeCacheKeyMulti 把 (userID, []string) 编为 cache key。
+//
+// 用 sorted-branch-list 保证调用方传 [A,B] 还是 [B,A] 都命中同一 entry;
+// 单一 branch 时退化为 scopeCacheKey 形态("userID|B001")保持兼容。
+func scopeCacheKeyMulti(userID string, branchIDs []string) string {
+	if len(branchIDs) == 1 {
+		return userID + "|" + branchIDs[0]
+	}
+	return userID + "|multi:" + strings.Join(branchIDs, ",")
 }

@@ -27,12 +27,13 @@ func buildTestRouter(t *testing.T) *gin.Engine {
 	return r
 }
 
-// ---- /stock/:branch_id/:product_id ----
+// ---- /stock/:product_id (X-Branch-ID header 取 branch) ----
 
 func TestHandler_GetStock_OK(t *testing.T) {
 	r := buildTestRouter(t)
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/stock/S001/P-1001", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stock/P-1001", nil)
+	req.Header.Set("X-Branch-ID", "S001")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -49,7 +50,9 @@ func TestHandler_GetStock_OK(t *testing.T) {
 
 func TestHandler_GetStock_NotFound(t *testing.T) {
 	r := buildTestRouter(t)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/stock/S002/P-1003", nil) // 跨店阻断
+	// 跨店阻断:S002 的 P-1003 没有库存。
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stock/P-1003", nil)
+	req.Header.Set("X-Branch-ID", "S002")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -57,16 +60,27 @@ func TestHandler_GetStock_NotFound(t *testing.T) {
 	}
 }
 
+func TestHandler_GetStock_MissingBranchHeader(t *testing.T) {
+	// X-Branch-ID 缺失 → 400 missing_branch_id(handler 不强制挂 RequireBranch 时)。
+	r := buildTestRouter(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/stock/P-1001", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400 (no branch header): %s", w.Code, w.Body.String())
+	}
+}
+
 // ---- NewClientFromEnv ----
 
-func TestNewClientFromEnv_ReturnsHTTPCubeClient(t *testing.T) {
-	// NewClientFromEnv 现在固定返回 HTTPCubeClient(去掉 CUBE_CLIENT_MODE 切换):
-	// PR 2 后 catalog / inventory 都走 HTTP(生产),测试场景用 cubeclient.NewInMemoryClient 直连。
+func TestNewClientFromEnv_DefaultIsMemory(t *testing.T) {
+	// 默认 CUBE_CLIENT_MODE=memory → NewInMemoryClient
+	// (生产用 CUBE_CLIENT_MODE=dapr 切到 SDK 模式;此处验证默认行为)
 	c, err := cubehttp.NewClientFromEnv()
 	if err != nil {
 		t.Fatalf("NewClientFromEnv: %v", err)
 	}
-	if _, ok := c.(*cubeclient.HTTPCubeClient); !ok {
-		t.Errorf("应 HTTPCubeClient, got %T", c)
+	if _, ok := c.(*cubeclient.InMemoryClient); !ok {
+		t.Errorf("默认应 InMemoryClient, got %T", c)
 	}
 }

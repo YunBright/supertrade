@@ -2,7 +2,7 @@
 //
 // 本期实现:
 //   - InMemoryClient(用真实六讯思迅 schema 的 mock 数据,服务单测/台本地开发用)
-//   - HTTPCubeClient(经 Dapr service invocation 调 cube-gateway /v1/load)
+//   - DaprCubeClient(经 dapr/go-sdk 调 cube /v1/load)
 //
 // cube 响应 DTO(本包内定义):
 //   - ProductDTO / StockSnapshotDTO / SupplierDTO 与 cube 各 model schema 一一对应
@@ -32,7 +32,7 @@ var ErrStockNotFound = errors.New("cubeclient: 该分店下的商品 stock 不�
 // ErrCubeNotFound 通用 cube 404(cube 找不到指定 entity);
 // 各 GetX 方法负责包成具体错误(ErrProductNotFound / ErrStockNotFound 等)。
 //
-// 引入原因:HTTPCubeClient.LoadCubeQuery 的 404 不能直接定为"商品"或"库存"——
+// 引入原因:DaprCubeClient.LoadCubeQuery 的 404 不能直接定为"商品"或"库存"——
 // cube 本身只说"找不到",具体语义由调用方决定。
 var ErrCubeNotFound = errors.New("cubeclient: cube 404 not found")
 

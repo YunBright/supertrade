@@ -11,19 +11,23 @@
 //
 // 端口分配:
 //
-//	catalog      :8103    inventory :8102    stocktake    :8106
+//	catalog      :8103    inventory :8105    stocktake    :8106
 //
 // 配置:
 //
 //	POSTGRES_DSN    必填(只支持 PostgreSQL)
-//	CUBE_CLIENT_MODE = memory(默认,本地)/ http
-//	DAPR_ENDPOINT    = "http://localhost:3500"
-//	CUBE_APP_ID      = "cube-gateway"
+//	CUBE_CLIENT_MODE = memory(默认,本地)/ dapr(SDK 模式)
+//	CUBE_APP_ID      = "cube-router"   // 默认 (走 cube-router 多源路由)
+//
+// 2026-09 PR 5 重构:跨服务调用经 dapr/go-sdk;无需 DAPR_ENDPOINT。
 package main
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
+	"time"
 
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/YunBright/supertrade/internal/catalog/db"
@@ -41,7 +45,7 @@ import (
 func main() {
 	cmdbootstrap.Run(cmdbootstrap.Options{
 		AppID:   "catalog",
-		Port:    ":8103",
+		Port:    cmdbootstrap.AppPort(":8103"),
 		OnStart: initApp,
 		Register: registerRoutes,
 	})
@@ -78,7 +82,22 @@ func initApp() error {
 	if appCube, err = cubehttp.NewClientFromEnv(); err != nil {
 		return fmt.Errorf("cube client: %w", err)
 	}
-	appUser = userinfo.New("userd")
+	appUser, err = userinfo.New("userd")
+	if err != nil {
+		return fmt.Errorf("userinfo client: %w", err)
+	}
+
+	// Warmup userd 跨主机冷握手(Consul DNS + mTLS + HTTP/2 SETTINGS + userd 进程
+	// DB pool),实测首次 7~12s 撞 userinfo.Client.timeout 默认 10s。提前烧掉,
+	// 业务请求进来时已 warm。失败仅 warn,业务首次走 cold path(已知行为)。
+	warmupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := appUser.Warmup(warmupCtx); err != nil {
+		slog.Warn("userinfo warmup 失败,业务首次 userd 调用将走 cold path",
+			"err", err)
+	} else {
+		slog.Info("userinfo warmup ok (userd 跨主机链路预热完成)")
+	}
 	return nil
 }
 
@@ -88,5 +107,30 @@ func registerRoutes(r *gin.Engine) {
 	}
 	// 全局挂 X-Branch-ID 解析(供 supplier / product handler 用)
 	r.Use(middleware.XBranchID())
+	// 把 caller 的 Authorization header 注入 ctx,后续 cubeclient / userinfo 内部
+	// 自动 forward 给下游(cube-gateway / userd)。userd 端 middleware.http.bearer
+	// 必需要 Authorization 头,无 token 会 401 Unauthenticated。
+	r.Use(forwardBearerToOutgoing())
 	handler.New(appSup, appProd, appCube, appUser, nil).RegisterRoutes(r)
+}
+
+// forwardBearerToOutgoing 把 gin request 的 Authorization header 注入 ctx。
+//
+// 用 cubeclient.WithBearer + userinfo.WithBearer 双写,两者各自的 dapr 调用路径里
+// 会读 ctx 拼到 outgoing gRPC metadata → sidecar 转 outgoing HTTP Authorization 给
+// 目标 app。这是跨 dapr app 调用透传 caller JWT 的标准做法(同 cube-gateway 调用的
+// cubeclient.WithBearer 模式)。
+//
+// 空 header 表示无 token(内部 job 路径),下游会以 401 拒绝,符合预期。
+func forwardBearerToOutgoing() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		bearer := c.Request.Header.Get("Authorization")
+		if bearer != "" {
+			ctx := c.Request.Context()
+			ctx = cubeclient.WithBearer(ctx, bearer)
+			ctx = userinfo.WithBearer(ctx, bearer)
+			c.Request = c.Request.WithContext(ctx)
+		}
+		c.Next()
+	}
 }

@@ -19,7 +19,7 @@ import (
 func main() {
 	cmdbootstrap.Run(cmdbootstrap.Options{
 		AppID:    "master-data",
-		Port:     ":8102",
+		Port:     cmdbootstrap.AppPort(":8102"),
 		Register: registerRoutes,
 	})
 }

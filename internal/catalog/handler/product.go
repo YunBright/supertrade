@@ -23,8 +23,8 @@ import (
 // 默认按 X-Branch-ID header 取 branch;cube 兜底时把 branchID 透传,
 // cube stock 维度按门店过滤。
 func (h *Handler) searchProducts(c *gin.Context) {
-	branchID := middleware.BranchFromCtx(c)
-	if branchID == nil {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if branchID == "" {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 			"code":    "missing_branch_id",
 			"message": "X-Branch-ID header 必填",
@@ -53,7 +53,7 @@ func (h *Handler) searchProducts(c *gin.Context) {
 		})
 		return
 	}
-	rows, err := h.cube.SearchProductsByBarcode(c.Request.Context(), barcode, branchID.String(), limit)
+	rows, err := h.cube.SearchProductsByBarcode(c.Request.Context(), barcode, branchID, limit)
 	if err != nil {
 		h.logger.Error("cube SearchProductsByBarcode 失败", "err", err, "barcode", barcode)
 		c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
@@ -97,7 +97,7 @@ func (h *Handler) searchProducts(c *gin.Context) {
 		"count":    len(out),
 		"meta": gin.H{
 			"barcode_query": barcode,
-			"branch_id":     branchID.String(),
+			"branch_id":     branchID,
 		},
 	})
 }

@@ -57,8 +57,8 @@ cd ../cube && dapr run --app-id cube-gateway --app-port 8082 \
 cd ../supertrade
 
 # 4a) cube-router(新增,PR 1)
+#     注:SDK 自动从 DAPR_GRPC_PORT 拿 sidecar 地址,dapr run 注入,无需 DAPR_ENDPOINT
 POSTGRES_DSN="postgres://postgres@localhost/supertrade?sslmode=disable" \
-DAPR_ENDPOINT="http://localhost:3500" \
 HTTP_LISTEN_PORT=":8116" \
 dapr run --app-id cube-router --app-port 8116 \
   --components-path ~/.dapr/components -- \
@@ -66,20 +66,18 @@ dapr run --app-id cube-router --app-port 8116 \
 
 # 4b) catalog(改造,PR 2 — 加本地表 + 鉴权中间件)
 POSTGRES_DSN="postgres://postgres@localhost/supertrade?sslmode=disable" \
-DAPR_ENDPOINT="http://localhost:3500" \
 dapr run --app-id catalog --app-port 8103 \
   --components-path ~/.dapr/components -- \
   go run ./cmd/catalog &
 
 # 4c) inventory(改造,PR 3 — getStock 加 RequireBranch)
-DAPR_ENDPOINT="http://localhost:3500" \
 dapr run --app-id inventory --app-port 8102 \
   --components-path ~/.dapr/components -- \
   go run ./cmd/inventory &
 
 # 4d) stocktake(改造,PR 3 — 13 端点 scope 守门 + 订阅 auth.user.access_changed)
+#     publisher fail-fast:缺 sidecar → 启动退出非 0(必须先 dapr run)
 POSTGRES_DSN="postgres://postgres@localhost/supertrade?sslmode=disable" \
-DAPR_ENDPOINT="http://localhost:3500" \
 dapr run --app-id stocktake --app-port 8106 \
   --components-path ~/.dapr/components -- \
   go run ./cmd/stocktake &
@@ -112,7 +110,8 @@ map $uri $dapr_appid {
 
 ```bash
 # 假设分店 UUID = S001 的门店用 sixun-hbposv7 cube 实例
-curl -X POST http://localhost:3500/v1.0/invoke/cube-router/method/admin/branch-cube-sources \
+# 走公网 nginx 入口(推荐,header-based proxy mode):
+curl -X POST https://<host>/api/v1/cube-router/admin/branch-cube-sources \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
@@ -122,19 +121,25 @@ curl -X POST http://localhost:3500/v1.0/invoke/cube-router/method/admin/branch-c
   }'
 # → 201 Created
 # 后续 stocktake / catalog / inventory 的 X-Branch-ID: S001 请求会自动路由到 sixun-hbposv7
+#
+# 直连 sidecar 仅供 host 内调试用 (同一台跑 cube-router 的机器):
+#   curl -X POST http://localhost:3500/admin/branch-cube-sources \
+#     -H "dapr-app-id: cube-router" ...
+# dapr-app-id header 是 proxy mode 等价于 legacy /v1.0/invoke/<id>/method/<rest> URL 的现代写法。
 ```
 
 ### 1.6 健康检查与冒烟
 
 ```bash
 # 各 app healthz(都返 200;不走鉴权)
+# 走 nginx 入口(推荐):
 for app in cube-router catalog inventory stocktake notification-gateway; do
   curl -s -o /dev/null -w "$app: %{http_code}\n" \
-    http://localhost:3500/v1.0/invoke/$app/method/healthz
+    https://<host>/api/v1/$app/healthz
 done
 
 # cube-router 转发冒烟
-curl -X POST http://localhost:3500/v1.0/invoke/cube-router/method/v1/load \
+curl -X POST https://<host>/api/v1/cube-router/v1/load \
   -H "Authorization: Bearer $TOKEN" \
   -H "X-Branch-ID: S001" \
   -H "Content-Type: application/json" \
@@ -142,12 +147,12 @@ curl -X POST http://localhost:3500/v1.0/invoke/cube-router/method/v1/load \
 # → 200 + cube 真实响应(说明 cube_router 已正确路由到 sixun-hbposv7)
 
 # catalog 鉴权冒烟(无 X-Branch-ID → 400 branch_required)
-curl http://localhost:3500/v1.0/invoke/catalog/method/suppliers \
+curl https://<host>/api/v1/catalog/suppliers \
   -H "Authorization: Bearer $TOKEN"
 # → 400 branch_required
 
 # catalog 鉴权冒烟(带 X-Branch-ID + 无 supplier:view → 403 forbidden)
-curl http://localhost:3500/v1.0/invoke/catalog/method/suppliers \
+curl https://<host>/api/v1/catalog/suppliers \
   -H "Authorization: Bearer $TOKEN" -H "X-Branch-ID: S001"
 # → 403 forbidden
 ```
@@ -188,7 +193,9 @@ class SupertradeClient {
 
 **注意事项**:
 - ❌ 老代码里所有 `?branch_id=<uuid>` query 参数(原 stocktake.SearchHeaders 的兜底逻辑)保留兼容,但**优先用 header**(server-side middleware 注入 ctx,header 优先级最高)
-- ❌ 严禁发送非合法 UUID 的 `X-Branch-ID`(服务端 400 `bad_request`)
+- ✅ `X-Branch-ID` 支持**自编码字符串**(migration 009 起),不再是 UUID 形态;可以是 `01` / `B001` / `S001` 等 ≤ 64 字符的任意字符串,只要与 DB `branches.id` 一致即可
+- ✅ `X-Branch-ID: 01,02,03` **逗号分隔**代表多店 union scopes(后端逐店拉 per-branch matrix 再 union 返 `branches: [...]` 明细)
+- ✅ `X-Branch-ID: *` **通配符**代表该用户权限范围内的全部门店(auth 中间件层用 JWT.AccessibleBranches 展开;business service 永远拿到具体 branch_id list,不感知通配语义)
 - ✅ 切换门店时同步更新 `currentBranchId`(后端所有响应按新门店 scope 校验)
 
 ### 2.2 错误码映射(统一收口)
@@ -248,9 +255,9 @@ class SupertradeClient {
 | `POST /api/v1/stocktake/stocktake-headers/:id/submit` | `inventory:manage` | 提交 |
 | `POST /api/v1/stocktake/stocktake-headers/:id/approve` | `inventory:approve`(店长) | 审核 |
 | `GET /api/v1/stocktake/products/search` | `inventory:view` + `supplier:view`(组合) | 扫条码 |
-| `GET /api/v1/stocktake/branches/:branch_id/default-stocktake` | `inventory:view` | 查门店默认盘点单 |
-| `PUT /api/v1/stocktake/branches/:branch_id/default-stocktake` | `inventory:manage` | 设置门店默认盘点单 |
-| `GET /api/v1/inventory/stock/:branch_id/:product_id` | `inventory:view`(走 claims.AccessibleBranches) | 查实时库存 |
+| `GET /api/v1/stocktake/default-stocktake` | `inventory:view` | 查当前门店默认盘点单(branch 走 `X-Branch-ID` header) |
+| `PUT /api/v1/stocktake/default-stocktake` | `inventory:manage` | 设置当前门店默认盘点单 |
+| `GET /api/v1/inventory/stock/:product_id` | `inventory:view`(走 claims.AccessibleBranches;branch 走 `X-Branch-ID` header) | 查实时库存 |
 | `GET /api/v1/catalog/suppliers[/:id]` | `supplier:view` | 查供应商 |
 | `POST/PUT/DELETE /api/v1/catalog/suppliers[/:id]` | `supplier:manage` | 改供应商 |
 | `GET /api/v1/catalog/products[/:id]` | `product:view` | 查商品 |

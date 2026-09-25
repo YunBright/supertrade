@@ -37,7 +37,7 @@ paths: ["**/*.go", "**/*.yaml", "**/*.conf"]
 
 | AppID | 在哪 | 本仓调用入口 |
 |---|---|---|
-| `userd` | `../auth` | 经 dapr `/v1.0/invoke/userd/method/...` |
+| `userd` | `../auth` | nginx `/api/v1/userd/*` → `proxy_set_header dapr-app-id userd` → sidecar `:3500` proxy → userd:8082（header-based proxy mode,dapr 现代路径） |
 | `login` | `../auth`（不走 dapr，nginx 旁路） | 不在库内直连；前端走 nginx |
 | `cube-gateway` | `../cube` | `internal/cubehttp` / `internal/cubeclient` |
 

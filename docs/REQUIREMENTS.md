@@ -68,10 +68,22 @@
 | `rbac.RequireScopeWithBranch(scope, branchFn, resolver)` | 在指定 branch 下校验动态 scope(`userinfo.GetBranchPermissions` 查) | `authkit/rbac/scope_branch.go`(2026-09 加) |
 
 **branch 来源优先级**(`branchFn` 由各服务按业务语义实现):
-- path `:branch_id` —— `/stock/:branch_id/:product_id` / `/branches/:branch_id/...`
-- X-Branch-ID header —— catalog / cube-router / stocktake 大多数端点
-- body `branch_id` —— `POST /stocktake-headers` 用 body 字段
+- X-Branch-ID header —— 几乎所有业务端点的统一入口(migration 009 起支持 `VARCHAR(124)` 自编码短码 / 逗号多店 union / `*` 通配展开)
+- body `branch_id` —— `POST /stocktake-headers` 用 body 字段(创建时,自编码短码)
 - 关联实体的 branch —— `stocktake_lines` 通过 header→hdr→line 反查
+
+**X-Branch-ID 多店 union 语义**(migration 009 起):
+
+| header 值 | middleware 透传给 handler 的 ctx 值 | 业务侧守门 |
+|---|---|---|
+| `B001`(单值) | `[]string{"B001"}` | 走 `userinfo.GetBranchPermissions(uid, "B001")` 单店 |
+| `B001,B002`(逗号多店) | `[]string{"B001","B002"}` | 走 `userinfo.GetBranchPermissionsMulti(uid, []string{"B001","B002"})` union scopes;`branches` 矩阵按 per-store 明细返回 |
+| `*`(通配) | JWT.AccessibleBranches 展开的具体 list | 同 multi,user 永远拿不到 `*` 字面值;business service 不感知通配语义 |
+
+> 2026-09 简化:path 不再带 `:branch_id`(`/stock/:branch_id/:product_id` 已并为
+> `/stock/:product_id`;`/branches/:branch_id/default-stocktake` 已并为
+> `/default-stocktake`)。所有 branch 上下文从 X-Branch-ID header 取,
+> middleware 只透传不强制(handler 强制要求时自己挂 `middleware.RequireBranch()`)。
 
 ### 1.4 待推 authkit 的开发需求(已落地)
 

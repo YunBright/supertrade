@@ -87,7 +87,7 @@
 | 数据 | 归属 | 服务 |
 |---|---|---|
 | **SKU / 商品** | **catalog 本地表 + cube 兜底** | `catalog.GET /products/search` 等 |
-| 实时库存 | cube-gateway 经 cube-router 转发 | `inventory.GET /stock/:branch_id/:product_id` |
+| 实时库存 | cube-gateway 经 cube-router 转发 | `inventory.GET /stock/:product_id`(branch 走 `X-Branch-ID` header) |
 | **供应商 / 客户** | **catalog 本地表 suppliers(type=0/1)+ cube 兜底** | `catalog.GET /suppliers` 等 |
 | 销售明细(思迅) | erp-connector 定期拉 → `erp_sales_raw` | `erp-connector`(订阅 `erp.sale.ingested`) |
 | **盘点表 + 盘点明细** | **本系统自维护** | `stocktake`(本期重点) |
@@ -200,25 +200,34 @@ suppliers.POST("",
 ### 3.2 分店隔离(数据级权限)
 
 `authkit` 0.2+ 已提供 `rbac.RequireBranch(branchFn, allowedFn)` 中间件 + `claims.GetEffectiveBranches()` /
-`IsAllowedBranch()` helper。本系统直接使用:
+`IsAllowedBranch()` helper。
+
+> 2026-09 简化(migration 009 强化):**所有 path 不再带 `:branch_id`**。branch 全部从
+> `X-Branch-ID` header 取(middleware.XBranchID 已注入 `[]string` ctx,handler 调
+> `middleware.BranchIDsFromContext(c)`)。跨店用户可用 `X-Branch-ID: B001,B002`(逗号
+> 分隔,**多店 union scopes**)或 `X-Branch-ID: *`(通配,**auth 中间件层用
+> JWT.AccessibleBranches 展开**;business service 永远拿到具体 branch_id list,不
+> 感知通配语义)。
+>
+> branch ID 形态(migration 009):`VARCHAR(64)` 自编码字符串(`B001` / `01` /
+> `S001` 等),**不再要求 UUID**。`X-Branch-ID` 字面值透传到下游 server,server
+> 自己 parse / 校验 ≤ 64 字符即可。
 
 ```go
-branches := r.Group("/branches/:branch_id")
-branches.GET("/sales",
+// /stock/:product_id —— branch 从 header 取
+r.GET("/stock/:product_id",
     rbac.RequireBranch(
         func(c *gin.Context) (string, bool) {
-            id := c.Param("branch_id")
-            return id, id != ""
+            b := c.GetHeader("X-Branch-ID")
+            return b, b != ""
         },
         func(c *gin.Context) ([]string, bool) {
             cl, ok := claims.FromContext(c.Request.Context())
-            if !ok {
-                return nil, false
-            }
+            if !ok { return nil, false }
             return cl.GetEffectiveBranches(), true
         },
     ),
-    handler.ListSales,
+    h.getStock,
 )
 ```
 

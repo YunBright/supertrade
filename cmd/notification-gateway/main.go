@@ -44,7 +44,7 @@ func main() {
 
 	cmdbootstrap.Run(cmdbootstrap.Options{
 		AppID:    appID,
-		Port:     ":8101",
+		Port:     cmdbootstrap.AppPort(":8101"),
 		Audience: auth.ExpectedAudience,
 		Logger:   logger,
 		OnStart: func() error {

@@ -2,13 +2,16 @@ package handler_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	dapr "github.com/dapr/go-sdk/client"
 	"github.com/YunBright/authkit/claims"
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/YunBright/supertrade/internal/cubeclient"
@@ -16,18 +19,28 @@ import (
 	"github.com/YunBright/supertrade/internal/stocktake/model"
 	"github.com/YunBright/supertrade/internal/stocktake/service"
 	"github.com/YunBright/supertrade/internal/stocktake/testdb"
+	"github.com/YunBright/supertrade/pkg/middleware"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // fakeUserD 模拟 userd 的 per-branch permissions 端点(全放行)。
 //
 // handler 的 scope 守门走 userd,测试不真正起 userd —— 用 httptest 起一个伪服务
 // 让所有 branch 都返回所有 stocktake 相关 scope,handler 顺利走通业务逻辑。
+//
+// 注意：mock server 路由用的是 deprecated URL form `/v1.0/invoke/<app>/method/<rest>`,
+// 仅因 dapr-go-sdk v1.15 的 InvokeMethodWithContent 内部 HTTP mock 接受该 form
+// (实际 daprd 走 gRPC UniversalService.InvokeMethod proxy mode,URL 是 dapr 内部细节,
+// 不影响 wire format)。prod 是 nginx `proxy_set_header dapr-app-id userd` header routing。
 func fakeUserD(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
+	// 保留 legacy URL form:让 fakeDaprForUserd 的 HTTP 拼装路径与 SDK 内部一致。
+	// dapr sidecar 不校验 URL prefix — proxy mode 实质是 gRPC proto,URL 仅 mock 自身 string。
 	mux.HandleFunc("/v1.0/invoke/userd/method/internal/users/", func(w http.ResponseWriter, r *http.Request) {
 		// /internal/users/{id}/permissions?branch_id=...
 		if !strings.Contains(r.URL.Path, "/permissions") {
@@ -42,15 +55,11 @@ func fakeUserD(t *testing.T) *httptest.Server {
 		uid, err := uuid.Parse(strings.TrimPrefix(r.URL.Path, "/v1.0/invoke/userd/method/internal/users/"))
 		_ = uid
 		_ = err
-		buid, perr := uuid.Parse(bid)
-		if perr != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
+		// migration 009:branch_id 是 string,直接用作 BranchID(不再 uuid.Parse)。
 		resp := userinfo.BranchPermissions{
 			Branches: []userinfo.BranchPermissionsRow{
 				{
-					BranchID: buid,
+					BranchID: bid,
 					Scopes: []string{
 						"inventory:view", "inventory:manage", "inventory:approve",
 						"supplier:view", "product:view",
@@ -62,6 +71,58 @@ func fakeUserD(t *testing.T) *httptest.Server {
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 	return httptest.NewServer(mux)
+}
+
+// fakeDaprForUserd 把 dapr.Client.InvokeMethodWithContent 转成对 userd httptest server 的 HTTP 调用。
+//
+// 仅用于 handler 测试 —— 把 sdk 的 dapr sidecar 调用转成直接的 httptest 访问。
+// 嵌入 dapr.Client(nil impl):其它方法被调用会 panic。
+type fakeDaprForUserd struct {
+	dapr.Client
+	baseURL string
+}
+
+// InvokeMethodWithContent 走 httptest server,模拟 dapr sidecar 转发语义。
+func (f *fakeDaprForUserd) InvokeMethodWithContent(
+	ctx context.Context, appID, method, verb string, content *dapr.DataContent,
+) ([]byte, error) {
+	// method 形如 "internal/users/{id}/permissions?branch_id=..."
+	// 拆 path + query
+	path := method
+	q := ""
+	if i := strings.Index(method, "?"); i >= 0 {
+		path = method[:i]
+		q = method[i+1:]
+	}
+	target := f.baseURL + "/v1.0/invoke/" + appID + "/method/" + path
+	if q != "" {
+		target += "?" + q
+	}
+	var body io.Reader
+	if content != nil && len(content.Data) > 0 {
+		body = bytes.NewReader(content.Data)
+	}
+	req, err := http.NewRequestWithContext(ctx, verb, target, body)
+	if err != nil {
+		return nil, err
+	}
+	if content != nil {
+		req.Header.Set("Content-Type", content.ContentType)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		// 转成 gRPC status,跟真实 SDK 行为对齐:404 → NotFound,其它 → Internal
+		if resp.StatusCode == 404 {
+			return nil, status.Error(codes.NotFound, string(data))
+		}
+		return nil, status.Error(codes.Internal, string(data))
+	}
+	return data, nil
 }
 
 // buildTestHandler 起一个完整 handler(配 SQLite + InMemoryCube + fake userd + 注入 claims)。
@@ -97,12 +158,21 @@ func buildTestHandler(t *testing.T) *gin.Engine {
 	// 注入 fake userd,让 per-branch 守门走通。
 	userd := fakeUserD(t)
 	t.Cleanup(userd.Close)
-	users := userinfo.New("userd", userinfo.WithEndpoint(userd.URL))
+	// userinfo 走 dapr SDK;测试用 fakeDaprForUserd 把 InvokeMethodWithContent
+	// 转成对 userd httptest server 的 HTTP 调用,避免真起 dapr sidecar。
+	users, err := userinfo.New("userd", userinfo.WithMockClient(&fakeDaprForUserd{baseURL: userd.URL}))
+	if err != nil {
+		t.Fatalf("userinfo.New: %v", err)
+	}
 	svc.SetUserInfo(users)
 
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.Use(injectTestClaims())
+	// 模拟 cmd/stocktake/main.go::registerRoutes 全局挂的 middleware.XBranchID(),
+	// 让 handler 的 middleware.SingleBranchFromCtx(c) 能从 ctx 拿到 branch。
+	// 测试用例需要在 req 上设 X-Branch-ID header(per-branch 端点必传)。
+	r.Use(middleware.XBranchID())
 	handler.New(svc).RegisterRoutes(r)
 	return r
 }
@@ -128,8 +198,7 @@ func injectTestClaims() gin.HandlerFunc {
 
 func claimsHeader(userID string) string {
 	cl := claims.Claims{
-		Sub:      userID,
-		DefaultBranchID: testBranchID,
+		Sub: userID,
 	}
 	b, _ := json.Marshal(cl)
 	return string(b)
@@ -147,6 +216,7 @@ func TestHandler_CreateHeader_201(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/stocktake-headers", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -174,6 +244,7 @@ func TestHandler_E2E_RealTimeStocktake(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/stocktake-headers", bytes.NewBufferString(createBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -188,6 +259,7 @@ func TestHandler_E2E_RealTimeStocktake(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/stocktake-headers/"+headerID+"/lines", bytes.NewBufferString(addBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -204,6 +276,7 @@ func TestHandler_E2E_RealTimeStocktake(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/stocktake-headers/"+headerID+"/lines", bytes.NewBufferString(addBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -213,6 +286,7 @@ func TestHandler_E2E_RealTimeStocktake(t *testing.T) {
 	// 4. 拉差异表
 	req = httptest.NewRequest(http.MethodGet, "/stocktake-headers/"+headerID+"/diff-report", nil)
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -246,6 +320,7 @@ func TestHandler_AddLine_ProductNotFound_400(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/stocktake-headers", bytes.NewBufferString(createBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	var hdr model.StocktakeHeader
@@ -256,6 +331,7 @@ func TestHandler_AddLine_ProductNotFound_400(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/stocktake-headers/"+hdr.ID+"/lines", bytes.NewBufferString(addBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -276,6 +352,7 @@ func TestHandler_Submit_Approve_Lifecycle(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/stocktake-headers", bytes.NewBufferString(`{"branch_id":"`+testBranchID+`"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	var hdr model.StocktakeHeader
@@ -286,12 +363,14 @@ func TestHandler_Submit_Approve_Lifecycle(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/stocktake-headers/"+hdr.ID+"/lines", bytes.NewBufferString(addBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
 	// submit
 	req = httptest.NewRequest(http.MethodPost, "/stocktake-headers/"+hdr.ID+"/submit", nil)
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -311,6 +390,7 @@ func TestHandler_Submit_Approve_Lifecycle(t *testing.T) {
 		bytes.NewBufferString(`{"auditor_id":"u-admin"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -326,29 +406,6 @@ func TestHandler_Submit_Approve_Lifecycle(t *testing.T) {
 	}
 }
 
-// ---- SearchProducts (REQUIREMENTS §2.1.4.1) ----
-
-// 模拟带 inventory:view + supplier:view 的登录用户
-func claimsHeaderFullPerm(userID string) string {
-	cl := claims.Claims{
-		Sub:      userID,
-		DefaultBranchID: testBranchID,
-		Scopes:   []string{"inventory:view", "supplier:view"},
-	}
-	b, _ := json.Marshal(cl)
-	return string(b)
-}
-
-// 模拟只读 + 无 supplier/inventory 权限
-func claimsHeaderNoPerm(userID string) string {
-	cl := claims.Claims{
-		Sub:      userID,
-		DefaultBranchID: testBranchID,
-	}
-	b, _ := json.Marshal(cl)
-	return string(b)
-}
-
 // ---- 2026-09-19 盘点单 H5 新端点 ----
 
 func TestHandler_RecheckHeader_RequiresParent_400(t *testing.T) {
@@ -359,6 +416,7 @@ func TestHandler_RecheckHeader_RequiresParent_400(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/stocktake-headers", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -380,6 +438,7 @@ func TestHandler_RecheckHeader_RequiresParent_400(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/stocktake-headers", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -395,6 +454,7 @@ func TestHandler_PlanItems_PostAndGet(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/stocktake-headers", bytes.NewBufferString(createBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -409,6 +469,7 @@ func TestHandler_PlanItems_PostAndGet(t *testing.T) {
 		bytes.NewBufferString(addBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -427,6 +488,7 @@ func TestHandler_PlanItems_PostAndGet(t *testing.T) {
 	// GET 应返 2 条,按 sort_order ASC 排序 → P-1002 (sort=1) 在前
 	req = httptest.NewRequest(http.MethodGet, "/stocktake-headers/"+hdr.ID+"/plan-items", nil)
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -451,6 +513,7 @@ func TestHandler_PlanItems_PostAndGet(t *testing.T) {
 		bytes.NewBufferString(dupBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -472,6 +535,7 @@ func TestHandler_ListHeaders_FilteredByType(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/stocktake-headers", bytes.NewBufferString(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusCreated {
@@ -482,6 +546,7 @@ func TestHandler_ListHeaders_FilteredByType(t *testing.T) {
 	// GET ?type=plan → 1 条
 	req := httptest.NewRequest(http.MethodGet, "/stocktake-headers?type=plan&page_size=10", nil)
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -510,6 +575,7 @@ func TestHandler_History_AfterAdd(t *testing.T) {
 		bytes.NewBufferString(`{"branch_id":"`+testBranchID+`","count_date":"2026-09-22"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	var hdr model.StocktakeHeader
@@ -520,6 +586,7 @@ func TestHandler_History_AfterAdd(t *testing.T) {
 		bytes.NewBufferString(`{"product_id":"P-1001","actual_qty":95,"actor_name":"张三","method":"scan"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -529,6 +596,7 @@ func TestHandler_History_AfterAdd(t *testing.T) {
 	// GET history
 	req = httptest.NewRequest(http.MethodGet, "/stocktake-headers/"+hdr.ID+"/history", nil)
 	req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
+	req.Header.Set("X-Branch-ID", testBranchID)
 	w = httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {

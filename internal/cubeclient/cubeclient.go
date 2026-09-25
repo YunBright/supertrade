@@ -2,7 +2,7 @@
 //
 // 实现:
 //   - InMemoryClient:mock 数据(单测/本地用)
-//   - HTTPCubeClient:经 Dapr service invocation 调 cube-gateway /v1/load
+//   - DaprCubeClient:经 dapr/go-sdk 的 dapr.Client 调 cube /v1/load
 //
 // DTO 定义见本包 dto.go。
 package cubeclient
@@ -18,7 +18,7 @@ import (
 
 // Client 是 cube sixun 的客户端抽象。
 //
-// 实现 InMemoryClient / HTTPCubeClient。
+// 实现 InMemoryClient / DaprCubeClient。
 type Client interface {
 	GetProduct(ctx context.Context, productID string) (*ProductDTO, error)
 	GetStock(ctx context.Context, branchID, productID string) (*StockSnapshotDTO, error)
