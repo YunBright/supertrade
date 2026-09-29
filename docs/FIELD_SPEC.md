@@ -271,7 +271,7 @@
 | `lines[]` | array | 仅列有差异的行(完整字段) |
 | `generated_at` | datetime | 服务生成时间 |
 
-### 1.8 master-data / pricing / sales-agg / erp-connector / llm-gw
+### 1.8 master-data / pricing / sales-agg / erp-connector
 
 字段按各自职责定义,沿用 §0 命名约定,清单在各自 dapr app 落地时再补。
 **FIELD_SPEC.md 不重复列举这些——只覆盖跟 cube 有映射的"商品/库存/销售/供应商"4 个核心实体 + 本期重点的 stocktake**。
@@ -282,7 +282,6 @@
 | `pricing` | `price_lists` / `promotions`(本地维护,本系统自营 POS 用) |
 | `sales-agg` | `sales_view_minute` / `sales_view_daily`(本地宽表,聚合 POS + erp-connector) |
 | `erp-connector` | `erp_sales_raw` / `sync_logs`(拉 cube 数据落库,供 sales-agg) |
-| `llm-gw` | `llm_call_logs`(LLM 调用留痕) |
 
 ---
 

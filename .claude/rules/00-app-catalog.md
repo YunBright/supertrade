@@ -6,12 +6,13 @@ paths: ["**/*.go", "**/*.yaml", "**/*.conf"]
 
 每个 `cmd/<name>/main.go` 的 `AppID` = 公网 URL 里的 `<app>` 段。
 
-## 本仓 16 个 dapr app
+## 本仓 14 个 dapr app
 
 > 2026-09 新增 `cube-router`(按 X-Branch-ID 路由到不同 cube 实例)。
-> 12 个占位 cmd(pos-gateway / pos / pricing / procurement / sales-agg / fresh-produce /
-> fresh-meat / erp-connector / bi-gateway / notification / llm-gw / master-data)保留作为
-> 后续 Sprint 入口,**不删除**(用户指令 2026-09-24)。
+> 10 个占位 cmd(pos-gateway / pos / pricing / procurement / sales-agg / fresh-produce /
+> fresh-meat / erp-connector / bi-gateway / master-data)作为后续 Sprint 入口保留。
+> `notification`(企微/钉钉占位)与 `llm-gw`(LLM 网关占位)已于 2026-09-29 删除 —
+> 占位 cmd 不再保留,这两个能力由外部服务承担。
 
 | cmd 目录 | AppID | 公网前缀 |
 |---|---|---|
@@ -29,9 +30,7 @@ paths: ["**/*.go", "**/*.yaml", "**/*.conf"]
 | `cmd/fresh-meat` | `fresh-meat` | `/api/v1/fresh-meat/` |
 | `cmd/erp-connector` | `erp-connector` | `/api/v1/erp-connector/` |
 | `cmd/bi-gateway` | `bi-gateway` | `/api/v1/bi-gateway/` |
-| `cmd/notification` | `notification` | `/api/v1/notification/` |
 | `cmd/notification-gateway` | `notification-gateway` | `/api/v1/notification-gateway/` |
-| `cmd/llm-gw` | `llm-gw` | `/api/v1/llm-gw/` |
 
 ## 外部仓的 app（不归本仓管，但本仓业务会调）
 

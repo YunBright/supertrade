@@ -1,5 +1,5 @@
 ---
-paths: ["internal/cubeclient/**/*.go", "internal/cubehttp/**/*.go", "internal/notification/**/*.go"]
+paths: ["internal/cubeclient/**/*.go", "internal/cubehttp/**/*.go"]
 ---
 
 # 跨服务调用（dapr service invocation）

@@ -11,7 +11,7 @@
 - **微服务编排**:Dapr(本地 `dapr init` + `dapr run`,无 docker)
 - **身份 / 权限**:`F:\go\src\github.com\YunBright\auth`(userd) + `github.com/YunBright/authkit`
 - **ERP 数据源**:`F:\go\src\github.com\YunBright\cube`(只读,不复制其语义层)
-- **LLM 接入**:`llm-gw` 统一调用智谱 / DeepSeek(本地 `pkg/llm` 可直调,后续接 llm-gw)
+- **LLM 接入**:外部服务(本仓不维护);fresh-meat 通过事件 `pig.arrived` / `pork.cuts.stocktaken` 把数据交给外部 LLM 网关,反推结果回写 `whole_pig.llm_advice_json`
 
 ### 三大原则
 
@@ -21,7 +21,7 @@
 
 ---
 
-## §1 微服务拆分(16 个 dapr app)
+## §1 微服务拆分(14 个 dapr app)
 
 ```
                       ┌──────────────────────────────────────────┐
@@ -43,18 +43,18 @@
         │  │ produce  │  │  meat   │  │   盘点    │  │ connector│    │
         │  │ 生鲜蔬果 │  │  生肉   │  └───────────┘  │  (cube)  │    │
         │  └──────────┘  └────┬────┘                  └───┬───────┘    │
-        │                     │ LLM                      │            │
+        │                     │ LLM(外部)               │            │
         │                     ▼                          ▼            │
-        │               ┌───────────┐            ┌───────────────┐    │
-        │               │  llm-gw   │            │  sales-agg    │    │
-        │               │ 智谱/DS │            │ 多端销售聚合  │    │
-        │               └───────────┘            └───────────────┘    │
+        │             (外部 LLM 网关)            ┌───────────────┐    │
+        │            智谱/DeepSeek               │  sales-agg    │    │
+        │            不在本仓                    │ 多端销售聚合  │    │
+        │                                       └───────────────┘    │
         │                                                          │
         └──────────────────────┬───────────────────────────────────┘
                                │
                   ┌────────────▼────────────┐
                   │ master-data  主数据     │
-                  │ notification 通知       │
+                  │ notification-gateway  WS│
                   └───────────────────────────┘
 
 身份/权限:外部 YunBright/auth 项目的 userd(JWT 签发) + authkit 公开包(claims + rbac + userinfo)
@@ -69,15 +69,15 @@
 | 5 | **pos** | 销售开单、收款、改价、退货、班次(本系统自营) | sales_orders, sale_lines, payments | cube-gateway(查 SKU) |
 | 6 | **pricing** | 售价/促销/会员/改价审批(本系统自营) | price_lists, promotions | cube-gateway |
 | 7 | **fresh-produce** ⭐ | 蔬果盘点驱动毛利(REQUIREMENTS §3) | produce_stocktake, waste_logs | cube-gateway, stocktake |
-| 8 | **fresh-meat** ⭐ | 生肉整猪 + LLM 分割(REQUIREMENTS §4) | whole_pig, pig_cuts, pork_cuts_stocktake | llm-gw, cube-gateway |
+| 8 | **fresh-meat** ⭐ | 生肉整猪 + LLM 分割(REQUIREMENTS §4) | whole_pig, pig_cuts, pork_cuts_stocktake | (外部 LLM 网关), cube-gateway |
 | 9 | **stocktake** ⭐ | **盘点表 + 盘点明细 CURD + 差异表生成**(REQUIREMENTS §2.1,本期重点) | stocktake_headers, stocktake_lines | cube-gateway |
 | 10 | **erp-connector** | 拉 cube /v1/load(REQUIREMENTS §5) | erp_sales_raw, sync_logs | cube-gateway |
 | 11 | **sales-agg** | 聚合 POS + erp-connector,供 BI / 跨服务拉 | sales_view | pos pub/sub, erp-connector |
-| 12 | **llm-gw** | LLM 路由 + prompt 模板 + 缓存 + 降级 | llm_call_logs | 智谱 / DeepSeek |
-| 13 | **master-data** | 门店/员工/班次(**供应商/客户走 catalog 本地表**) | stores, employees | cube-gateway |
-| 14 | **bi-gateway** | BI 出口,调 cube-gateway + 本系统聚合 | — | cube-gateway |
-| 15 | **notification** | 企微 / 钉钉 / 短信通知 | notification_logs | — |
-| 16 | **cube-router** ⭐ | **按 X-Branch-ID 路由 POST /v1/load 到正确 cube 实例(sixun-hbposv7 / sixun-ysx)** | branch_cube_sources | dapr invoke → cube 实例, userd(scope) |
+| 12 | **master-data** | 门店/员工/班次(**供应商/客户走 catalog 本地表**) | stores, employees | cube-gateway |
+| 13 | **bi-gateway** | BI 出口,调 cube-gateway + 本系统聚合 | — | cube-gateway |
+| 14 | **cube-router** ⭐ | **按 X-Branch-ID 路由 POST /v1/load 到正确 cube 实例(sixun-hbposv7 / sixun-ysx)** | branch_cube_sources | dapr invoke → cube 实例, userd(scope) |
+
+> 2026-09-29 移除占位 cmd `llm-gw`(LLM 网关)和 `notification`(企微/钉钉),由外部服务承担 — 详见 §13。`notification-gateway`(WebSocket 推送网关)保留为 #5。
 
 > **身份/权限不归本系统**:`auth` 项目的 userd 提供 JWT 签发 + 用户/角色/权限 CRUD;
 > 本系统每个 dapr app 通过 `authkit` 中间件鉴权。**不写 iam 服务**。
@@ -129,9 +129,9 @@ secret.local.yaml     # secret: LLM API Key 等(本地 file,生产换 kubernetes
 | `purchase.completed` | procurement | inventory, fresh-produce | grn_id, lines[] |
 | `sale.completed` | pos | inventory, fresh-meat, sales-agg | sale_id, branch_id, lines[] |
 | `stocktake.completed` | stocktake | inventory, fresh-produce, fresh-meat | task_id, type |
-| `pig.arrived` | fresh-meat | llm-gw(异步分析) | pig_id, gross_weight_kg |
-| `pig.stocktaken` | fresh-meat | llm-gw(异步分析) | stocktake_id, variance_kg |
-| `pig.analysis.completed` | fresh-meat | notification, dashboard | pig_id, analysis_json |
+| `pig.arrived` | fresh-meat | (外部 LLM 网关,异步分析) | pig_id, gross_weight_kg |
+| `pig.stocktaken` | fresh-meat | (外部 LLM 网关,异步分析) | stocktake_id, variance_kg |
+| `pig.analysis.completed` | (外部 LLM 网关) | fresh-meat / dashboard | pig_id, analysis_json |
 | `erp.sale.ingested` | erp-connector | sales-agg | source, batch_id, count |
 | `sale.aggregated` | sales-agg | bi-gateway + 其它 dapr app | branch_id, period, kpis |
 
@@ -143,7 +143,7 @@ pos-gateway ─invoke─▶ pos ─invoke─▶ inventory (锁库/释放)
                                              ─▶ fresh-meat 落 line_sales_by_pig
                                              ─▶ sales-agg 聚合
 
-fresh-meat ─invoke─▶ llm-gw (ChatCompletion, json_mode)
+fresh-meat ─pub─▶ pig.arrived ─▶ 外部 LLM 网关(订阅 + ChatCompletion + 回写)
 erp-connector ─invoke─▶ cube-gateway (/v1/load)
 bi-gateway ─invoke─▶ cube-gateway (BI 走 cube 自家的,不经本系统 cube 兼容层)
 ```
@@ -501,16 +501,15 @@ fresh-meat 服务
         ├─ 发 pig.arrived(pig_id, gross_weight_kg)
         │
         ▼
-   (异步,后台 job)
+   (外部 LLM 网关订阅)
         │
-        ├─ llm-gw.ChatCompletion({
+        ├─ ChatCompletion({
         │     pig_id, gross_weight_kg,
         │     history_pigs (近 30 天 ±10% 重量段),
         │     task: "predict_cuts"
         │   })
         │
-        ├─ 写 whole_pig.llm_advice_json
-        └─ 发 pig.analysis.completed 事件
+        └─ 写回 whole_pig.llm_advice_json
 ```
 
 ### 6.2 日终:**整店按部位盘点**(可选,不阻断销售,REPLACE)
@@ -532,24 +531,17 @@ fresh-meat 服务
         ├─ 计算 expected_remain_kg_by_cut = 入库 - 已销 - 报损(按 cut 维度)
         ├─ variance_kg = actual - expected(逐 cut)
         │
-        ├─ llm-gw.ChatCompletion({
-        │     stocktake_id, pigs[],
-        │     task: "review_cuts"
-        │   })
-        │   // 每头猪独立反推实际分割比例,
-        │   // 标记"分割异常"和"明日分割建议"
-        │
-        ├─ 发 pork.stocktaken 事件
+        ├─ 发 pork.cuts.stocktaken 事件 ──▶ (外部 LLM 网关订阅后 ChatCompletion)
         │   payload.is_complete = is_complete // 供 sales-agg 标注 BI
         │
-        └─ 没录入盘点 → 当日不发 pork.stocktaken 事件
+        └─ 没录入盘点 → 当日不发 pork.cuts.stocktaken 事件
               sales-agg 用 llm 推演 / 历史均值估算当日 fresh-meat 毛利
               BI 页面在次日的鲜猪毛利卡片显示 "⚠ 未盘点,数据为推演"
 ```
 
 ### 6.3 LLM 失败降级
 
-`llm-gw` 失败 / 超时(>30s):
+外部 LLM 网关失败 / 超时(>30s,由外部自行降级):
 - 早盘建议 → 历史同重量段均值
 - 日终反推 → 历史损耗均值
 - 不阻塞业务流程,只在 dashboard 显示"分析降级"
@@ -627,10 +619,8 @@ F:\go\src\github.com\YunBright\supertrade\
 │   ├── stocktake/
 │   ├── erp-connector/
 │   ├── sales-agg/
-│   ├── llm-gw/
 │   ├── master-data/
-│   ├── bi-gateway/
-│   └── notification/
+│   └── bi-gateway/
 ├── internal/                  # 每个 cmd 同名子目录
 │   ├── catalog/
 │   │   ├── handler/  service/  repo/  model/  dto/
@@ -641,7 +631,6 @@ F:\go\src\github.com\YunBright\supertrade\
 │   ├── eventbus/              # 事件 schema + 编解码
 │   ├── workspace/             # 分店隔离 helper(临时,后续推 authkit)
 │   ├── money/  decimal/  time/ # 通用基础
-│   └── llm/                   # 直调 LLM 客户端(后续接 llm-gw)
 ├── migrations/                # 每个服务一个 schema 目录
 │   ├── catalog/        .../001_init.up.sql
 │   ├── inventory/      ...
@@ -686,8 +675,8 @@ F:\go\src\github.com\YunBright\supertrade\
 
 **Week 3:事件落地 + BI**
 - EVENT-CATALOG §12 Step 4(pos publish sale.completed → inventory subscribe 扣库)
-- llm-gw + erp-connector + sales-agg + bi-gateway
-- 整猪 → LLM 分割建议 → 日终盘点的端到端 demo
+- erp-connector + sales-agg + bi-gateway
+- 整猪 → 外部 LLM 分割建议 → 日终盘点的端到端 demo(LLM 网关外部)
 
 > **约束**(USER 已确认):
 > - 步骤 1(跑单 dapr app)✅ 已验证
@@ -702,7 +691,7 @@ F:\go\src\github.com\YunBright\supertrade\
 | 风险 | 对策 |
 |---|---|
 | 蔬果盘点周期不一,毛利节点难对齐 | profit_periods 表按"上次盘点 → 本次盘点"切片,与周期配置解耦 |
-| LLM 慢 / 费用 | llm-gw 缓存 + 异步触发 + 失败降级到历史均值 |
+| LLM 慢 / 费用(外部 LLM 网关) | 异步触发 + 失败降级到历史均值(由外部 LLM 网关自维护缓存) |
 | Cube 拉数慢 / 漏数 | erp-connector 多拉 1h lookback + 哈希幂等 + 缺失告警;**catalog / inventory / stocktake 等转发服务加短期 cache** 兜底(本期不实现,后续 Phase) |
 | Cube 不可达 | stocktake 创建表时降级:book_qty 留空,前端手填,后续 cube 恢复后回填(本期不实现,记 issue) |
 | 微服务多,本地起不来 | `dapr run --app-id <app>` 单跑任一服务,不影响其它 |
@@ -911,3 +900,4 @@ func OnSaleCompleted(c *gin.Context, env events.Envelope) {
 | 2026-09-17 | Mavis | 修订 4:本期只读 cube + 转发(SKU/库存/供应商不维护),§4.5 stocktake 详情,§12 EVENT-CATALOG 落地说明 |
 | 2026-09-17 | Mavis | 修订 5:stocktake 实时盘点(营业中、非锁库)+ §4.5.3 按需拉快照 + 盘点单不跨店 |
 | 2026-09-17 | Mavis | 修订 6:`/api/v1/products/search` 端点 + 权限过滤 + barcode 长度策略(对齐 scan.html 后端) |
+| 2026-09-29 | Tinkler | 修订 7:删除占位 cmd `llm-gw`(LLM 网关)和 `notification`(企微/钉钉);§1 微服务从 16 缩到 14;LLM 网关改为外部服务,fresh-meat 通过 `pig.arrived` / `pork.cuts.stocktaken` 事件交接;`pig.analysis.completed` topic 由外部网关负责(详见 EVENT-CATALOG §2.9);同步 .goreleaser.yaml / deploy-supertrade.ps1 / .claude/rules/00-app-catalog.md / README.md |

@@ -44,7 +44,8 @@
 **当前实现的服务(4 个)**:stocktake / catalog / inventory / cube-router。
 **已订阅 pub/sub 的服务(2 个)**:stocktake(订阅 `auth.user.access_changed`)+ notification-gateway(订阅 stocktake.* + auth.user.*)。
 
-其余 12 个 `cmd` 目录(pos-gateway / pos / pricing / procurement / sales-agg / fresh-produce / fresh-meat / erp-connector / bi-gateway / notification / llm-gw / master-data)保留为后续 Sprint 入口骨架,**不删除**。
+其余 10 个 `cmd` 目录(pos-gateway / pos / pricing / procurement / sales-agg / fresh-produce / fresh-meat / erp-connector / bi-gateway / master-data)保留为后续 Sprint 入口骨架。
+`notification`(企微/钉钉占位)与 `llm-gw`(LLM 网关占位)已于 2026-09-29 删除 — 占位 cmd 不再保留,这两个能力由外部服务承担。
 
 ---
 
@@ -120,7 +121,7 @@ supertrade/
 │   ├── cube-router/main.go           # 多 cube 实例 per-branch 路由
 │   ├── notification-gateway/main.go  # WebSocket 推送网关
 │   ├── pos-gateway/main.go           # BFF 骨架(占位)
-│   └── ... (其它 11 个占位 cmd)
+│   └── ... (其它 9 个占位 cmd)
 │
 ├── internal/                          # 各 cmd 对应的内部包(handler / service / model / db)
 │   ├── stocktake/
@@ -158,7 +159,7 @@ supertrade/
 
 ## 服务清单 (App ↔ URL)
 
-下表覆盖本仓 17 个 cmd(16 个 dapr app + 1 个 BFF)+ 2 个外部依赖。
+下表覆盖本仓 15 个 cmd(14 个 dapr app + 1 个 BFF)+ 2 个外部依赖。
 
 | `cmd` 目录 | dapr app-id | 公网 URL 前缀 | 端口(本仓默认值) | 实现状态 |
 |---|---|---|---|---|
@@ -176,9 +177,7 @@ supertrade/
 | `cmd/fresh-meat` | `fresh-meat` | `/api/v1/fresh-meat/` | `:8080` | 🟡 占位 |
 | `cmd/erp-connector` | `erp-connector` | `/api/v1/erp-connector/` | `:8080` | 🟡 占位 |
 | `cmd/bi-gateway` | `bi-gateway` | `/api/v1/bi-gateway/` | `:8080` | 🟡 占位 |
-| `cmd/notification` | `notification` | `/api/v1/notification/` | `:8080` | 🟡 占位 |
 | `cmd/master-data` | `master-data` | `/api/v1/master-data/` | `:8080` | 🟡 占位 |
-| `cmd/llm-gw` | `llm-gw` | `/api/v1/llm-gw/` | `:8080` | 🟡 占位 |
 
 **外部依赖**(不在本仓,但业务会调):
 
@@ -593,3 +592,4 @@ daprCli.InvokeMethodWithContent(ctx,
 | 日期 | 修订人 | 内容 |
 |---|---|---|
 | 2026-09-25 | Tinkler | 初版;汇总 4 个完整服务(stocktake / catalog / inventory / cube-router)+ notification-gateway + 12 占位 cmd 的路由表;声明 deployer 仓契约测试 |
+| 2026-09-29 | Tinkler | 删除 `cmd/notification` 与 `cmd/llm-gw` 占位 cmd(对应 .goreleaser.yaml / deploy-supertrade.ps1 / docs/EVENT-CATALOG / docs/DESIGN / .claude/rules);本仓现 14 个 dapr app + 1 BFF;LLM 网关 + 企微/钉钉通知改由外部服务承担 |

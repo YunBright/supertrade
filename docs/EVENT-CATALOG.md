@@ -59,11 +59,10 @@
 | `purchase.completed` | procurement | inventory / fresh-produce | grn_id, lines[] | §2.2 |
 | `sale.completed` | pos | inventory / fresh-meat / sales-agg | sale_id, branch_id, lines[] | §2.3 |
 | `stocktake.completed` | stocktake | inventory / fresh-produce / fresh-meat | task_id, type, branch_id | §2.4 |
-| `produce.stocktake.completed` | fresh-produce | sales-agg / bi-gateway / notification | stocktake_id, is_complete, profit_period | §2.5 |
+| `produce.stocktake.completed` | fresh-produce | sales-agg / bi-gateway | stocktake_id, is_complete, profit_period | §2.5 |
 | `waste.log.recorded` | fresh-produce / fresh-meat | sales-agg / bi-gateway | waste_id, sku_id, qty_kg, reason | §2.6 |
-| `pig.arrived` | fresh-meat | llm-gw(早盘) | pig_id, ear_tag, gross_weight_kg | §2.7 |
-| `pork.cuts.stocktaken` | fresh-meat | llm-gw(日终) / sales-agg / notification | stocktake_id, is_complete, cuts[] | §2.8 |
-| `pig.analysis.completed` | llm-gw | fresh-meat / notification / dashboard | pig_id, analysis_json, task | §2.9 |
+| `pig.arrived` | fresh-meat | (外部 LLM 网关,早盘分割建议) | pig_id, ear_tag, gross_weight_kg | §2.7 |
+| `pork.cuts.stocktaken` | fresh-meat | sales-agg | stocktake_id, is_complete, cuts[] | §2.8 |
 | `erp.sale.ingested` | erp-connector | sales-agg | source, batch_id, count, batch_at | §2.10 |
 | `sale.aggregated` | sales-agg | bi-gateway + 其它 dapr app | branch_id, period, kpis | §2.11 |
 | `stocktake.line.added` | stocktake | notification-gateway | header_id, line_id, branch_id | §2.12 |
@@ -216,11 +215,10 @@
 }
 ```
 
-订阅方 `llm-gw` 收到后:
+订阅方(外部 LLM 网关,不在本仓)收到后:
 1. 查近 30 天 ±10% 重量段的 history_pigs
-2. 调 llm-gw.ChatCompletion(task="predict_cuts")
+2. 调外部 ChatCompletion(task="predict_cuts")
 3. 写回 whole_pig.llm_advice_json
-4. 发 `pig.analysis.completed`(§2.9)
 
 ### 2.8 pork.cuts.stocktaken
 
@@ -250,32 +248,11 @@
 > 当日**未**录入盘点 → sales-agg 用 llm 推演 / 历史均值估算 fresh-meat 毛利,
 > BI 在鲜猪毛利卡片显示"⚠ 未盘点,数据为推演"。
 
-### 2.9 pig.analysis.completed
+### 2.9 外部 LLM 网关(原 pig.analysis.completed)
 
-**触发时机**:llm-gw 完成早盘预测或日终反推后。
-
-```jsonc
-// data:
-{
-  "analysis_id":  "uuid",
-  "task":         "predict_cuts" | "review_cuts",
-  "branch_id":    "S001",
-  "pig_ids":      ["uuid", "uuid"],          // 关联的整猪 PK 列表
-  "stocktake_id": "uuid",                     // task=review_cuts 时填
-  "analysis": {
-    "predicted_cuts": [                       // task=predict_cuts 时填
-      { "pig_id": "uuid", "cut_type": "belly", "predicted_kg": 92.0 }
-    ],
-    "review": {                              // task=review_cuts 时填
-      "anomaly_pigs": ["uuid"],              // 标记分割异常的猪
-      "tomorrow_suggestion": "..."           // 明日分割建议(自由文本)
-    }
-  },
-  "llm_latency_ms": 1234,
-  "fallback_used":  false,                    // true=LLM 失败,降级到历史均值
-  "completed_at":   "2026-09-17T06:18:30Z"
-}
-```
+`pig.analysis.completed` 原由 `llm-gw` 服务发布,2026-09-29 删除 `llm-gw` 后,
+该 topic 由外部 LLM 网关(不在本仓)直接消费 `pig.arrived` / `pork.cuts.stocktaken` 并
+写回 `whole_pig.llm_advice_json`。payload schema 由外部服务自维护,本仓不再做契约。
 
 ### 2.10 erp.sale.ingested
 
