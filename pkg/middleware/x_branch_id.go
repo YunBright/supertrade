@@ -121,7 +121,7 @@ func SingleBranchFromCtx(c *gin.Context) string {
 	return bs[0]
 }
 
-// RequireBranch 强制要求 X-Branch-ID header 非空;缺失返 400 missing_branch_id。
+// RequireBranch 强制要求 X-Branch-ID header 非空;缺失返 400 branch_required。
 //
 // 用于"必须有门店上下文"的业务端点(handler 不想自己写 if 判断时挂这个中间件)。
 // 不校验 UUID —— UUID 校验交给 handler(用 uuid.Parse 进一步拒非合法格式)。
@@ -134,7 +134,7 @@ func RequireBranch() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if len(BranchFromCtx(c)) == 0 {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-				"code":    "missing_branch_id",
+				"code":    "branch_required",
 				"message": "X-Branch-ID header 必填(支持 UUID / * / 逗号多店)",
 			})
 			return

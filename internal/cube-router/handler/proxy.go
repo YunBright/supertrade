@@ -37,7 +37,7 @@ func (h *Handler) proxyLoad(c *gin.Context) {
 	if branchID == "" {
 		// 中间件应该已阻断了非法 header;此处兜底。
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-			"code":    "missing_branch_id",
+			"code":    "branch_required",
 			"message": "X-Branch-ID header 必填",
 		})
 		return

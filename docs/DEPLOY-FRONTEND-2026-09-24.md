@@ -202,7 +202,7 @@ class SupertradeClient {
 
 | HTTP | code | 含义 | 前端处理 |
 |---|---|---|---|
-| 400 | `bad_request` / `branch_required` / `missing_branch_id` / `missing_param` | 请求参数 / header 缺失 | Toast 提示,引导重新选门店或检查 URL |
+| 400 | `bad_request` / `branch_required` / `branch_required` / `missing_param` | 请求参数 / header 缺失 | Toast 提示,引导重新选门店或检查 URL |
 | 401 | `unauthenticated` | JWT 缺失或过期 | 跳登录 |
 | 403 | `forbidden` | 该用户在当前 branch 无 `xxx:view/manage` scope | Toast「无权限,请联系店长」;触发 `meController.load()` 重拉 |
 | 404 | `supplier_not_found` / `stocktake_header_not_found` / `cube_source_not_configured` / ... | 资源不存在 | Toast「资源不存在」;若 `cube_source_not_configured` → 提示联系 admin 配置分支 |

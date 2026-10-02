@@ -61,7 +61,7 @@ func TestHandler_GetStock_NotFound(t *testing.T) {
 }
 
 func TestHandler_GetStock_MissingBranchHeader(t *testing.T) {
-	// X-Branch-ID 缺失 → 400 missing_branch_id(handler 不强制挂 RequireBranch 时)。
+	// X-Branch-ID 缺失 → 400 branch_required(handler 不强制挂 RequireBranch 时)。
 	r := buildTestRouter(t)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/stock/P-1001", nil)
 	w := httptest.NewRecorder()

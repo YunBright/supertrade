@@ -116,7 +116,7 @@ func (h *Handler) SearchHeaders(c *gin.Context) {
 	// shim,与项目约定(.claude/rules/02-handler-routes.md)冲突。
 	branchID := middleware.SingleBranchFromCtx(c)
 	if branchID == "" {
-		writeError(c, http.StatusBadRequest, "missing_branch_id",
+		writeError(c, http.StatusBadRequest, "branch_required",
 			"X-Branch-ID header 必填(per-branch 端点的 branch 上下文唯一来源)")
 		return
 	}
@@ -161,7 +161,7 @@ func (h *Handler) SearchHeaders(c *gin.Context) {
 func (h *Handler) SetDefaultStocktake(c *gin.Context) {
 	branchID := strings.TrimSpace(c.Request.Header.Get("X-Branch-ID"))
 	if branchID == "" {
-		writeError(c, http.StatusBadRequest, "missing_branch_id", "X-Branch-ID header 必填")
+		writeError(c, http.StatusBadRequest, "branch_required", "X-Branch-ID header 必填")
 		return
 	}
 	cl, ok := claims.FromContext(c.Request.Context())
@@ -202,7 +202,7 @@ func (h *Handler) SetDefaultStocktake(c *gin.Context) {
 func (h *Handler) GetDefaultStocktake(c *gin.Context) {
 	branchID := strings.TrimSpace(c.Request.Header.Get("X-Branch-ID"))
 	if branchID == "" {
-		writeError(c, http.StatusBadRequest, "missing_branch_id", "X-Branch-ID header 必填")
+		writeError(c, http.StatusBadRequest, "branch_required", "X-Branch-ID header 必填")
 		return
 	}
 	if !h.requireScope(c, branchID, "inventory:view") {
@@ -357,7 +357,7 @@ func (h *Handler) CreateHeader(c *gin.Context) {
 // 分页:page (default 1) / page_size (default 20, max 100)
 //
 // 权限:inventory:view(per-branch;branch 从 X-Branch-ID header 取,
-// middleware.XBranchID 已注入 ctx)。未传 X-Branch-ID → 400 missing_branch_id,
+// middleware.XBranchID 已注入 ctx)。未传 X-Branch-ID → 400 branch_required,
 // 不再 fallback 到 ?branch_id= / claims.DefaultBranchID。
 func (h *Handler) ListHeaders(c *gin.Context) {
 	cl, ok := claims.FromContext(c.Request.Context())
@@ -367,7 +367,7 @@ func (h *Handler) ListHeaders(c *gin.Context) {
 	}
 	branchID := middleware.SingleBranchFromCtx(c)
 	if branchID == "" {
-		writeError(c, http.StatusBadRequest, "missing_branch_id",
+		writeError(c, http.StatusBadRequest, "branch_required",
 			"X-Branch-ID header 必填(per-branch 端点的 branch 上下文唯一来源)")
 		return
 	}
@@ -668,7 +668,7 @@ func (h *Handler) SearchProducts(c *gin.Context) {
 	}
 	branchID := middleware.SingleBranchFromCtx(c)
 	if branchID == "" {
-		writeError(c, http.StatusBadRequest, "missing_branch_id",
+		writeError(c, http.StatusBadRequest, "branch_required",
 			"X-Branch-ID header 必填(per-branch 端点的 branch 上下文唯一来源)")
 		return
 	}

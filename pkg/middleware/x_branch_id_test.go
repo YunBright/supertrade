@@ -219,7 +219,7 @@ func TestRequireBranch_MissingHeader(t *testing.T) {
 
 	var body map[string]any
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &body))
-	assert.Equal(t, "missing_branch_id", body["code"])
+	assert.Equal(t, "branch_required", body["code"])
 }
 
 // TestRequireBranch_PresentHeader 通过。

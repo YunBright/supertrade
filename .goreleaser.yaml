@@ -31,6 +31,12 @@
 #       pos/ pos-gateway/ pricing/ procurement/ sales-agg/
 #       fresh-produce/ fresh-meat/ erp-connector/ bi-gateway/
 #       notification-gateway/
+#       fresh-meat/                       ← 2026-10-01 特殊:除二进制外还含 components/
+#         fresh-meat                      ← 二进制
+#         components/                     ← dapr Component(pubsub + conversation)
+#           pubsub.yaml                   ← 由 .goreleaser "files" 块打包
+#           conversation.yaml             ← 由 .goreleaser "files" 块打包
+#         (systemd --resources-path 写死指这里)
 #
 # 端口约定:catalog :8101, inventory :8102, master-data :8103, cube-router :8116;
 # 其它 11 个 binary 默认监听 :8080(其中 pos/pricing/procurement/sales-agg/
@@ -340,6 +346,24 @@ archives:
       - fresh-meat
     wrap_in_directory: false
     name_template: 'apps/fresh-meat/fresh-meat_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+    # 2026-10-01:fresh-meat 额外打包 dapr Component yaml。
+    # 解压后顶层:
+    #   fresh-meat            (binary,deploy-supertrade.ps1 chmod +x 自动识别)
+    #   components/pubsub.yaml
+    #   components/conversation.yaml
+    # 落到 <RemoteDir>/apps/fresh-meat/components/ 下,与 systemd unit
+    # `--resources-path /opt/YunBright/supertrade/apps/fresh-meat/components` 完全对齐。
+    #
+    # 源路径必须放在 `dapr/components/<service>/` 而不是 `apps/<service>/components/` —
+    # deploy-supertrade.ps1:445 写死 `Join-Path $SupertradeDir (Join-Path 'dapr/components' $s)`,
+    # 单服务 deploy 时(`goreleaser build --id fresh-meat`,无 archive 阶段)脚本手工 stage 这条路径。
+    # 与 wechat-bot-manager 的 components 部署模式一致。
+    #
+    # 共享 dapr Configuration(/opt/YunBright/.dapr/config.yaml) 不在此处打包 —
+    # 它由 stocktake / cube-router 等其它 supertrade-* app 部署链路共用,不在 fresh-meat 归档内。
+    files:
+      - src: dapr/components/fresh-meat/*
+        dst: components
 
   - id: "erp-connector"
     format: tar.gz

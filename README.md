@@ -379,7 +379,7 @@ go test ./internal/stocktake/... -run TestSearch     # 单包 / 单 case
 
 | HTTP | code | 含义 |
 |---|---|---|
-| 400 | `bad_request` / `branch_required` / `missing_branch_id` / `missing_param` / `bad_json` | 参数或 header 缺失 |
+| 400 | `bad_request` / `branch_required` / `branch_required` / `missing_param` / `bad_json` | 参数或 header 缺失 |
 | 401 | `unauthenticated` | JWT 缺失或过期 |
 | 403 | `forbidden` | 该用户在当前 branch 无 `xxx:view/manage` scope |
 | 404 | `not_found` / `product_not_found` / `stocktake_header_not_found` / `cube_source_not_configured` / ... | 资源不存在 |
@@ -479,7 +479,7 @@ handler 调用 middleware.SingleBranchFromCtx(c) (单店) / BranchFromCtx(c) (�
 - **禁止**把 `:branch_id` 放 path 里(已重构移除)。
 - **禁止**从 `?branch_id=` query 兜底(已删除)。
 - **禁止**从 `claims.DefaultBranchID` 兜底(已删除)。
-- header 缺失时,由 handler 显式判 `400 missing_branch_id`。
+- header 缺失时,由 handler 显式判 `400 branch_required`。
 
 ---
 

@@ -26,7 +26,7 @@ func (h *Handler) searchProducts(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if branchID == "" {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-			"code":    "missing_branch_id",
+			"code":    "branch_required",
 			"message": "X-Branch-ID header 必填",
 		})
 		return

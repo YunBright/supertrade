@@ -1,0 +1,28 @@
+# local-secret-store 是在服务器上独立的component,所有差异化配置都放在服务器的 secret-store 里,不放在代码仓库里。
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: pubsub
+  namespace: default
+spec:
+  type: pubsub.redis
+  version: v1
+  metadata:
+    - name: redisHost
+      value: "172.12.1.1:6379"
+    - name: redisPassword
+      secretKeyRef:
+        name: redis.password
+        key: redis.password
+    - name: consumerID
+      value: "{appID}"
+    - name: enableDeadLetter
+      value: "true"
+    - name: deadLetterTTL
+      value: "86400"
+    - name: processingTimeout
+      value: "30s"
+    - name: redeliverInterval
+      value: "30s"
+auth:
+  secretStore: local-secret-store
