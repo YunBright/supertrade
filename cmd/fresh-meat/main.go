@@ -8,8 +8,8 @@
 // 数据存储:**只支持 PostgreSQL**。POSTGRES_DSN 必填,缺失直接启动失败。
 // 不提供 SQLite fallback;单元测试用 *_test.go 内部 SQLite(与生产隔离)。
 //
-// 阶段3 集成:dapr go-sdk NewClient + DaprConversationPredictFn(同步调 Conversation API);
-// cube-gateway 客户端(走 cube-router,见 internal/cubehttp)校验 supplier_id。
+// 集成:dapr go-sdk NewClient + DaprConversationPredictFn(同步调 Conversation API);
+// cube 客户端(走 cube-router,见 internal/cubehttp)校验 supplier_id。
 package main
 
 import (
@@ -99,7 +99,7 @@ func initApp() error {
 	appSvc.SetPublisher(pub)
 	slog.Info("dapr publisher enabled")
 
-	// 阶段3 注入 cube 客户端(走 cube-router)。
+	// 注入 cube 客户端(走 cube-router)。
 	cube, err := cubehttp.NewClientFromEnv()
 	if err != nil {
 		return fmt.Errorf("cube client: %w", err)
@@ -107,7 +107,7 @@ func initApp() error {
 	appSvc.SetCubeClient(cube)
 	slog.Info("cube client enabled")
 
-	// 阶段3 注入 Dapr Conversation API predict fn(同步调 LLM)。
+	// 注入 Dapr Conversation API predict fn(同步调 LLM)。
 	daprCli, err := dapr.NewClient()
 	if err != nil {
 		return fmt.Errorf("dapr client: %w (确认 dapr run 已起)", err)
@@ -174,7 +174,7 @@ func registerRoutes(r *gin.Engine) {
 	}
 	// 全局挂 X-Branch-ID 解析中间件(handler 用 SingleBranchFromCtx 读)。
 	r.Use(middleware.XBranchID())
-	// bearer 透传:阶段2+ 接入 userd / cube 后,持 / userinfo.WithBearer 双写,与 stocktake cmd 模式一致。
+	// bearer 透传:与 stocktake cmd 模式一致。
 	r.Use(forwardBearerToOutgoing())
 	h := handler.New(appSvc)
 	h.RegisterRoutes(r)

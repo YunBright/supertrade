@@ -18,8 +18,6 @@
 //	POSTGRES_DSN    必填(只支持 PostgreSQL)
 //	CUBE_CLIENT_MODE = memory(默认,本地)/ dapr(SDK 模式)
 //	CUBE_APP_ID      = "cube-router"   // 默认 (走 cube-router 多源路由)
-//
-// 2026-09 PR 5 重构:跨服务调用经 dapr/go-sdk;无需 DAPR_ENDPOINT。
 package main
 
 import (

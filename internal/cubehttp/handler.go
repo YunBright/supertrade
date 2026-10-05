@@ -56,8 +56,6 @@ type RegisterOptions struct {
 // Register 把选中的路由组注册到 r。
 //
 // 所有路由挂在 r 之下,各 cmd 通常把 r 设成 r.Group("/api/v1")。
-//
-// 2026-09 简化:path 不再有 `:branch_id`,branch 全部走 X-Branch-ID header。
 func (h *Handler) Register(r gin.IRouter, opts RegisterOptions) {
 	if opts.Stock {
 		handlers := []gin.HandlerFunc{}

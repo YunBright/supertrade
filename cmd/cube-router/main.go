@@ -9,11 +9,6 @@
 //
 // 数据存储:**只支持 PostgreSQL**。POSTGRES_DSN 必填,缺失启动失败。
 //
-// 2026-09 PR 5 重构:
-//   - 跨服务调用经 dapr/go-sdk(不再读 DAPR_ENDPOINT)
-//   - dapr.NewClient() 自动从 DAPR_GRPC_PORT 拿 sidecar
-//   - userinfo.New() 同样走 SDK,无 DAPR_ENDPOINT 配置
-//
 // nginx map 加一行:`~^/api/v1/cube-router/  cube-router`(.claude/rules/04-nginx-map.md)。
 //
 // 鉴权:

@@ -96,7 +96,7 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.PUT("/branch-cut-mappings/:id", requireBranch, h.UpdateBranchCutMapping)
 	r.DELETE("/branch-cut-mappings/:id", requireBranch, h.DeleteBranchCutMapping)
 
-	// dapr cron binding 触发(阶段4,deployer 仓加 bindings.cron.yaml)—
+	// dapr cron binding 触发(deployer 仓加 bindings.cron.yaml)—
 	// 走 dapr 自身 cron binding,无 JWT 无 X-Branch-ID;**不挂** requireBranch。
 	r.GET("/cron/daily-reminder", h.CronDailyReminder)
 
@@ -130,12 +130,12 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 //
 // 日终 22:00 推送仓管待办:早盘录入失败 / 销售 / 报损 / 库存不平衡等告警;
 //
-// 阶段4 占位 — 真实清单生成待 BI / sales-agg 接入后实装;
+// 占位 — 真实清单生成待 BI / sales-agg 接入后实装;
 // 本阶段只返 "skipped: all branches covered" 状态(便于 dapr 校验可达)。
 func (h *Handler) CronDailyReminder(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ok":      true,
-		"note":    "阶段4 占位;真实清单生成待 BI 接入后实装",
+		"note":    "占位;真实清单生成待 BI 接入后实装",
 		"trigger": "dapr-cron",
 	})
 }
@@ -326,7 +326,7 @@ func (h *Handler) ListPigCutsByPig(c *gin.Context) {
 // RecordPorkCutsStocktake POST /pork-cuts-stocktake
 //
 // 日终按部位盘点(整店;可选,不阻断销售)。
-// is_complete=true 时 publish pork.cuts.stocktaken(阶段2)。
+// is_complete=true 时 publish pork.cuts.stocktaken。
 func (h *Handler) RecordPorkCutsStocktake(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "freshmeat:write") {

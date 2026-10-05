@@ -1,4 +1,4 @@
-// Package service / gross_margin.go —— 按门店 + 营业日汇总鲜肉毛利(2026-10-01 优化 Stage D)。
+// Package service / gross_margin.go —— 按门店 + 营业日汇总鲜肉毛利。
 //
 // 算法:
 //   per cut:

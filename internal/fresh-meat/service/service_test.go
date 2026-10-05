@@ -1,4 +1,4 @@
-// Package service_test 是 fresh-meat 服务的单元测试(阶段1)。
+// Package service_test 是 fresh-meat 服务的单元测试。
 //
 // 用 SQLite in-memory + 一个 recording publisher 验证:
 //   - 5 张表 CRUD 正确性
@@ -128,7 +128,7 @@ func TestRecordWholePig_OK_PurchaseCostPrecision(t *testing.T) {
 	if !pig.PurchaseCostYuan.Equal(d("11536.00")) {
 		t.Errorf("purchase_cost = %s, want 11536.00", pig.PurchaseCostYuan)
 	}
-	// 阶段3 起默认 predictFn = defaultPredictFn → data_source 应为 history_avg
+	// 默认 predictFn = defaultPredictFn → data_source 应为 history_avg
 	// (单测没注入真 LLM,降级路径必触发;`stub` 语义在 production 已不可达)。
 	if pig.DataSource != model.DataSourceHistoryAvg {
 		t.Errorf("data_source = %q, want history_avg(单测无 LLM,降级路径)", pig.DataSource)
@@ -137,7 +137,7 @@ func TestRecordWholePig_OK_PurchaseCostPrecision(t *testing.T) {
 		t.Errorf("id 前缀应是 WP, got %q", pig.ID)
 	}
 	if len(pub.calls) != 0 {
-		t.Errorf("阶段1 不应发任何事件, got %d calls", len(pub.calls))
+		t.Errorf("RecordWholePig 不应发任何事件, got %d calls", len(pub.calls))
 	}
 }
 
@@ -507,7 +507,7 @@ func TestEventPayload_NoTenantID(t *testing.T) {
 	}
 }
 
-// ---- OnSaleCompleted 阶段2 新增 ----
+// ---- OnSaleCompleted 测试 ----
 
 // seedPigForSaleTests 录一头猪 + 配一个 belly 映射(为 resolvePigByCubeProduct 准备)。
 func seedPigForSaleTests(t *testing.T, svc *service.Service) model.WholePig {

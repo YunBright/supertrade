@@ -1,7 +1,5 @@
 // Package service / stocktake_calc.go —— 服务端计算 expected_remain_kg_by_cut。
 //
-// 阶段4 实装完整盘点路径(2026-10-01 优化):
-//
 //   expected_remain_kg_by_cut
 //     = opening(昨夜库存结转) + 入库(whole_pig + pig_cuts) - 已销(line_sales_by_pig) - 报损(waste_logs)
 //

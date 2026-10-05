@@ -1,7 +1,7 @@
 // Package service 实现 fresh-meat 服务的业务逻辑(fresh-meat)。
 //
 // 关键设计(REQUIREMENTS §4 / DESIGN §6):
-//   - 早盘整猪录入(一头一行)+ 同步调 LLM 推演预期分割(阶段3 起接入;阶段1 stub)
+//   - 早盘整猪录入(一头一行)+ 同步调 LLM 推演预期分割
 //   - 白天单品补录(pig_cuts)+ POS 销售事件本地聚合(line_sales_by_pigs)
 //   - 日终按部位盘点(整店,可选,不阻断销售)
 //   - 报损走 fresh_meat.waste_log(同 fresh-produce 流程)
@@ -9,15 +9,7 @@
 //
 // 状态机:本服务**无状态机**。盘点只记 "是否完整(is_complete)",不冻单。
 //
-// 阶段说明:
-//   - 阶段1(本版本):CRUD + DB 写 + 数据校验;LLM stub(data_source="stub");
-//     events noop(publisher 未注入)
-//   - 阶段2:发 pork.cuts.stocktaken / waste.log.recorded;订阅 sale.completed;
-//     落 line_sales_by_pig
-//   - 阶段3:调 Dapr Conversation API 替换 stub;Cube supplier 校验
-//   - 阶段4:日终完整路径(cube + line_sales + waste_log 三方聚合 expected_remain_kg)
-//
-// 时区口径(2026-10-01 优化):营业日界按门店本地时区(默认 Asia/Shanghai, UTC+8),
+// 时区口径:营业日界按门店本地时区(默认 Asia/Shanghai, UTC+8),
 // 4:30 北京时间进场的猪落进"今日"窗口而非 UTC 前一天。Env FRESHMEAT_BIZ_TZ 可覆盖。
 package service
 
@@ -46,19 +38,19 @@ import (
 //
 // 字段:
 //   - db:PG 连接(GORM)
-//   - cube:cube-gateway 客户端(阶段3 注入;阶段1 为 nil,RecordWholePig 跳过 supplier 校验)
-//   - publisher:pub/sub 广播(阶段2 注入 DaprPublisher;阶段1 nil = noop)
+//   - cube:cube-gateway 客户端(可 nil,RecordWholePig 跳过 supplier 校验)
+//   - publisher:pub/sub 广播(可 nil,启用 = DaprPublisher)
 //   - userInfo:per-branch effective scopes 校验客户端(可 nil,HasEffectiveScope 返 ErrUserInfoUnavailable)
 //   - scopeCache + scopeMu + scopeTTL:effective scopes 60s 缓存
-//   - predictFn:LLM 预测函数(默认 history_avg 降级;阶段3 注入 Dapr Conversation API)
+//   - predictFn:LLM 预测函数(默认 history_avg 降级;SetPredictFn 注入 Dapr Conversation API)
 type Service struct {
 	db        *gorm.DB
-	cube      CubeClient // 阶段3 注入,阶段1 可 nil
+	cube      CubeClient // 可 nil
 	publisher Publisher  // nil = 禁用 pub/sub 广播
 	userInfo  *userinfo.Client
 	pubLogger *slog.Logger
 	now       func() time.Time
-	predictFn PredictFn // 阶段3 覆盖为 DaprConversationPredictFn
+	predictFn PredictFn // SetPredictFn 覆盖
 	bizTZ     *time.Location // 营业日界时区(默认 Asia/Shanghai UTC+8)
 
 	scopeMu    sync.RWMutex
@@ -68,7 +60,7 @@ type Service struct {
 
 // CubeClient 是 cube-gateway 客户端的最小抽象(便于单测注入 mock)。
 //
-// 阶段3 改为 *cubeclient.Client;SearchSuppliers 用于 supplier_id 校验。
+// SearchSuppliers 用于 supplier_id 校验。
 type CubeClient interface {
 	SearchSuppliers(ctx context.Context, query string, limit int) ([]cubeclient.SupplierDTO, error)
 }
@@ -82,9 +74,9 @@ type scopeCacheEntry struct {
 // defaultScopeTTL 是 effective scopes 缓存的默认 TTL。
 const defaultScopeTTL = 60 * time.Second
 
-// New 构造 Service(阶段1)。
+// New 构造 Service。
 //
-// db 是 PG 连接(GORM);cube / predictFn 在阶段3 注入(SetCubeClient / SetPredictFn)。
+// db 是 PG 连接(GORM);cube / predictFn 通过 SetCubeClient / SetPredictFn 注入。
 // bizTZ 默认 Asia/Shanghai(UTC+8);通过 SetBizTZ 覆盖。
 func New(db *gorm.DB) *Service {
 	return &Service{
@@ -181,12 +173,12 @@ var (
 
 // ---- 整猪录入(RecordWholePig) ----
 
-// RecordWholePig 录入一头猪 + 同步调 LLM(阶段3 接入;阶段1 stub)。
+// RecordWholePig 录入一头猪 + 同步调 LLM。
 //
-// 阶段1 行为:DB insert + data_source="stub"。
-// 阶段3 行为:DB insert → 调 s.predictFn(pig, history) →
+// 流程:DB insert → 调 s.predictFn(pig, history) →
 //   - 成功 → UPDATE whole_pig SET llm_advice_json=?, data_source='llm'
 //   - 失败 / 超时 → 走 history_avg 兜底(UPDATE data_source='history_avg')
+//
 // **失败不视为业务错误**:返 200 + data_source=history_avg 给仓管。
 func (s *Service) RecordWholePig(ctx context.Context, branchID string, in model.RecordWholePigInput, operatorID string) (*model.WholePig, error) {
 	if branchID == "" {
@@ -211,7 +203,7 @@ func (s *Service) RecordWholePig(ctx context.Context, branchID string, in model.
 		return nil, fmt.Errorf("%w: arrived_at 必填", ErrInvalidInput)
 	}
 
-	// 阶段3 supplier_id 校验:调 cube.SearchSuppliers 拿前 1 个 supplier,
+	// supplier_id 校验(需注入 cube client):调 cube.SearchSuppliers 拿前 1 个 supplier,
 	// 若 ID 不匹配 → ErrInvalidInput。
 	if s.cube != nil {
 		if err := s.validateSupplierID(ctx, in.SupplierID); err != nil {
@@ -243,7 +235,7 @@ func (s *Service) RecordWholePig(ctx context.Context, branchID string, in model.
 		return nil, fmt.Errorf("create whole_pig: %w", err)
 	}
 
-	// 阶段3:查近 30 天 ±10% 重量段历史 + 调 LLM。
+	// 查近 30 天 ±10% 重量段历史 + 调 LLM。
 	history := s.findHistoryPigs(ctx, branchID, in.GrossWeightKg, in.ArrivedAt)
 	result, predictErr := s.predictFn(ctx, pig, history)
 	if predictErr != nil {
@@ -330,7 +322,7 @@ func (s *Service) findHistoryPigs(ctx context.Context, branchID string, grossKg 
 //   - pig.branch_id == branchID(防跨店)
 //   - (branch_id, cut_type) 已在 branch_cut_mapping 配置(防止未知 SKU)
 //
-// 阶段1 不发事件;阶段2 仍不发(line_sales_by_pig 由 sale.completed 落)。
+// 不发事件;line_sales_by_pig 由 sale.completed 落。
 func (s *Service) RecordPigCut(ctx context.Context, branchID string, in model.RecordPigCutInput, operatorID string) (*model.PigCut, error) {
 	if branchID == "" {
 		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
@@ -397,7 +389,7 @@ func (s *Service) RecordPigCut(ctx context.Context, branchID string, in model.Re
 //   - cut_type:必须在 12 类枚举内
 //   - actual_remain_kg:>= 0
 //
-// 阶段4 完整路径:
+// 日终完整路径:
 //   - 服务端调用 computeExpectedRemainKgByCut 算 expected_per_cut(含昨夜 opening + waste)
 //   - 把 expected_per_cut 按 caller actual 占比摊销到每 SKU(per-SKU expected)
 //   - 计算 variance = actual - expected(per-SKU)
@@ -548,13 +540,11 @@ func openingStringMap(in map[model.CutType]decimal.Decimal) map[string]decimal.D
 
 // ---- 报损(RecordWasteLog) ----
 
-// RecordWasteLog 录入报损(2026-10-01 优化:DB 持久化 + 事件双发)。
+// RecordWasteLog 录入报损。
 //
-// 阶段1 旧:仅 publish,DB 不写(丢数据)。
-// 当前行为:
-//   - Tx:INSERT waste_logs → publish waste.log.recorded;任一失败全滚;
-//   - 字段:log_id / branch_id / pig_id(可空)/ cut_type(可空)/ cube_product_id(可空)/
-//     qty_kg / reason / recorded_at / operator_id。
+// Tx:INSERT waste_logs → publish waste.log.recorded;任一失败全滚。
+// 字段:log_id / branch_id / pig_id(可空)/ cut_type(可空)/ cube_product_id(可空)/
+// qty_kg / reason / recorded_at / operator_id。
 //   - 本仓内表 `fresh_meat.waste_logs`(9 字段 + 时间)由 AutoMigrate 建。
 //
 // 验参:branch_id / operator_id / qty_kg > 0 / reason 非空 / cut_type(若填)Valid。
@@ -717,7 +707,7 @@ func (s *Service) GetPorkCutsStocktake(_ context.Context, branchID, stocktakeID 
 
 // ListLineSalesByPig 查某 pig / 某 cut_type 的销售聚合。
 //
-// 阶段1 不实装(返回空);阶段2 由 OnSaleCompleted 落 line_sales_by_pig 后启用。
+// 由 OnSaleCompleted 落 line_sales_by_pig 后启用。
 func (s *Service) ListLineSalesByPig(_ context.Context, branchID, pigID string, _ *model.CutType, _, _ time.Time) ([]model.LineSalesByPig, error) {
 	if branchID == "" {
 		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
@@ -746,7 +736,7 @@ func (s *Service) ListBranchCutMappings(_ context.Context, branchID string) ([]m
 
 // CreateBranchCutMapping 新建 (branch, cut_type) → cube_product_id 映射。
 //
-// UNIQUE 冲突 → ErrBranchCutMappingConflict。阶段3 接 cube 校验 cube_product_id 存在。
+// UNIQUE 冲突 → ErrBranchCutMappingConflict。cube 校验 cube_product_id 存在。
 func (s *Service) CreateBranchCutMapping(_ context.Context, branchID string, in model.CreateBranchCutMappingInput) (*model.BranchCutMapping, error) {
 	if branchID == "" {
 		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)

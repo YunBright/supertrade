@@ -3,7 +3,7 @@
 // Dapr sidecar 调 GET /dapr/subscribe 拿订阅清单,然后对每个订阅 topic
 // POST /events/<topic> 推送 CloudEvents。
 //
-// 本服务订阅 2 个 topic(阶段2):
+// 本服务订阅 2 个 topic:
 //
 //   - auth.user.access_changed:合并 events,取代旧的 permissions_changed。
 //     payload 含 user_id(必填)+ branch_id(可选,缺省清空 user 全部缓存)。

@@ -5,10 +5,6 @@
 //  2. svc.ResolveCubeSource(branchID) → cube_source_name(可能 404 / 503)
 //  3. 透传 gin request body → dapr service invocation → 透传 response
 //
-// 2026-09 PR 5 重构:用 dapr/go-sdk 的 client.InvokeMethodWithContent 完成转发。
-// 不再手拼 URL、不再 req.Header.Set("Authorization", ...);JWT 透传走
-// outgoing gRPC metadata "authorization",sidecar 自动转 HTTP Authorization 头。
-//
 // 为什么不复用 cubeclient.DaprCubeClient.LoadCubeQuery:
 //   - 它要求 CubeQuery 结构(measures/dimensions 字段),会改写 body shape
 //   - cube /v1/load 实际接受任意 JSON(measures/dimensions/filters/limit/...)

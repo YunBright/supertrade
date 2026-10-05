@@ -396,7 +396,7 @@ fresh-meat 启动期 `AutoMigrate` 自动建:`whole_pigs` / `pig_cuts` / `pork_c
 | 文件 / 目录 | 改动 | 备注 |
 |---|---|---|
 | `deployer/apps/fresh-meat/components/pubsub.yaml` | **新增**(必需) | 见 §1.5.1 |
-| `deployer/apps/fresh-meat/components/conversation.yaml` | **新增**(必需) | 见 §1.5.2;endpoint 指向内部 LLM 网关 |
+| `deployer/apps/fresh-meat/components/conversation.yaml` | **新增**(必需) | 见 §1.5.2;endpoint 指向外部 LLM 服务(本仓已无内部 LLM 网关;`llm-gw` 占位 cmd 于 2026-09-29 删除) |
 | `deployer/.dapr/config.yaml`(or apps/fresh-meat/components/config.yaml) | **新增**(强烈推荐) | 见 §1.5.3;现成的 `dapr/baiyuan-config.yaml` 可参考 |
 | `deployer/nginx/yun-bright.conf` | **不动** | `<app>` 段无变 |
 | `deployer/systemd/supertrade-fresh-meat.service` | 已存在,无需动 | `--resources-path` 与 `--config` 路径已正确 |

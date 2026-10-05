@@ -11,11 +11,6 @@
 //
 // 数据存储:**只支持 PostgreSQL**。POSTGRES_DSN 必填,缺失直接启动失败。
 // 不提供 SQLite fallback;单元测试用 *_test.go 内部 SQLite(与生产隔离)。
-//
-// 2026-09 PR 5 重构:
-//   - 跨服务调用经 dapr/go-sdk(DaprCubeClient + DaprPublisher);无需 DAPR_ENDPOINT
-//   - dapr.NewClient() 自动从 DAPR_GRPC_PORT 拿 sidecar;dapr run 自动注入
-//   - publisher fail-fast: dapr.NewClient() 失败 → 启动直接退出非 0
 package main
 
 import (

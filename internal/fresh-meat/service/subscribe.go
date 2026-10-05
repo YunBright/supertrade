@@ -1,10 +1,10 @@
 // Package service / subscribe.go —— Dapr pub/sub 订阅回调实现。
 //
-// 监听领域(阶段2):
+// 监听领域:
 //   - sale.completed   → OnSaleCompleted 落 line_sales_by_pig
 //   - auth.user.access_changed → OnAccessChanged 失效 scope cache(已在 service.go 实现)
 //
-// 关键设计(2026-10-01 优化):
+// 关键设计:
 //   - 只对 fresh_type=meat 的行落 line_sales_by_pig(produce 行丢弃,非本仓职责)。
 //   - 退货 R 行(负 qty/amount):POS 已自翻符号,本服务直存 OrderStatus="R";毛利计算时排除。
 //   - line 缺 pig_id 但有 cube_product_id 时,新规则 resolvePigForSaleLine:

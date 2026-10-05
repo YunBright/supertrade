@@ -4,13 +4,9 @@
 // 把事件发给 pubsub component(默认 Redis Streams;notification-gateway 通过
 // /dapr/subscribe 订阅)。
 //
-// 2026-09 切到 dapr/go-sdk:不再读 DAPR_ENDPOINT,SDK 自动从 DAPR_GRPC_PORT
-// (默认 :50001) 拿 sidecar 地址;sidecar 自动跨主机寻址 + 跨 app-id 转发。
-//
 // 失败处理:
-//   - dapr.NewClient() 失败 → 启动期 fail-fast:publisher 不可用会让事件丢失,
-//     但 fresh-meat 主要业务(早盘录入)不依赖发事件(stocktake 依赖 access_changed 订阅)。
-//     阶段1 main.go 可不调 NewDaprPublisherFromEnv;阶段2 必须调以发 pork.cuts.stocktaken。
+//   - dapr.NewClient() 失败 → 启动期 fail-fast:fresh-meat 业务不依赖发事件,
+//     失败仅 log,不影响早盘录入。
 //   - Publish 失败 → 返 error,service.publish 内部 log;dapr sidecar 内部重试机制独立。
 package service
 
@@ -32,9 +28,6 @@ type DaprPublisher struct {
 // NewDaprPublisherFromEnv 构造 publisher(失败则返 error,caller 应启动失败)。
 //
 //	DAPR_PUBSUB = "pubsub"   // 默认
-//
-// dapr.NewClient() 自动从 DAPR_GRPC_PORT 拿 sidecar 地址(默认 :50001),
-// 无需 DAPR_ENDPOINT 环境变量。
 func NewDaprPublisherFromEnv() (*DaprPublisher, error) {
 	cli, err := dapr.NewClient()
 	if err != nil {

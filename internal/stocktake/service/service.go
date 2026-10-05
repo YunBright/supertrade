@@ -974,10 +974,9 @@ func sortReasonAggs(aggs []model.ReasonAgg) {
 //
 // 格式保持 ST 开头 + 8 位日期 + 8 位 hex 随机 = 18 字符,远小于 varchar(64)。
 // 随机后缀用 crypto/rand(非 math/rand),保证跨进程、跨重启无碰撞倾向。
-//
-// 历史 bug:旧实现 headerIDSeq 是进程内 atomic counter,服务重启后归零 → 同日两次 deploy
-// 必撞 pkey(unique constraint violation)。这里换成随机后缀彻底解决。
 // 同日 ~10k 张单碰撞概率 ~10^-5;若未来真出现同日万级量,再换 crypto/rand 12 位或 UUID。
+//
+// crypto/rand:旧 atomic counter 重启会撞 pkey。
 func generateHeaderID(now time.Time) string {
 	var b [4]byte
 	if _, err := cryptorand.Read(b[:]); err != nil {

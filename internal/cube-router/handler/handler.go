@@ -35,10 +35,6 @@ import (
 //
 // 持有 svc(业务逻辑)+ daprClient(dapr/go-sdk gRPC client,转发到 cube instance)
 // + users(userd 客户端,scope 守门用)+ logger。
-//
-// 2026-09 PR 5 重构:删 daprEndpoint 字段;改 daprClient (dapr.Client 接口),
-// 由 caller 在 OnStart 期 dapr.NewClient() 构造,handler 调
-// daprClient.InvokeMethodWithContent 完成转发,不再手拼 URL。
 type Handler struct {
 	svc        *service.Service
 	users      *userinfo.Client

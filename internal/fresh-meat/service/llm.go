@@ -6,16 +6,9 @@
 //       └─ 失败 / 超时 → fallbackToHistoryAvg → update whole_pig llm_advice_json + data_source = "history_avg"
 //
 //   - **失败不视为业务错误**:返回 200 给仓管,data_source 标注降级来源。
-//     这是用户决策 2026-10-01:不返 5xx,业务照常。
-//   - 默认 PredictFn 是 "history_avg"(类似 stub);生产注入 DaprConversationPredictFn。
+//   - 默认 PredictFn 是 "history_avg";生产注入 DaprConversationPredictFn。
 //   - ConvName 默认 "conversation";env FRESHMEAT_CONVERSATION 覆盖。
 //   - LLMTimeout 默认 30s;env FRESHMEAT_LLM_TIMEOUT 覆盖。
-//
-// Dapr 1.18 Conversation API:
-//   - sidecar 组件名 `conversation`(env DAPR_CONVERSATION_COMPONENT 可改)
-//   - Go SDK 1.15.0: dapr.Client.ConverseAlpha1(ctx, req, options...)
-//   - 但 SDK 的 conversationRequest 类型**未导出**,无法跨包引用;
-//     此处用一个窄接口 LLMClient.Predict() 抽象,生产实现内部封装 dapr.Client。
 package service
 
 import (
@@ -59,8 +52,8 @@ type PredictFn func(ctx context.Context, pig *model.WholePig, history []model.Wh
 
 // defaultPredictFn 是 service.New() 后默认的 predictFn(返回 history_avg 结果)。
 //
-// 阶段1 骨架阶段不接 LLM,直接走 history_avg 兜底;
-// 阶段3 真实接入 Dapr Conversation API 时由 main.go 调 SetPredictFn 覆盖。
+// 默认不走 LLM,直接走 history_avg 兜底;真实接入 Dapr Conversation API 时
+// 由 main.go 调 SetPredictFn 覆盖。
 func defaultPredictFn(_ context.Context, pig *model.WholePig, history []model.WholePig) (*LLMResult, error) {
 	cuts, raw, err := fallbackToHistoryAvg(pig, history)
 	if err != nil {
@@ -87,7 +80,7 @@ func fallbackToHistoryAvg(pig *model.WholePig, history []model.WholePig) ([]Pred
 		return nil, raw, nil
 	}
 
-	// 简化:阶段1 暂未接 cube 的历史 pig_cuts 聚合,直接透传;真正接 cube 后,
+	// 简化:暂未接 cube 的历史 pig_cuts 聚合,直接透传;真正接 cube 后,
 	// 这里会按 cut_type × 重量段聚合,缩放到本次 gross_kg。
 	raw, err := json.Marshal(map[string]any{
 		"cuts":          []any{},
@@ -100,7 +93,7 @@ func fallbackToHistoryAvg(pig *model.WholePig, history []model.WholePig) ([]Pred
 	return nil, raw, nil
 }
 
-// ---- Dapr Conversation API 真实接入(阶段3) ----
+// ---- Dapr Conversation API 真实接入 ----
 
 // DaprConversationPredictFn 构造生产用 PredictFn。
 //
@@ -216,7 +209,7 @@ func (s *Service) SetPredictFn(fn PredictFn) {
 	s.predictFn = fn
 }
 
-// SetCubeClient 注入 cube client(阶段3 supplier_id 校验)。
+// SetCubeClient 注入 cube client(supplier_id 校验)。
 func (s *Service) SetCubeClient(c CubeClient) {
 	if c == nil {
 		return
@@ -224,7 +217,7 @@ func (s *Service) SetCubeClient(c CubeClient) {
 	s.cube = c
 }
 
-// 静默引用 os(为 env 读取预留,阶段3 部署同步时启用)。
+// 静默引用 os(为 env 读取预留)。
 var _ = os.Getenv
 
 // 静默引用 time.Duration(为 timeout 配置预留)。

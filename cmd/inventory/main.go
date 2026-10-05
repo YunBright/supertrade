@@ -5,8 +5,8 @@
 // 本期定位(REQUIREMENTS §7.5 / DESIGN §3):
 //
 //	inventory 是 cube stock 的**转发 / 聚合 / 短期缓存**出口。
-//	**不维护库存表**,所有读走 cube-gateway /v1/load;写入(出入库)本期不实现,
-//	留待 Phase 2 与 erp-connector / pos 联动。
+//	**不维护库存表**,所有读走 cube-router /v1/load(cube-router 按 X-Branch-ID
+//	路由到具体 cube 实例);写入(出入库)本期不实现,留待 Phase 2 与 erp-connector / pos 联动。
 //
 // 端口分配见 cmd/catalog/main.go 注释。
 //
@@ -14,8 +14,6 @@
 //
 //	CUBE_CLIENT_MODE = memory(默认)/ dapr(SDK 模式,经 dapr sidecar 调 cube-router / cube-gateway)
 //	CUBE_APP_ID      = "cube-router"   // 默认 (走多源路由);改 "cube-gateway" 直连
-//
-// 2026-09 PR 5 重构:跨服务调用经 dapr/go-sdk;无需 DAPR_ENDPOINT。
 package main
 
 import (

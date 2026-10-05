@@ -15,7 +15,7 @@
 //     trotter / liver / intestine / heart / lung / kidney / stomach
 //   - whole_pig 加 3 字段:half_pig / offal_included / purchase_group_id(场景一/二/三区分)
 //   - whole_pig.llm_advice_json 是 jsonb,字段实际写入时由 service 在 insert 后调
-//     Dapr Conversation API(见 service/llm.go)同步写入;阶段阶段1 留空。
+//     Dapr Conversation API(见 service/llm.go)同步写入;默认 predictFn 不接 LLM 时留空。
 //   - line_sales_by_pig 用于 POS sale.completed 中 fresh_type=meat 行的本地聚合宽表,
 //     含 unit_price_yuan 供毛利计算;order_status 区分 S/R(退货 R 行 qty/amount 直存负数)。
 //   - waste_logs 表报损持久化(避免 dapr 失败丢数据)。
@@ -74,7 +74,7 @@ type DataSource string
 const (
 	DataSourceLLM        DataSource = "llm"         // 由 Dapr Conversation API 同步返回
 	DataSourceHistoryAvg DataSource = "history_avg" // LLM 失败/超时降级:近 30 天 ±10% 重量段均值
-	DataSourceStub       DataSource = "stub"        // 阶段1 骨架用;阶段3 起 LLM 真接后不再出现
+	DataSourceStub       DataSource = "stub"        // 骨架占位;LLM 真实接入后不再使用
 )
 
 // ---- 表1:whole_pig ----
@@ -82,7 +82,7 @@ const (
 // WholePig 整猪录入(早盘,一头一行)。
 //
 // 主键格式:`WP<yyyymmdd><8-hex random>`,由 service.RecordWholePig 生成。
-// LLMAdviceJSON 同步调 Dapr Conversation API(阶段3)后写入;阶段1 留 NULL + DataSourceStub。
+// LLMAdviceJSON 同步调 Dapr Conversation API 后写入;predictFn 未注入或失败时留 NULL + DataSourceStub。
 // BranchID 录入后不可改;ArrivedAt 索引 (branch_id, arrived_at) 便于按门店按日查。
 type WholePig struct {
 	ID                    string          `gorm:"primaryKey;column:id;type:varchar(64)" json:"id"`
@@ -136,7 +136,7 @@ func (PigCut) TableName() string { return "pig_cuts" }
 //
 // 粒度:branch_id + taken_at(日);不是一头猪一行,而是按 cut_type 一行。
 // IsComplete 决定 BI 标注(✓ 已盘点 / ⚠ 未盘点 数据为推演)。
-// Cuts JSONB 数组:CutSnapshot;LLMReviewJSON 由阶段4 日终反推后写入。
+// Cuts JSONB 数组:CutSnapshot;LLMReviewJSON 由日终反推后写入。
 type PorkCutsStocktake struct {
 	ID            string         `gorm:"primaryKey;column:id;type:varchar(64)" json:"id"`
 	BranchID      string         `gorm:"column:branch_id;type:varchar(64);not null;index:idx_branch_taken,priority:1" json:"branch_id"`
@@ -171,7 +171,7 @@ type CutSnapshot struct {
 // UNIQUE(branch_id, pos_line_id) — 同一 pos_line 二次投递 idempotent (do nothing)。
 // SaleDate 是 datatypes.Date(只存日期部分),不存时分秒,与 BI 按日聚合对齐。
 // CubeProductID 是冗余(sale.completed 可能不含 cube product id;从 branch_cut_mapping 补) ,
-// 阶段2 实现时由 OnSaleCompleted 写入。
+// 由 OnSaleCompleted 写入。
 // UnitPriceYuan 从 sale.completed.unit_price_yuan 直接拷贝,供后续 per-SKU 单价 / 毛利计算。
 // OrderStatus "S"=销售 "R"=退货;POS 已自翻符号(负 qty/amount);毛利计算时 R 行不进 revenue。
 type LineSalesByPig struct {

@@ -2,7 +2,7 @@
 //
 // DaprCubeClient 经 github.com/dapr/go-sdk 的 dapr.Client 调 cube /v1/load。
 //
-// 推荐配置 (2026-09 PR 5 后,SDK 模式):
+// 推荐配置:
 //   CUBE_APP_ID = "cube-router"        // 走 cube-router 多源路由 (默认)
 //              = "cube-gateway"        // 直连 cube-gateway (历史 fallback)
 //              = "sixun-hbposv7"       // 直连具体实例,跳过 gateway
@@ -20,12 +20,6 @@
 //     ctx := authctx.WithBearer(c.Request.Context(), c.Request.Header.Get("Authorization"))
 //     appSvc.SearchProducts(ctx, ...)
 //   LoadCubeQuery 内部自动 ctx.Value(bearerCtxKey) 取出并塞 gRPC metadata。
-//
-// 2026-09 重构对比旧 http_client.go:
-//   - 不再读 DAPR_ENDPOINT(SDK 自动从 DAPR_GRPC_PORT 拿 :50001)
-//   - 不再手拼 /v1.0/invoke/<app-id>/method/v1/load URL
-//   - 不再 http.Client + req.Header.Set("Authorization", ...)
-//   - 由 dapr.Client.InvokeMethodWithContent 完成所有上述工作
 package cubeclient
 
 import (
