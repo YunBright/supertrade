@@ -6,8 +6,8 @@ import (
 	"errors"
 	"testing"
 
-	dapr "github.com/dapr/go-sdk/client"
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	dapr "github.com/dapr/go-sdk/client"
 	"github.com/shopspring/decimal"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -60,16 +60,19 @@ func newFakeClient(fn func(ctx context.Context, appID, method, verb string, cont
 			return fakeResp(st, data)
 		},
 	}
-	return cubeclient.NewDaprCubeClient(fake, "cube-gateway")
+	// app-id 与路径必须成对:这里用 cube-router 拓扑(superttrade cube-router + /v1/load)。
+	return cubeclient.NewDaprCubeClient(fake, "supertrade-cube-router", "v1/load")
 }
 
 // ---- GetProduct ----
 
 func TestDaprCubeClient_GetProduct_OK(t *testing.T) {
 	c := newFakeClient(func(_ context.Context, appID, method, verb string, content *dapr.DataContent) (int, []map[string]any, error) {
-		if appID != "cube-gateway" {
-			t.Errorf("appID = %q, want cube-gateway", appID)
+		if appID != "supertrade-cube-router" {
+			t.Errorf("appID = %q, want supertrade-cube-router", appID)
 		}
+		// supertrade-cube-router 只注册 POST /v1/load;query 是 cube 语义层 app 的路由。
+		// 拿错路径会稳定 404,并被误分类成"商品不存在"。
 		if method != "v1/load" || verb != "POST" {
 			t.Errorf("method=%q verb=%q, want v1/load POST", method, verb)
 		}
@@ -160,6 +163,52 @@ func TestDaprCubeClient_GetStock_CrossBranchBlocked(t *testing.T) {
 	_, err := c.GetStock(context.Background(), "S002", "P-1003")
 	if !errors.Is(err, cubeclient.ErrStockNotFound) {
 		t.Errorf("跨店阻断应报 ErrStockNotFound, got %v", err)
+	}
+}
+
+// 回归锁(2026-10-08 用户现场故障):盘点新增明细报
+// 「该分店下的商品 stock 不存在(疑似跨店盘点): branch_id=00 product_id=6957583900828」,
+// 而该商品在本店实际有 261 件库存。
+//
+// 根因:查询里带了 stock.branch_id 过滤,拿 supertrade 的 branch_id("00")
+// 去比 cube 的 stock.branch_id —— 后者存的是思迅 branch_no(实测 "0001"),
+// 两套编码毫无关系(业务方确认必须忽略 branch_no),于是永远匹配不上。
+//
+// 门店隔离靠 X-Branch-ID → cube-router → 该门店专属 cube 实例,不是靠这个维度。
+// 这里断言:stock 查询里**不得**出现任何 stock.branch_id 过滤。
+func TestDaprCubeClient_GetStock_MustNotFilterOnCubeBranchID(t *testing.T) {
+	var body cubeclient.CubeQuery
+	c := newFakeClient(func(_ context.Context, _, _, _ string, content *dapr.DataContent) (int, []map[string]any, error) {
+		if err := json.Unmarshal(content.Data, &body); err != nil {
+			t.Fatalf("decode query body: %v", err)
+		}
+		return 200, []map[string]any{
+			{
+				"stock.product_id":     "6957583900828",
+				"stock.branch_id":      "0001", // 思迅 branch_no,故意给一个不相关的值
+				"stock.total_quantity": 261,
+				"stock.avg_cost":       3.2,
+			},
+		}, nil
+	})
+
+	snap, err := c.GetStock(context.Background(), "00", "6957583900828")
+	if err != nil {
+		t.Fatalf("GetStock 应成功(库存存在), got %v", err)
+	}
+
+	// 关键断言:不得用思迅 branch_no 那一列做过滤。
+	for _, f := range body.Filters {
+		if f.Member == "stock.branch_id" {
+			t.Errorf("stock 查询不得按 stock.branch_id 过滤(那是思迅 branch_no,值 %v,与 branch_id 无关)", f.Values)
+		}
+	}
+	if !snap.Quantity.Equal(decimal.NewFromInt(261)) {
+		t.Errorf("quantity = %s, want 261", snap.Quantity)
+	}
+	// BranchID 必须是本系统的 branch_id,不能把思迅的 0001 泄漏出去。
+	if snap.BranchID != "00" {
+		t.Errorf("BranchID = %q, want \"00\"(本系统 branch_id,不得填思迅 branch_no)", snap.BranchID)
 	}
 }
 

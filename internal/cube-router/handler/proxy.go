@@ -7,8 +7,13 @@
 //
 // 为什么不复用 cubeclient.DaprCubeClient.LoadCubeQuery:
 //   - 它要求 CubeQuery 结构(measures/dimensions 字段),会改写 body shape
-//   - cube /v1/load 实际接受任意 JSON(measures/dimensions/filters/limit/...)
 //   - 这里保留调用方原 body,避免协议耦合与字段丢失
+//
+// 出口方法名是 query 而不是 v1/load:
+//   cube 侧 cube app 只注册了 POST /query + GET /healthz;cube-gateway 也只注册
+//   /register /unregister /v1/source/:source/load /v1/sources /healthz,并且
+//   gateway 调上游同样走 /query。整条链路上没有任何服务提供 v1/load,
+//   原先转发 v1/load 会稳定拿到 404。
 package handler
 
 import (
@@ -76,14 +81,22 @@ func (h *Handler) rawForward(c *gin.Context, cubeSourceName string, body []byte)
 	ctx, cancel := context.WithTimeout(ctx, invokeTimeout)
 	defer cancel()
 
-	resp, err := h.daprClient.InvokeMethodWithContent(ctx, cubeSourceName, "v1/load", "POST",
+	resp, err := h.daprClient.InvokeMethodWithContent(ctx, cubeSourceName, cubeQueryMethod, "POST",
 		&dapr.DataContent{ContentType: "application/json", Data: body})
 	if err != nil {
-		// dapr SDK 把 sidecar 端 HTTP 4xx/5xx 转 gRPC status error;
-		// 这里统一按 cube_unavailable 502 暴露(保持原行为)。
-		c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
-			"code":    "cube_unavailable",
-			"message": err.Error(),
+		// dapr SDK 把 sidecar 端 HTTP 4xx/5xx 转 gRPC status error。
+		//
+		// 关键:404 必须显式区分。cube app 返回 404 = "这个 query 查不到数据"是**业务结论**,
+		// 但 "方法名写错 / source 没注册 / 路由没命中" 也是 404,且属于基础设施故障。
+		// 两者混在一起,上层就无法区分"商品不存在"和"链路坏了"——
+		// 原先的错误坍缩链就是:
+		//   cube 404 → gRPC NotFound → ErrCubeNotFound → ErrProductNotFound → 200 [] →
+		//   Flutter 显示「本门店没有条码 XXX 的商品」
+		// 把基础设施故障显示成业务结论,是比 502 更糟的失败模式。
+		code, status, msg := classifyInvokeError(err)
+		c.AbortWithStatusJSON(status, gin.H{
+			"code":    code,
+			"message": msg,
 		})
 		return
 	}

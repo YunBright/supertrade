@@ -23,6 +23,7 @@ import (
 	"net/http"
 
 	"github.com/YunBright/supertrade/internal/fresh-meat/service"
+	"github.com/YunBright/supertrade/pkg/eventbus"
 	"github.com/gin-gonic/gin"
 )
 
@@ -68,7 +69,7 @@ func (h *Handler) RegisterSubscribeRoutes(r *gin.Engine, logger *slog.Logger) {
 func (h *Handler) subscribeList(c *gin.Context) {
 	pubsub := c.Query("pubsubname")
 	if pubsub == "" {
-		pubsub = "pubsub"
+		pubsub = eventbus.Name
 	}
 	out := make([]Subscription, 0, len(SubscribeTopics))
 	for _, t := range SubscribeTopics {

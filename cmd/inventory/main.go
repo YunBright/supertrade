@@ -12,8 +12,11 @@
 //
 // 配置:
 //
-//	CUBE_CLIENT_MODE = memory(默认)/ dapr(SDK 模式,经 dapr sidecar 调 cube-router / cube-gateway)
-//	CUBE_APP_ID      = "cube-router"   // 默认 (走多源路由);改 "cube-gateway" 直连
+//	CUBE_APP_ID      = "supertrade-cube-router"  // 默认(走 cube-router 多源路由)
+//	CUBE_QUERY_PATH  = "v1/load"                 // 默认(该 app-id 上的查询路径)
+//
+// 两者必须成对,且都取自实际部署身份,详见 internal/cubeclient/errors.go 的对照表。
+// 没有 mock / 内存模式:测试用 internal/cubeclient/cubeclientfake。
 package main
 
 import (
@@ -28,7 +31,7 @@ func main() {
 		AppID: "inventory",
 		Port:  cmdbootstrap.AppPort(":8105"),
 		OnStart: func() error {
-			cube, err := cubehttp.NewClientFromEnv()
+			cube, err := cubehttp.NewClient()
 			if err != nil {
 				return err
 			}
@@ -42,28 +45,37 @@ func main() {
 var appCube cubeclient.Client
 
 func registerRoutes(r *gin.Engine) {
-	// 把 caller 的 Authorization header 注入 ctx,后续 cubeclient 内部自动 forward
-	// 给下游 cube-router(cube-gateway)。cube-router 的 userinfo 调用会再次
-	// WithBearer 转给 userd —— 跨 dapr app 链式透传 caller JWT 的标准做法。
-	r.Use(forwardBearerToOutgoing())
+	// 把 caller 的 Authorization + X-Branch-ID 注入 ctx,后续 cubeclient 内部自动 forward。
+	// X-Branch-ID 缺了 cube-router 会 400,见 forwardOutgoingHeaders 注释。
+	r.Use(forwardOutgoingHeaders())
 	cubehttp.New(appCube).Register(r, cubehttp.RegisterOptions{
 		Stock:         true,
 		RequireBranch: true, // /stock/:product_id 走 claims.AccessibleBranches 守门(branch 从 X-Branch-ID header 取)
 	})
 }
 
-// forwardBearerToOutgoing 把 gin request 的 Authorization header 注入 ctx。
+// forwardOutgoingHeaders 把 caller 的 Authorization + X-Branch-ID 两个头都注入 ctx。
 //
-// 此 cmd 不直连 userinfo,只走 cubeclient 转发给 cube-router / cube-gateway。
-// cube 端是否要 Authorization 取决于具体实例(本机 cube-gateway 可能不挂
-// bearer middleware,但 userd 必须有);保守起见一律 forward。
-func forwardBearerToOutgoing() gin.HandlerFunc {
+// Authorization:cubeclient 读出来拼成 outgoing gRPC metadata,sidecar 转成下游
+// cube-router 的 Authorization 头。
+//
+// X-Branch-ID:**必须一起透传**。cube-router 的 /v1/load 靠这个头解析门店
+// (branch_cube_sources → 该门店专属 cube 实例),缺了直接返 400 branch_required,
+// 而 dapr 会把 400 包成 gRPC "Internal: Bad Request" —— 现象是本服务返 500
+// cube_error,完全看不出是少了门店头。
+//
+// 这个漏传长期没被发现,是因为本服务此前走 CUBE_CLIENT_MODE 默认的 InMemoryClient,
+// 从来没有真的发过请求到 cube。2026-10-08 移除 mock 后才暴露。
+func forwardOutgoingHeaders() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		bearer := c.Request.Header.Get("Authorization")
-		if bearer != "" {
-			ctx := cubeclient.WithBearer(c.Request.Context(), bearer)
-			c.Request = c.Request.WithContext(ctx)
+		ctx := c.Request.Context()
+		if bearer := c.Request.Header.Get("Authorization"); bearer != "" {
+			ctx = cubeclient.WithBearer(ctx, bearer)
 		}
+		if branchID := c.Request.Header.Get("X-Branch-ID"); branchID != "" {
+			ctx = cubeclient.WithBranchID(ctx, branchID)
+		}
+		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	}
 }

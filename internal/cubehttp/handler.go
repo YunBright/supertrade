@@ -8,7 +8,7 @@
 //
 // 使用示例(cmd/inventory/main.go):
 //
-//	cube, _ := cubehttp.NewClientFromEnv()
+//	cube, _ := cubehttp.NewClient()
 //	h := cubehttp.New(cube)
 //	cmdbootstrap.Run(cmdbootstrap.Options{
 //	    AppID: "inventory",
@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 
 	dapr "github.com/dapr/go-sdk/client"
 	"github.com/YunBright/authkit/claims"
@@ -141,34 +140,50 @@ func (h *Handler) mapErr(c *gin.Context, err error) {
 	}
 }
 
-// NewClientFromEnv 按 CUBE_CLIENT_MODE 选 InMemoryClient 或 DaprCubeClient。
+// NewClient 构造走 dapr 的 cube 客户端。**没有任何 mock 分支**。
 //
-//	CUBE_CLIENT_MODE=memory  (默认) InMemoryClient(mock 数据,本地 / 测试用)
-//	CUBE_CLIENT_MODE=dapr    DaprCubeClient,经 dapr/go-sdk 调 cube /v1/load
+// 2026-10-08 移除了原先的 CUBE_CLIENT_MODE 开关与 InMemoryClient。移除原因:
+// 未设 CUBE_CLIENT_MODE 时默认值是 "memory",而 catalog / inventory / fresh-meat
+// 三个服务的 systemd unit 里根本没有这个变量 —— 它们因此在**生产**读 mock 假数据,
+// 没有任何报错。运行期能切到假实现的开关本身就是隐患,现在从结构上消除。
+//
+// 需要 mock 的测试请用 internal/cubeclient/cubeclientfake。
 //
 // 配置项:
 //
-//	CUBE_APP_ID   = "cube-router"    // 默认 (走 cube-router 多源路由)
+//	CUBE_APP_ID      dapr app-id。默认 supertrade-cube-router。
+//	CUBE_QUERY_PATH  该 app-id 上的查询方法路径。默认 v1/load。
 //
-// SDK 模式不需要 DAPR_ENDPOINT — dapr.NewClient() 自动读 DAPR_GRPC_PORT (默认 :50001);
+// ⚠️ APP_ID 与 PATH 必须成对配置,三者互不兼容(2026-10-08 生产实测):
+//
+//	目标                        dapr app-id                 路径
+//	-------------------------  --------------------------  ---------------------------
+//	supertrade cube-router      supertrade-cube-router      POST /v1/load      ← 唯一支持 per-branch 路由
+//	cube 语义层 app             cube-sixun-ysx-fb           POST /query
+//	cube-gateway               cube-gateway               POST /v1/source/:source/load
+//
+// 历史上这里默认 app-id="cube-router"、路径="query",两者都是**代码里的约定名**,
+// 不是任何服务的真实身份:dapr 里注册的是 supertrade-cube-router,而 supertrade-cube-router
+// 上根本没有 /query 路由。两者一错,调用稳定 404。
+//
+// 这个错误特别隐蔽,因为它和"商品真的不存在"返回的是同一个 404,于是被错误分类逻辑
+// 一起翻译成了「本门店没有条码 X 的商品」。参见 internal/cubeclient/errors.go。
+//
+// 默认走 cube-router 是因为只有它读 branch_cube_sources 做 per-branch 路由;
+// 直连某个 cube app 会绕过分门店隔离,拿到全部门店的数据。
+//
+// 不需要 DAPR_ENDPOINT —— dapr.NewClient() 自动读 DAPR_GRPC_PORT (默认 :50001);
 // dapr run 自动注入 DAPR_GRPC_PORT 到 app 进程 env。
 //
-// 调用方:catalog / inventory / stocktake.SearchProducts 等所有需转发 cube 的服务。
-func NewClientFromEnv() (cubeclient.Client, error) {
-	mode := os.Getenv("CUBE_CLIENT_MODE")
-	if mode == "" {
-		mode = "memory"
-	}
-	if mode == "memory" {
-		return cubeclient.NewInMemoryClient(), nil
-	}
+// 调用方:catalog / inventory / fresh-meat / stocktake.SearchProducts 等所有需转发 cube 的服务。
+func NewClient() (cubeclient.Client, error) {
 	daprCli, err := dapr.NewClient()
 	if err != nil {
 		return nil, fmt.Errorf("dapr.NewClient: %w (确认 dapr run 已起)", err)
 	}
-	appID := os.Getenv("CUBE_APP_ID")
-	if appID == "" {
-		appID = "cube-router"
-	}
-	return cubeclient.NewDaprCubeClient(daprCli, appID), nil
+	return cubeclient.NewDaprCubeClient(
+		daprCli,
+		cubeclient.DefaultCubeAppID(),
+		cubeclient.DefaultCubeQueryPath(),
+	), nil
 }

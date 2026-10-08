@@ -1,7 +1,7 @@
-# local-secret-store 是在服务器上独立的component,所有差异化配置都放在服务器的 secret-store 里,不放在代码仓库里。
+# local-secret-store 是在服务器上独立 component，所有差异化配置放在服务器的 secret-store 里,不放在代码仓库里。
 # ⚠️ metadata.name 必须是 **tradewind-pubsub** —— 与 auth / wechat-bot 一致。
-# 本仓库原先写 "pubsub",与 auth(userd)的 DAPR_PUBSUB_NAME 不同,
-# 会让两条 bus 互不相通(详见 notification-gateway/pubsub.yaml 顶部的完整说明)。
+# 本仓库原先写 "pubsub",导致 stocktake 发的事件与 auth 发的事件落在两条
+# 互不相通的 bus 上(详见 notification-gateway/pubsub.yaml 顶部的完整说明)。
 # dapr 的 component name 是路由键,发布方与订阅方必须逐字相同。
 apiVersion: dapr.io/v1alpha1
 kind: Component

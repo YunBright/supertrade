@@ -56,6 +56,14 @@ func main() {
 			hub.Shutdown()
 			return nil
 		},
+		RegisterDapr: func(r *gin.Engine) {
+			// /dapr/subscribe + /events/<topic> 注册在 auth 中间件**之前**。
+			// sidecar 拉订阅清单时不带 Authorization 头,若这两个路由带上
+			// claims.RequireAudience,sidecar 会拿到 401 —— 于是订阅永不建立,
+			// 事件一条也推不出去,而 /healthz 依然 200(极易误判为"已部署")。
+			// 详见 pkg/cmdbootstrap.Options.RegisterDapr 的注释。
+			events.NewHandler(registry, metrics, logger).RegisterRoutes(r)
+		},
 		Register: func(r *gin.Engine) {
 			registerRoutes(r, registry, metrics, logger)
 		},
@@ -64,15 +72,15 @@ func main() {
 
 // registerRoutes 把业务路由挂到 gin engine。
 //
-// 注意：cmdbootstrap 已注册 /healthz（公开），不需要再注册。
+// 注意:cmdbootstrap 已注册 /healthz(公开),不需要再注册。
+//
+// ⚠️ /dapr/subscribe 与 /events/<topic> **不在这里** —— 它们由
+// Options.RegisterDapr 在 auth 中间件之前注册,见 main() 里的说明。
 func registerRoutes(r *gin.Engine, registry *gateway.Registry, metrics *observability.Metrics, logger *slog.Logger) {
-	// /dapr/subscribe + /events/<topic>
-	events.NewHandler(registry, metrics, logger).RegisterRoutes(r)
-
-	// /ws 升级端点（已隐含在 claims.GinMiddleware 之后）
+	// /ws 升级端点(已隐含在 claims.GinMiddleware 之后)
 	r.GET("/ws", wsUpgradeHandler(registry, metrics, logger))
 
-	// /metrics（自实现,避免 prometheus 依赖）
+	// /metrics(自实现,避免 prometheus 依赖)
 	r.GET("/metrics", metricsHandler(metrics))
 }
 

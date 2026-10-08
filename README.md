@@ -132,7 +132,8 @@ supertrade/
 │   │   └── db.go
 │   ├── catalog/handler/{handler,supplier,product}.go
 │   ├── cube-router/handler/{handler,proxy}.go
-│   ├── cubeclient/                   # cube 客户端(DaprCubeClient + InMemoryClient)
+│   ├── cubeclient/                   # cube 客户端(生产只有 DaprCubeClient)
+│   ├── cubeclient/cubeclientfake/    # cube 客户端测试替身(仅 _test 引用)
 │   ├── cubehttp/handler.go           # inventory 用的 cube HTTP 转发器
 │   ├── notification-gateway/         # WS Hub / Registry / TenantRouter
 │   └── ...
@@ -206,8 +207,8 @@ supertrade/
 | 变量 | 必填 | 说明 |
 |---|---|---|
 | `POSTGRES_DSN` | ✅ | PostgreSQL 连接串;缺失则启动失败 |
-| `CUBE_CLIENT_MODE` | ❌ | `memory`(默认,本地 mock)/ `dapr`(经 sidecar) |
-| `CUBE_APP_ID` | ❌ | 默认 `cube-router`(多源路由) |
+| `CUBE_APP_ID` | ❌ | dapr app-id。默认 `supertrade-cube-router`(多源路由) |
+| `CUBE_QUERY_PATH` | ❌ | 该 app-id 上的查询路径。默认 `v1/load`;与 `CUBE_APP_ID` 必须成对 |
 | `APP_PORT` | ❌ | 监听端口;默认 `:8080`;常用别名 `:8101 / :8103 / :8105 / :8106 / :8107` |
 | `DAPR_GRPC_PORT` | ❌ | dapr run 自动注入;勿手设 |
 
@@ -555,7 +556,7 @@ daprCli.InvokeMethodWithContent(ctx,
 ### 本仓测试
 
 - **单元 + 集成测试**:Go `*_test.go`,运行 `go test ./...`
-- **Mock 模式**:外部依赖(Dapr sidecar / cube / userd)用 fakeDaprClient / InMemoryClient mock;不写 httptest mock sidecar(SDK 走 gRPC over `:50001`)
+- **Mock 模式**:cube 依赖用 `internal/cubeclient/cubeclientfake`(仅 `_test` 可引用);dapr SDK 层用 fake dapr.Client;不写 httptest mock sidecar(SDK 走 gRPC over `:50001`)
 - **不写** powershell / python / shell 测试脚本
 - **不写** 启动脚本
 

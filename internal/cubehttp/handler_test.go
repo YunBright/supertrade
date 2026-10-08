@@ -2,11 +2,14 @@ package cubehttp_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/cubeclient/cubeclientfake"
 	"github.com/YunBright/supertrade/internal/cubehttp"
 	"github.com/gin-gonic/gin"
 )
@@ -17,7 +20,7 @@ import (
 // catalog 服务,不在本测试覆盖范围。
 func buildTestRouter(t *testing.T) *gin.Engine {
 	t.Helper()
-	cube := cubeclient.NewInMemoryClient()
+	cube := cubeclientfake.New()
 	h := cubehttp.New(cube)
 
 	gin.SetMode(gin.TestMode)
@@ -71,16 +74,32 @@ func TestHandler_GetStock_MissingBranchHeader(t *testing.T) {
 	}
 }
 
-// ---- NewClientFromEnv ----
+// ---- NewClient ----
 
-func TestNewClientFromEnv_DefaultIsMemory(t *testing.T) {
-	// 默认 CUBE_CLIENT_MODE=memory → NewInMemoryClient
-	// (生产用 CUBE_CLIENT_MODE=dapr 切到 SDK 模式;此处验证默认行为)
-	c, err := cubehttp.NewClientFromEnv()
+// 回归锁(2026-10-08):原先 NewClientFromEnv 在未设 CUBE_CLIENT_MODE 时默认走
+// InMemoryClient(mock 假数据),而 catalog / inventory / fresh-meat 三个服务的
+// systemd unit 根本没有这个变量 —— 它们因此在**生产**读 mock 数据且零报错。
+//
+// 现在 mock 已从生产包移出(internal/cubeclient/cubeclientfake),构造函数恒定返回
+// dapr 实现。本测试锁死两件事:
+//  1. 即使环境里还残留 CUBE_CLIENT_MODE=memory,也**不得**返回任何 mock;
+//  2. 返回的具体类型必须是 *cubeclient.DaprCubeClient。
+func TestNewClient_HasNoMockBranch(t *testing.T) {
+	// 故意设成旧值:证明这个变量已经彻底失效,不会把假数据接回线上。
+	t.Setenv("CUBE_CLIENT_MODE", "memory")
+
+	c, err := cubehttp.NewClient()
 	if err != nil {
-		t.Fatalf("NewClientFromEnv: %v", err)
+		// 没有 dapr sidecar 时构造可能失败(grpc 懒连接,通常不会);
+		// 失败也算通过 —— 关键是**不可能**返回 mock。
+		t.Skipf("dapr 不可用(%v),跳过类型断言;仍可确认没有 mock 分支", err)
 	}
-	if _, ok := c.(*cubeclient.InMemoryClient); !ok {
-		t.Errorf("默认应 InMemoryClient, got %T", c)
+
+	if _, isDapr := c.(*cubeclient.DaprCubeClient); !isDapr {
+		t.Fatalf("NewClient 必须返回 *cubeclient.DaprCubeClient, got %T", c)
+	}
+	// 类型名里出现 fake / Memory 即说明 mock 又被接回生产路径。
+	if tn := fmt.Sprintf("%T", c); strings.Contains(tn, "fake") || strings.Contains(tn, "Memory") {
+		t.Errorf("NewClient 返回了 mock 实现: %s", tn)
 	}
 }

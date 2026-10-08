@@ -40,7 +40,8 @@ func main() {
 		OnStart: func() error {
 			return initApp()
 		},
-		Register: registerRoutes,
+		RegisterDapr: registerDaprRoutes,
+		Register:     registerRoutes,
 	})
 }
 
@@ -120,9 +121,9 @@ func initApp() error {
 	return nil
 }
 
-// initCubeClient 走 cubehttp.NewClientFromEnv(catalog / inventory 复用)。
+// initCubeClient 走 cubehttp.NewClient(catalog / inventory / fresh-meat 复用)。
 func initCubeClient() (cubeclient.Client, error) {
-	return cubehttp.NewClientFromEnv()
+	return cubehttp.NewClient()
 }
 
 func registerRoutes(r *gin.Engine) {
@@ -137,9 +138,19 @@ func registerRoutes(r *gin.Engine) {
 	r.Use(forwardBearerToOutgoing())
 	h := handler.New(appSvc)
 	h.RegisterRoutes(r)
-	// Dapr pub/sub 订阅(挂在 engine,不走业务路由组):
-	//   GET  /dapr/subscribe  → 订阅清单
-	//   POST /events/<topic>  → 事件分发(本服务订阅 auth.user.access_changed)
+}
+
+// registerDaprRoutes 在 auth 中间件**之前**注册 Dapr 订阅端点。
+//
+//   GET  /dapr/subscribe  → 订阅清单
+//   POST /events/<topic>  → 事件分发(本服务订阅 auth.user.access_changed)
+//
+// 必须早于 cmdbootstrap 的 claims.GinMiddleware + rbac.RequireAudience:
+// sidecar 调这两个端点不带 Authorization 头,带上鉴权中间件就会 401,
+// sidecar 于是永远拿不到订阅清单 —— 事件推不出去,但 /healthz 仍 200。
+// 详见 pkg/cmdbootstrap.Options.RegisterDapr 的注释。
+func registerDaprRoutes(r *gin.Engine) {
+	h := handler.New(appSvc)
 	h.RegisterSubscribeRoutes(r, slog.Default())
 }
 

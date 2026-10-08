@@ -116,6 +116,16 @@ var (
 	ErrPlanItemDuplicated   = errors.New("service: 同一商品已在计划清单中")
 	ErrRecheckRequiresParent = errors.New("service: 复盘点单必须指定 parent_header_id")
 	ErrInvalidOpType        = errors.New("service: 非法的 op_type")
+	// 以下三个是 2026-10-07 补的入参校验,handler 统一映射 400 bad_request。
+	//
+	// 补它们的直接原因:handler 的 addLineReq.ActualQty 带 `binding:"required"`,
+	// 但那是对 **decimal.Decimal 指针** 生效的 —— validator 的 hasValue 落到
+	// `field.IsValid() && !field.IsZero()`,而 decimal.Decimal 是 struct,
+	// decimal.NewFromInt(0) 得到的 struct 仍非零值。于是 0 与 -5 都能通过
+	// binding,一路走到 tx.Create 把负数实际库存写进 decimal(20,4) 列。
+	ErrInvalidQty          = errors.New("service: 数量非法")
+	ErrInvalidDiffReason   = errors.New("service: 非法的 diff_reason")
+	ErrInvalidOpMethod     = errors.New("service: 非法的 method")
 	// ErrUserInfoUnavailable userd 未注入或调用失败(handler 映射 503)。
 	// 区别于 ErrCubeUnavailable:这里是权限校验依赖不可用。
 	ErrUserInfoUnavailable  = errors.New("service: userd 不可用,无法校验 effective scopes")
@@ -323,14 +333,108 @@ func (s *Service) Approve(ctx context.Context, id, auditorID string) (*model.Sto
 	return updated, nil
 }
 
+// ---- 入参校验 (2026-10-07) ----
+
+// qtyScale 是数量列 decimal(20,4) 的小数位数。
+//
+// 列定义见 model.StocktakeLine.ActualQty / DiffQty / AvgCostYuan /
+// DiffAmountYuan,全是 decimal(20,4)。超过 4 位小数时 Postgres 会**静默四舍五入**
+// (不是报错),于是 "1.00005" 存成 "1.0001",而 diff_amount 又拿 round 后的
+// diff_qty 去乘 —— 客户端看到的回显与自己提交的值对不上,排查极难。
+// 在入口就拒掉,把问题留在提交那一刻。
+const qtyScale = 4
+
+// qtyMaxIntegerDigits 是数量列 decimal(20,4) 的整数位数上限。
+//
+// 超过后 Postgres 报 numeric field overflow,经 "create line: %w" 包装后
+// 落到 handler.mapErr 的 default 分支 → **500 internal_error**。
+// 客户端输入错误不该伪装成服务端故障,所以在这里拦成 400。
+const qtyMaxIntegerDigits = 20 - qtyScale
+
+// validateActualQty 校验"实盘数量"这个语义量。
+//
+// 与 accumulate 的 delta 区分开:accumulate 传的是增量(允许负,见
+// AddLineInput/UpdateLineInput 注释),它校验的是**累加后的结果**,
+// 见 validateAccumulatedQty。
+//
+// 校验项:
+//  1. 非负 —— 实物盘点出负数没有物理意义;
+//     负 actual_qty 会经 diff_qty = actual - book 放大,并污染
+//     header 上的 total_diff_qty / total_diff_amount_yuan 冻结汇总。
+//  2. 小数位 <= qtyScale —— 否则被 PG 静默 round,回显与提交值不一致。
+//  3. 整数位 <= qtyMaxIntegerDigits —— 否则 PG 溢出 → 500。
+func validateActualQty(q decimal.Decimal, field string) error {
+	if q.IsNegative() {
+		return fmt.Errorf("%w: %s 不能为负数 (got %s)", ErrInvalidQty, field, q.String())
+	}
+	if err := validateQtyShape(q, field); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateQtyShape 只校验 decimal(20,4) 的**形状**(小数位 + 整数位),
+// 不管符号 —— UpdateLine 的 accumulate delta 与累加结果都可能为负。
+//
+// 量位数用 `q.String()` 而不是 `-q.Exponent()`:
+//
+//	"95.12345" → String() = "95.12345" → 5 位小数 → 拒(会被 PG 静默 round)
+//	"95.12340" → String() = "95.1234"  → 4 位小数 → 放行(尾随 0 不是"多一位")
+//
+// 曾经试过 q.Round(qtyScale) 先归一化,**不行**:Round 会把 95.12345 变成
+// 95.1235,量出来正好 4 位,于是"小数位超限"这条校验被自己抹掉了
+// (TestService_AddLine_RejectsTooManyDecimals 当场红)。
+// shopspring 的 String() 本来就会去掉尾随 0,正是我们要的语义。
+func validateQtyShape(q decimal.Decimal, field string) error {
+	s := q.String()
+	if strings.ContainsAny(s, "eE") {
+		// String() 在极端量级下会给科学计数法,那必然远超 decimal(20,4)。
+		return fmt.Errorf("%w: %s 数值过大,超出 decimal(20,4) 可表示范围 (got %s)",
+			ErrInvalidQty, field, s)
+	}
+	s = strings.TrimPrefix(s, "-")
+	intPart, fracPart, hasFrac := strings.Cut(s, ".")
+
+	if hasFrac && len(fracPart) > qtyScale {
+		return fmt.Errorf("%w: %s 最多 %d 位小数 (got %s)",
+			ErrInvalidQty, field, qtyScale, q.String())
+	}
+	// 前导 0 不占位("0.5" 的整数位是 1 而不是 len("0")==1,这里统一去掉后再判,
+	// 全 0 时按 1 位算,避免把 "0.0001" 误判成整数位 0)。
+	intDigits := len(strings.TrimLeft(intPart, "0"))
+	if intDigits == 0 {
+		intDigits = 1
+	}
+	if intDigits > qtyMaxIntegerDigits {
+		return fmt.Errorf("%w: %s 整数位最多 %d 位 (got %s)",
+			ErrInvalidQty, field, qtyMaxIntegerDigits, q.String())
+	}
+	return nil
+}
+
+// validateAccumulatedQty 校验 accumulate 累加后的最终数量仍是非负且形状合法。
+//
+// accumulate 的 delta 本身允许为负(减库存),但**结果**不能为负 ——
+// 否则等于"允许把库存改成负数",和上面直接录负数是同一个漏洞换了个入口。
+func validateAccumulatedQty(sum decimal.Decimal) error {
+	if sum.IsNegative() {
+		return fmt.Errorf("%w: accumulate 后数量不能为负数 (got %s)",
+			ErrInvalidQty, sum.String())
+	}
+	return validateQtyShape(sum, "累加后数量")
+}
+
 // ---- Line ----
 
 // AddLineInput 添加盘点明细入参。
 //
-// OpType:create / overwrite / accumulate 三种;default = create(同旧行为)。
-//   - create:首次录入(明细行不存在时,服务端忽略 overwrite/accumulate)
-//   - overwrite:覆盖(同 create 行为,只是 audit 上区分)
-//   - accumulate:累加(若行已存在,本函数将转给 UpdateLine 走 accumulate 分支)
+// OpType:create / overwrite;default = create。
+//   - create:首次录入
+//   - overwrite:同 create 行为,只是 audit 上区分
+//
+// **accumulate 在这里非法**:AddLine 无条件新建一行,没有"旧值"可累加,
+// 历史上它甚至会绕过负数校验把 actual_qty=-50 落库。要"再加 N 件"请调
+// UpdateLine(PUT /stocktake-lines/:id),那里才做 prev + delta。
 //
 // ActorID / ActorName 用于写 StocktakeLineOperation;为空时归为 "unknown"。
 // Method:scan / manual / import,默认 manual。
@@ -368,6 +472,35 @@ func (s *Service) AddLine(ctx context.Context, headerID string, in AddLineInput)
 		return nil, fmt.Errorf("%w: 只能在 counting 状态录入", ErrInvalidStatus)
 	}
 
+	// 0. 入参校验(先于任何 cube 调用,省一次跨主机往返)
+	//
+	// ⚠️ accumulate 在 AddLine 上是**非法**的,必须显式拒绝。
+	//
+	// AddLineInput 的注释曾写"accumulate: 若行已存在则转给 UpdateLine 走累加分支",
+	// 但 AddLine 从来没有查过"行已不存在"——它无条件构造一行新的
+	// (ActualQty: in.ActualQty / PrevQty: 0 / QtyDelta: in.ActualQty)。
+	// 于是 op_type=accumulate + actual_qty=-50 会:
+	//   1. 跳过下面"非负"校验(因为 accumulate 被当成 delta 放行);
+	//   2. 直接把 actual_qty=-50 落库 —— 正是本次要堵的负库存漏洞;
+	//   3. 往审计表写一条伪造的 "accumulate(PrevQty=0)" 操作记录。
+	// 累加语义只在 UpdateLine(PUT /stocktake-lines/:id)上有意义,因为那里才有
+	// 旧值可加。客户端要"再加 N 件"请改调 updateLine。
+	if in.OpType == model.OpAccumulate {
+		return nil, fmt.Errorf("%w: op_type=accumulate 只能用于 PUT /stocktake-lines/:id,"+
+			"新增明细请用 create/overwrite", ErrInvalidOpType)
+	}
+	if err := validateActualQty(in.ActualQty, "actual_qty"); err != nil {
+		return nil, err
+	}
+	if !in.DiffReason.Valid() {
+		return nil, fmt.Errorf("%w: diff_reason=%q,合法值 %v",
+			ErrInvalidDiffReason, string(in.DiffReason), model.AllDiffReasons())
+	}
+	if in.Method != "" && !in.Method.Valid() {
+		return nil, fmt.Errorf("%w: method=%q,合法值 %v",
+			ErrInvalidOpMethod, string(in.Method), model.AllOpMethods())
+	}
+
 	// 1. 拉 cube product
 	product, err := s.cube.GetProduct(ctx, in.ProductID)
 	if err != nil {
@@ -389,6 +522,20 @@ func (s *Service) AddLine(ctx context.Context, headerID string, in AddLineInput)
 			return nil, fmt.Errorf("%w: %v", ErrStockNotFound, err)
 		}
 		return nil, fmt.Errorf("cube get stock: %w", err)
+	}
+	// 兜底: 与上面 GetProduct 同一个坑 —— cube 对 COUNT(*) 查询即使无匹配也返
+	// 1 行空记录,cubeclient.GetStock 只在 len(data)==0 时报错,一条空记录会被
+	// asDecimal 兜底成 decimal.Zero。没有这道闸,跨店盘点会**静默**落库
+	// book_qty=0,于是 diff_qty = actual_qty、diff_amount = 0 —— 一条看起来
+	// "全部盘亏" 的假数据,而本该返回 400 跨店提示。
+	if snap == nil {
+		return nil, fmt.Errorf("%w: branch_id=%q product_id=%q (cube 返空记录)",
+			ErrStockNotFound, h.BranchID, in.ProductID)
+	}
+	// ProductID 回填:snapshot 若为空行,其 ProductID 必然为零值。
+	if snap.ProductID == "" {
+		return nil, fmt.Errorf("%w: branch_id=%q product_id=%q (cube 返空记录)",
+			ErrStockNotFound, h.BranchID, in.ProductID)
 	}
 
 	// 3. 计算 diff
@@ -545,6 +692,16 @@ func (s *Service) UpdateLine(ctx context.Context, lineID string, in UpdateLineIn
 	if method == "" {
 		method = model.MethodManual
 	}
+	// 与 AddLine 同一套入参校验。放在算出 targetQty 之后、落库之前 ——
+	// accumulate 必须校验**结果**而不是 delta,见 validateAccumulatedQty。
+	if !method.Valid() {
+		return nil, fmt.Errorf("%w: method=%q,合法值 %v",
+			ErrInvalidOpMethod, string(method), model.AllOpMethods())
+	}
+	if in.DiffReason != nil && !in.DiffReason.Valid() {
+		return nil, fmt.Errorf("%w: diff_reason=%q,合法值 %v",
+			ErrInvalidDiffReason, string(*in.DiffReason), model.AllDiffReasons())
+	}
 
 	updates := map[string]any{"updated_at": s.now()}
 	var targetQty decimal.Decimal
@@ -555,6 +712,16 @@ func (s *Service) UpdateLine(ctx context.Context, lineID string, in UpdateLineIn
 			targetQty = prevQty.Add(*in.ActualQty)
 		default: // overwrite / create
 			targetQty = *in.ActualQty
+		}
+		// 两条路径都是"最终要落库的实际库存",所以校验的是 targetQty。
+		// 单独给 accumulate 写一条消息是因为它的失败原因(累加过头)与
+		// 直接录负数不同,排查时要能一眼区分。
+		if opType == model.OpAccumulate {
+			if err := validateAccumulatedQty(targetQty); err != nil {
+				return nil, err
+			}
+		} else if err := validateActualQty(targetQty, "actual_qty"); err != nil {
+			return nil, err
 		}
 		updates["actual_qty"] = targetQty
 		diffQty := targetQty.Sub(line.BookQty)
@@ -804,11 +971,22 @@ func (s *Service) SearchProducts(ctx context.Context, in SearchProductsInput, in
 
 	rows, err := s.cube.SearchProductsByBarcode(ctx, in.Barcode, in.BranchID, limit)
 	if err != nil {
+		// 把 cube 的**链路故障**翻译成 service 层哨兵错误,让 handler 能分档返回。
+		//
+		// 不做这层翻译的话,cubeclient.ErrCubeUnavailable 一路冒泡到 mapErr 的
+		// default 分支,变成 500 internal_error —— 终端用户看到"服务器内部错误",
+		// 完全无法区分"商品没入库"和"cube 服务挂了"。
+		//
+		// 注意这里**不**翻译 not-found:SearchProductsByBarcode 已经把
+		//"确实没这个商品"收敛成空切片返回,能走到这里说明不是业务结论。
+		if cubeclient.IsCubeUnavailable(err) {
+			return nil, fmt.Errorf("%w: %s", ErrCubeUnavailable, err.Error())
+		}
 		return nil, fmt.Errorf("cube search products: %w", err)
 	}
 
 	// 准备 supplier 一次性查(本期只用同店 supplier;Cube 拉所有供货这家店的 supplier 太重,
-	// 直接按 product.supplier_id 查 supplier 名,逐条 InMemoryClient.SearchSuppliers)
+	// 直接按 product.supplier_id 查 supplier 名,逐条 Client.SearchSuppliers)
 	out := &SearchProductsOutput{
 		Products: make([]SearchProductRow, 0, len(rows)),
 		Meta: SearchProductsMeta{

@@ -33,7 +33,6 @@ import (
 	dapr "github.com/dapr/go-sdk/client"
 	"github.com/shopspring/decimal"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 )
 
 // bearerCtxKey 是 context.Value 的 key,值是 "Bearer <token>" 完整字符串(可空)。
@@ -97,21 +96,35 @@ func branchFromCtx(ctx context.Context) string {
 // timeout 是 SDK 调用的本端超时(SDK 内部还有 default 5s 超时;
 // 短超时优先)。
 type DaprCubeClient struct {
-	dapr    dapr.Client
-	appID   string // "cube-router" / "cube-gateway" / 具体 instance
-	timeout time.Duration
+	dapr      dapr.Client
+	appID     string
+	queryPath string // 该 app-id 上的查询方法路径,随 appID 变化
+	timeout   time.Duration
 }
 
 // NewDaprCubeClient 构造 dapr cube client。
 //
 // daprClient 通常是 dapr.NewClient() 的返回值;测试可注入 fake (实现 dapr.Client 接口)。
-// appID 例:"cube-router"(默认,经 cube-router 多源路由) / "cube-gateway"(直连)
-// / "sixun-hbposv7"(具体实例)。
-func NewDaprCubeClient(daprClient dapr.Client, appID string) *DaprCubeClient {
+//
+// appID 与 queryPath **必须成对给**,它们描述同一个 dapr app 的地址:
+//
+//	appID                     queryPath
+//	-----------------------  ---------------
+//	supertrade-cube-router   v1/load        ← 默认,唯一支持 per-branch 路由
+//	cube-sixun-ysx-fb        query          ← 直连语义层 app,绕过 branch 隔离
+//
+// 传错组合(例如拿 supertrade-cube-router 配 query)会稳定 404,而 404 与
+// "商品不存在" 无法区分 —— 这正是 2026-10-08 那次故障被显示成
+//「本门店没有条码 X 的商品」的机制。参见 errors.go 的注释表。
+func NewDaprCubeClient(daprClient dapr.Client, appID, queryPath string) *DaprCubeClient {
+	if queryPath == "" {
+		queryPath = DefaultCubeQueryPathName
+	}
 	return &DaprCubeClient{
-		dapr:    daprClient,
-		appID:   appID,
-		timeout: 10 * time.Second,
+		dapr:      daprClient,
+		appID:     appID,
+		queryPath: queryPath,
+		timeout:   10 * time.Second,
 	}
 }
 
@@ -160,13 +173,10 @@ func (c *DaprCubeClient) LoadCubeQuery(ctx context.Context, modelName string, q 
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
-	resp, err := c.dapr.InvokeMethodWithContent(ctx, c.appID, "v1/load", "POST",
+	resp, err := c.dapr.InvokeMethodWithContent(ctx, c.appID, c.queryPath, "POST",
 		&dapr.DataContent{ContentType: "application/json", Data: b})
 	if err != nil {
-		if st, ok := status.FromError(err); ok && st.Code().String() == "NotFound" {
-			return nil, ErrCubeNotFound
-		}
-		return nil, fmt.Errorf("cube dapr: %w", err)
+		return nil, classifyCubeError(err)
 	}
 	var out struct {
 		Data []map[string]any `json:"data"`
@@ -210,15 +220,32 @@ func (c *DaprCubeClient) GetProduct(ctx context.Context, productID string) (*Pro
 	}, nil
 }
 
-// GetStock 查 cube stock(按 branch_id + product_id)。
+// GetStock 查该门店 cube 实例里的商品库存快照(按 product_id)。
 //
-// cube stock.total_quantity / cube stock.avg_cost。
+// ⚠️ 这里**刻意不加 branch 过滤**,原因是一次真实故障(2026-10-08):
+//
+//	cube 的 stock.branch_id 来自思迅 t_im_branch_stock.branch_no,实测值 "0001";
+//	supertrade 的 branch_id 是 "00"。两者是**完全无关的两套编码**
+//	(业务方确认:思迅 branch_no 与 branch_id 没有任何联系,必须忽略)。
+//	原先把 "00" 塞进 stock.branch_id 过滤,结果永远匹配不上 ——
+//	每个商品都报「该分店下的商品 stock 不存在(疑似跨店盘点)」,
+//	而实际该商品在本店有 261 件库存。
+//
+// 门店隔离**不靠这个维度**,而靠 X-Branch-ID 路由链:
+//
+//	X-Branch-ID → cube-router → branch_cube_sources(branch_id → cube_source_name)
+//	            → 该门店专属的 cube 实例 → 其 DuckDB 即该门店的数据
+//
+// 一个 cube 实例 = 一家门店(cube wire source id = [family]-[version]-[store])。
+// 所以到达这里的查询天然只含本店数据,再按 branch_no 过滤既多余又会失配。
+// 商品查询(GetProduct / SearchProductsByBarcode)本来就没有门店过滤,stock 保持一致。
+//
+// "跨店阻断"仍然成立:本店 cube 里没有该商品的库存记录时,照样返回 ErrStockNotFound。
 func (c *DaprCubeClient) GetStock(ctx context.Context, branchID, productID string) (*StockSnapshotDTO, error) {
 	data, err := c.LoadCubeQuery(ctx, "stock", CubeQuery{
-		Dimensions: []string{"stock.product_id", "stock.branch_id"},
+		Dimensions: []string{"stock.product_id"},
 		Measures:   []string{"stock.total_quantity", "stock.avg_cost"},
 		Filters: []CubeFilter{
-			{Member: "stock.branch_id", Operator: "equals", Values: []any{branchID}},
 			{Member: "stock.product_id", Operator: "equals", Values: []any{productID}},
 		},
 		Limit: 1,
@@ -236,8 +263,10 @@ func (c *DaprCubeClient) GetStock(ctx context.Context, branchID, productID strin
 	}
 	row := data[0]
 	return &StockSnapshotDTO{
-		ProductID:   asStr(row["stock.product_id"]),
-		BranchID:    asStr(row["stock.branch_id"]),
+		ProductID: asStr(row["stock.product_id"]),
+		// 填 supertrade 的 branch_id(路由键),不是 cube 返回的 stock.branch_id ——
+		// 后者是思迅 branch_no,与本系统门店无关,填进去只会误导排查。
+		BranchID:    branchID,
 		Quantity:    asDecimal(row["stock.total_quantity"]),
 		AvgCostYuan: asDecimal(row["stock.avg_cost"]),
 		UpdatedAt:   time.Now().UTC(), // cube stock.updated_at 本期未拉(简化)
@@ -246,12 +275,25 @@ func (c *DaprCubeClient) GetStock(ctx context.Context, branchID, productID strin
 
 // SearchProductsByBarcode 按 barcode 查商品,合并该门店 stock。
 //
-// 把 barcode 当 item_no 精确查(cube product.id = 思迅 item_no,
-// 条码和 item_no 在思迅系统里通常是同一字段)。
+// 把 barcode 当 item_no 精确查(cube product.id = 思迅 item_no)。
 // 长度 < 3 时返空(防全表扫 + 防无效输入)。
 //
-// 注:本期 cube sixun-models/product 不含 barcode dimension,
-// 条码模糊查询需要 cube 仓库扩展,后续 Phase 跟进。
+// 领域事实(2026-10-08 与业务方确认 + 思迅 hbposv10 实测,勿再推翻):
+//
+//  1. **item_no 就是条码。** 门店实际扫出来的东西绝大多数直接等于 item_no,
+//     包括部分生鲜的自建短码。例:6957583900828 →
+//     t_bd_item_info.item_no = "6957583900828",item_name = "凤派XL码抽纸8包"。
+//     它是商品编码,不是 EAN 条码 —— 早期把它当成"缺 barcode 维度"是误判。
+//  2. t_bd_item_barcode.item_barcode 是**一品多码**补充表,不是主码表。
+//     实测全库仅 152 行 / 覆盖 108 个商品(占 27299 个商品的 0.4%),
+//     一个商品可以挂多条(示例:02000089 有 3 条)。
+//     因此它**不能**用来替代 id 维度,也不该被平铺进 product ——
+//     1:N 平铺会把商品行放大约 1.4 倍,污染 count / avg_price_yuan 这类 measure。
+//
+// 结论:本期保持"barcode == item_no"的单查语义。
+// 日后若真要支持一品多码检索,正确形态是独立 barcode model,
+// 而不是往 product 上加维度 —— 且 cube 查询引擎目前尚未消费 cross-model join
+// (Joins 仅在 cubeschema 里被解析),该能力落地前做不了。
 func (c *DaprCubeClient) SearchProductsByBarcode(ctx context.Context, barcode, branchID string, limit int) ([]ProductWithStock, error) {
 	if len(barcode) < 3 {
 		return []ProductWithStock{}, nil
@@ -262,6 +304,9 @@ func (c *DaprCubeClient) SearchProductsByBarcode(ctx context.Context, barcode, b
 		if errors.Is(err, ErrProductNotFound) {
 			return []ProductWithStock{}, nil
 		}
+		// ⚠️ 这里只吞"确实没有这个商品"。链路故障(Unimplemented / Unavailable /
+		// 超时)必须原样上抛 —— 吞掉它就等于把一次 cube 故障报告成
+		//「本门店没有条码 XXX 的商品」,现场无法区分"商品没入库"和"系统挂了"。
 		return nil, err
 	}
 	out := []ProductWithStock{{Product: p}}

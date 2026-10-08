@@ -15,6 +15,8 @@ import (
 	"os"
 
 	dapr "github.com/dapr/go-sdk/client"
+
+	"github.com/YunBright/supertrade/pkg/eventbus"
 )
 
 // DaprPublisher service.Publisher 的 dapr-sdk 实现。
@@ -22,12 +24,15 @@ import (
 // 持有 dapr.Client (gRPC SDK 接口) + pubsub component name。
 type DaprPublisher struct {
 	client dapr.Client
-	pubsub string // pubsub component name,默认 "pubsub"
+	pubsub string // pubsub component name,默认 eventbus.Name
 }
 
 // NewDaprPublisherFromEnv 构造 publisher(失败则返 error,caller 应启动失败)。
 //
-//	DAPR_PUBSUB = "pubsub"   // 默认
+//	DAPR_PUBSUB = "tradewind-pubsub"   // 默认
+//
+// ⚠️ 必须与订阅侧 component metadata.name 逐字相同,否则事件没有订阅者且
+// **完全不报错**。见 pkg/eventbus 的说明。
 func NewDaprPublisherFromEnv() (*DaprPublisher, error) {
 	cli, err := dapr.NewClient()
 	if err != nil {
@@ -35,7 +40,7 @@ func NewDaprPublisherFromEnv() (*DaprPublisher, error) {
 	}
 	ps := os.Getenv("DAPR_PUBSUB")
 	if ps == "" {
-		ps = "pubsub"
+		ps = eventbus.Name
 	}
 	return &DaprPublisher{client: cli, pubsub: ps}, nil
 }

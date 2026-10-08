@@ -40,7 +40,8 @@ func main() {
 		OnStart: func() error {
 			return initApp()
 		},
-		Register: registerRoutes,
+		RegisterDapr: registerDaprRoutes,
+		Register:     registerRoutes,
 	})
 }
 
@@ -100,7 +101,7 @@ func initApp() error {
 	slog.Info("dapr publisher enabled")
 
 	// 注入 cube 客户端(走 cube-router)。
-	cube, err := cubehttp.NewClientFromEnv()
+	cube, err := cubehttp.NewClient()
 	if err != nil {
 		return fmt.Errorf("cube client: %w", err)
 	}
@@ -178,9 +179,19 @@ func registerRoutes(r *gin.Engine) {
 	r.Use(forwardBearerToOutgoing())
 	h := handler.New(appSvc)
 	h.RegisterRoutes(r)
-	// Dapr pub/sub 订阅(挂在 engine,不走业务路由组):
-	//   GET  /dapr/subscribe  → 订阅清单
-	//   POST /events/<topic>  → 事件分发(本服务订阅 auth.user.access_changed + sale.completed)
+}
+
+// registerDaprRoutes 在 auth 中间件**之前**注册 Dapr 订阅端点。
+//
+//   GET  /dapr/subscribe  → 订阅清单
+//   POST /events/<topic>  → 事件分发(本服务订阅 auth.user.access_changed + sale.completed)
+//
+// 必须早于 claims.GinMiddleware + rbac.RequireAudience:sidecar 调这两个端点
+// 不带 Authorization 头,带上鉴权中间件就会 401(sidecar 于是永远拿不到订阅)。
+// 2026-10-07 生产实测本服务 /dapr/subscribe 一直返回 401,即由此而来。
+// 详见 pkg/cmdbootstrap.Options.RegisterDapr 的注释。
+func registerDaprRoutes(r *gin.Engine) {
+	h := handler.New(appSvc)
 	h.RegisterSubscribeRoutes(r, slog.Default())
 }
 

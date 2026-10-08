@@ -18,6 +18,7 @@ import (
 
 	"github.com/YunBright/supertrade/internal/notification-gateway/fanout"
 	"github.com/YunBright/supertrade/internal/notification-gateway/gateway"
+	"github.com/YunBright/supertrade/pkg/eventbus"
 	"github.com/YunBright/supertrade/internal/notification-gateway/observability"
 	"github.com/YunBright/supertrade/internal/notification-gateway/wsmsg"
 )
@@ -81,7 +82,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 func (h *Handler) Subscribe(c *gin.Context) {
 	pubsub := c.Query("pubsubname")
 	if pubsub == "" {
-		pubsub = "pubsub"
+		pubsub = eventbus.Name
 	}
 	out := make([]Subscription, 0, len(Topics))
 	for _, t := range Topics {
@@ -114,9 +115,7 @@ func (h *Handler) dispatch(c *gin.Context, topic string) {
 		// 兼容 Dapr 原始 payload：直接从 topic 推断 type
 		env = wsmsg.Envelope{Type: topic, Data: body}
 	}
-	if env.Type == "" {
-		env.Type = topic
-	}
+	env = wsmsg.NormalizeCloudEventType(env, topic)
 
 	strategy := fanout.Classify(env)
 	switch strategy {

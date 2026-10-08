@@ -16,7 +16,7 @@
 // 配置:
 //
 //	POSTGRES_DSN    必填(只支持 PostgreSQL)
-//	CUBE_CLIENT_MODE = memory(默认,本地)/ dapr(SDK 模式)
+//	CUBE_APP_ID      = "supertrade-cube-router" // 默认(多源路由);CUBE_QUERY_PATH = "v1/load"
 //	CUBE_APP_ID      = "cube-router"   // 默认 (走 cube-router 多源路由)
 package main
 
@@ -77,7 +77,7 @@ func initApp() error {
 	appProd = service.NewProductService(appDB)
 
 	// cube client 用作 products/search 兜底(本期未实装本地 product CRUD)
-	if appCube, err = cubehttp.NewClientFromEnv(); err != nil {
+	if appCube, err = cubehttp.NewClient(); err != nil {
 		return fmt.Errorf("cube client: %w", err)
 	}
 	appUser, err = userinfo.New("userd")

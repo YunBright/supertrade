@@ -1,4 +1,4 @@
-package cubeclient_test
+package cubeclientfake_test
 
 import (
 	"context"
@@ -7,11 +7,12 @@ import (
 	"time"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/cubeclient/cubeclientfake"
 	"github.com/shopspring/decimal"
 )
 
-func TestInMemoryClient_GetProduct_OK(t *testing.T) {
-	c := cubeclient.NewInMemoryClient()
+func TestFake_GetProduct_OK(t *testing.T) {
+	c := cubeclientfake.New()
 	p, err := c.GetProduct(context.Background(), "P-1001")
 	if err != nil {
 		t.Fatalf("GetProduct: %v", err)
@@ -27,16 +28,16 @@ func TestInMemoryClient_GetProduct_OK(t *testing.T) {
 	}
 }
 
-func TestInMemoryClient_GetProduct_NotFound(t *testing.T) {
-	c := cubeclient.NewInMemoryClient()
+func TestFake_GetProduct_NotFound(t *testing.T) {
+	c := cubeclientfake.New()
 	_, err := c.GetProduct(context.Background(), "P-9999")
 	if !errors.Is(err, cubeclient.ErrProductNotFound) {
 		t.Errorf("err 应为 ErrProductNotFound, got %v", err)
 	}
 }
 
-func TestInMemoryClient_GetStock_OK(t *testing.T) {
-	c := cubeclient.NewInMemoryClient()
+func TestFake_GetStock_OK(t *testing.T) {
+	c := cubeclientfake.New()
 	// 注入固定时钟断言快照时间
 	fixed := time.Date(2026, 9, 17, 9, 0, 0, 0, time.UTC)
 	c.SetClock(func() time.Time { return fixed })
@@ -60,16 +61,16 @@ func TestInMemoryClient_GetStock_OK(t *testing.T) {
 }
 
 // 跨店阻断:S002 盘点,但 P-1003 不在 S002 → ErrStockNotFound
-func TestInMemoryClient_GetStock_CrossBranch(t *testing.T) {
-	c := cubeclient.NewInMemoryClient()
+func TestFake_GetStock_CrossBranch(t *testing.T) {
+	c := cubeclientfake.New()
 	_, err := c.GetStock(context.Background(), "S002", "P-1003")
 	if !errors.Is(err, cubeclient.ErrStockNotFound) {
 		t.Errorf("跨店 stock 应报 ErrStockNotFound, got %v", err)
 	}
 }
 
-func TestInMemoryClient_UpsertStock_ReflectsNewValue(t *testing.T) {
-	c := cubeclient.NewInMemoryClient()
+func TestFake_UpsertStock_ReflectsNewValue(t *testing.T) {
+	c := cubeclientfake.New()
 	c.UpsertStock("S001", "P-1001", decimal.NewFromInt(80), decimal.NewFromFloat(2.5))
 	snap, err := c.GetStock(context.Background(), "S001", "P-1001")
 	if err != nil {
@@ -82,8 +83,8 @@ func TestInMemoryClient_UpsertStock_ReflectsNewValue(t *testing.T) {
 
 // ---- SearchProductsByBarcode ----
 
-func TestInMemoryClient_SearchProductsByBarcode_TooShort(t *testing.T) {
-	c := cubeclient.NewInMemoryClient()
+func TestFake_SearchProductsByBarcode_TooShort(t *testing.T) {
+	c := cubeclientfake.New()
 	out, err := c.SearchProductsByBarcode(context.Background(), "123", "S001", 10)
 	if err != nil {
 		t.Fatalf("SearchProductsByBarcode: %v", err)
@@ -93,9 +94,9 @@ func TestInMemoryClient_SearchProductsByBarcode_TooShort(t *testing.T) {
 	}
 }
 
-func TestInMemoryClient_SearchProductsByBarcode_Exact13(t *testing.T) {
+func TestFake_SearchProductsByBarcode_Exact13(t *testing.T) {
 	// ≥13 位精确匹配:13 位的 "6901234567890" 是 P-1001 的 barcode
-	c := cubeclient.NewInMemoryClient()
+	c := cubeclientfake.New()
 	out, err := c.SearchProductsByBarcode(context.Background(), "6901234567890", "S001", 10)
 	if err != nil {
 		t.Fatalf("SearchProductsByBarcode: %v", err)
@@ -113,9 +114,9 @@ func TestInMemoryClient_SearchProductsByBarcode_Exact13(t *testing.T) {
 	}
 }
 
-func TestInMemoryClient_SearchProductsByBarcode_Suffix5to12(t *testing.T) {
+func TestFake_SearchProductsByBarcode_Suffix5to12(t *testing.T) {
 	// 5~12 位后缀匹配:"67890" 是 P-1001 (6901234567890) 的后缀
-	c := cubeclient.NewInMemoryClient()
+	c := cubeclientfake.New()
 	out, err := c.SearchProductsByBarcode(context.Background(), "67890", "S001", 10)
 	if err != nil {
 		t.Fatalf("SearchProductsByBarcode: %v", err)
@@ -135,9 +136,9 @@ func TestInMemoryClient_SearchProductsByBarcode_Suffix5to12(t *testing.T) {
 	}
 }
 
-func TestInMemoryClient_SearchProductsByBarcode_NoStockBranch(t *testing.T) {
+func TestFake_SearchProductsByBarcode_NoStockBranch(t *testing.T) {
 	// 商品存在但该门店无 stock → Product 有,Stock 为 nil
-	c := cubeclient.NewInMemoryClient()
+	c := cubeclientfake.New()
 	out, err := c.SearchProductsByBarcode(context.Background(), "6901234567890", "S999", 1)
 	if err != nil {
 		t.Fatalf("SearchProductsByBarcode: %v", err)
@@ -152,8 +153,8 @@ func TestInMemoryClient_SearchProductsByBarcode_NoStockBranch(t *testing.T) {
 
 // ---- SearchSuppliers ----
 
-func TestInMemoryClient_SearchSuppliers_Empty(t *testing.T) {
-	c := cubeclient.NewInMemoryClient()
+func TestFake_SearchSuppliers_Empty(t *testing.T) {
+	c := cubeclientfake.New()
 	out, err := c.SearchSuppliers(context.Background(), "", 0)
 	if err != nil {
 		t.Fatalf("SearchSuppliers: %v", err)
@@ -163,8 +164,8 @@ func TestInMemoryClient_SearchSuppliers_Empty(t *testing.T) {
 	}
 }
 
-func TestInMemoryClient_SearchSuppliers_ByName(t *testing.T) {
-	c := cubeclient.NewInMemoryClient()
+func TestFake_SearchSuppliers_ByName(t *testing.T) {
+	c := cubeclientfake.New()
 	out, err := c.SearchSuppliers(context.Background(), "可口可乐", 0)
 	if err != nil {
 		t.Fatalf("SearchSuppliers: %v", err)
@@ -177,8 +178,8 @@ func TestInMemoryClient_SearchSuppliers_ByName(t *testing.T) {
 	}
 }
 
-func TestInMemoryClient_SearchSuppliers_ByID(t *testing.T) {
-	c := cubeclient.NewInMemoryClient()
+func TestFake_SearchSuppliers_ByID(t *testing.T) {
+	c := cubeclientfake.New()
 	out, err := c.SearchSuppliers(context.Background(), "SUP-101", 0)
 	if err != nil {
 		t.Fatalf("SearchSuppliers: %v", err)

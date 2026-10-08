@@ -14,7 +14,7 @@ import (
 	dapr "github.com/dapr/go-sdk/client"
 	"github.com/YunBright/authkit/claims"
 	"github.com/YunBright/authkit/userinfo"
-	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/cubeclient/cubeclientfake"
 	"github.com/YunBright/supertrade/internal/stocktake/handler"
 	"github.com/YunBright/supertrade/internal/stocktake/model"
 	"github.com/YunBright/supertrade/internal/stocktake/service"
@@ -144,12 +144,12 @@ func buildTestHandler(t *testing.T) *gin.Engine {
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	cube := cubeclient.NewInMemoryClient()
+	cube := cubeclientfake.New()
 	svc := service.New(db, cube)
 	fixed := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
 	svc.SetClock(func() time.Time { return fixed })
 	cube.SetClock(func() time.Time { return fixed })
-	// cube InMemoryClient 默认 seed 数据 branch = "S001";handler test 现在用 UUID
+	// cube fake 默认 seed 数据 branch = "S001";handler test 现在用 UUID
 	// 风格 testBranchID,加对应 UUID branch 的库存让 AddLine 走通。
 	cube.UpsertStock(testBranchID, "P-1001", decimal.NewFromInt(100), decimal.NewFromFloat(2.5))
 	cube.UpsertStock(testBranchID, "P-1002", decimal.NewFromInt(50), decimal.NewFromFloat(2.5))

@@ -1,0 +1,75 @@
+# local-secret-store 是在服务器上独立 component，所有差异化配置放在服务器的 secret-store 里,不放在代码仓库里。
+#
+# notification-gateway 的 pubsub component —— 与 fresh-meat/pubsub.yaml 同构
+# (同一套 Redis Streams 后端 + 同一个 local-secret-store)。
+#
+# 为什么以前没这个文件:2026-10-03 首次部署时该服务只带了裸二进制,
+# 既没有 dapr/components/notification-gateway/ 目录,systemd unit 也没写
+# --resources-path。结果 sidecar 起来后**一个 component 都没加载**,
+# /dapr/subscribe 永远不会被 sidecar 调用 —— 即"pubsub 没打通"。
+#
+# ⚠️ metadata.name 必须是 **tradewind-pubsub**,不能随手写成 "pubsub"。
+#
+# 2026-10-08 实测事故(WS 契约测试 TestNotificationWSDeliversAccessChanged 抓到的):
+# 本仓库原先用 "pubsub",而**事件的真正发布侧 auth(userd)用的是 "tradewind-pubsub"**
+#   auth       /opt/auth/.env        → DAPR_PUBSUB_NAME=tradewind-pubsub
+#   auth       components/pubsub.yaml → metadata.name: tradewind-pubsub
+#   wechat-bot components/pubsub.yaml → metadata.name: tradewind-pubsub
+#   supertrade components/*/pubsub.yaml → metadata.name: pubsub   ← 改之前
+#
+# dapr 的 pubsub component name 是**路由键**:发布 `POST /v1.0/publish/<name>/<topic>`,
+# 订阅方也要在 /dapr/subscribe 里声明同一个 <name>。名字不同 = 两条互不相通的
+# bus,即使指向同一个 Redis 也一样(Redis Streams 的流名由 <name>-<topic> 派生)。
+#
+# 于是当时的现象是**纯静默**的,而且每一层单独看都"正常":
+#   sidecar 日志: "app is subscribed to [... auth.user.access_changed] through pubsub=pubsub" ✅
+#   /dapr/subscribe: 200,7 条订阅齐全                                                          ✅
+#   WS 连接: 101 + welcome,client 正常 registered                                                 ✅
+#   auth 侧: publish 成功,零报错                                                               ✅
+#   → 但事件永远不会到 WS,因为压根不在同一条 bus 上。
+#
+# 统一到 tradewind-pubsub(与 auth / wechat-bot 一致)后,supertrade 的 stocktake /
+# fresh-meat / notification-gateway 才真正接入全平台唯一的事件总线。
+#
+# 与发布侧的对应关系:
+#   stocktake  → PublishEvent(ctx, DAPR_PUBSUB | "tradewind-pubsub", topic, data)
+#                ← internal/stocktake/service/dapr_publisher.go
+#   auth       → PublishEvent(ctx, DAPR_PUBSUB_NAME="tradewind-pubsub", ...)
+#   本服务     → GET /dapr/subscribe 声明 7 个 topic
+#                ← internal/notification-gateway/events/dapr_subscription.go
+#
+# 改名的连带影响:Redis Streams 的流名由 <name>-<topic> 派生,改名后旧流
+# (pubsub-stocktake.line.added 等)不再被消费。它们是瞬时事件流,直接过期即可,
+# 不需要迁移。
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: tradewind-pubsub
+  namespace: default
+spec:
+  type: pubsub.redis
+  version: v1
+  metadata:
+    - name: redisHost
+      value: "172.12.1.1:6379"
+    - name: redisPassword
+      secretKeyRef:
+        name: redis.password
+        key: redis.password
+    - name: consumerID
+      value: "{appID}"
+    - name: enableDeadLetter
+      value: "true"
+    - name: deadLetterTTL
+      value: "86400"
+    # 30s 与 fresh-meat 保持一致。dispatch() 只是解 envelope + fanout 到内存里的
+    # WS 连接 (events/dapr_subscription.go:102-139),不做任何外部 IO,正常路径在毫秒级;
+    # 30s 纯粹是给 fanout 目标端点全阻塞时留的兜底。
+    - name: processingTimeout
+      value: "30s"
+    # 消费失败重投间隔。fanout 失败会 200 之外的状态码,sidecar 据此重投;
+    # 与 fresh-meat 对齐,便于两套服务的 Redis Streams 运维参数一致。
+    - name: redeliverInterval
+      value: "30s"
+auth:
+  secretStore: local-secret-store

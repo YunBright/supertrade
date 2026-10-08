@@ -26,7 +26,10 @@ resp, err := daprCli.InvokeMethodWithContent(ctx,
 )
 
 // Pub/sub —— 业务事件发布
-err = daprCli.PublishEvent(ctx, "pubsub", "auth.user.access_changed", data)
+// ⚠️ pubsub name 必须用 eventbus.Name("tradewind-pubsub"),与 auth(userd)的
+//    DAPR_PUBSUB_NAME、以及各服务 components/pubsub.yaml 的 metadata.name 逐字相同。
+//    名字不一致 = 两条互不相通的 bus,事件静默丢失(全流程零报错)。
+err = daprCli.PublishEvent(ctx, eventbus.Name, "auth.user.access_changed", data)
 ```
 
 底层 sidecar 解析 app-id(`sixun-hbposv7` / `cube-gateway` / `userd` 等)→ 跨主机 DNS 解析→ HTTP 转给目标进程。
@@ -103,9 +106,13 @@ bi-gateway 等所有需要 cube 的服务,**把 `POST /v1/load` 转发到 cube-r
 **业务侧接入方式**(走 SDK):
 
 ```go
-daprCli, _ := dapr.NewClient()
-// cubehttp.NewClientFromEnv() 内部已经做 NewDaprCubeClient(daprCli, "cube-router")
-cli, _ := cubehttp.NewClientFromEnv()
+// cubehttp.NewClient() 内部做 NewDaprCubeClient(daprCli, appID, queryPath),
+// 默认 appID = supertrade-cube-router、queryPath = v1/load
+// (用 CUBE_APP_ID / CUBE_QUERY_PATH 覆盖;两者必须成对,见 internal/cubeclient/errors.go)
+// 没有 mock 分支:2026-10-08 起 CUBE_CLIENT_MODE 开关与 InMemoryClient 一并移除
+// (未设该变量时默认值是 "memory",曾导致 catalog / inventory / fresh-meat
+//  在生产读假数据)。需要 mock 的测试请用 internal/cubeclient/cubeclientfake。
+cli, _ := cubehttp.NewClient()
 result, err := cli.LoadCubeQuery(ctx, "supplier.count", cubeclient.CubeQuery{
     Measures: []string{"supplier.count"},
 })
@@ -113,4 +120,4 @@ result, err := cli.LoadCubeQuery(ctx, "supplier.count", cubeclient.CubeQuery{
 
 参考:`internal/cube-router/handler/proxy.go`(handler 转发到 cube 实例),
 `internal/cubeclient/dapr_client.go`(DaprCubeClient 实现),
-`internal/cubehttp/handler.go::NewClientFromEnv`(caller 注入入口)。
+`internal/cubehttp/handler.go::NewClient`(caller 注入入口)。

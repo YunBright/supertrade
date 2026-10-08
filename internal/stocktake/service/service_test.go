@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/cubeclient/cubeclientfake"
 	"github.com/YunBright/supertrade/internal/stocktake/model"
 	"github.com/YunBright/supertrade/internal/stocktake/service"
 	"github.com/YunBright/supertrade/internal/stocktake/testdb"
@@ -19,7 +19,7 @@ import (
 //
 // DB 走 internal/stocktake/testdb(测试专用,生产代码不引用)。
 // 生产代码只支持 PostgreSQL(见 stocktake.OpenPostgres)。
-func setupTestService(t *testing.T) (*service.Service, *cubeclient.InMemoryClient) {
+func setupTestService(t *testing.T) (*service.Service, *cubeclientfake.Client) {
 	t.Helper()
 	db, err := testdb.OpenSQLite(":memory:?_pragma=foreign_keys(1)")
 	if err != nil {
@@ -34,7 +34,7 @@ func setupTestService(t *testing.T) (*service.Service, *cubeclient.InMemoryClien
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	cube := cubeclient.NewInMemoryClient()
+	cube := cubeclientfake.New()
 	svc := service.New(db, cube)
 	// 注入固定时间,便于断言
 	fixed := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)

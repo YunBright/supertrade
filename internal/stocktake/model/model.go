@@ -55,6 +55,42 @@ const (
 	ReasonOther     DiffReason = "other"      // 其它
 )
 
+// diffReasons 是 DiffReason 的全集(2026-10-07 新增,校验用)。
+//
+// 单独列出来的原因:模型里只定义了常量,service 过去**没有任何地方**校验过
+// diff_reason,`handler.addLineReq.DiffReason` 是 string,原样透传落库
+// (service.go 的 DiffReason: in.DiffReason)。后果是
+//   - 任意字符串都能落库,差异报表按 reason 聚合时出现无法解释的分组;
+//   - 超过列宽 varchar(32) 的值由 Postgres 报错,经 service 的
+//     "create line: %w" 包装后落到 mapErr 的 default 分支,返回 **500
+//     internal_error** —— 一个纯粹的客户端输入错误被当成服务端故障。
+var diffReasons = []DiffReason{
+	ReasonLoss, ReasonOverage, ReasonDamage, ReasonWrongUnit, ReasonOther,
+}
+
+// AllDiffReasons 返回合法的差异原因全集(供 handler 回给前端做下拉选项)。
+func AllDiffReasons() []DiffReason {
+	out := make([]DiffReason, len(diffReasons))
+	copy(out, diffReasons)
+	return out
+}
+
+// Valid 判断 r 是否是合法的差异原因。
+//
+// **空值合法**:diff_reason 列可空(见 StocktakeLine.DiffReason 的 omitempty),
+// 差异为 0 的行本来就没有原因可填,强行要求非空会让正常录入 400。
+func (r DiffReason) Valid() bool {
+	if r == "" {
+		return true
+	}
+	for _, v := range diffReasons {
+		if r == v {
+			return true
+		}
+	}
+	return false
+}
+
 // StocktakeHeader 盘点单据头(本系统 PG 建表)。
 //
 // 主键格式:`ST<yyyymmdd><seq>`(例:ST20260917001),由 service 在 CreateHeader 时生成。
@@ -179,6 +215,23 @@ const (
 	MethodManual OpMethod = "manual" // 手动输入
 	MethodImport OpMethod = "import" // 批量导入
 )
+
+// Valid 判断 m 是否是合法的操作通道。
+//
+// 与 DiffReason.Valid 不同:**空值不合法** —— service 会把空值兜底成
+// MethodManual,所以到这一步为空只可能是绕过 service 直接构造的值。
+func (m OpMethod) Valid() bool {
+	switch m {
+	case MethodScan, MethodManual, MethodImport:
+		return true
+	}
+	return false
+}
+
+// AllOpMethods 返回合法的操作通道全集(供 handler 回给前端)。
+func AllOpMethods() []OpMethod {
+	return []OpMethod{MethodScan, MethodManual, MethodImport}
+}
 
 // StocktakeLineOperation 盘点明细的操作历史(append-only 审计日志)。
 //

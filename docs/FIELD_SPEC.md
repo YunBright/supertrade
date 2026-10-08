@@ -37,7 +37,7 @@
 **本期定位(2026-09 重构后)**:
 - **本地维护** `catalog.suppliers` 表(带 `branch_id`,复合主键 `(id, branch_id)`)—— 本系统数据
 - **本地维护** `catalog.products` 表(带 `branch_id`)—— schema 占位,业务 CRUD 暂未实装,search 接口过渡期走 cube 兜底
-- **不再代理** cube `product` / `category` 转发;cube 转发**仅在 `products/search` 本地表无数据时作为兜底**(`CUBE_CLIENT_MODE=http` + cube-router)
+- **不再代理** cube `product` / `category` 转发;cube 转发**仅在 `products/search` 本地表无数据时作为兜底**(经 supertrade-cube-router)
 
 `catalog.suppliers`(本地表):
 

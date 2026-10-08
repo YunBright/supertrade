@@ -19,6 +19,8 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/YunBright/supertrade/pkg/eventbus"
 )
 
 // SubscribeTopics 是本服务订阅的 Dapr topic 列表。
@@ -62,7 +64,7 @@ func (h *Handler) RegisterSubscribeRoutes(r *gin.Engine, logger *slog.Logger) {
 func (h *Handler) subscribeList(c *gin.Context) {
 	pubsub := c.Query("pubsubname")
 	if pubsub == "" {
-		pubsub = "pubsub"
+		pubsub = eventbus.Name
 	}
 	out := make([]Subscription, 0, len(SubscribeTopics))
 	for _, t := range SubscribeTopics {

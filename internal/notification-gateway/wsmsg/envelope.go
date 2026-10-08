@@ -14,7 +14,7 @@ import (
 //
 // JSON 字段:
 //   - type:        CloudEvents `type`（必填）；控制帧用 hello/welcome/ping/pong/...，
-//                  业务帧用 stocktake.line.added 之类
+//     业务帧用 stocktake.line.added 之类
 //   - data:        业务 payload（任意 JSON 兼容对象）
 //   - id:          CloudEvents `id`（幂等去重）
 //   - time:        CloudEvents `time`（RFC3339 UTC）
@@ -22,14 +22,68 @@ import (
 //   - subject:     CloudEvents `subject`（如 "stocktake_line/12"）
 //   - specversion: 固定 "1.0"
 type Envelope struct {
-	Type           string          `json:"type"`
-	Data           json.RawMessage `json:"data,omitempty"`
-	ID             string          `json:"id,omitempty"`
-	Time           string          `json:"time,omitempty"`
-	Source         string          `json:"source,omitempty"`
-	Subject        string          `json:"subject,omitempty"`
-	SpecVersion    string          `json:"specversion,omitempty"`
-	DataContentType string         `json:"datacontenttype,omitempty"`
+	Type            string          `json:"type"`
+	Data            json.RawMessage `json:"data,omitempty"`
+	ID              string          `json:"id,omitempty"`
+	Time            string          `json:"time,omitempty"`
+	Source          string          `json:"source,omitempty"`
+	Subject         string          `json:"subject,omitempty"`
+	SpecVersion     string          `json:"specversion,omitempty"`
+	DataContentType string          `json:"datacontenttype,omitempty"`
+
+	// Topic 是 Dapr pub/sub 在 CloudEvents **之外**附加的业务 topic 名
+	// （`{"topic":"auth.user.access_changed", ...}`）。
+	//
+	// 它是 Dapr 投递形态下唯一可靠的"这条事件是什么"——因为 Dapr 把
+	// CloudEvents 的 type 固定写成 [TypeComDaprEventSent]。
+	// 见 [NormalizeCloudEventType]。
+	Topic string `json:"topic,omitempty"`
+}
+
+// TypeComDaprEventSent 是 Dapr pub/sub 投递时写死在 CloudEvents `type` 字段里的值。
+//
+// ⚠️ **不要**用 `type` 判断业务事件。Dapr 的 pub/sub HTTP 投递形态实测为：
+//
+//	{
+//	  "data":         {"user_id":"..."},
+//	  "topic":        "auth.user.access_changed",   ← 真正的 topic
+//	  "type":         "com.dapr.event.sent",         ← 固定值，无业务含义
+//	  "pubsubname":   "tradewind-pubsub",
+//	  "datacontenttype": "application/json",
+//	  "specversion":  "1.0"
+//	}
+//
+// 2026-10-08 实测事故：曾按 `type` 做 fanout 分类，于是**所有**事件都落进
+// default 分支（按 tenant/branch 过滤），而 pub/sub 事件的 payload 里根本没有
+// branch_id/tenant_id —— 结果一条也投不出去。全程零报错：
+// sidecar 订阅成功、/dapr/subscribe 200、WS 握手 101、消费组 lag=0，
+// 客户端就是收不到。
+//
+// 这也是为什么 auth 自己的 SSE 一直没暴露这个问题：它按**订阅路由 URL**
+// (`/dapr/events/<topic>`) 分发，不看 envelope 的 type。
+const TypeComDaprEventSent = "com.dapr.event.sent"
+
+// NormalizeCloudEventType 把 Dapr pub/sub 的投递形态归一化成"type == 业务 topic"。
+//
+// fallbackTopic 是订阅路由里的 topic（`/events/<topic>` 的最后一段），在 envelope
+// 自带 topic 字段缺失时兜底 —— 它由 sidecar 的订阅路由保证与实际 topic 一致。
+//
+// 优先级：
+//  1. type 为空            → 用 envelope.Topic
+//  2. type 是 Dapr 固定值   → 用 envelope.Topic
+//  3. envelope.Topic 为空   → 用 fallbackTopic
+//
+// 已经带业务 type 的 envelope（我们自己在 WS 上发的 welcome/ping，以及某些
+// 直连投递）原样返回，不做任何改写。
+func NormalizeCloudEventType(env Envelope, fallbackTopic string) Envelope {
+	if env.Type == "" || env.Type == TypeComDaprEventSent {
+		if env.Topic != "" {
+			env.Type = env.Topic
+		} else if fallbackTopic != "" {
+			env.Type = fallbackTopic
+		}
+	}
+	return env
 }
 
 // New 构造一个 envelope（自动填 time / specversion / datacontenttype）。
@@ -87,8 +141,8 @@ const (
 
 // 错误码（与 Flutter WsErrorCodes 对齐）。
 const (
-	ErrAuthExpired     = "auth_expired"
+	ErrAuthExpired      = "auth_expired"
 	ErrAudienceMismatch = "audience_mismatch"
-	ErrProtocolError   = "protocol_error"
-	ErrForbidden       = "forbidden"
+	ErrProtocolError    = "protocol_error"
+	ErrForbidden        = "forbidden"
 )

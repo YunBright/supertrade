@@ -242,7 +242,13 @@ func mapErr(c *gin.Context, err error) {
 		errors.Is(err, service.ErrStockNotFound),
 		errors.Is(err, service.ErrPlanItemDuplicated),
 		errors.Is(err, service.ErrRecheckRequiresParent),
-		errors.Is(err, service.ErrInvalidOpType):
+		errors.Is(err, service.ErrInvalidOpType),
+		// 2026-10-07:纯客户端入参错误,映射 400。
+		// 不加这三个的话它们会落 default 分支返 500 internal_error ——
+		// 一个"数量填了负数"被上报成服务端故障。
+		errors.Is(err, service.ErrInvalidQty),
+		errors.Is(err, service.ErrInvalidDiffReason),
+		errors.Is(err, service.ErrInvalidOpMethod):
 		writeError(c, http.StatusBadRequest, "bad_request", err.Error())
 	case errors.Is(err, service.ErrCubeUnavailable):
 		writeError(c, http.StatusServiceUnavailable, "cube_unavailable", err.Error())

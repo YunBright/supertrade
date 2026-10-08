@@ -440,24 +440,39 @@ notification-gateway 的 TenantRouter 仅在 `branch_id` 落在 client 的 `effe
 
 ```yaml
 # 例:pos 的订阅声明
+#
+# ⚠️ pubsubname 必须是 **tradewind-pubsub**(Go 侧常量 pkg/eventbus.Name)。
+#    它是全平台唯一的事件总线名,发布侧 auth(userd) 用的是同一个名字。
+#    名字一旦不一致,发布与订阅就落在两条互不相通的 bus 上 ——
+#    sidecar 照常加载 component、/dapr/subscribe 照常返 200、连接照常建立,
+#    但事件**永远送不到**,且全程零报错。本仓库在 2026-10-08 踩过这个坑。
 subscriptions:
-  - pubsubname: pubsub
+  - pubsubname: tradewind-pubsub
     topic: sale.completed
     route: /events/sale-completed
 ```
 
 ### 3.2 代码式(`/dapr/subscribe`)
 
-骨架阶段不实现,后续按 topic 落地 handler 时补:
+**已实现(2026-10-07 之前是"骨架阶段不实现",那句话已过时)。**
 
-```go
-r.GET("/dapr/subscribe", func(c *gin.Context) {
-    c.JSON(200, []map[string]string{
-        {"pubsubname": "pubsub", "topic": "sale.completed", "route": "/events/sale-completed"},
-    })
-})
-r.POST("/events/sale-completed", handleSaleCompleted)
-```
+当前实现:
+
+| 服务 | 订阅端点 | 注册位置 | 订阅的 topic |
+|---|---|---|---|
+| `notification-gateway` | `GET /dapr/subscribe`、`POST /events/<topic>` | `cmd/notification-gateway/main.go` 的 `Options.RegisterDapr` | §2.12~2.14 全部 7 个 |
+| `stocktake` | 同上 | `cmd/stocktake/main.go` 的 `Options.RegisterDapr` | `auth.user.access_changed` |
+| `fresh-meat` | 同上 | `cmd/fresh-meat/main.go` 的 `Options.RegisterDapr` | 各自清单 |
+
+> ⚠️ **这两个端点必须注册在 auth 中间件之前**,即走
+> `cmdbootstrap.Options.RegisterDapr` 而不是 `Options.Register`。
+> Dapr sidecar 调它们时**不带 `Authorization` 头**(调用方是 sidecar 自己,
+> 不是终端用户),而 `rbac.RequireAudience` 对缺 claims 的请求一律 401。
+> 后果是 sidecar 永远拿不到订阅清单,事件一条也推不出去,而 `/healthz` 仍 200、
+> 业务仍正常 —— 只有"通知不响"一个症状。
+> 这就是 2026-10-07 之前 notification-gateway 一直"pubsub 没打通"的真实原因
+> (当时三个服务全部中招,包括一直当参考的 fresh-meat)。
+> 回归锁见 `pkg/cmdbootstrap/dapr_routes_test.go`。
 
 ---
 

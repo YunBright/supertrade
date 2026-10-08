@@ -297,6 +297,23 @@ archives:
       - stocktake
     wrap_in_directory: false
     name_template: 'apps/stocktake/stocktake_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+    # 2026-10-07:stocktake 是盘点事件的**发布侧**
+    # (service.NewDaprPublisherFromEnv → PublishEvent(ctx, eventbus.Name, topic, data))。
+    # 以前 unit 里没有 --resources-path,sidecar 加载不到任何 component,
+    # 于是 PublishEvent 找不到对应 component 直接失败 ——
+    # 而 events.go:57-75 的 publish 是"尽力而为"(失败只 log),所以**故障完全静默**:
+    # 盘点照常成功,只是没有任何事件推给 notification-gateway。
+    #
+    # ⚠️ component 的 metadata.name 必须是 tradewind-pubsub(pkg/eventbus.Name),
+    #    与 auth(userd)的 DAPR_PUBSUB_NAME 逐字相同。改名会让事件静默消失。
+    #
+    # 解压后顶层 = stocktake + components/pubsub.yaml,与 systemd unit 的
+    # `--resources-path /opt/YunBright/supertrade/apps/stocktake/components` 对齐。
+    # 源路径必须是 dapr/components/<service>/:deploy-supertrade.ps1:445 写死了这条路径,
+    # 单服务 deploy(goreleaser build,无 archive 阶段)时脚本会手工 stage 它。
+    files:
+      - src: dapr/components/stocktake/*
+        dst: components
 
   - id: "pos"
     format: tar.gz
@@ -385,6 +402,17 @@ archives:
       - notification-gateway
     wrap_in_directory: false
     name_template: 'apps/notification-gateway/notification-gateway_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+    # 2026-10-07:与 fresh-meat / stocktake 同一套模式。
+    # 没有这个 files 块时,单服务 deploy 出来的归档里只有裸二进制,
+    # sidecar 找不到 pubsub component → /dapr/subscribe 永远不被调用
+    # (表现就是"pubsub 没打通",但服务本身 /healthz 仍然 200,极易误判为已部署)。
+    #
+    # 解压后顶层 = notification-gateway + components/pubsub.yaml,
+    # 与 systemd unit 的
+    # `--resources-path /opt/YunBright/supertrade/apps/notification-gateway/components` 对齐。
+    files:
+      - src: dapr/components/notification-gateway/*
+        dst: components
 
 checksum:
   name_template: 'checksums.txt'

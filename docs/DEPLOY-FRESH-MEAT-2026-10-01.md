@@ -119,7 +119,7 @@ dapr run --app-id fresh-meat --app-port 8108 \
 | `POSTGRES_DSN 必填` | env 漏配 | 注入 DSN 后重启 |
 | `open db: ...` | PG 不可达 / 凭证错 | 检查 PG 状态 + 凭证 |
 | `dapr publisher: ...` | dapr sidecar 未起 / 端口错 | `dapr run --app-port` 与启动脚本一致 |
-| `cube client: ...` | cube-router 未起 / 配置错 | `cubehttp.NewClientFromEnv` 失败 |
+| `cube client: ...` | cube-router 未起 / 配置错 | `cubehttp.NewClient` 失败 |
 | `FRESHMEAT_BIZ_TZ load failed` | IANA 名拼错 | fallback Asia/Shanghai,**不阻断**启动 |
 
 成功启动日志:`fresh-meat app initialized` + `db_driver=postgres` + `schema="fresh_meat (6 tables)"` + `biz_tz="Asia/Shanghai"`。
@@ -343,7 +343,7 @@ spec:
 | 1 | **PostgreSQL** | 同机 / 同集群 | `psql "$POSTGRES_DSN" -c '\dt'` 能连 | `open db` 失败,fail-fast |
 | 2 | **dapr sidecar** | dapr CLI | `dapr run --app-id fresh-meat --app-port 8080` 注入 `DAPR_GRPC_PORT` | `dapr publisher: ...` / `dapr client: ...` fail-fast |
 | 3 | **userd** | `../auth` | `curl http://localhost:8081/healthz` 200 + `GET /internal/users/{id}/permissions?branch_id=...` 返回有效 scope | `freshmeat:view` / `freshmeat:write` scope 解析失败,handler `requireScope` 返 403 |
-| 4 | **cube-gateway**(经 cube-router) | `../cube` + 本仓 `internal/cube-router` | `cubehttp.NewClientFromEnv()` 启动通过 | `cube client: ...` fail-fast |
+| 4 | **cube-gateway**(经 cube-router) | `../cube` + 本仓 `internal/cube-router` | `cubehttp.NewClient()` 启动通过 | `cube client: ...` fail-fast |
 | 5 | **Dapr Conversation 组件** | dapr components | `dapr components-path` 下有 `conversation.yaml` | predict 调不通,降级 history_avg(`data_source="history_avg"`),**不阻断** |
 
 ### 2.2 软依赖(可选 / 故障兜底)
