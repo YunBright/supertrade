@@ -78,30 +78,38 @@ func (c *Client) SetClock(fn func() time.Time) {
 
 func (c *Client) seed() {
 	now := time.Date(2026, 9, 17, 9, 0, 0, 0, time.UTC)
+	// 2026-10-08:seed 补 PriceYuan。以前 fake 不带售价,而 SearchProductRow.Price
+	// 直接取 r.Product.PriceYuan —— 不 seed 就让所有"售价"断言永远拿不到非 nil,
+	// 等于这条路径没有任何测试覆盖。
+	p1001 := decimal.NewFromFloat(3.5)
+	p1002 := decimal.NewFromFloat(3.5)
+	p1003 := decimal.NewFromFloat(2.0)
+	p2001 := decimal.NewFromFloat(42.0)
+	p3001 := decimal.NewFromFloat(4.5)
 	c.products["P-1001"] = cubeclient.ProductDTO{
 		ID: "P-1001", Name: "可口可乐 330ml", CategoryID: "CAT-01",
 		SupplierID: "SUP-001", Unit: "瓶", Spec: "330ml",
-		Status: "active", Barcode: "6901234567890",
+		Status: "active", Barcode: "6901234567890", PriceYuan: &p1001,
 	}
 	c.products["P-1002"] = cubeclient.ProductDTO{
 		ID: "P-1002", Name: "雪碧 330ml", CategoryID: "CAT-01",
 		SupplierID: "SUP-001", Unit: "瓶", Spec: "330ml",
-		Status: "active", Barcode: "6901234567891",
+		Status: "active", Barcode: "6901234567891", PriceYuan: &p1002,
 	}
 	c.products["P-1003"] = cubeclient.ProductDTO{
 		ID: "P-1003", Name: "农夫山泉 550ml", CategoryID: "CAT-01",
 		SupplierID: "SUP-002", Unit: "瓶", Spec: "550ml",
-		Status: "active", Barcode: "6901234567892",
+		Status: "active", Barcode: "6901234567892", PriceYuan: &p1003,
 	}
 	c.products["P-2001"] = cubeclient.ProductDTO{
 		ID: "P-2001", Name: "五花肉", CategoryID: "CAT-02",
 		SupplierID: "SUP-101", Unit: "kg", Spec: "新鲜",
-		Status: "active", Barcode: "2001",
+		Status: "active", Barcode: "2001", PriceYuan: &p2001,
 	}
 	c.products["P-3001"] = cubeclient.ProductDTO{
 		ID: "P-3001", Name: "大白菜", CategoryID: "CAT-03",
 		SupplierID: "SUP-201", Unit: "kg", Spec: "新鲜",
-		Status: "active", Barcode: "3001",
+		Status: "active", Barcode: "3001", PriceYuan: &p3001,
 	}
 
 	c.stock["S001"] = map[string]cubeclient.StockSnapshotDTO{
@@ -142,6 +150,22 @@ func (c *Client) UpsertStock(branchID, productID string, qty, avgCost decimal.De
 		ProductID: productID, BranchID: branchID,
 		Quantity: qty, AvgCostYuan: avgCost, UpdatedAt: c.clock(),
 	}
+}
+
+// UpsertProductPrice 设置/清除某商品的售价(测试用)。
+//
+// 传 nil 模拟"该商品没维护售价" —— 这是与"售价为 0 元"必须区分的状态:
+// 生产里 DaprCubeClient 用 asDecimalPtr,缺列时给 nil;前端据此显示
+// 「未维护」而不是「¥ 0.00」。
+func (c *Client) UpsertProductPrice(productID string, price *decimal.Decimal) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p, ok := c.products[productID]
+	if !ok {
+		return
+	}
+	p.PriceYuan = price
+	c.products[productID] = p
 }
 
 func (c *Client) GetProduct(_ context.Context, productID string) (*cubeclient.ProductDTO, error) {

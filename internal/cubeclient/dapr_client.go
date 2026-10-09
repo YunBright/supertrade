@@ -3,23 +3,26 @@
 // DaprCubeClient 经 github.com/dapr/go-sdk 的 dapr.Client 调 cube /v1/load。
 //
 // 推荐配置:
-//   CUBE_APP_ID = "cube-router"        // 走 cube-router 多源路由 (默认)
-//              = "cube-gateway"        // 直连 cube-gateway (历史 fallback)
-//              = "sixun-hbposv7"       // 直连具体实例,跳过 gateway
+//
+//	CUBE_APP_ID = "cube-router"        // 走 cube-router 多源路由 (默认)
+//	           = "cube-gateway"        // 直连 cube-gateway (历史 fallback)
+//	           = "sixun-hbposv7"       // 直连具体实例,跳过 gateway
 //
 // 协议参考:F:\go\src\github.com\YunBright\cube\pkg\cubequery\query.go
-//   请求:{ measures, dimensions, filters, limit }
-//   响应:{ data: [{ "<model>.<field>": value, ... }] }
+//
+//	请求:{ measures, dimensions, filters, limit }
+//	响应:{ data: [{ "<model>.<field>": value, ... }] }
 //
 // JWT 透传约定:
-//   cube-gateway 的 dapr-sidecar 配了 middleware.http.bearer,要求请求带 Authorization: Bearer <token>。
-//   stocktake 等 supertrade dapr app 经 dapr service invocation 直连 cube-gateway 时,
-//   把 JWT 塞进 outgoing gRPC metadata "authorization";SDK 把它转成 outgoing HTTP
-//   Authorization 头给目标 app。
-//   调用模式 (在 handler 里):
-//     ctx := authctx.WithBearer(c.Request.Context(), c.Request.Header.Get("Authorization"))
-//     appSvc.SearchProducts(ctx, ...)
-//   LoadCubeQuery 内部自动 ctx.Value(bearerCtxKey) 取出并塞 gRPC metadata。
+//
+//	cube-gateway 的 dapr-sidecar 配了 middleware.http.bearer,要求请求带 Authorization: Bearer <token>。
+//	stocktake 等 supertrade dapr app 经 dapr service invocation 直连 cube-gateway 时,
+//	把 JWT 塞进 outgoing gRPC metadata "authorization";SDK 把它转成 outgoing HTTP
+//	Authorization 头给目标 app。
+//	调用模式 (在 handler 里):
+//	  ctx := authctx.WithBearer(c.Request.Context(), c.Request.Header.Get("Authorization"))
+//	  appSvc.SearchProducts(ctx, ...)
+//	LoadCubeQuery 内部自动 ctx.Value(bearerCtxKey) 取出并塞 gRPC metadata。
 package cubeclient
 
 import (
@@ -90,13 +93,27 @@ func branchFromCtx(ctx context.Context) string {
 	return ""
 }
 
+// daprInvoker 是 DaprCubeClient 对 dapr SDK 的**全部**依赖面。
+//
+// 为什么收窄:go-sdk v1.10.1 只带 actor/mock,**没有 client/mock**,
+// 而 dapr.Client 有几十个方法 —— 单测想捕获"到底往 cube 发了什么 query"
+// 就得手写整个接口,成本高到没人愿意写,于是 GetProduct 的 Dimensions
+// 只能靠肉眼 review 保护(2026-10-09 加 product.unit 时就是如此:
+// 把它删掉不会有任何测试变红,只会让 wx-h5 静默退回显示「件」)。
+//
+// 收窄后 dapr.Client 自动满足本接口(结构化子集),所有现有调用方零改动。
+type daprInvoker interface {
+	InvokeMethodWithContent(ctx context.Context, appID, methodName, verb string,
+		content *dapr.DataContent) ([]byte, error)
+}
+
 // DaprCubeClient 是 cube-gateway / cube-router 的 client (dapr SDK 封装)。
 //
-// 持有 dapr.Client (gRPC SDK 接口) + appID + timeout。
+// 持有 daprInvoker (dapr.Client 的结构化子集) + appID + timeout。
 // timeout 是 SDK 调用的本端超时(SDK 内部还有 default 5s 超时;
 // 短超时优先)。
 type DaprCubeClient struct {
-	dapr      dapr.Client
+	dapr      daprInvoker
 	appID     string
 	queryPath string // 该 app-id 上的查询方法路径,随 appID 变化
 	timeout   time.Duration
@@ -104,7 +121,9 @@ type DaprCubeClient struct {
 
 // NewDaprCubeClient 构造 dapr cube client。
 //
-// daprClient 通常是 dapr.NewClient() 的返回值;测试可注入 fake (实现 dapr.Client 接口)。
+// daprClient 通常是 dapr.NewClient() 的返回值(它自动满足 daprInvoker 这个
+// 结构化子集,所有现有调用方无需改动);测试可注入只实现了
+// InvokeMethodWithContent 的窄 fake,见 query_shape_test.go。
 //
 // appID 与 queryPath **必须成对给**,它们描述同一个 dapr app 的地址:
 //
@@ -115,8 +134,8 @@ type DaprCubeClient struct {
 //
 // 传错组合(例如拿 supertrade-cube-router 配 query)会稳定 404,而 404 与
 // "商品不存在" 无法区分 —— 这正是 2026-10-08 那次故障被显示成
-//「本门店没有条码 X 的商品」的机制。参见 errors.go 的注释表。
-func NewDaprCubeClient(daprClient dapr.Client, appID, queryPath string) *DaprCubeClient {
+// 「本门店没有条码 X 的商品」的机制。参见 errors.go 的注释表。
+func NewDaprCubeClient(daprClient daprInvoker, appID, queryPath string) *DaprCubeClient {
 	if queryPath == "" {
 		queryPath = DefaultCubeQueryPathName
 	}
@@ -192,9 +211,19 @@ func (c *DaprCubeClient) LoadCubeQuery(ctx context.Context, modelName string, q 
 // GetProduct 查 cube product(按 item_no)。
 func (c *DaprCubeClient) GetProduct(ctx context.Context, productID string) (*ProductDTO, error) {
 	data, err := c.LoadCubeQuery(ctx, "product", CubeQuery{
-		Measures:   []string{"product.count"},
+		// 2026-10-08 加 avg_price_yuan:之前只查 product.count,导致
+		// SearchProductRow.Price 永远是 nil → wx-h5 显示「商品当前售价 -」。
+		//
+		// 为什么用 AVG 而不是新加一个 price 维度:
+		//   - price_yuan 列**已经在 cube 的 product 表里**(mapping sale_price→price_yuan),
+		//     且 schema 已有 avg/min/max_price_yuan 三个 measure,不用改 cube 也不用重新拉数据;
+		//   - 这里按 product.id 精确命中**单行**,AVG/MIN/MAX 在单行上恒等于该值,
+		//     所以 AVG(price_yuan) 就是"这个商品的售价",不存在聚合失真;
+		//   - 真要一个 price 维度就得改 sixun-models/product/schema.yaml(共享 schema,
+		//     影响 ysx + hbposv7 两个 family),为同一件事付两倍代价,不划算。
+		Measures: []string{"product.count", "product.avg_price_yuan"},
 		Dimensions: []string{"product.id", "product.name", "product.category_id",
-			"product.supplier_id", "product.status"},
+			"product.supplier_id", "product.unit", "product.status"},
 		Filters: []CubeFilter{
 			{Member: "product.id", Operator: "equals", Values: []any{productID}},
 		},
@@ -215,7 +244,14 @@ func (c *DaprCubeClient) GetProduct(ctx context.Context, productID string) (*Pro
 		Name:       asStr(row["product.name"]),
 		CategoryID: asStr(row["product.category_id"]),
 		SupplierID: asStr(row["product.supplier_id"]),
-		Status:     asStr(row["product.status"]),
+		// Unit: cube product.unit(2026-10-09 起由 t_bd_item_info.unit_no 映射而来)。
+		// cube 侧 dimension 与 ysx / hbposv7 两个 family 的 mapping 已同时补齐,
+		// 所以这里不再恒为空。仍保留空值:老数据 / 该商品未维护单位时 wx-h5 回退显示「件」。
+		Unit:   asStr(row["product.unit"]),
+		Status: asStr(row["product.status"]),
+		// PriceYuan 走指针:nil = cube 没给售价(旧数据 / 该商品未维护价),
+		// 与"售价为 0"是两件事,前端要能区分(0 元商品 vs 没维护价)。
+		PriceYuan: asDecimalPtr(row["product.avg_price_yuan"]),
 		// Barcode: cube product schema 本期不含,留空;后续 cube 仓库扩展后补
 	}, nil
 }
@@ -326,7 +362,7 @@ func (c *DaprCubeClient) SearchProductsByBarcode(ctx context.Context, barcode, b
 // 否则走 name contains。
 func (c *DaprCubeClient) SearchSuppliers(ctx context.Context, query string, limit int) ([]SupplierDTO, error) {
 	cq := CubeQuery{
-		Measures:   []string{"supplier.count"},
+		Measures: []string{"supplier.count"},
 		Dimensions: []string{"supplier.id", "supplier.name", "supplier.type",
 			"supplier.contact", "supplier.phone"},
 	}
@@ -376,6 +412,18 @@ func asStr(v any) string {
 
 func asDecimal(v any) decimal.Decimal {
 	return ParseDecimal(v)
+}
+
+// asDecimalPtr 与 asDecimal 的区别:缺失(nil)时返回 nil 而不是 decimal.Zero。
+//
+// 用于「售价」这类**缺失有语义**的字段 —— 商品没维护价格(nil)与
+// 商品确实是 0 元(Zero)在前端要显示成不同的话,合并成 Zero 就丢了这个信息。
+func asDecimalPtr(v any) *decimal.Decimal {
+	if v == nil {
+		return nil
+	}
+	d := ParseDecimal(v)
+	return &d
 }
 
 // ParseDecimal 把 cube 返回的任意数值字段转为 decimal.Decimal(导出,测试可见)。

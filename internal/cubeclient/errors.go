@@ -76,6 +76,19 @@ func classifyCubeError(err error) error {
 		// 查询本身不合法。调用方 bug,不该退化成"查不到"。
 		return fmt.Errorf("%w: %s", ErrCubeBadRequest, st.Message())
 
+	// 2026-10-08 新增两档。起因:原来这两档都落 default → ErrCubeUnavailable(503),
+	// 造成一次"店员没有 cube:read"的权限问题被显示成「查询失败: HTTP 503」。
+	// 排查时所有人都会去看 cube 服不健康,而 cube 其实一直好好的、只是拒绝了这个人。
+	case codes.Unauthenticated:
+		// cube 端 middleware.http.bearer 拒了透传过去的 caller JWT。
+		// 语义 = 登录态失效,**不是** cube 故障。
+		return fmt.Errorf("%w: %s: %s", ErrCubeAuthRejected, st.Code(), st.Message())
+
+	case codes.PermissionDenied:
+		// cube-router 的 /v1/load 有 rbac.RequireScopeWithBranch("cube:read") 守门。
+		// 403 = 这个调用者确实没这个 scope。语义 = 权限不足,**不是** cube 故障。
+		return fmt.Errorf("%w: %s: %s", ErrCubeForbidden, st.Code(), st.Message())
+
 	default:
 		// Unimplemented(方法名错) / Unavailable(连不上) / DeadlineExceeded(超时)
 		// / ResourceExhausted / Internal / 5xx —— 全部是基础设施故障。

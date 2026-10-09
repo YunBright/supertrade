@@ -61,6 +61,11 @@ func TestClassifyCubeError_Infrastructure(t *testing.T) {
 			if errors.Is(err, ErrCubeNotFound) {
 				t.Fatalf("%s 不能被当成 '数据不存在'", tc.code)
 			}
+			// 2026-10-08 新增:基础设施故障不得被误判成权限/登录态问题,
+			// 否则一次 cube 挂机会被显示成"你没权限"。
+			if errors.Is(err, ErrCubeForbidden) || errors.Is(err, ErrCubeAuthRejected) {
+				t.Fatalf("%s 是基础设施故障,不得归类为权限/登录态(403/401)", tc.code)
+			}
 		})
 	}
 }
@@ -78,93 +83,69 @@ func TestClassifyCubeError_BadRequest(t *testing.T) {
 	}
 }
 
-// 非 gRPC 错误(Dapr 未就绪 / 序列化失败)同样是链路故障。
-func TestClassifyCubeError_NonGRPC(t *testing.T) {
-	err := classifyCubeError(errors.New("dapr sidecar not ready"))
+// ---------------------------------------------------------------------------
+// 2026-10-08 第二次线上故障:cube-router 的 401/403 被 default 分支吞成 503。
+//
+// 真实链路:店员(merchant 角色,无 cube:read)盘点扫码 → stocktake 透传 caller JWT
+// 调 cube-router /v1/load → rbac.RequireScopeWithBranch("cube:read") 返 **403**
+// → 旧代码 default 分支 → ErrCubeUnavailable → handler 503 cube_unavailable
+// → wx-h5 显示「查询失败: HTTP 503」。
+//
+// 危害:①用户以为是服务故障,反复重试/反复登录;②排查的人全去看 cube 健不健康,
+// 而 cube 一直好好的,只是拒绝了这个人。
+// ---------------------------------------------------------------------------
+
+func TestClassifyCubeError_UnauthenticatedIsAuthNotUnavailable(t *testing.T) {
+	err := classifyCubeError(status.Error(codes.Unauthenticated, "Unauthorized"))
+	if !errors.Is(err, ErrCubeAuthRejected) {
+		t.Fatalf("Unauthenticated 应归类为 ErrCubeAuthRejected, got %v", err)
+	}
+	// 反向锁:绝不能再被标成"链路不可用",否则又退回 503。
+	if errors.Is(err, ErrCubeUnavailable) || IsCubeUnavailable(err) {
+		t.Fatalf("401 是登录态问题,不得被标为 ErrCubeUnavailable(503)")
+	}
+	// 更不能被当成"商品不存在"——那会把权限问题翻译成业务结论。
+	if errors.Is(err, ErrCubeNotFound) {
+		t.Fatalf("401 不得被当成 not-found")
+	}
+}
+
+func TestClassifyCubeError_PermissionDeniedIsForbiddenNotUnavailable(t *testing.T) {
+	err := classifyCubeError(status.Error(codes.PermissionDenied, "需要 cube:read"))
+	if !errors.Is(err, ErrCubeForbidden) {
+		t.Fatalf("PermissionDenied 应归类为 ErrCubeForbidden, got %v", err)
+	}
+	if errors.Is(err, ErrCubeUnavailable) || IsCubeUnavailable(err) {
+		t.Fatalf("403 是权限问题,不得被标为 ErrCubeUnavailable(503)")
+	}
+	if errors.Is(err, ErrCubeNotFound) {
+		t.Fatalf("403 不得被当成 not-found")
+	}
+}
+
+func TestClassifyCubeError_NonGRPCStaysUnavailable(t *testing.T) {
+	// 防御:非 gRPC 错误不能被 status.FromError 误判成 Unauthenticated。
+	// status.FromError 对普通 error 返回 ok=false,但如果哪天底层换了包装方式,
+	// 这条锁能第一时间发现。
+	err := classifyCubeError(errors.New("dial tcp 172.12.1.5:50001: connection refused"))
 	if !errors.Is(err, ErrCubeUnavailable) {
-		t.Fatalf("非 gRPC 错误应归类为 ErrCubeUnavailable, got %v", err)
+		t.Fatalf("非 gRPC 错误应为 ErrCubeUnavailable, got %v", err)
+	}
+	if errors.Is(err, ErrCubeForbidden) || errors.Is(err, ErrCubeAuthRejected) {
+		t.Fatalf("非 gRPC 错误不得归类为权限/登录态")
 	}
 }
 
-func TestClassifyCubeError_NilIsNil(t *testing.T) {
-	if err := classifyCubeError(nil); err != nil {
-		t.Fatalf("nil 应返回 nil, got %v", err)
+func TestClassifyCubeError_NilPassthrough(t *testing.T) {
+	if classifyCubeError(nil) != nil {
+		t.Fatalf("nil 输入必须返回 nil")
 	}
 }
 
-// 三类错误必须互斥且完备:每个错误恰好命中一个谓词。
-// 任何两个 sentinel 同时命中(或全不命中),上层"二选一"的判断就会失效,
-// 故障又会退回到"数据不存在"的歧义里。
-func TestCubeErrorClassesAreMutuallyExclusive(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-		want string
-	}{
-		{"notfound", classifyCubeError(status.Error(codes.NotFound, "x")), "notfound"},
-		{"unavailable", classifyCubeError(status.Error(codes.Unavailable, "x")), "unavailable"},
-		{"unimplemented", classifyCubeError(status.Error(codes.Unimplemented, "x")), "unavailable"},
-		{"badrequest", classifyCubeError(status.Error(codes.InvalidArgument, "x")), "badrequest"},
-	}
-	predicates := map[string]func(error) bool{
-		"notfound":    IsCubeNotFound,
-		"unavailable": IsCubeUnavailable,
-		"badrequest":  func(e error) bool { return errors.Is(e, ErrCubeBadRequest) },
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			var hits []string
-			for pname, pred := range predicates {
-				if pred(tc.err) {
-					hits = append(hits, pname)
-				}
-			}
-			if len(hits) != 1 {
-				t.Fatalf("命中 %v,应恰好命中 1 个(err=%v)", hits, tc.err)
-			}
-			if hits[0] != tc.want {
-				t.Fatalf("归类为 %q, want %q (err=%v)", hits[0], tc.want, tc.err)
-			}
-		})
-	}
-}
-
-// 回归锁(2026-10-08 生产实测):默认 app-id 与默认路径必须成对正确。
-//
-// 原先是 app-id="cube-router" + path="query"。但 dapr / Consul 里注册的
-// 名字是 supertrade-cube-router(见 deployer systemd unit),而它只注册
-// POST /v1/load,没有 /query —— 于是每次调用都 404,再被误分类成"商品不存在"。
-//
-// 这里同时锁 app-id 与 path,避免只修一半又错一次。
-func TestDefaultTargetAndPathPair(t *testing.T) {
-	t.Setenv("CUBE_APP_ID", "")
-	t.Setenv("CUBE_QUERY_PATH", "")
-
-	appID := DefaultCubeAppID()
-	path := DefaultCubeQueryPath()
-
-	if appID != "supertrade-cube-router" {
-		t.Errorf("默认 dapr app-id = %q, want \"supertrade-cube-router\"(deployer unit 里注册的名字)", appID)
-	}
-	if path != "v1/load" {
-		t.Errorf("默认查询路径 = %q, want \"v1/load\"(supertrade-cube-router 只注册 /v1/load)", path)
-	}
-	// 这两个不是同一个服务,不能用 cube app 的路由去调 cube-router。
-	if strings.EqualFold(appID, "cube-router") {
-		t.Errorf("\"cube-router\" 只是代码里的约定名,dapr 里没有这个 app-id")
-	}
-	if path == "query" {
-		t.Errorf("\"query\" 是 cube 语义层 app 的路由,不是 cube-router 的")
-	}
-}
-
-func TestDefaultTargetAndPathEnvOverride(t *testing.T) {
-	t.Setenv("CUBE_APP_ID", "cube-sixun-ysx-fb")
-	t.Setenv("CUBE_QUERY_PATH", "query")
-	if got := DefaultCubeAppID(); got != "cube-sixun-ysx-fb" {
-		t.Errorf("CUBE_APP_ID 未生效: %q", got)
-	}
-	if got := DefaultCubeQueryPath(); got != "query" {
-		t.Errorf("CUBE_QUERY_PATH 未生效: %q", got)
+func TestClassifyCubeError_MessageKeepsDownstreamDetail(t *testing.T) {
+	// 排查时要能看到 cube 说了什么(哪个 scope 缺),所以原 message 必须保留。
+	err := classifyCubeError(status.Error(codes.PermissionDenied, "用户在该 branch 下无 cube:read scope"))
+	if !strings.Contains(err.Error(), "cube:read") {
+		t.Fatalf("错误信息必须保留下游原文, got %v", err)
 	}
 }

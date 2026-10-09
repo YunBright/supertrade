@@ -252,6 +252,16 @@ func mapErr(c *gin.Context, err error) {
 		writeError(c, http.StatusBadRequest, "bad_request", err.Error())
 	case errors.Is(err, service.ErrCubeUnavailable):
 		writeError(c, http.StatusServiceUnavailable, "cube_unavailable", err.Error())
+	// 2026-10-08:调用者 token 被 userd 拒(401)。必须排在 ErrUserInfoUnavailable
+	// **之前**判断 —— 前者是"你的登录态没了,重新登录即可",后者是"userd 挂了,
+	// 重试没用"。合成一个 503 会把前者伪装成依赖故障,前端只能弹"服务不可用"。
+	case errors.Is(err, service.ErrCallerTokenRejected):
+		writeError(c, http.StatusUnauthorized, "token_rejected", err.Error())
+	// 2026-10-08:cube 侧守门拒绝 = 403 权限不足,不是 503 服务不可用。
+	// 排在 ErrCubeUnavailable 之前,避免被它抢走(两者语义完全相反)。
+	case errors.Is(err, service.ErrCubeForbidden):
+		writeError(c, http.StatusForbidden, "cube_forbidden",
+			"当前账号未被授予本门店的数据读取权限(cube:read),请联系管理员开通")
 	case errors.Is(err, service.ErrUserInfoUnavailable):
 		writeError(c, http.StatusServiceUnavailable, "userd_unavailable", err.Error())
 	default:

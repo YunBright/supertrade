@@ -51,6 +51,21 @@ var ErrCubeUnavailable = errors.New("cubeclient: cube 调用链路不可用")
 // 属于调用方 bug,应暴露为 400 而不是"查不到"。
 var ErrCubeBadRequest = errors.New("cubeclient: cube 拒绝该查询")
 
+// ErrCubeAuthRejected 表示 cube 端 middleware.http.bearer **拒了透传过去的
+// caller JWT**(gRPC Unauthenticated → cube 401)。
+//
+// ⚠️ 与 ErrCubeUnavailable 严格区分:这是"你的登录态没了",重新登录能解决;
+// 而 ErrCubeUnavailable 是"cube 挂了",重试也没用。混在一起会让一个登录态问题
+// 被显示成「查询失败: HTTP 503」,排查时全部跑去查 cube 健康度。
+var ErrCubeAuthRejected = errors.New("cubeclient: cube 拒绝调用者凭证")
+
+// ErrCubeForbidden 表示 cube-router 的 per-branch 守门拒绝了这次调用
+// (gRPC PermissionDenied → cube 403),最常见是缺 `cube:read` scope。
+//
+// ⚠️ 同样不是"cube 不可用":cube 活得好好的,只是这个账号没被授予读数据的权限。
+// 对应到终端用户 = 权限不足(403),不是服务故障(503)。
+var ErrCubeForbidden = errors.New("cubeclient: 调用者缺少该门店的 cube 读权限")
+
 // ---- cube 响应 DTO(非 GORM,只作类型契约 / 响应类型) ----
 
 // ProductDTO 是 cube `product` model 的响应子集,作为本系统的响应类型契约。
@@ -58,15 +73,38 @@ var ErrCubeBadRequest = errors.New("cubeclient: cube 拒绝该查询")
 // 字段含义与 cube `F:\go\src\github.com\YunBright\cube\sixun-models\product\schema.yaml` 一致;
 // 本系统不创建对应的 PG 表(REQUIREMENTS §7.5),但 Go struct 字段名 / 类型 / JSON tag 全部对齐。
 type ProductDTO struct {
-	ID         string `json:"id"`               // cube product.id = 思迅 item_no
-	Name       string `json:"name"`             // cube product.name
-	CategoryID string `json:"category_id"`      // cube product.category_id
-	SupplierID string `json:"supplier_id"`      // cube product.supplier_id
-	Unit       string `json:"unit,omitempty"`   // 商品基本单位(扩展字段)
-	Spec       string `json:"spec,omitempty"`   // 规格(扩展字段)
-	Status     string `json:"status"`           // cube product.status
+	ID         string `json:"id"`                // cube product.id = 思迅 item_no
+	Name       string `json:"name"`              // cube product.name
+	CategoryID string `json:"category_id"`       // cube product.category_id
+	SupplierID string `json:"supplier_id"`       // cube product.supplier_id
+	Unit       string `json:"unit,omitempty"`    // 商品基本单位(见下方说明)
+	Spec       string `json:"spec,omitempty"`    // 规格(扩展字段)
+	Status     string `json:"status"`            // cube product.status
 	Barcode    string `json:"barcode,omitempty"` // 主条码(扩展,给扫码用)
+	// PriceYuan 商品当前售价(元),来自 cube 的 product.avg_price_yuan。
+	//
+	// 2026-10-08 新增。此前 GetProduct 不查价,wx-h5 的「商品当前售价」永远是 "-"。
+	// 用指针:nil = cube 没给(该商品未维护价格),与"售价就是 0 元"是两件事。
+	PriceYuan *decimal.Decimal `json:"price_yuan,omitempty"`
 }
+
+// Unit 从哪来(2026-10-09 已打通,别再重复调研):
+//
+//	cube product.unit ← 思迅 t_bd_item_info.unit_no (char),ysx + hbposv7 两个 family 都映射了。
+//
+// 这个列**值直接就是单位名本身**(实测 '提'),不是单位编号,
+// 所以不需要 join 单位表,也不需要 enum_map / transform。
+//
+// ⚠️ cube 的 product 表列由 mapping-product.yaml **白名单**决定 —— schema 里
+// 加了 dimension 不会自动有数据,mapping 没映射的列 DuckDB 里根本不存在。
+// 而且 sixun-models/product/schema.yaml 是 ysx + hbposv7 **共享**的,
+// 两个 family 的 mapping 必须同时补,漏一边则查 product.unit 时该 family 直接 SQL 报错。
+// 改完还必须**重新全量拉取**才会把新列写进 DuckDB。
+//
+// 仍可能为空的情况:老数据 / 该商品未维护单位。wx-h5 对此回退显示「件」(见前端 formatQty)。
+//
+// Spec 目前**仍然恒为空** —— cube product 表没有规格列(ysx 的 item_size 是 '1*10'
+// 这类字符串,不适合直接当规格维度用),要接需要单独评估。
 
 // StockSnapshotDTO 是某门店 cube 实例里某商品的库存快照。
 //

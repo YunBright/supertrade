@@ -7,7 +7,8 @@
 //   - 差异表实时生成:counting/adjusted/approved 任意状态都允许
 //
 // 状态机:
-//   counting ─submit─▶ adjusted ─approve─▶ approved
+//
+//	counting ─submit─▶ adjusted ─approve─▶ approved
 package service
 
 import (
@@ -26,6 +27,8 @@ import (
 	"github.com/YunBright/supertrade/internal/stocktake/model"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"gorm.io/gorm"
 )
 
@@ -35,8 +38,8 @@ import (
 type Service struct {
 	db        *gorm.DB
 	cube      cubeclient.Client
-	publisher Publisher       // nil = 禁用 pub/sub 广播
-	pubLogger *slog.Logger    // 发布日志;默认 slog.Default()
+	publisher Publisher        // nil = 禁用 pub/sub 广播
+	pubLogger *slog.Logger     // 发布日志;默认 slog.Default()
 	now       func() time.Time // 注入时间,默认 time.Now().UTC()
 
 	// effective scopes 校验用 userinfo 客户端;nil 时 GetEffectiveScopes 返 ErrUserInfoUnavailable。
@@ -105,17 +108,17 @@ func (s *Service) SetScopeTTL(ttl time.Duration) {
 // ---- 业务错误(供 handler 映射 HTTP 状态码) ----
 
 var (
-	ErrHeaderNotFound       = errors.New("service: 盘点单不存在")
-	ErrLineNotFound         = errors.New("service: 盘点明细不存在")
-	ErrInvalidStatus        = errors.New("service: 盘点单状态不允许该操作")
-	ErrInvalidTransition    = errors.New("service: 非法状态转移")
-	ErrCubeUnavailable      = errors.New("service: cube client 未配置")
-	ErrProductNotFound      = errors.New("service: 商品在 cube 中不存在") // 包装 cubeclient.ErrProductNotFound
-	ErrStockNotFound        = errors.New("service: 该分店下的商品 stock 不存在(疑似跨店盘点)") // 包装 cubeclient.ErrStockNotFound
-	ErrPlanItemNotFound     = errors.New("service: 计划盘点商品不存在")
-	ErrPlanItemDuplicated   = errors.New("service: 同一商品已在计划清单中")
+	ErrHeaderNotFound        = errors.New("service: 盘点单不存在")
+	ErrLineNotFound          = errors.New("service: 盘点明细不存在")
+	ErrInvalidStatus         = errors.New("service: 盘点单状态不允许该操作")
+	ErrInvalidTransition     = errors.New("service: 非法状态转移")
+	ErrCubeUnavailable       = errors.New("service: cube client 未配置")
+	ErrProductNotFound       = errors.New("service: 商品在 cube 中不存在")             // 包装 cubeclient.ErrProductNotFound
+	ErrStockNotFound         = errors.New("service: 该分店下的商品 stock 不存在(疑似跨店盘点)") // 包装 cubeclient.ErrStockNotFound
+	ErrPlanItemNotFound      = errors.New("service: 计划盘点商品不存在")
+	ErrPlanItemDuplicated    = errors.New("service: 同一商品已在计划清单中")
 	ErrRecheckRequiresParent = errors.New("service: 复盘点单必须指定 parent_header_id")
-	ErrInvalidOpType        = errors.New("service: 非法的 op_type")
+	ErrInvalidOpType         = errors.New("service: 非法的 op_type")
 	// 以下三个是 2026-10-07 补的入参校验,handler 统一映射 400 bad_request。
 	//
 	// 补它们的直接原因:handler 的 addLineReq.ActualQty 带 `binding:"required"`,
@@ -123,13 +126,46 @@ var (
 	// `field.IsValid() && !field.IsZero()`,而 decimal.Decimal 是 struct,
 	// decimal.NewFromInt(0) 得到的 struct 仍非零值。于是 0 与 -5 都能通过
 	// binding,一路走到 tx.Create 把负数实际库存写进 decimal(20,4) 列。
-	ErrInvalidQty          = errors.New("service: 数量非法")
-	ErrInvalidDiffReason   = errors.New("service: 非法的 diff_reason")
-	ErrInvalidOpMethod     = errors.New("service: 非法的 method")
+	ErrInvalidQty        = errors.New("service: 数量非法")
+	ErrInvalidDiffReason = errors.New("service: 非法的 diff_reason")
+	ErrInvalidOpMethod   = errors.New("service: 非法的 method")
 	// ErrUserInfoUnavailable userd 未注入或调用失败(handler 映射 503)。
 	// 区别于 ErrCubeUnavailable:这里是权限校验依赖不可用。
-	ErrUserInfoUnavailable  = errors.New("service: userd 不可用,无法校验 effective scopes")
+	ErrUserInfoUnavailable = errors.New("service: userd 不可用,无法校验 effective scopes")
+	// ErrCallerTokenRejected userd **拒绝了这个调用者的 token**(401)。
+	// handler 映射 401,前端据此提示"登录已失效/权限不足"而不是"服务不可用"。
+	//
+	// 2026-10-08 新增。起因:本服务 sidecar **没有** middleware.http.bearer
+	// (components/ 下只有 pubsub.yaml + localSecretStore.yaml),而
+	// authkit/claims.GinMiddleware 明确"不验签、只解析 payload",于是
+	// stocktake 自己一个 token 都不验 —— userd 是这条链路上**唯一**的验签点。
+	// 后果是 access_token 过期时:
+	//   stocktake 照常放行 → 拿过期 token 调 userd → userd 返 401
+	//   → 旧代码一律包成 ErrUserInfoUnavailable → 对外 503「userd 不可用」
+	// 一个"登录态过期"被伪装成"依赖服务故障",排查时所有人都会去看 userd 健不健康。
+	// 语义相反的两件事必须分开:401 = 重新登录能解决,503 = 重试/查服务。
+	ErrCallerTokenRejected = errors.New("service: 调用者凭证无效或已过期")
+	// ErrCubeForbidden cube 侧 per-branch 守门拒绝(最常见:缺 cube:read scope)。
+	// handler 映射 403 —— cube 本身是健康的,拒绝的是**这个账号**。
+	ErrCubeForbidden = errors.New("service: 当前账号缺少该门店的 cube 读权限")
 )
+
+// authRejectedErr 判断 err 是否表示"userd 拒绝了调用者的 token"。
+//
+// 只认 gRPC codes.Unauthenticated —— dapr 的 service invocation 在目标 app 的
+// middleware.http.bearer 拒收时映射成这个码(userinfo.Warmup 也在用它判断
+// "链路已通、只是没带 token")。其它码(Unavailable / DeadlineExceeded / NotFound …)
+// 一律不算,否则网络抖动会被再次误报成登录态问题。
+//
+// 注意:userinfo 的错误是 fmt.Errorf("%w") 包过的,必须用 status.FromError
+// 而不是 errors.Is —— gRPC 状态不进 errors 树。
+func authRejectedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	st, ok := status.FromError(err)
+	return ok && st.Code() == codes.Unauthenticated
+}
 
 // ---- Header ----
 
@@ -138,11 +174,11 @@ var (
 // ParentHeaderID 仅在 Type == recheck 时必填(指向原始盘点单);
 // type == plan 时忽略。
 type CreateHeaderInput struct {
-	BranchID      string
-	CountDate     time.Time
-	Type          model.StocktakeType
-	OperatorID    string
-	Remark        string
+	BranchID       string
+	CountDate      time.Time
+	Type           model.StocktakeType
+	OperatorID     string
+	Remark         string
 	ParentHeaderID string
 }
 
@@ -216,6 +252,9 @@ func (s *Service) GetHeader(_ context.Context, id string) (*model.StocktakeHeade
 }
 
 // GetHeaderWithLines 查盘点表 + 所有明细行(按 created_at 升序)。
+//
+// 每行额外回填"最后一次操作"的操作人(OperatorName / OperatorAt),来源是
+// stocktake_line_operations —— 见 model.StocktakeLine 派生字段注释。
 func (s *Service) GetHeaderWithLines(_ context.Context, id string) (*model.StocktakeHeader, error) {
 	h, err := s.GetHeader(context.Background(), id)
 	if err != nil {
@@ -225,8 +264,43 @@ func (s *Service) GetHeaderWithLines(_ context.Context, id string) (*model.Stock
 	if err := s.db.Where("header_id = ?", id).Order("created_at ASC").Find(&lines).Error; err != nil {
 		return nil, err
 	}
+	s.fillLineOperators(lines)
 	h.Lines = lines
 	return h, nil
+}
+
+// fillLineOperators 把「每个 line 的最后一次操作」的操作人回填到 line 上。
+//
+// 做法:一次查出该 header 下全部 operation,按 op_at 升序遍历,后写覆盖先写 ——
+// 遍历结束时每个 line 上留的就是"最后一次"。
+//
+// 为什么不在 SQL 里做 DISTINCT ON / 窗口函数:SQLite(测试用)与 Postgres
+// 语法不同,而单张盘点单的 operation 行数是几十级别,内存里归并的成本可以忽略。
+// 详见 model.StocktakeLine.OperatorName 的注释(这段能力缺失导致的前端症状)。
+func (s *Service) fillLineOperators(lines []model.StocktakeLine) {
+	if len(lines) == 0 {
+		return
+	}
+	headerID := lines[0].HeaderID
+	var ops []model.StocktakeLineOperation
+	if err := s.db.Where("header_id = ?", headerID).
+		Order("op_at ASC").Find(&ops).Error; err != nil {
+		// 回填是锦上添花,失败不该让整个查询失败 —— 行数据本身已经拿到了。
+		s.pubLogger.Warn("fillLineOperators 读操作历史失败", "header_id", headerID, "err", err)
+		return
+	}
+	last := make(map[string]model.StocktakeLineOperation, len(ops))
+	for _, op := range ops {
+		last[op.LineID] = op
+	}
+	for i := range lines {
+		op, ok := last[lines[i].ID]
+		if !ok {
+			continue
+		}
+		lines[i].OperatorName = op.ActorName
+		lines[i].OperatorAt = op.OpAt.UTC().Format(time.RFC3339)
+	}
 }
 
 // GetHeaderByLineID 拿某 line 所属 header 的 branchID(handler 守门用)。
@@ -268,10 +342,10 @@ func (s *Service) Submit(ctx context.Context, id string) (*model.StocktakeHeader
 	if err := s.db.Model(&model.StocktakeHeader{}).
 		Where("id = ?", id).
 		Updates(map[string]any{
-			"status":                   model.StatusAdjusted,
-			"total_diff_qty":           summary.TotalDiffQty,
-			"total_diff_amount_yuan":   summary.TotalDiffAmountYuan,
-			"updated_at":               now,
+			"status":                 model.StatusAdjusted,
+			"total_diff_qty":         summary.TotalDiffQty,
+			"total_diff_amount_yuan": summary.TotalDiffAmountYuan,
+			"updated_at":             now,
 		}).Error; err != nil {
 		return nil, err
 	}
@@ -281,13 +355,13 @@ func (s *Service) Submit(ctx context.Context, id string) (*model.StocktakeHeader
 	}
 	// §2.13 stocktake.header.submitted
 	s.publish(ctx, TopicStocktakeHeaderSubmitted, &HeaderEventData{
-		HeaderID:    updated.ID,
-		BranchID:    updated.BranchID,
-		Type:        string(updated.Type),
-		Status:      string(updated.Status),
-		ParentID:    stringOrEmpty(updated.ParentHeaderID),
-		OperatorID:  updated.OperatorID,
-		OccurredAt:  now.UTC().Format(time.RFC3339),
+		HeaderID:   updated.ID,
+		BranchID:   updated.BranchID,
+		Type:       string(updated.Type),
+		Status:     string(updated.Status),
+		ParentID:   stringOrEmpty(updated.ParentHeaderID),
+		OperatorID: updated.OperatorID,
+		OccurredAt: now.UTC().Format(time.RFC3339),
 	})
 	return updated, nil
 }
@@ -322,13 +396,13 @@ func (s *Service) Approve(ctx context.Context, id, auditorID string) (*model.Sto
 	}
 	// §2.13 stocktake.header.approved
 	s.publish(ctx, TopicStocktakeHeaderApproved, &HeaderEventData{
-		HeaderID:    updated.ID,
-		BranchID:    updated.BranchID,
-		Type:        string(updated.Type),
-		Status:      string(updated.Status),
-		ParentID:    stringOrEmpty(updated.ParentHeaderID),
-		OperatorID:  auditorID,
-		OccurredAt:  now.UTC().Format(time.RFC3339),
+		HeaderID:   updated.ID,
+		BranchID:   updated.BranchID,
+		Type:       string(updated.Type),
+		Status:     string(updated.Status),
+		ParentID:   stringOrEmpty(updated.ParentHeaderID),
+		OperatorID: auditorID,
+		OccurredAt: now.UTC().Format(time.RFC3339),
 	})
 	return updated, nil
 }
@@ -439,8 +513,8 @@ func validateAccumulatedQty(sum decimal.Decimal) error {
 // ActorID / ActorName 用于写 StocktakeLineOperation;为空时归为 "unknown"。
 // Method:scan / manual / import,默认 manual。
 type AddLineInput struct {
-	ProductID string
-	ActualQty decimal.Decimal
+	ProductID  string
+	ActualQty  decimal.Decimal
 	DiffReason model.DiffReason
 	Remark     string
 	OpType     model.LineOpType // default OpCreate
@@ -635,6 +709,11 @@ func (s *Service) AddLine(ctx context.Context, headerID string, in AddLineInput)
 		OperatorName: actorName,
 		OccurredAt:   now.UTC().Format(time.RFC3339),
 	})
+	// 2026-10-08:回填派生字段,让本次响应里的 line 自带操作人。
+	// 前端保存成功后会把返回的 line 塞回本地列表,不回填就会出现
+	// "刚保存的那条显示未知,刷新一次才显示名字"。
+	line.OperatorName = actorName
+	line.OperatorAt = now.UTC().Format(time.RFC3339)
 	return line, nil
 }
 
@@ -804,6 +883,8 @@ func (s *Service) UpdateLine(ctx context.Context, lineID string, in UpdateLineIn
 		OperatorName: actorName,
 		OccurredAt:   now.UTC().Format(time.RFC3339),
 	})
+	updated.OperatorName = actorName
+	updated.OperatorAt = now.UTC().Format(time.RFC3339)
 	return updated, nil
 }
 
@@ -922,24 +1003,24 @@ type SearchProductsInput struct {
 // 零值 decimal.Decimal 不触发 omitempty(JSON 把所有 struct 都视为非零),
 // 而权限字段没值时必须不输出。
 type SearchProductRow struct {
-	Barcode      string           `json:"barcode"`                  // = item_no (本期)
+	Barcode      string           `json:"barcode"` // = item_no (本期)
 	ProductID    string           `json:"product_id"`
 	ProductName  string           `json:"product_name"`
 	Category     string           `json:"category,omitempty"`
 	Brand        string           `json:"brand,omitempty"`
 	Unit         string           `json:"unit,omitempty"`
-	Price        *decimal.Decimal `json:"price,omitempty"`           // 扩展字段,本期 mock
-	StockQty     *decimal.Decimal `json:"stock_qty,omitempty"`        // 需 inventory:view
+	Price        *decimal.Decimal `json:"price,omitempty"`     // cube product.avg_price_yuan(单行命中,AVG 即售价)
+	StockQty     *decimal.Decimal `json:"stock_qty,omitempty"` // 需 inventory:view
 	AvgCostYuan  *decimal.Decimal `json:"avg_cost_yuan,omitempty"`
-	SupplierID   string           `json:"supplier_id,omitempty"`     // 需 supplier:view
+	SupplierID   string           `json:"supplier_id,omitempty"` // 需 supplier:view
 	SupplierName string           `json:"supplier_name,omitempty"`
 }
 
 // SearchProductsMeta 权限可见性元数据。
 type SearchProductsMeta struct {
-	InvViewable       bool   `json:"inv_viewable"`
-	SupplierViewable  bool   `json:"supplier_viewable"`
-	BarcodeQuery      string `json:"barcode_query,omitempty"`
+	InvViewable      bool   `json:"inv_viewable"`
+	SupplierViewable bool   `json:"supplier_viewable"`
+	BarcodeQuery     string `json:"barcode_query,omitempty"`
 }
 
 // SearchProductsOutput 搜索结果。
@@ -982,6 +1063,16 @@ func (s *Service) SearchProducts(ctx context.Context, in SearchProductsInput, in
 		if cubeclient.IsCubeUnavailable(err) {
 			return nil, fmt.Errorf("%w: %s", ErrCubeUnavailable, err.Error())
 		}
+		// 2026-10-08:权限/登录态两类必须原样透出,不能落到下面那行变成 500。
+		// 起因:cube-router 的 /v1/load 有 cube:read 守门,店员没这个 scope 时
+		// 返 403 → 一路冒泡到 mapErr 的 default → 500 internal_error,
+		// 用户看到的是"服务器内部错误",既不知道是自己没权限也不知道该找谁。
+		if errors.Is(err, cubeclient.ErrCubeForbidden) {
+			return nil, fmt.Errorf("%w: %s", ErrCubeForbidden, err.Error())
+		}
+		if errors.Is(err, cubeclient.ErrCubeAuthRejected) {
+			return nil, fmt.Errorf("%w: %s", ErrCallerTokenRejected, err.Error())
+		}
 		return nil, fmt.Errorf("cube search products: %w", err)
 	}
 
@@ -1008,9 +1099,11 @@ func (s *Service) SearchProducts(ctx context.Context, in SearchProductsInput, in
 			ProductID:   r.Product.ID,
 			ProductName: r.Product.Name,
 			Category:    r.Product.CategoryID, // 简化:返回 ID 即可;前端要做"分类 ID → 名称"映射的话后续 Phase
-			Brand:       "",                  // cube 标准 product 无 brand 字段(扩展)
+			Brand:       "",                   // cube 标准 product 无 brand 字段(扩展)
 			Unit:        r.Product.Unit,
-			Price:       nil,                  // cube 标准 product 无 price 字段(扩展,本期 mock)
+			// 2026-10-08:此前恒为 nil(注释写"cube 无 price 字段"是错的 ——
+			// price_yuan 一直在 cube 的 product 表里,只是 GetProduct 没查)。
+			Price: r.Product.PriceYuan,
 		}
 		if invViewable && r.Stock != nil {
 			q := r.Stock.Quantity
@@ -1256,6 +1349,7 @@ type SearchHeadersOutput struct {
 // 匹配规则:
 //   - id LIKE 'q%'           单号前缀(单号 ST<yyyyMMdd><hex> 全大写,前缀够用)
 //   - LOWER(remark) LIKE '%q%'  备注大小写无关包含
+//
 // 两者 OR;branchID 为空时不过滤门店。
 //
 // 分页同 ListHeaders(page=1 / page_size=20 / max=100);排序 count_date DESC, id DESC。
@@ -1611,6 +1705,16 @@ func (s *Service) GetEffectiveScopes(ctx context.Context, userID, branchID strin
 
 	p, err := s.userInfo.GetBranchPermissions(ctx, userID, branchID)
 	if err != nil {
+		// 三档分类,顺序不能换(ErrPermissionsUnavailable 是 NotFound,先判它):
+		//   1. Unauthenticated → 调用者 token 被 userd 拒(401),**不是** userd 故障
+		//   2. NotFound        → userd 没部署 permissions 端点(部署态问题,503)
+		//   3. 其它            → 真的调不通(网络/超时/ACL),503
+		if authRejectedErr(err) {
+			// 不 cache:token 刷新后同一个 (user,branch) 会恢复正常,不能把失败缓存住
+			s.pubLogger.Warn("userd 拒绝调用者 token(401),按登录态失效处理",
+				"user_id", userID, "branch_id", branchID, "err", err)
+			return nil, fmt.Errorf("%w: %v", ErrCallerTokenRejected, err)
+		}
 		// ErrPermissionsUnavailable 视作 userd 没部署新端点 —— 降级返 nil 让 handler
 		// 走 403(而不是把 userd 部署状态当 503 透出去)。
 		if errors.Is(err, userinfo.ErrPermissionsUnavailable) {
@@ -1713,6 +1817,12 @@ func (s *Service) GetEffectiveScopesMulti(ctx context.Context, userID string, br
 	// 自动展开为重复 ?branch_id=A&branch_id=B query。
 	p, err := s.userInfo.GetBranchPermissionsMulti(ctx, userID, uniq)
 	if err != nil {
+		// 同 GetEffectiveScopes:401(调用者 token 被拒)必须与 503(调不通)分开。
+		if authRejectedErr(err) {
+			s.pubLogger.Warn("userd 拒绝调用者 token(401),按登录态失效处理",
+				"user_id", userID, "branch_ids", uniq, "err", err)
+			return nil, fmt.Errorf("%w: %v", ErrCallerTokenRejected, err)
+		}
 		if errors.Is(err, userinfo.ErrPermissionsUnavailable) {
 			s.pubLogger.Warn("userinfo.GetBranchPermissionsMulti 404 (userd 未提供 permissions 端点)",
 				"user_id", userID, "branch_ids", uniq)

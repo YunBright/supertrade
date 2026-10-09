@@ -143,6 +143,19 @@ type StocktakeLine struct {
 	CreatedAt      time.Time       `gorm:"column:created_at;not null" json:"created_at"`
 	UpdatedAt      time.Time       `gorm:"column:updated_at;not null" json:"updated_at"`
 	DeletedAt      gorm.DeletedAt  `gorm:"column:deleted_at;index" json:"-"`
+
+	// ---- 派生字段(不入库,查询时从 stocktake_line_operations 回填) ----
+	//
+	// 2026-10-08 新增。之前 line 上**没有任何操作人信息**,而 wx-h5 的
+	// renderExistingHintHTML 读的是 `line.operator_name || line.operator_id` ——
+	// 两者永远 undefined,于是「本盘点单已有记录」永远显示「操作人 未知」。
+	// 数据其实一直有:stocktake_line_operations.actor_name 存着"梁昌军"/"admin"。
+	//
+	// gorm:"-" 让 GORM 完全无视这两个字段(不建列、不参与 Where/Update),
+	// 由 service 在 GetHeaderWithLines / AddLine / UpdateLine 时显式回填。
+	// 用派生字段而不是 JOIN 进 model,是为了不动存量表结构。
+	OperatorName string `gorm:"-" json:"operator_name,omitempty"`
+	OperatorAt   string `gorm:"-" json:"operator_at,omitempty"`
 }
 
 // TableName 显式表名。
@@ -244,19 +257,19 @@ func AllOpMethods() []OpMethod {
 //   - accumulate:prev_qty=旧 actual, new_qty=新 actual, qty_delta=新-旧
 //   - delete:prev_qty=旧 actual, new_qty=0, qty_delta=-旧 actual
 type StocktakeLineOperation struct {
-	ID         string          `gorm:"primaryKey;column:id;type:varchar(64)" json:"id"`
-	HeaderID   string          `gorm:"column:header_id;type:varchar(64);not null;index" json:"header_id"`
-	LineID     string          `gorm:"column:line_id;type:varchar(64);not null;index" json:"line_id"`
-	OpType     LineOpType      `gorm:"column:op_type;type:varchar(16);not null;index" json:"op_type"`
-	ActorID    string          `gorm:"column:actor_id;type:varchar(64);not null;index" json:"actor_id"`
-	ActorName  string          `gorm:"column:actor_name;type:varchar(128);not null" json:"actor_name"`
-	PrevQty    decimal.Decimal `gorm:"column:prev_qty;type:decimal(20,4);not null" json:"prev_qty"`
-	NewQty     decimal.Decimal `gorm:"column:new_qty;type:decimal(20,4);not null" json:"new_qty"`
-	QtyDelta   decimal.Decimal `gorm:"column:qty_delta;type:decimal(20,4);not null" json:"qty_delta"`
-	OpAt       time.Time       `gorm:"column:op_at;not null;index" json:"op_at"`
-	Method     OpMethod        `gorm:"column:method;type:varchar(16);not null" json:"method"`
-	Remark     string          `gorm:"column:remark;type:text" json:"remark,omitempty"`
-	CreatedAt  time.Time       `gorm:"column:created_at;not null" json:"created_at"`
+	ID        string          `gorm:"primaryKey;column:id;type:varchar(64)" json:"id"`
+	HeaderID  string          `gorm:"column:header_id;type:varchar(64);not null;index" json:"header_id"`
+	LineID    string          `gorm:"column:line_id;type:varchar(64);not null;index" json:"line_id"`
+	OpType    LineOpType      `gorm:"column:op_type;type:varchar(16);not null;index" json:"op_type"`
+	ActorID   string          `gorm:"column:actor_id;type:varchar(64);not null;index" json:"actor_id"`
+	ActorName string          `gorm:"column:actor_name;type:varchar(128);not null" json:"actor_name"`
+	PrevQty   decimal.Decimal `gorm:"column:prev_qty;type:decimal(20,4);not null" json:"prev_qty"`
+	NewQty    decimal.Decimal `gorm:"column:new_qty;type:decimal(20,4);not null" json:"new_qty"`
+	QtyDelta  decimal.Decimal `gorm:"column:qty_delta;type:decimal(20,4);not null" json:"qty_delta"`
+	OpAt      time.Time       `gorm:"column:op_at;not null;index" json:"op_at"`
+	Method    OpMethod        `gorm:"column:method;type:varchar(16);not null" json:"method"`
+	Remark    string          `gorm:"column:remark;type:text" json:"remark,omitempty"`
+	CreatedAt time.Time       `gorm:"column:created_at;not null" json:"created_at"`
 }
 
 // TableName 显式表名。
