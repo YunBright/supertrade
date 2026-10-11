@@ -1,0 +1,23 @@
+# local-secret-store 是在服务器上独立的component,所有差异化配置都放在服务器的 secret-store 里,不放在代码仓库里。
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: conversation
+  namespace: default
+spec:
+  type: conversation.openai
+  metadata:
+  - name: key
+    secretKeyRef:
+      name: deepseek.key
+      key: deepseek.key
+  - name: model
+    secretKeyRef:
+      name: deepseek.model
+      key: deepseek.model
+  - name: endpoint
+    value: 'https://api.deepseek.com'
+  - name: responseCacheTTL
+    value: 10m
+auth:
+  secretStore: local-secret-store

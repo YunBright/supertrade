@@ -27,6 +27,7 @@ package cubeclient
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -441,8 +442,22 @@ func ParseDecimal(v any) decimal.Decimal {
 	case int64:
 		return decimal.NewFromInt(x)
 	case string:
-		d, _ := decimal.NewFromString(x)
-		return d
+		if d, err := decimal.NewFromString(x); err == nil {
+			return d
+		}
+		// MSSQL live 源(sixun 直查,如 settlement/stock/sale_day)的 decimal 经
+		// go-mssqldb 以 []byte 返回,encoding/json 把 []byte 序列化成 base64
+		// (如 SUM(sheet_amt) "NDY0OTIuMDIwMA==" = "46492.0200")。
+		// 直接 NewFromString 失败时按 base64 解码再试;纯数字串在第一分支就
+		// 命中,不会被误当 base64。解出来仍不是合法数字 → 保持 Zero 语义。
+		if raw, berr := base64.StdEncoding.DecodeString(x); berr == nil {
+			if s := strings.TrimSpace(string(raw)); s != "" {
+				if d, nerr := decimal.NewFromString(s); nerr == nil {
+					return d
+				}
+			}
+		}
+		return decimal.Zero
 	case json.Number:
 		d, _ := decimal.NewFromString(x.String())
 		return d

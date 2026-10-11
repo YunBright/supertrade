@@ -512,9 +512,13 @@ func (h *Handler) AddLine(c *gin.Context) {
 		return
 	}
 	cl, _ := claims.FromContext(c.Request.Context())
-	// AddLine 会查 cube product + stock,需要把 caller JWT + X-Branch-ID 透传给 cube-gateway sidecar。
+	// AddLine 会查 cube product + stock,需要把 caller JWT + branch 透传给 cube sidecar。
+	// branch 权威来源是盘点单 header 记录(hdr.BranchID),与上面 requireScope 的鉴权
+	// branch、service 层 GetStock 的 branch 保持一致 —— 不用请求头 X-Branch-ID:
+	// 请求不带/带错时 cube-router 无法选 source(400 branch_required),错误会坍缩成
+	// 500 "链路不可用",且请求头与单记录不一致还会把 product 查询路由到另一门店的 cube。
 	ctx := cubeclient.WithBearer(c.Request.Context(), c.Request.Header.Get("Authorization"))
-	ctx = cubeclient.WithBranchID(ctx, c.Request.Header.Get("X-Branch-ID"))
+	ctx = cubeclient.WithBranchID(ctx, hdr.BranchID)
 	line, err := h.svc.AddLine(ctx, headerID, service.AddLineInput{
 		ProductID:  req.ProductID,
 		ActualQty:  req.ActualQty,

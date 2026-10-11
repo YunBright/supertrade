@@ -142,8 +142,8 @@ func registerRoutes(r *gin.Engine) {
 
 // registerDaprRoutes 在 auth 中间件**之前**注册 Dapr 订阅端点。
 //
-//   GET  /dapr/subscribe  → 订阅清单
-//   POST /events/<topic>  → 事件分发(本服务订阅 auth.user.access_changed)
+//	GET  /dapr/subscribe  → 订阅清单
+//	POST /events/<topic>  → 事件分发(本服务订阅 auth.user.access_changed)
 //
 // 必须早于 cmdbootstrap 的 claims.GinMiddleware + rbac.RequireAudience:
 // sidecar 调这两个端点不带 Authorization 头,带上鉴权中间件就会 401,
@@ -152,6 +152,9 @@ func registerRoutes(r *gin.Engine) {
 func registerDaprRoutes(r *gin.Engine) {
 	h := handler.New(appSvc)
 	h.RegisterSubscribeRoutes(r, slog.Default())
+	// S2S 内部端点(settlement-auditor 建计划盘点单):同样不能走 JWT,
+	// 靠 dapr 内网 + nginx 不暴露 /internal/* 保护。
+	h.RegisterInternalRoutes(r)
 }
 
 // forwardBearerToOutgoing 把 gin request 的 Authorization header 注入 ctx。

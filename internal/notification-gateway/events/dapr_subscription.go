@@ -44,6 +44,10 @@ var Topics = []string{
 	"stocktake.header.approved",
 	"stocktake.plan_item.added",
 	"auth.user.access_changed",
+	// settlement-auditor(结算付款审批机器一审):状态变化 + 推理日志增量,
+	// payload 含 branch_id + user_id,走 tenant+branch 过滤(同 stocktake.*)。
+	"settlement.audit.status",
+	"settlement.audit.log",
 }
 
 // Subscription 是 /dapr/subscribe 返回结构。

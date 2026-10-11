@@ -73,6 +73,11 @@
 | `stocktake.plan_item.added` | stocktake | notification-gateway | header_id, items_count | §2.13 |
 | `auth.user.access_changed` | auth (userd) | notification-gateway / **stocktake(失效 scope cache)** | user_id, tenant_id, changed_scopes, changed_roles, changed_branches, changed_default_branch, snapshot_version | §2.14 |
 | `cube.source.changed` | cube-router | erp-connector / stocktake / catalog / inventory(失效本地 cache) | branch_id, cube_source_name, enabled | §2.15 |
+| `settlement.audit.status` | settlement-auditor | notification-gateway | approval_id, branch_id, user_id, status, sp_no | §2.16 |
+| `settlement.audit.log` | settlement-auditor | notification-gateway | approval_id, branch_id, user_id, step, output_summary | §2.16 |
+| `wecom.approval.command` | settlement-auditor | wechat-bot(执行企微命令) | id, type(apply_event/notify_text/stocktake_taskcard), corp_id, payload | §2.17 |
+| `wecom.approval.command_result` | wechat-bot | settlement-auditor | command_id, type, ok, sp_no, error | §2.17 |
+| `wecom.approval.status_changed` | wechat-bot | settlement-auditor | corp_id, sp_no, sp_status, applyer_userid | §2.17 |
 
 ---
 
@@ -430,6 +435,78 @@ notification-gateway 的 TenantRouter 仅在 `branch_id` 落在 client 的 `effe
 
 订阅方实现:收到事件后,失效本地缓存(若有 cube-source 路由表),下次 `POST /v1/load` 转发前重新调 cube-router 拿路由。
 
+### 2.16 settlement.audit.{status,log}
+
+**触发时机**:settlement-auditor(结算付款审批机器一审)在审批实例状态迁移 /
+审核流水线每步完成时发出。
+**订阅方**:notification-gateway → tenant+branch 过滤(同 stocktake.*)→
+Flutter 审批监控页实时刷新状态 / 追加推理日志。
+
+```jsonc
+// settlement.audit.status data:
+{
+  "approval_id": "32hex",
+  "branch_id":   "0001",
+  "user_id":     "user-uuid",         // 申请人(auth sub)
+  "status":      "received|auditing|approved|rejected|failed|human_approved|human_rejected|cancelled",
+  "sp_no":       "202610100001",      // 可选:企微审批单号(apply_event 成功后回填)
+  "sp_status":   1,                   // 可选:企微 sp_status
+  "at":          "2026-10-10T10:23:45Z"
+}
+
+// settlement.audit.log data(推理日志增量,完整日志拉 GET /settlement-approvals/:id/logs):
+{
+  "approval_id":    "32hex",
+  "branch_id":      "0001",
+  "user_id":        "user-uuid",
+  "step":           "fetch_settlements|expand_lines|check_sheets|check_amounts|check_quantity|llm_verdict|stocktake|finish",
+  "output_summary": "拆出 12 行 PI/RO",
+  "at":             "2026-10-10T10:23:46Z"
+}
+```
+
+### 2.17 wecom.approval.{command,command_result,status_changed}
+
+**跨仓 wire 契约**:settlement-auditor(supertrade 仓)↔ wechat-bot(wechat-bot 仓)。
+两个 module 不能跨仓 import,wire struct 在两仓各自定义(
+supertrade `internal/settlement-auditor/service/publisher.go` ↔
+wechat-bot `internal/wapproval/model.go`),**字段必须逐字对齐,改动需双仓同步**。
+
+```jsonc
+// wecom.approval.command data(settlement-auditor → wechat-bot):
+{
+  "id":      "uuid",                  // 命令 id(command_result 关联键)
+  "type":    "apply_event|notify_text|stocktake_taskcard",
+  "corp_id": "wwxxxx",                // wcorp 友好 id
+  "payload": { /* apply_event:{creator_userid,template_id,use_template_approver,notify_type,apply_data,summary_list}
+                   notify_text:{to_user[],content}
+                   stocktake_taskcard:{to_user[],title,description,url,task_id} */ }
+}
+
+// wecom.approval.command_result data(wechat-bot → settlement-auditor):
+{
+  "command_id": "uuid",
+  "type":       "apply_event",
+  "corp_id":    "wwxxxx",
+  "ok":         true,
+  "sp_no":      "202610100001",       // apply_event 成功时有
+  "error":      "",                   // 失败时有
+  "at":         "2026-10-10T10:24:00Z"
+}
+
+// wecom.approval.status_changed data(wechat-bot 收到企微回调 → settlement-auditor):
+{
+  "corp_id":        "wwxxxx",
+  "sp_no":          "202610100001",
+  "sp_name":        "结算付款审批",
+  "sp_status":      1,                // 1审批中 2通过 3驳回 4撤销 6通过后撤销 10已支付
+  "template_id":    "3TkaFxxxx",
+  "apply_time":     1760000000,
+  "applyer_userid": "zhangsan",
+  "received_at":    "2026-10-10T10:25:00Z"
+}
+```
+
 ---
 
 ## §3 订阅注册
@@ -460,9 +537,10 @@ subscriptions:
 
 | 服务 | 订阅端点 | 注册位置 | 订阅的 topic |
 |---|---|---|---|
-| `notification-gateway` | `GET /dapr/subscribe`、`POST /events/<topic>` | `cmd/notification-gateway/main.go` 的 `Options.RegisterDapr` | §2.12~2.14 全部 7 个 |
+| `notification-gateway` | `GET /dapr/subscribe`、`POST /events/<topic>` | `cmd/notification-gateway/main.go` 的 `Options.RegisterDapr` | §2.12~2.14 全部 7 个 + settlement.audit.{status,log} |
 | `stocktake` | 同上 | `cmd/stocktake/main.go` 的 `Options.RegisterDapr` | `auth.user.access_changed` |
 | `fresh-meat` | 同上 | `cmd/fresh-meat/main.go` 的 `Options.RegisterDapr` | 各自清单 |
+| `settlement-auditor` | 同上 + `POST /job/settlement-auditor-rescan` | `cmd/settlement-auditor/main.go` 的 `Options.RegisterDapr` | `wecom.approval.status_changed` / `wecom.approval.command_result` / `auth.user.access_changed` |
 
 > ⚠️ **这两个端点必须注册在 auth 中间件之前**,即走
 > `cmdbootstrap.Options.RegisterDapr` 而不是 `Options.Register`。
@@ -484,3 +562,4 @@ subscriptions:
 | 2026-09-19 | Mavis | 新增 §2.12 stocktake.line.{added,updated,deleted} + §2.13 stocktake.header.{submitted,approved} + stocktake.plan_item.added + §2.14 auth.user.permissions_changed;同步 stocktake/service.go 6 个 publish 调用点与 notification-gateway 订阅实现 |
 | 2026-09-23 | Mavis | Phase 3:§2.14 auth.user.permissions_changed → auth.user.access_changed;payload 增加 changed_branches / changed_default_branch;subscribe Topics 与 wsmsg.TypeUserAccessChanged 同步切换 |
 | 2026-09-24 | Tinkler | 修订 8:§1 topic 表新增 cube-router 自有 `cube.source.changed` 事件 + §2.15 payload schema;§2.14 `auth.user.access_changed` 订阅方加 stocktake(失效 scope cache);保留全部 12 占位 cmd(用户指令);保留 go.mod `replace ../authkit` |
+| 2026-10-10 | Tinkler | 修订 9:settlement-auditor(结算付款审批机器一审)上线:§1 新增 settlement.audit.{status,log} + wecom.approval.{command,command_result,status_changed};§2.16/§2.17 payload schema(§2.17 为 supertrade↔wechat-bot 跨仓 wire 契约,改动需双仓同步);notification-gateway Topics +2;§3.2 订阅表加 settlement-auditor |

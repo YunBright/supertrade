@@ -385,6 +385,16 @@ func TestParseDecimal(t *testing.T) {
 		{"12.5", "12.5"},
 		{json.Number("99.9"), "99.9"},
 		{nil, "0"},
+		// MSSQL live 源:decimal 经 go-mssqldb []byte → JSON base64。
+		// 样本取自 2026-10-10 生产 sixun-ysx-fb settlement SUM(sheet_amt) 实测。
+		// (注意 shopspring String() 会去尾零:46492.0200 → 46492.02)
+		{"NDY0OTIuMDIwMA==", "46492.02"},          // "46492.0200"
+		{"MjkzMTE0ODQuMTIzMw==", "29311484.1233"}, // "29311484.1233"
+		{"MTM5MzguNDcwMA==", "13938.47"},          // "13938.4700"
+		// base64 可解码但解码结果不是数字 → Zero
+		{"abcd", "0"},
+		// 非法 base64 → Zero
+		{"not base64!!", "0"},
 	}
 	for _, tc := range cases {
 		got := cubeclient.ParseDecimal(tc.in)

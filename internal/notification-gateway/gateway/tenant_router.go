@@ -39,7 +39,8 @@ func (r *TenantRouter) shouldDeliver(env wsmsg.Envelope, c *Client) bool {
 		return false
 	}
 	switch {
-	case strings.HasPrefix(env.Type, "stocktake."):
+	case strings.HasPrefix(env.Type, "stocktake."), strings.HasPrefix(env.Type, "settlement.audit."):
+		// 业务事件(stocktake.* / settlement.audit.*):tenant + branch 过滤
 		return r.matchStocktake(env, c)
 	case strings.HasPrefix(env.Type, "auth.user."):
 		return r.matchAuthUser(env, c)
