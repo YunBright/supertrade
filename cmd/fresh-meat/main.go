@@ -126,39 +126,36 @@ func initApp() error {
 	appSvc.SetPredictFn(service.DaprConversationPredictFn(daprCli, convName, llmTimeout))
 	slog.Info("dapr conversation client enabled", "component", convName, "timeout", llmTimeout)
 
-	// 注入 userinfo 客户端(走 dapr app-id `auth-internal`,调 /internal/users/{id}/permissions)。
+	// 注入 userinfo 客户端(走 dapr app-id `userd`,调 /internal/users/{id}/permissions)。
 	//
-	// fresh-meat 是 supertrade 仓内**首个**切到 `auth-internal` 的服务:
-	// 不再走 userd(:8082),改打 auth-internal(:8083) — 该端口只暴露
-	// `/internal/users/*` + `/internal/sms-codes/*` + `/healthz`,由 dapr mTLS +
-	// auth-validator-internal(aud=internal)双重保护(参考 auth 文档 §1.1 + §1.2)。
+	// 2026-10-12:本服务从 `auth-internal` 切到 `userd`。auth 侧把独立的
+	// app-id=auth-internal 进程合并进了 userd(`--mode=internal` 已废弃并映射为
+	// userd),/internal/* 现在挂在 userd engine 上,共用同一个 app、同一 sidecar、
+	// 同一个应用层验签器(authn)—— 鉴权只有一套实现,不存在"哪条链路漏了"。
+	//
+	// 调用路径本身没变:userinfo 一律打 `internal/users/*`,所以只换 app-id。
 	//
 	// SDK 行为:userinfo.New 内部调 dapr.NewClient() 自动从 DAPR_GRPC_PORT 拿
 	// 本地 sidecar gRPC 客户端,无需任何 endpoint 配置。未注入时 svc.HasEffectiveScope
 	// 返 ErrUserInfoUnavailable(503 userd_unavailable) — 历史行为。
-	//
-	// ⚠️ 切到 `auth-internal` 后,caller JWT 必须含 `aud: auth-internal`,否则
-	// auth-internal 端 auth-validator-internal bearer 中间件会拒(401)。
-	// dapr/config.yaml policy(本仓不启用)+ auth 仓库 components/bearer-auth.yaml
-	// 的 auth-validator-internal component 需同步就绪(详见 auth 仓库 SOP §1.2)。
-	ui, err := userinfo.New("auth-internal")
+	ui, err := userinfo.New("userd")
 	if err != nil {
 		return fmt.Errorf("userinfo client: %w (确认 dapr run 已起)", err)
 	}
 	appSvc.SetUserInfo(ui)
 
-	// Warmup auth-internal 跨主机冷握手(Consul DNS + mTLS + HTTP/2 SETTINGS +
-	// auth-internal 进程 DB pool),实测首次 7~12s 撞 userinfo.Client.timeout 默认
+	// Warmup userd 跨主机冷握手(Consul DNS + mTLS + HTTP/2 SETTINGS +
+	// userd 进程 DB pool),实测首次 7~12s 撞 userinfo.Client.timeout 默认
 	// 10s。提前烧掉,业务请求进来时已 warm,首个 contract test 不再 503。
 	//
 	// 不阻断启动:失败仅 warn,业务首次走 cold path(已知行为)。
 	warmupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := ui.Warmup(warmupCtx); err != nil {
-		slog.Warn("userinfo warmup 失败 (auth-internal 链路未预热),业务首次调用走 cold path",
+		slog.Warn("userinfo warmup 失败 (userd 链路未预热),业务首次调用走 cold path",
 			"err", err)
 	} else {
-		slog.Info("userinfo warmup ok (auth-internal 链路预热完成)")
+		slog.Info("userinfo warmup ok (userd 链路预热完成)")
 	}
 
 	slog.Info("fresh-meat app initialized",
@@ -196,7 +193,7 @@ func registerDaprRoutes(r *gin.Engine) {
 }
 
 // forwardBearerToOutgoing 把 caller 的 Authorization header 注入 ctx,供下游
-// dapr 调用 (cubeclient → cube-gateway,userinfo → auth-internal) 自动转发。
+// dapr 调用 (cubeclient → cube-gateway,userinfo → userd) 自动转发。
 //
 // 用 cubeclient.WithBearer + userinfo.WithBearer 双写,两者各自的 dapr 调用路径里
 // 会读 ctx 拼到 outgoing gRPC metadata → sidecar 转 outgoing HTTP Authorization

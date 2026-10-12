@@ -144,8 +144,9 @@ func initApp() error {
 	// stocktake 盘点建单客户端(内部端点,任务 1c 提供)。
 	appSvc.SetStocktake(service.NewDaprStocktakeClient(daprCli, appSvc.Config().StocktakeAppID))
 
-	// userinfo(auth-internal,per-branch scopes;同 fresh-meat 链路)。
-	ui, err := userinfo.New("auth-internal")
+	// userinfo(userd,per-branch scopes;同 fresh-meat 链路)。
+	// 2026-10-12:auth-internal 已合并进 userd,调用方统一打 app-id=userd。
+	ui, err := userinfo.New("userd")
 	if err != nil {
 		return fmt.Errorf("userinfo client: %w (确认 dapr run 已起)", err)
 	}
@@ -225,7 +226,7 @@ func registerDaprRoutes(r *gin.Engine) {
 }
 
 // forwardBearerToOutgoing 把 caller 的 Authorization 注入 ctx,供下游
-// dapr 调用(cubeclient → cube-router,userinfo → auth-internal)转发。
+// dapr 调用(cubeclient → cube-router,userinfo → userd)转发。
 func forwardBearerToOutgoing() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		bearer := c.Request.Header.Get("Authorization")

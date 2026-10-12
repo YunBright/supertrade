@@ -55,6 +55,10 @@ func newEngine(t *testing.T, withDapr bool) *gin.Engine {
 	}
 	// 与 Run 完全一致的两段式装配:NewRouter(公开端点 + dapr 路由 + auth 中间件)
 	// → MountBusiness(业务路由)。单测如果自己重排这个顺序,就会和真机行为分叉。
+	//
+	// AllowUnverified:本组用例断言的是**注册顺序**,不需要真实验签器。
+	// 显式声明跳过,而不是靠"没装配就 fallback"蒙混过去。
+	opts.AllowUnverified = true
 	r := cmdbootstrap.NewRouter(opts)
 	cmdbootstrap.MountBusiness(r, opts)
 	return r
@@ -187,6 +191,7 @@ func TestBusinessRoutesAreRegisteredExactlyOnce(t *testing.T) {
 	}
 
 	// 正确用法:NewRouter 一次 + MountBusiness 一次,不 panic。
+	opts.AllowUnverified = true
 	r := cmdbootstrap.NewRouter(opts)
 	cmdbootstrap.MountBusiness(r, opts)
 
@@ -246,6 +251,7 @@ func TestOnStartRunsBeforeAnyRouteRegistration(t *testing.T) {
 			t.Fatalf("OnStart: %v", err)
 		}
 	}
+	opts.AllowUnverified = true
 	r := cmdbootstrap.NewRouter(opts)
 	cmdbootstrap.MountBusiness(r, opts)
 
@@ -292,6 +298,7 @@ func TestRegisterDaprSeesStateBuiltByOnStart(t *testing.T) {
 			t.Fatalf("OnStart: %v", err)
 		}
 	}
+	opts.AllowUnverified = true
 	r := cmdbootstrap.NewRouter(opts)
 
 	req := httptest.NewRequest(http.MethodPost, "/events/t", nil)
