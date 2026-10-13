@@ -55,6 +55,10 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/settlement-approvals/:id", requireBranch, h.Get)
 	r.GET("/settlement-approvals/:id/logs", requireBranch, h.GetLogs)
 	r.POST("/settlement-approvals/:id/retry", requireBranch, h.Retry)
+	// 物理删一次审批及其 5 张从表（数据治理 / 测试清理）。
+	// 此前本服务零 DELETE 路由，契约测试每跑一次就往生产留一整套审批残留。
+	// 流水线在途时会返 409 让调用方稍后重试 —— 详见 service.ErrApprovalInFlight。
+	r.DELETE("/settlement-approvals/:id", requireBranch, h.Delete)
 }
 
 // ---- 错误响应 ----
@@ -74,6 +78,12 @@ func mapErr(c *gin.Context, err error) {
 		writeError(c, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, service.ErrInvalidInput), errors.Is(err, service.ErrInvalidStatus):
 		writeError(c, http.StatusBadRequest, "bad_request", err.Error())
+	case errors.Is(err, service.ErrApprovalInFlight):
+		// 409 + 明确的重试指引。
+		// 不用 400:这不是请求写错了,客户端改任何参数都没用 ——
+		// 只能等流水线自己跑完。400 会让清理脚本把它当成参数错误而放弃,
+		// 或者 endless 重试。
+		writeError(c, http.StatusConflict, "approval_in_flight", err.Error())
 	case errors.Is(err, service.ErrCubeUnavailable):
 		writeError(c, http.StatusServiceUnavailable, "cube_unavailable", err.Error())
 	case errors.Is(err, service.ErrUserInfoUnavailable):
@@ -234,6 +244,31 @@ func (h *Handler) Retry(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusAccepted, gin.H{"ok": true})
+}
+
+// Delete DELETE /settlement-approvals/:id
+//
+// 物理删除一次审批实例及其 5 张从表。scope 用 settlement:audit（与 Submit/Retry 同级）——
+// 能发起审核就能删掉它产生的记录。
+//
+// 先按 branch 校验归属再删：跨门店删别人的审批不该被"有 audit scope"就放行，
+// 顺序与 Retry 一致（先 GetApprovalDetail 验归属，再动数据）。
+//
+// 流水线在途时 service 返 ErrApprovalInFlight → 409，客户端应稍后重试。
+func (h *Handler) Delete(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "settlement:audit") {
+		return
+	}
+	if _, err := h.svc.GetApprovalDetail(c.Request.Context(), branchID, c.Param("id")); err != nil {
+		mapErr(c, err)
+		return
+	}
+	if err := h.svc.DeleteApproval(c.Request.Context(), c.Param("id")); err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"deleted": true, "id": c.Param("id")})
 }
 
 // ListCubeSettlements GET /settlement-approvals/cube/settlements?from&to&supplier_id

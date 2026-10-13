@@ -223,6 +223,10 @@ func registerRoutes(r *gin.Engine) {
 func registerDaprRoutes(r *gin.Engine) {
 	h := handler.New(appSvc)
 	h.RegisterSubscribeRoutes(r, slog.Default())
+	// 兜底清理端点。收尾清理时未必持有 token，所以必须在这个
+	// **免鉴权窗口**注册；公网安全靠 nginx 的
+	// `location ^~ /api/v1/settlement-auditor/internal/ { return 404; }`。
+	handler.RegisterPurgeRoutes(r, appDB)
 }
 
 // forwardBearerToOutgoing 把 caller 的 Authorization 注入 ctx,供下游

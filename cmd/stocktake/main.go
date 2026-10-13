@@ -154,7 +154,7 @@ func registerDaprRoutes(r *gin.Engine) {
 	h.RegisterSubscribeRoutes(r, slog.Default())
 	// S2S 内部端点(settlement-auditor 建计划盘点单):同样不能走 JWT,
 	// 靠 dapr 内网 + nginx 不暴露 /internal/* 保护。
-	h.RegisterInternalRoutes(r)
+	h.RegisterInternalRoutes(r, appDB)
 }
 
 // forwardBearerToOutgoing 把 gin request 的 Authorization header 注入 ctx。

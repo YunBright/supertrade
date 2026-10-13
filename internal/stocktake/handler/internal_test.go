@@ -37,7 +37,7 @@ func buildInternalRouter(t *testing.T) (*gin.Engine, *gorm.DB) {
 	svc := service.New(db, cubeclientfake.New())
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	handler.New(svc).RegisterInternalRoutes(r)
+	handler.New(svc).RegisterInternalRoutes(r, db)
 	return r, db
 }
 

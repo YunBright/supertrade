@@ -70,11 +70,17 @@ type ApprovalInstance struct {
 	// JWT,JWT_TTL=1h 覆盖正常审核窗口;重跑时由 Retry 请求刷新)。
 	// 机器终态(approved/rejected/failed)即清空,缩短凭证落库时间窗。
 	// 永不序列化(json:"-")。
-	ApplicantBearer string   `gorm:"size:2048" json:"-"`
-	RejectReason    string   `gorm:"size:1024" json:"reject_reason"`
-	Error           string   `gorm:"size:1024" json:"error"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `gorm:"index" json:"updated_at"`
+	ApplicantBearer string `gorm:"size:2048" json:"-"`
+	RejectReason    string `gorm:"size:1024" json:"reject_reason"`
+	Error           string `gorm:"size:1024" json:"error"`
+	// 溯源走旁表 testrun_rows(见 core/testrun),业务表零改动。
+	//
+	// 本服务的审批是**异步**的(POST 返 202 后跑流水线,一次提交会写
+	// approval_settlements / audit_signals / audit_logs / llm_verdicts 等
+	// 多张表),但每张表都被独立记账 —— 收尾 sweep 不需要"先认领主表再级联",
+	// 直接按各自记下的主键删即可,也就没有"从表排在主表之前"那条顺序约束。
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `gorm:"index" json:"updated_at"`
 }
 
 func (ApprovalInstance) TableName() string { return "approval_instances" }
@@ -155,12 +161,12 @@ func (ApprovalStocktakeLink) TableName() string { return "approval_stocktake_lin
 // 提交审批成功时自动覆盖;发起页 GET 偏好端点带出。
 type ApprovalApproverPreference struct {
 	// ID 形如 "<branchID>:<applicantUserID>"。
-	ID              string    `gorm:"primaryKey;size:128" json:"id"`
-	BranchID        string    `gorm:"size:32;index" json:"branch_id"`
-	ApplicantUserID string    `gorm:"size:64;index" json:"applicant_user_id"`
+	ID              string         `gorm:"primaryKey;size:128" json:"id"`
+	BranchID        string         `gorm:"size:32;index" json:"branch_id"`
+	ApplicantUserID string         `gorm:"size:64;index" json:"applicant_user_id"`
 	ApproverUserIDs datatypes.JSON `gorm:"type:jsonb" json:"approver_userids"`
 	CcUserIDs       datatypes.JSON `gorm:"type:jsonb" json:"cc_userids"`
-	UpdatedAt       time.Time `gorm:"index" json:"updated_at"`
+	UpdatedAt       time.Time      `gorm:"index" json:"updated_at"`
 }
 
 func (ApprovalApproverPreference) TableName() string { return "approval_approver_preferences" }

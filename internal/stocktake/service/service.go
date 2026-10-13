@@ -111,6 +111,14 @@ var (
 	ErrHeaderNotFound        = errors.New("service: 盘点单不存在")
 	ErrLineNotFound          = errors.New("service: 盘点明细不存在")
 	ErrInvalidStatus         = errors.New("service: 盘点单状态不允许该操作")
+	// ErrHeaderApproved —— 删除端点专用，映射 409（见 mapErr）。
+	//
+	// 刻意不复用 ErrInvalidStatus：那个映射成 400 bad_request，语义是
+	// "你请求写错了，改了再来"。而"这张单已经 approved、不可删"不是请求的错，
+	// 客户端改任何参数都没用，只能换个时点 —— 那正是 409 的定义。
+	// 用 400 的后果很具体:清理脚本会把冲突当成参数错误 endlessly 重试,
+	// 或者干脆在重试里放大成"删不掉就多试几次"的压力。
+	ErrHeaderApproved = errors.New("service: 盘点单已审核,不可删除")
 	ErrInvalidTransition     = errors.New("service: 非法状态转移")
 	ErrCubeUnavailable       = errors.New("service: cube client 未配置")
 	ErrProductNotFound       = errors.New("service: 商品在 cube 中不存在")             // 包装 cubeclient.ErrProductNotFound
@@ -233,7 +241,18 @@ func (s *Service) CreateHeader(ctx context.Context, in CreateHeaderInput) (*mode
 		CreatedAt:           now,
 		UpdatedAt:           now,
 	}
-	if err := s.db.Create(h).Error; err != nil {
+	// ⚠️ WithContext 是**必须**的，不是风格选择。
+	//
+	// 溯源记账的 gorm 回调读的是 `Statement.Context` 里的 run_id
+	// （core/testrun）。`s.db` 自带的 context 是 context.Background()，
+	// 直接 `s.db.Create(h)` 会让回调第一行就拿到空串返回 ——
+	// **行照样写进生产库，但旁表一条账都不记**，于是收尾 sweep 永远
+	// 找不到它。这正是 2026-10-13 首次全量跑的实际结果：
+	// stocktake_headers 涨了 7 行、testrun_rows 却是 0。
+	//
+	// 方法签名已经收了 ctx（handler 传的是 c.Request.Context()），
+	// 不用它就等于把溯源链路在这里剪断。
+	if err := s.db.WithContext(ctx).Create(h).Error; err != nil {
 		return nil, fmt.Errorf("create header: %w", err)
 	}
 	return h, nil
@@ -682,7 +701,11 @@ func (s *Service) AddLine(ctx context.Context, headerID string, in AddLineInput)
 		CreatedAt: now,
 	}
 
-	err = s.db.Transaction(func(tx *gorm.DB) error {
+	// WithContext 必须挂在 Transaction 上（而不是只挂 tx）——
+	// 事务继承的是外层 db 的 context，挂错了里面的 tx.Create 依旧丢溯源。
+	// 判据：凡是"用了 ctx 却在别处丢掉"的写路径，症状都是**静默的**
+	//（行写进去了、账没记、清理永远找不到）。
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(line).Error; err != nil {
 			return fmt.Errorf("create line: %w", err)
 		}
@@ -850,7 +873,7 @@ func (s *Service) UpdateLine(ctx context.Context, lineID string, in UpdateLineIn
 		CreatedAt: now,
 	}
 
-	err = s.db.Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&model.StocktakeLine{}).
 			Where("id = ?", lineID).
 			Updates(updates).Error; err != nil {
@@ -933,7 +956,7 @@ func (s *Service) DeleteLine(ctx context.Context, lineID string, actorID, actorN
 		CreatedAt: now,
 	}
 
-	err = s.db.Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Delete(&line).Error; err != nil {
 			return fmt.Errorf("delete line: %w", err)
 		}
@@ -956,6 +979,76 @@ func (s *Service) DeleteLine(ctx context.Context, lineID string, actorID, actorN
 		OccurredAt:   now.UTC().Format(time.RFC3339),
 	})
 	return nil
+}
+
+// DeleteHeader 物理删除盘点单及其全部从表（数据治理 / 测试清理用）。
+//
+// ## 为什么需要它
+//
+// 契约测试直接打生产。`deployer/tests/contract/inventory_test.go` 有 6 处
+// POST /stocktake-headers 建单、`settlement_auditor_test.go` 还有 1 处建计划盘点单，
+// 而本服务此前**只有** DELETE /stocktake-lines/:id、**没有删单头的端点** ——
+// 于是盘点单一经创建就永久留在生产表里，随每次全量测试线性增长。
+//
+// ## 为什么必须显式级联（而不是指望外键）
+//
+// 本模型的从表关联里只有 `Lines []StocktakeLine` 声明了
+// `constraint:OnDelete:CASCADE`。另外三张表用的是**裸 string 外键、无 FK 约束**：
+//
+//	stocktake_line_operations —— 明细操作历史（append-only 审计）
+//	stocktake_plan_items     —— 计划盘点预选商品
+//	stocktake_branch_defaults—— 门店默认盘点单指针
+//
+// 只删主表会留下三类孤儿：操作历史挂在一个不存在的单号下、计划商品永远查不出来、
+// **门店默认盘点单指向已删除的单**（前端"快速进入盘点"直接 404/500）。
+// 所以这里逐张显式删，顺序按依赖：先叶子后主表。
+//
+// 为什么不改成带 FK 的 schema：那是一次存量数据迁移，风险与本次治理目标不成比例。
+//
+// ## 状态闸门
+//
+// **approved 单据不可删**。approved 的盘点单已经过了差异调整、影响过库存口径，
+// 删掉它会让库存与账面产生无法解释的差额。这是业务约束，不是清理约束 ——
+// 契约测试造出来的单子都停在 counting，不受该闸门影响。
+//
+// ## 幂等性
+//
+// 单据不存在 → ErrHeaderNotFound。清理侧必须把"已经不在了"和"删掉了"
+// 视作同一件事（第二次调用会拿到 404，这是刻意的：让"参数写错 id"
+// 不会返回成功）。
+func (s *Service) DeleteHeader(ctx context.Context, id string) error {
+	if id == "" {
+		return fmt.Errorf("%w: id 不能为空", ErrInvalidStatus)
+	}
+	var h model.StocktakeHeader
+	if err := s.db.WithContext(ctx).First(&h, "id = ?", id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrHeaderNotFound
+		}
+		return err
+	}
+	if h.Status == model.StatusApproved {
+		return ErrHeaderApproved
+	}
+
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 顺序:先叶子后主表。即使某张表将来加上 FK CASCADE,显式删除也无害 ——
+		// 但反过来(现在这样只删主表)就会静默留下孤儿行,而孤儿行不会报错。
+		for _, m := range []any{
+			&model.StocktakeLineOperation{},
+			&model.StocktakePlanItem{},
+			&model.StocktakeBranchDefault{},
+			&model.StocktakeLine{},
+		} {
+			if err := tx.Delete(m, "header_id = ?", id).Error; err != nil {
+				return fmt.Errorf("delete children of header %s: %w", id, err)
+			}
+		}
+		if err := tx.Delete(&h).Error; err != nil {
+			return fmt.Errorf("delete header %s: %w", id, err)
+		}
+		return nil
+	})
 }
 
 // validOpType 校验 OpType 取值。
@@ -1473,7 +1566,7 @@ func (s *Service) AddPlanItems(ctx context.Context, headerID string, in AddPlanI
 	now := s.now()
 	out := make([]model.StocktakePlanItem, 0, len(in.Items))
 
-	err = s.db.Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for _, it := range in.Items {
 			if it.ProductID == "" {
 				return fmt.Errorf("%w: product_id 必填", ErrInvalidStatus)
@@ -1567,7 +1660,7 @@ var ErrBranchDefaultNotFound = errors.New("service: 该店未设置默认盘点�
 //
 // upsert 行为:同一 BranchID 已有记录则覆盖(更新 header_id / updated_by / updated_at);
 // GORM Save 会按主键覆盖,ErrBranchDefaultNotFound 与 ErrInvalidTransition 已在 mapErr 处理。
-func (s *Service) SetBranchDefaultStocktake(_ context.Context, branchID, headerID, operatorID string) (*model.StocktakeBranchDefault, error) {
+func (s *Service) SetBranchDefaultStocktake(ctx context.Context, branchID, headerID, operatorID string) (*model.StocktakeBranchDefault, error) {
 	if branchID == "" {
 		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidStatus)
 	}
@@ -1578,7 +1671,7 @@ func (s *Service) SetBranchDefaultStocktake(_ context.Context, branchID, headerI
 		operatorID = "unknown"
 	}
 
-	h, err := s.GetHeader(context.Background(), headerID)
+	h, err := s.GetHeader(ctx, headerID)
 	if err != nil {
 		return nil, err
 	}
@@ -1599,7 +1692,10 @@ func (s *Service) SetBranchDefaultStocktake(_ context.Context, branchID, headerI
 		UpdatedAt: now,
 	}
 	// Save 按主键覆盖 → upsert 语义;新建/更新统一走这一条路径。
-	if err := s.db.Save(rec).Error; err != nil {
+	//
+	// WithContext 同样必须挂 —— 否则 branch_default 建的行不进旁表，
+	// 兜底清理永远找不到它（症状与 CreateHeader 那处完全一样：静默）。
+	if err := s.db.WithContext(ctx).Save(rec).Error; err != nil {
 		return nil, fmt.Errorf("upsert branch default: %w", err)
 	}
 	return rec, nil

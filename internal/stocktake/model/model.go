@@ -109,9 +109,11 @@ type StocktakeHeader struct {
 	TotalDiffQty        decimal.Decimal `gorm:"column:total_diff_qty;type:decimal(20,4);default:0" json:"total_diff_qty"`
 	TotalDiffAmountYuan decimal.Decimal `gorm:"column:total_diff_amount_yuan;type:decimal(20,4);default:0" json:"total_diff_amount_yuan"`
 	Remark              string          `gorm:"column:remark;type:text" json:"remark,omitempty"`
-	CreatedAt           time.Time       `gorm:"column:created_at;not null" json:"created_at"`
-	UpdatedAt           time.Time       `gorm:"column:updated_at;not null" json:"updated_at"`
-	Lines               []StocktakeLine `gorm:"foreignKey:HeaderID;references:ID;constraint:OnDelete:CASCADE" json:"lines,omitempty"`
+	// 溯源走旁表 testrun_rows(见 core/testrun),业务表零改动。
+	// 盘点单曾因"没有删除端点"而永久堆积;现在有确定的账可依。
+	CreatedAt time.Time `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
+	Lines     []StocktakeLine `gorm:"foreignKey:HeaderID;references:ID;constraint:OnDelete:CASCADE" json:"lines,omitempty"`
 }
 
 // TableName 显式表名(避免 GORM 默认复数推断)。

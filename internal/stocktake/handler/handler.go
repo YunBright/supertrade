@@ -78,6 +78,10 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.POST("/stocktake-headers/:id/plan-items", h.AddPlanItems)
 	r.POST("/stocktake-headers/:id/submit", h.Submit)
 	r.POST("/stocktake-headers/:id/approve", h.Approve)
+	// 删整单(数据治理 / 测试清理)。此前只有删明细行的端点,盘点单一经创建
+	// 就永久留在生产表里 —— 契约测试每跑一次多一张。详见 service.DeleteHeader
+	// 关于"为什么必须显式级联无 FK 的三张从表"的说明。
+	r.DELETE("/stocktake-headers/:id", h.DeleteHeader)
 
 	r.PUT("/stocktake-lines/:id", h.UpdateLine)
 	r.DELETE("/stocktake-lines/:id", h.DeleteLine)
@@ -236,6 +240,10 @@ func mapErr(c *gin.Context, err error) {
 		errors.Is(err, service.ErrPlanItemNotFound),
 		errors.Is(err, service.ErrBranchDefaultNotFound):
 		writeError(c, http.StatusNotFound, "not_found", err.Error())
+	case errors.Is(err, service.ErrHeaderApproved):
+		// 409 而不是复用上面的 400:这是**状态冲突**不是请求错误,
+		// 客户端改任何参数都不会有用。见 service.ErrHeaderApproved 的说明。
+		writeError(c, http.StatusConflict, "header_approved", err.Error())
 	case errors.Is(err, service.ErrInvalidStatus),
 		errors.Is(err, service.ErrInvalidTransition),
 		errors.Is(err, service.ErrProductNotFound),
@@ -606,6 +614,35 @@ func (h *Handler) DeleteLine(c *gin.Context) {
 		return
 	}
 	c.Status(http.StatusNoContent)
+}
+
+// DeleteHeader DELETE /stocktake-headers/:id
+//
+// 物理删除整张盘点单及其明细/操作历史/计划商品/门店默认指针。
+// 与 DeleteLine(只删单行)是不同层级的动作:DeleteLine 属于业务操作并留审计,
+// 这里是数据治理,不留痕迹。
+//
+// 权限沿用 inventory:manage(仓管),与 CreateHeader 同级 ——
+// 能建单就能删单,否则测试清理会被权限卡住。
+//
+// 闸门在 service 层:approved 单据不可删(已影响库存口径),映射成
+// **409 conflict** 而不是 400 —— 不是参数写错,是**当前状态不允许**这个动作,
+// 客户端改参数重试没有意义。
+func (h *Handler) DeleteHeader(c *gin.Context) {
+	id := c.Param("id")
+	hdr, err := h.svc.GetHeader(c.Request.Context(), id)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	if !h.requireScope(c, hdr.BranchID, "inventory:manage") {
+		return
+	}
+	if err := h.svc.DeleteHeader(c.Request.Context(), id); err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"deleted": true, "id": id})
 }
 
 // DiffReport GET /stocktake-headers/:id/diff-report

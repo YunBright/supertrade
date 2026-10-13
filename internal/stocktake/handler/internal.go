@@ -16,6 +16,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 
 	"github.com/YunBright/supertrade/internal/stocktake/model"
 	"github.com/YunBright/supertrade/internal/stocktake/service"
@@ -41,8 +42,12 @@ type CreatePlanHeaderResponse struct {
 //
 // 必须由 cmd/stocktake/main.go 在 registerDaprRoutes(auth 中间件之前)调用 —
 // 内部调用不带 Authorization 头,挂上鉴权中间件就会 401。
-func (h *Handler) RegisterInternalRoutes(r *gin.Engine) {
+//
+// db 是给 /internal/datastore/purge 用的(兜底 sweep 需要直接访问 DB)。
+// 显式传参而不是从 svc 里掏:这样"purge 有没有装上"是一件可以被断言的事。
+func (h *Handler) RegisterInternalRoutes(r *gin.Engine, db *gorm.DB) {
 	r.POST("/internal/stocktake-plan-headers", h.CreatePlanHeaderInternal)
+	RegisterPurgeRoutes(r, db)
 }
 
 // CreatePlanHeaderInternal POST /internal/stocktake-plan-headers

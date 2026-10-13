@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/YunBright/core/testrun"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -37,5 +38,16 @@ func OpenPostgres(dsn string) (*gorm.DB, error) {
 	sqlDB.SetMaxOpenConns(10)
 	sqlDB.SetMaxIdleConns(2)
 	sqlDB.SetConnMaxLifetime(time.Hour)
+	// 溯源：把每次测试运行写入的行记到旁表 testrun_rows（core/testrun）。
+	// 业务表零改动 —— 每张被写入的表（含 4 张从表）都被独立记账，
+	// 收尾 sweep 按各自记下的主键精确删。
+	// 漏注册的表现是静默的：数据照写但旁表里没有那笔账，
+	// 清理找不到它们且无任何报错。
+	if err := testrun.EnsureTable(db); err != nil {
+		return nil, err
+	}
+	if err := testrun.RegisterGorm(db); err != nil {
+		return nil, err
+	}
 	return db, nil
 }

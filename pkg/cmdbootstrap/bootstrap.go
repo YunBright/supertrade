@@ -32,6 +32,7 @@ import (
 
 	"github.com/YunBright/authkit/claims"
 	"github.com/YunBright/authkit/rbac"
+	"github.com/YunBright/core/testrun"
 	"github.com/gin-gonic/gin"
 )
 
@@ -126,6 +127,16 @@ func NewRouter(opts Options) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
+
+	// RunID 溯源（契约测试创建的行打标记）。**必须在这里、在所有路由之前**。
+	//
+	// gin 的 r.Use 只对**之后**注册的路由生效，所以位置很关键：
+	// 装在下面（auth 之前 / RegisterDapr 之后）会让 /healthz 与
+	// RegisterDapr 免鉴权窗口拿不到 run_id —— 而后者恰恰是溯源最该覆盖的部分
+	//（免鉴权端点造出来的数据同样要能清理）。
+	//
+	// 生产流量不带该头，本链路对它是 no-op。
+	r.Use(testrun.Middleware())
 
 	// (1) 公开健康检查
 	r.GET("/healthz", healthzHandler(opts.AppID))

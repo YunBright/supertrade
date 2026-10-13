@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/YunBright/core/testrun"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -36,5 +37,14 @@ func OpenPostgres(dsn string) (*gorm.DB, error) {
 	sqlDB.SetMaxOpenConns(10)
 	sqlDB.SetMaxIdleConns(2)
 	sqlDB.SetConnMaxLifetime(time.Hour)
+	// 溯源记账到旁表 testrun_rows（core/testrun），见 internal/stocktake/db.go 的说明。
+	// fresh-meat 目前不在 sweep 清单里（契约测试也不写它），先注册好，
+	// 将来把它加进 registry 就不必再记得回来 —— 漏注册的表现是静默失效。
+	if err := testrun.EnsureTable(db); err != nil {
+		return nil, err
+	}
+	if err := testrun.RegisterGorm(db); err != nil {
+		return nil, err
+	}
 	return db, nil
 }
