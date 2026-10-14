@@ -1,29 +1,22 @@
 // purge.go —— settlement-auditor 的兜底清理（契约测试第二层 sweep）。
 //
-// # 它补的是什么洞
-//
-// 第一层清理挂在每个测试的 t.Cleanup 上（DELETE /settlement-approvals/:id）。
-// 那层精确，但**进程被 Ctrl-C / kill / panic 时一行都不执行** —— 而契约
-// 测试打的是生产，那一次跑造出来的审批就永久留下了。
+// 第一层清理挂在每个测试的 t.Cleanup 上（DELETE /settlement-approvals/:id），
+// 但**进程被 Ctrl-C / kill / panic 时一行都不执行**——而契约测试打的是生产，
+// 那一次跑造出来的审批就永久留下了。
 //
 // # 本服务与另两个服务的根本差别：它**有后台流水线在写**
 //
-// stocktake / auth 的数据只被同步 API 读写，删就删了。
-// settlement-auditor 不一样：POST /settlement-approvals 返 202 之后，
-// 一条异步流水线（cube 核对 → 信号分级 → LLM 研判）会持续往
-// audit_signals / audit_logs / llm_verdicts 写，状态从 received 走到 auditing。
+// stocktake / auth 的数据只被同步 API 读写，删就删了。这里不一样：
+// POST /settlement-approvals 返 202 之后，一条异步流水线（cube 核对 → 信号分级
+// → LLM 研判）会持续往 audit_signals / audit_logs / llm_verdicts 写，状态从
+// received 走到 auditing。
 //
-// 流水线跑一半时把主表删掉，它下一次写从表会撞"审批实例不存在"，
-// 于是一次本该成功的审核变成 failed，**清理反而制造了新的脏数据**。
-// 所以这里必须跳过在途状态 —— 与 service.DeleteApproval 的
-// terminalStatuses 保持同一套判据。
+// 流水线跑一半时把主表删掉，它下一次写从表会撞"审批实例不存在"，于是一次本该
+// 成功的审核变成 failed——**清理反而制造了新的脏数据**。所以这里必须跳过在途
+// 状态，与 service.DeleteApproval 的 terminalStatuses 保持同一套判据。
 //
-// # 旁表记账把级联变简单了
-//
-// 6 张表（主表 + 5 张从表）全都被**独立记账**，清理按各自记下的主键删。
-// 第一版里从表没有溯源列、只能靠"父 id ∈ 本次运行的父 id)"反查，
-// 于是 registry 里"从表必须排在主表之前"成了硬不变量 ——
-// 违反时表现是**从表一行都没删且不报错**。现在那条约束不存在了。
+// 主表 + 5 张从表都被旁表**独立记账**，清理按各自记下的主键删，registry 的顺序
+// 不再是语义。
 //
 // approval_approver_preferences **不在范围内**：主键是
 // `<branchID>:<applicantUserID>`，记的是"这人上次选了谁当审批人"，
@@ -40,11 +33,11 @@ import (
 
 // deletableStatuses 是 sweep 可删的终态，与 service.terminalStatuses 同源。
 //
-// ⚠️ approved **不在**这里：它是"机器一审通过、企微申请已提交/提交中"，
-// 后面还可能转 human_approved / human_rejected / cancelled ——
-// 企微回调仍可能回来并写入。删它等于让一次在途的外部回调写进虚空。
+// ⚠️ approved **不在**这里：它是"机器一审通过、企微申请已提交/提交中"，后面还
+// 可能转 human_approved / human_rejected / cancelled——企微回调仍可能回来并写入。
+// 删它等于让一次在途的外部回调写进虚空。
 //
-// 这里从 model 常量构造而不是抄一段字面量：抄写的那份一旦与
+// 从 model 常量构造而不是抄一段字面量：抄写的那份一旦与
 // service.terminalStatuses 漂移，后果是"少删/多删一类审批"且不报错。
 var deletableStatuses = []string{
 	model.StatusRejected,
@@ -58,27 +51,18 @@ var deletableStatuses = []string{
 //
 // # 为什么从表不能只靠自己的账
 //
-// 旁表记账让每张表都被**独立**定位 —— 这本来意味着「主表跳过 → 从表照删」。
-// 在 auth / stocktake 上那没问题（它们没有"跳过父行"这种语义）。
+// 旁表记账让每张表都被独立定位——这本来意味着「主表跳过 → 从表照删」。在
+// auth / stocktake 上那没问题（它们没有"跳过父行"这种语义）；但这里恰恰有：
+// received / auditing / approved 三种状态在途，不能删。若只跳过主表，它的
+// audit_signals / llm_verdicts 会被删光，而父行还在 → 流水线下一次写入撞
+// "审批实例不存在"，**清理制造了新的脏数据**。
 //
-// 但这里恰恰有：received / auditing / approved 三种状态在途，不能删。
-// 若只跳过主表，它的 audit_signals / llm_verdicts 等会被删光 ——
-//
-//	流水线下一次写入会撞"审批实例不存在" → 一次本该成功的审核变成 failed，
-//	而父行还在 → 孤行。
-//
-// 也就是"清理制造了新的脏数据"。所以每张从表都要带上
-// 「父审批可删」这个条件，用子查询表达，与主表的 KeepSQL **同一份判据**。
-//
-// 判据：一个"跳过"决定必须传播到它保护的所有行，
-// 否则它保护的就只是自己那一行。
+// 判据：一个"跳过"决定必须传播到它保护的所有行，否则它保护的就只是自己那一行。
 func childOfDeletableApproval() (string, any) {
 	return "approval_id IN (SELECT id FROM approval_instances WHERE status IN ?)", deletableStatuses
 }
 
-// PurgeRegistry 是 settlement-auditor 的可清理实体清单。
-//
-// **顺序随便** —— 每张表按自己的账定位（见文件头）。
+// PurgeRegistry 是 settlement-auditor 的可清理实体清单。顺序随便（见文件头）。
 func PurgeRegistry() *purge.Registry {
 	childSQL, childArg := childOfDeletableApproval()
 	return purge.NewRegistry(
@@ -101,9 +85,8 @@ func PurgeRegistry() *purge.Registry {
 // 免鉴权，且公网**不可达**：nginx 有
 // `location ^~ /api/v1/settlement-auditor/internal/ { return 404; }`
 // （回归锁见 deployer/tests/config/nginx_internal_test.go）。
-//
-// 与 stocktake 同一范式 —— 本端点注册在 RegisterDapr 窗口
-// （auth 中间件之前），因为收尾清理时未必还持有 token。
+// 与 stocktake 同一范式——端点注册在 RegisterDapr 窗口（auth 中间件之前），
+// 因为收尾清理时未必还持有 token。
 func RegisterPurgeRoutes(r *gin.Engine, db *gorm.DB) {
 	r.POST("/internal/datastore/purge", purge.Handler(db, PurgeRegistry()))
 }

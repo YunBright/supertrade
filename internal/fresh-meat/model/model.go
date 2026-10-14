@@ -97,9 +97,9 @@ type WholePig struct {
 	LLMAdviceJSON         datatypes.JSON  `gorm:"column:llm_advice_json;type:jsonb" json:"llm_advice_json,omitempty"`
 	DataSource            DataSource      `gorm:"column:data_source;type:varchar(16);not null;default:'stub'" json:"data_source"`
 	// 场景一/二/三区分:
-	HalfPig         bool   `gorm:"column:half_pig;not null;default:false" json:"half_pig"`                            // 半头猪
-	OffalIncluded   bool   `gorm:"column:offal_included;not null;default:false" json:"offal_included"`                // 带全猪下水
-	PurchaseGroupID string `gorm:"column:purchase_group_id;type:varchar(64);index:idx_branch_group,priority:2" json:"purchase_group_id,omitempty"` // 场景三 2 头同 group
+	HalfPig         bool      `gorm:"column:half_pig;not null;default:false" json:"half_pig"`                                                         // 半头猪
+	OffalIncluded   bool      `gorm:"column:offal_included;not null;default:false" json:"offal_included"`                                             // 带全猪下水
+	PurchaseGroupID string    `gorm:"column:purchase_group_id;type:varchar(64);index:idx_branch_group,priority:2" json:"purchase_group_id,omitempty"` // 场景三 2 头同 group
 	CreatedAt       time.Time `gorm:"column:created_at;not null" json:"created_at"`
 	UpdatedAt       time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
 }
@@ -157,7 +157,7 @@ func (PorkCutsStocktake) TableName() string { return "pork_cuts_stocktakes" }
 // 下不同 SKU(如 五花肉 / 梅肉 / 五花片)各一条记录。
 type CutSnapshot struct {
 	CutType          CutType         `json:"cut_type"`
-	CubeProductID    string          `json:"cube_product_id"`                  // 必填;由 (branch, cut_type) 在 branch_cut_mapping 校验
+	CubeProductID    string          `json:"cube_product_id"` // 必填;由 (branch, cut_type) 在 branch_cut_mapping 校验
 	ActualRemainKg   decimal.Decimal `json:"actual_remain_kg"`
 	ExpectedRemainKg decimal.Decimal `json:"expected_remain_kg"`
 	VarianceKg       decimal.Decimal `json:"variance_kg"`
@@ -175,11 +175,11 @@ type CutSnapshot struct {
 // UnitPriceYuan 从 sale.completed.unit_price_yuan 直接拷贝,供后续 per-SKU 单价 / 毛利计算。
 // OrderStatus "S"=销售 "R"=退货;POS 已自翻符号(负 qty/amount);毛利计算时 R 行不进 revenue。
 type LineSalesByPig struct {
-	ID           uint64          `gorm:"primaryKey;column:id;autoIncrement" json:"id"`
-	BranchID      string         `gorm:"column:branch_id;type:varchar(64);not null;index:idx_branch_date,priority:1" json:"branch_id"`
-	SaleDate      datatypes.Date `gorm:"column:sale_date;not null;index:idx_branch_date,priority:2" json:"sale_date"`
-	PigID         string         `gorm:"column:pig_id;type:varchar(64);not null;index" json:"pig_id"`
-	CutType       CutType        `gorm:"column:cut_type;type:varchar(32);not null" json:"cut_type"`
+	ID            uint64          `gorm:"primaryKey;column:id;autoIncrement" json:"id"`
+	BranchID      string          `gorm:"column:branch_id;type:varchar(64);not null;index:idx_branch_date,priority:1" json:"branch_id"`
+	SaleDate      datatypes.Date  `gorm:"column:sale_date;not null;index:idx_branch_date,priority:2" json:"sale_date"`
+	PigID         string          `gorm:"column:pig_id;type:varchar(64);not null;index" json:"pig_id"`
+	CutType       CutType         `gorm:"column:cut_type;type:varchar(32);not null" json:"cut_type"`
 	QtyKg         decimal.Decimal `gorm:"column:qty_kg;type:decimal(12,3);not null" json:"qty_kg"`
 	AmountYuan    decimal.Decimal `gorm:"column:amount_yuan;type:decimal(14,2);not null" json:"amount_yuan"`
 	UnitPriceYuan decimal.Decimal `gorm:"column:unit_price_yuan;type:decimal(10,2);not null;default:0" json:"unit_price_yuan"`
@@ -277,8 +277,8 @@ type CutInput struct {
 
 // RecordPorkCutsStocktakeInput POST /pork-cuts-stocktake 入参。
 type RecordPorkCutsStocktakeInput struct {
-	IsComplete bool      `json:"is_complete"`
-	Cuts      []CutInput `json:"cuts" binding:"required"`
+	IsComplete bool       `json:"is_complete"`
+	Cuts       []CutInput `json:"cuts" binding:"required"`
 }
 
 // RecordWasteLogInput POST /waste-logs 入参。
@@ -294,7 +294,7 @@ type RecordWasteLogInput struct {
 // CreateBranchCutMappingInput POST /branch-cut-mappings 入参。
 type CreateBranchCutMappingInput struct {
 	CutType       CutType `json:"cut_type" binding:"required"`
-	CubeProductID  string  `json:"cube_product_id" binding:"required"`
+	CubeProductID string  `json:"cube_product_id" binding:"required"`
 }
 
 // UpdateBranchCutMappingInput PUT /branch-cut-mappings/:id 入参。
@@ -310,16 +310,16 @@ type UpdateBranchCutMappingInput struct {
 // **不携带 tenant_id**(本仓不持久化 tenant;见 service/events.go)。
 // OpeningKg / WasteKg 是新键(优化 2026-10-01):key=cut_type,value=decimal.Decimal;下游若不读可忽略。
 type PorkCutsStocktakenEventData struct {
-	StocktakeID string        `json:"stocktake_id"`
-	BranchID    string        `json:"branch_id"`
-	IsComplete  bool          `json:"is_complete"`
-	Cuts        []CutSnapshot `json:"cuts"`
+	StocktakeID string                     `json:"stocktake_id"`
+	BranchID    string                     `json:"branch_id"`
+	IsComplete  bool                       `json:"is_complete"`
+	Cuts        []CutSnapshot              `json:"cuts"`
 	OpeningKg   map[string]decimal.Decimal `json:"opening_kg,omitempty"`
 	WasteKg     map[string]decimal.Decimal `json:"waste_kg,omitempty"`
-	LLMReviewed bool          `json:"llm_reviewed"`
-	DataSource  string        `json:"data_source"` // actual | llm_reviewed | history_avg
-	CompletedAt time.Time     `json:"completed_at"`
-	OperatorID  string        `json:"operator_id"`
+	LLMReviewed bool                       `json:"llm_reviewed"`
+	DataSource  string                     `json:"data_source"` // actual | llm_reviewed | history_avg
+	CompletedAt time.Time                  `json:"completed_at"`
+	OperatorID  string                     `json:"operator_id"`
 }
 
 // WasteLogRecordedEventData 报损事件(EVENT-CATALOG §2.6)。

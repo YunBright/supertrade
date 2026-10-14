@@ -18,9 +18,9 @@ import (
 
 	"github.com/YunBright/supertrade/internal/notification-gateway/fanout"
 	"github.com/YunBright/supertrade/internal/notification-gateway/gateway"
-	"github.com/YunBright/supertrade/pkg/eventbus"
 	"github.com/YunBright/supertrade/internal/notification-gateway/observability"
 	"github.com/YunBright/supertrade/internal/notification-gateway/wsmsg"
+	"github.com/YunBright/supertrade/pkg/eventbus"
 )
 
 // Topics 是本服务订阅的全部 Dapr pub/sub topic。

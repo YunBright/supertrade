@@ -23,13 +23,13 @@ import (
 	"os"
 	"time"
 
-	dapr "github.com/dapr/go-sdk/client"
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/YunBright/supertrade/internal/cube-router/db"
 	"github.com/YunBright/supertrade/internal/cube-router/handler"
 	"github.com/YunBright/supertrade/internal/cube-router/model"
 	"github.com/YunBright/supertrade/internal/cube-router/service"
 	"github.com/YunBright/supertrade/pkg/cmdbootstrap"
+	dapr "github.com/dapr/go-sdk/client"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -48,10 +48,10 @@ func main() {
 // 跟 cmd/stocktake/main.go 同样的 pattern(package var 因为 cmdbootstrap.Options
 // 回调签名不返回外部状态)。
 var (
-	appDB     *gorm.DB
-	appSvc    *service.Service
-	appUser   *userinfo.Client
-	appDapr   dapr.Client
+	appDB   *gorm.DB
+	appSvc  *service.Service
+	appUser *userinfo.Client
+	appDapr dapr.Client
 )
 
 func initApp() error {

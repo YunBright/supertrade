@@ -12,9 +12,9 @@ package testdb
 import (
 	"fmt"
 
-	_ "modernc.org/sqlite" // 注册驱动名 "sqlite"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
+	_ "modernc.org/sqlite" // 注册驱动名 "sqlite"
 )
 
 // OpenSQLite 打开 SQLite in-memory 数据库(测试用)。

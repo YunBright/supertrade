@@ -1,11 +1,11 @@
 // Package service / stocktake_calc.go —— 服务端计算 expected_remain_kg_by_cut。
 //
-//   expected_remain_kg_by_cut
-//     = opening(昨夜库存结转) + 入库(whole_pig + pig_cuts) - 已销(line_sales_by_pig) - 报损(waste_logs)
+//	expected_remain_kg_by_cut
+//	  = opening(昨夜库存结转) + 入库(whole_pig + pig_cuts) - 已销(line_sales_by_pig) - 报损(waste_logs)
 //
 // 入库口径优先级:
-//   1. pig_cuts.weight_kg(仓管实际扫码录入,权威)
-//   2. 兜底:whole_pig.llm_advice_json.cuts[].expected_kg(LLM 推演值;若 LLM 未返则 0)
+//  1. pig_cuts.weight_kg(仓管实际扫码录入,权威)
+//  2. 兜底:whole_pig.llm_advice_json.cuts[].expected_kg(LLM 推演值;若 LLM 未返则 0)
 //
 // opening 口径(2026-10-01 优化):
 //   - 查 is_complete=true PorkCutsStocktake WHERE taken_at ∈ [startOfDay-24h, startOfDay)

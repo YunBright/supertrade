@@ -91,9 +91,9 @@ func defaultVerdictFn(_ context.Context, in *AuditInput) (*VerdictResult, error)
 			reason = reason[:1000]
 		}
 		raw, _ := json.Marshal(map[string]any{
-			"conclusion":       ConclusionReject,
-			"reason":           reason,
-			"confidence":       1,
+			"conclusion":        ConclusionReject,
+			"reason":            reason,
+			"confidence":        1,
 			"suggest_stocktake": suggestion,
 		})
 		return &VerdictResult{
@@ -110,9 +110,9 @@ func defaultVerdictFn(_ context.Context, in *AuditInput) (*VerdictResult, error)
 		reason = fmt.Sprintf("规则审核通过:无阻断信号(%d 条警告待人工终审关注)", len(warns))
 	}
 	raw, _ := json.Marshal(map[string]any{
-		"conclusion":       ConclusionPass,
-		"reason":           reason,
-		"confidence":       0.9,
+		"conclusion":        ConclusionPass,
+		"reason":            reason,
+		"confidence":        0.9,
 		"suggest_stocktake": suggestion,
 	})
 	return &VerdictResult{

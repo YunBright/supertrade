@@ -108,17 +108,17 @@ func (s *Service) SetScopeTTL(ttl time.Duration) {
 // ---- 业务错误(供 handler 映射 HTTP 状态码) ----
 
 var (
-	ErrHeaderNotFound        = errors.New("service: 盘点单不存在")
-	ErrLineNotFound          = errors.New("service: 盘点明细不存在")
-	ErrInvalidStatus         = errors.New("service: 盘点单状态不允许该操作")
+	ErrHeaderNotFound = errors.New("service: 盘点单不存在")
+	ErrLineNotFound   = errors.New("service: 盘点明细不存在")
+	ErrInvalidStatus  = errors.New("service: 盘点单状态不允许该操作")
 	// ErrHeaderApproved —— 删除端点专用，映射 409（见 mapErr）。
 	//
 	// 刻意不复用 ErrInvalidStatus：那个映射成 400 bad_request，语义是
 	// "你请求写错了，改了再来"。而"这张单已经 approved、不可删"不是请求的错，
 	// 客户端改任何参数都没用，只能换个时点 —— 那正是 409 的定义。
-	// 用 400 的后果很具体:清理脚本会把冲突当成参数错误 endlessly 重试,
+	// 用 400 的后果很具体：清理脚本会把冲突当成参数错误反复重试，
 	// 或者干脆在重试里放大成"删不掉就多试几次"的压力。
-	ErrHeaderApproved = errors.New("service: 盘点单已审核,不可删除")
+	ErrHeaderApproved        = errors.New("service: 盘点单已审核,不可删除")
 	ErrInvalidTransition     = errors.New("service: 非法状态转移")
 	ErrCubeUnavailable       = errors.New("service: cube client 未配置")
 	ErrProductNotFound       = errors.New("service: 商品在 cube 中不存在")             // 包装 cubeclient.ErrProductNotFound
@@ -241,17 +241,12 @@ func (s *Service) CreateHeader(ctx context.Context, in CreateHeaderInput) (*mode
 		CreatedAt:           now,
 		UpdatedAt:           now,
 	}
-	// ⚠️ WithContext 是**必须**的，不是风格选择。
-	//
-	// 溯源记账的 gorm 回调读的是 `Statement.Context` 里的 run_id
-	// （core/testrun）。`s.db` 自带的 context 是 context.Background()，
-	// 直接 `s.db.Create(h)` 会让回调第一行就拿到空串返回 ——
-	// **行照样写进生产库，但旁表一条账都不记**，于是收尾 sweep 永远
-	// 找不到它。这正是 2026-10-13 首次全量跑的实际结果：
-	// stocktake_headers 涨了 7 行、testrun_rows 却是 0。
-	//
-	// 方法签名已经收了 ctx（handler 传的是 c.Request.Context()），
-	// 不用它就等于把溯源链路在这里剪断。
+	// ⚠️ WithContext 是**必须**的，不是风格选择。溯源记账的 gorm 回调读
+	// `Statement.Context` 里的 run_id，而 `s.db` 自带的 context 是
+	// context.Background()——直接 `s.db.Create(h)` 会让回调第一行就返回：
+	// **行照样写进生产库，但旁表一条账都不记**，收尾 sweep 永远找不到它。
+	// 方法签名已经收了 ctx（handler 传的是 c.Request.Context()），不用它
+	// 就等于把溯源链路在这里剪断。
 	if err := s.db.WithContext(ctx).Create(h).Error; err != nil {
 		return nil, fmt.Errorf("create header: %w", err)
 	}
@@ -701,10 +696,8 @@ func (s *Service) AddLine(ctx context.Context, headerID string, in AddLineInput)
 		CreatedAt: now,
 	}
 
-	// WithContext 必须挂在 Transaction 上（而不是只挂 tx）——
-	// 事务继承的是外层 db 的 context，挂错了里面的 tx.Create 依旧丢溯源。
-	// 判据：凡是"用了 ctx 却在别处丢掉"的写路径，症状都是**静默的**
-	//（行写进去了、账没记、清理永远找不到）。
+	// WithContext 必须挂在 Transaction 上（而不是只挂 tx）——事务继承外层 db 的
+	// context，挂错了里面的 tx.Create 依旧丢溯源。
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(line).Error; err != nil {
 			return fmt.Errorf("create line: %w", err)
@@ -1692,9 +1685,8 @@ func (s *Service) SetBranchDefaultStocktake(ctx context.Context, branchID, heade
 		UpdatedAt: now,
 	}
 	// Save 按主键覆盖 → upsert 语义;新建/更新统一走这一条路径。
-	//
-	// WithContext 同样必须挂 —— 否则 branch_default 建的行不进旁表，
-	// 兜底清理永远找不到它（症状与 CreateHeader 那处完全一样：静默）。
+	// WithContext 同样必须挂——否则 branch_default 建的行不进旁表，
+	// 兜底清理永远找不到它（症状与 CreateHeader 那处一样：静默）。
 	if err := s.db.WithContext(ctx).Save(rec).Error; err != nil {
 		return nil, fmt.Errorf("upsert branch default: %w", err)
 	}

@@ -92,20 +92,20 @@ func marshalOrLog(v any) json.RawMessage {
 // 字段命名严格对齐 EVENT-CATALOG.md;operator_name 用于 Flutter
 // 端展示 "张三 改了 五花肉" 这种自然语言提示。
 type LineEventData struct {
-	HeaderID    string  `json:"header_id"`
-	LineID      string  `json:"line_id"`
-	BranchID    string  `json:"branch_id"`
-	TenantID    string  `json:"tenant_id"`
-	ProductID   string  `json:"sku_id"`
-	ProductName string  `json:"product_name"`
-	Barcode     string  `json:"barcode,omitempty"`
-	SystemQty   float64 `json:"system_qty"` // book_qty(JSON 不能直接解 decimal.Decimal)
-	ActualQty   float64 `json:"actual_qty"`
-	DiffQty     float64 `json:"diff_qty"`
-	Unit        string  `json:"unit,omitempty"`
-	OperatorID  string  `json:"operator_id"`
-	OperatorName string `json:"operator_name,omitempty"`
-	OccurredAt  string  `json:"occurred_at"` // RFC3339 UTC
+	HeaderID     string  `json:"header_id"`
+	LineID       string  `json:"line_id"`
+	BranchID     string  `json:"branch_id"`
+	TenantID     string  `json:"tenant_id"`
+	ProductID    string  `json:"sku_id"`
+	ProductName  string  `json:"product_name"`
+	Barcode      string  `json:"barcode,omitempty"`
+	SystemQty    float64 `json:"system_qty"` // book_qty(JSON 不能直接解 decimal.Decimal)
+	ActualQty    float64 `json:"actual_qty"`
+	DiffQty      float64 `json:"diff_qty"`
+	Unit         string  `json:"unit,omitempty"`
+	OperatorID   string  `json:"operator_id"`
+	OperatorName string  `json:"operator_name,omitempty"`
+	OccurredAt   string  `json:"occurred_at"` // RFC3339 UTC
 }
 
 // withTenant 实现 payload 的 tenant 注入接口。
@@ -113,14 +113,14 @@ func (d *LineEventData) withTenant(t string) { d.TenantID = t }
 
 // LineDeletedEventData §2.12 deleted 事件 data(字段更少)。
 type LineDeletedEventData struct {
-	HeaderID    string `json:"header_id"`
-	LineID      string `json:"line_id"`
-	BranchID    string `json:"branch_id"`
-	TenantID    string `json:"tenant_id"`
-	ProductID   string `json:"sku_id"`
-	OperatorID  string `json:"operator_id"`
+	HeaderID     string `json:"header_id"`
+	LineID       string `json:"line_id"`
+	BranchID     string `json:"branch_id"`
+	TenantID     string `json:"tenant_id"`
+	ProductID    string `json:"sku_id"`
+	OperatorID   string `json:"operator_id"`
 	OperatorName string `json:"operator_name,omitempty"`
-	OccurredAt  string `json:"occurred_at"`
+	OccurredAt   string `json:"occurred_at"`
 }
 
 // withTenant 实现 payload 的 tenant 注入接口。
@@ -130,15 +130,15 @@ func (d *LineDeletedEventData) withTenant(t string) { d.TenantID = t }
 
 // HeaderEventData §2.13 头级事件 data。
 type HeaderEventData struct {
-	HeaderID    string `json:"header_id"`
-	BranchID    string `json:"branch_id"`
-	TenantID    string `json:"tenant_id"`
-	Type        string `json:"type"`        // general / produce / plan / recheck
-	Status      string `json:"status"`      // counting / adjusted / approved / cancelled
-	ParentID    string `json:"parent_id,omitempty"`
-	OperatorID  string `json:"operator_id"`
+	HeaderID     string `json:"header_id"`
+	BranchID     string `json:"branch_id"`
+	TenantID     string `json:"tenant_id"`
+	Type         string `json:"type"`   // general / produce / plan / recheck
+	Status       string `json:"status"` // counting / adjusted / approved / cancelled
+	ParentID     string `json:"parent_id,omitempty"`
+	OperatorID   string `json:"operator_id"`
 	OperatorName string `json:"operator_name,omitempty"`
-	OccurredAt  string `json:"occurred_at"`
+	OccurredAt   string `json:"occurred_at"`
 }
 
 // withTenant 实现 payload 的 tenant 注入接口。
@@ -146,15 +146,15 @@ func (d *HeaderEventData) withTenant(t string) { d.TenantID = t }
 
 // PlanItemEventData §2.13 plan_item.added 事件 data。
 type PlanItemEventData struct {
-	HeaderID    string `json:"header_id"`
-	BranchID    string `json:"branch_id"`
-	TenantID    string `json:"tenant_id"`
-	ItemsCount  int    `json:"items_count"`
-	BatchIndex  int    `json:"batch_index,omitempty"`
-	BatchTotal  int    `json:"batch_total,omitempty"`
-	OperatorID  string `json:"operator_id"`
+	HeaderID     string `json:"header_id"`
+	BranchID     string `json:"branch_id"`
+	TenantID     string `json:"tenant_id"`
+	ItemsCount   int    `json:"items_count"`
+	BatchIndex   int    `json:"batch_index,omitempty"`
+	BatchTotal   int    `json:"batch_total,omitempty"`
+	OperatorID   string `json:"operator_id"`
 	OperatorName string `json:"operator_name,omitempty"`
-	OccurredAt  string `json:"occurred_at"`
+	OccurredAt   string `json:"occurred_at"`
 }
 
 // withTenant 实现 payload 的 tenant 注入接口。
@@ -164,11 +164,10 @@ func (d *PlanItemEventData) withTenant(t string) { d.TenantID = t }
 //
 // 与 EVENT-CATALOG.md §2.12~2.13 一一对应;cmd 层直接复用。
 const (
-	TopicStocktakeLineAdded        = "stocktake.line.added"
-	TopicStocktakeLineUpdated      = "stocktake.line.updated"
-	TopicStocktakeLineDeleted      = "stocktake.line.deleted"
-	TopicStocktakeHeaderSubmitted  = "stocktake.header.submitted"
-	TopicStocktakeHeaderApproved   = "stocktake.header.approved"
-	TopicStocktakePlanItemAdded    = "stocktake.plan_item.added"
+	TopicStocktakeLineAdded       = "stocktake.line.added"
+	TopicStocktakeLineUpdated     = "stocktake.line.updated"
+	TopicStocktakeLineDeleted     = "stocktake.line.deleted"
+	TopicStocktakeHeaderSubmitted = "stocktake.header.submitted"
+	TopicStocktakeHeaderApproved  = "stocktake.header.approved"
+	TopicStocktakePlanItemAdded   = "stocktake.plan_item.added"
 )
-

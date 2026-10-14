@@ -42,7 +42,7 @@ type Handler struct {
 	suppliers *service.SupplierService
 	products  *service.ProductService
 	cube      cubeclient.Client // 兜底,本地表无数据时转发 cube
-	users     *userinfo.Client // per-branch scope 守门用
+	users     *userinfo.Client  // per-branch scope 守门用
 	logger    *slog.Logger
 }
 

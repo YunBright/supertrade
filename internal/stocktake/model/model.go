@@ -111,8 +111,8 @@ type StocktakeHeader struct {
 	Remark              string          `gorm:"column:remark;type:text" json:"remark,omitempty"`
 	// 溯源走旁表 testrun_rows(见 core/testrun),业务表零改动。
 	// 盘点单曾因"没有删除端点"而永久堆积;现在有确定的账可依。
-	CreatedAt time.Time `gorm:"column:created_at;not null" json:"created_at"`
-	UpdatedAt time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
+	CreatedAt time.Time       `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt time.Time       `gorm:"column:updated_at;not null" json:"updated_at"`
 	Lines     []StocktakeLine `gorm:"foreignKey:HeaderID;references:ID;constraint:OnDelete:CASCADE" json:"lines,omitempty"`
 }
 

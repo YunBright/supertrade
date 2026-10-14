@@ -67,9 +67,9 @@ type WecomCommand struct {
 
 // ApplyEventPayload 代提交审批申请。
 type ApplyEventPayload struct {
-	CreatorUserID       string          `json:"creator_userid"`
-	TemplateID          string          `json:"template_id"`
-	UseTemplateApprover int             `json:"use_template_approver"`
+	CreatorUserID       string `json:"creator_userid"`
+	TemplateID          string `json:"template_id"`
+	UseTemplateApprover int    `json:"use_template_approver"`
 	// Process 显式审批流程(UseTemplateApprover=0 时必填),对齐企微 91853
 	// process.node_list:type 1=审批人 2=抄送人 3=办理人;审批/办理节点
 	// 需 apv_rel(1会签 2或签 3依次审批)。镜像 wechat-bot

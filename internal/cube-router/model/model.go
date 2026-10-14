@@ -2,7 +2,7 @@
 //
 // 数据归属:cube-router 是 branch_cube_sources 表的唯一拥有方(catalog /
 // inventory 不读不写这张表);Admin 通过 /admin/branch-cube-sources CRUD 配置
-//"某个门店的 cube 查询应转发到哪个 cube 实例"(六讯思迅 cube 各门店版本不同)。
+// "某个门店的 cube 查询应转发到哪个 cube 实例"(六讯思迅 cube 各门店版本不同)。
 //
 // 设计要点:
 //   - branch_id 是 PK(每门店一行;一店一行配置)。uuid.String() 36 字符,放进

@@ -10,10 +10,11 @@
 //   - 这里保留调用方原 body,避免协议耦合与字段丢失
 //
 // 出口方法名是 query 而不是 v1/load:
-//   cube 侧 cube app 只注册了 POST /query + GET /healthz;cube-gateway 也只注册
-//   /register /unregister /v1/source/:source/load /v1/sources /healthz,并且
-//   gateway 调上游同样走 /query。整条链路上没有任何服务提供 v1/load,
-//   原先转发 v1/load 会稳定拿到 404。
+//
+//	cube 侧 cube app 只注册了 POST /query + GET /healthz;cube-gateway 也只注册
+//	/register /unregister /v1/source/:source/load /v1/sources /healthz,并且
+//	gateway 调上游同样走 /query。整条链路上没有任何服务提供 v1/load,
+//	原先转发 v1/load 会稳定拿到 404。
 package handler
 
 import (

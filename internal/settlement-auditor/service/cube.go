@@ -110,6 +110,7 @@ func NewDaprCubeQuerier(c *cubeclient.DaprCubeClient) *DaprCubeQuerier {
 // ctxWithBranch 透传 branch。bearer 不在此处处理:
 //   - 请求路径(H5 勾选数据源)由 main.go 中间件把请求 JWT 注入 ctx;
 //   - 流水线路径由 runAudit 从实例记录注入申请人 JWT。
+//
 // cube 实例 sidecar 的 middleware.http.bearer 强制 JWT,空 bearer 必被
 // Unauthenticated 拒(2026-10-10 契约测试红过一次:此处曾 WithBearer(ctx,"")
 // 把中间件注入的 JWT 覆盖掉)。
@@ -219,10 +220,10 @@ func (q *DaprCubeQuerier) ListAuditedSettlements(ctx context.Context, branchID, 
 	out := make([]SettlementRow, 0, len(data))
 	for _, r := range data {
 		out = append(out, SettlementRow{
-			ID:             rowStr(r, "settlement.id"),
-			SupplierID:     rowStr(r, "settlement.supplier_id"),
-			DocumentType:   rowStr(r, "settlement.document_type"),
-			ApproveStatus:  rowStr(r, "settlement.approve_status"),
+			ID:            rowStr(r, "settlement.id"),
+			SupplierID:    rowStr(r, "settlement.supplier_id"),
+			DocumentType:  rowStr(r, "settlement.document_type"),
+			ApproveStatus: rowStr(r, "settlement.approve_status"),
 			// MSSQL live 源的 datetime 是 "09  1 2021 12:00AM" 这种串,展示与
 			// 排序都不友好,统一规范成 "2006-01-02"(解析失败保留原串)。
 			PeriodStart:    normalizeCubeDate(rowStr(r, "settlement.period_start")),

@@ -20,10 +20,10 @@ import (
 	"log/slog"
 	"net/http"
 
-	dapr "github.com/dapr/go-sdk/client"
 	"github.com/YunBright/authkit/claims"
 	"github.com/YunBright/authkit/rbac"
 	"github.com/YunBright/authkit/userinfo"
+	dapr "github.com/dapr/go-sdk/client"
 	"github.com/gin-gonic/gin"
 
 	"github.com/YunBright/supertrade/internal/cube-router/model"

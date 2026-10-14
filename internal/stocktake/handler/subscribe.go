@@ -4,9 +4,9 @@
 // POST /events/<topic> 推送 CloudEvents。
 //
 // 本服务订阅 auth.user.access_changed(合并 events,取代旧的 permissions_changed):
-//  - payload 含 user_id(必填)+ branch_id(可选,缺省清空 user 全部缓存)
-//  - 收到后调 svc.InvalidateScopeCache(userID, branchID) 让下一次权限校验
-//    走 userd 重新拉权限矩阵。
+//   - payload 含 user_id(必填)+ branch_id(可选,缺省清空 user 全部缓存)
+//   - 收到后调 svc.InvalidateScopeCache(userID, branchID) 让下一次权限校验
+//     走 userd 重新拉权限矩阵。
 //
 // 不订阅 stocktake.line.added 等本服务自己发的事件——dapr sidecar 默认不
 // 收自己的发布,避免循环。
@@ -35,9 +35,9 @@ var SubscribeTopics = []string{
 
 // Subscription 是 /dapr/subscribe 返回结构。
 type Subscription struct {
-	PubsubName string `json:"pubsubname"`
-	Topic      string `json:"topic"`
-	Route      string `json:"route"`
+	PubsubName string   `json:"pubsubname"`
+	Topic      string   `json:"topic"`
+	Route      string   `json:"route"`
 	Metadata   struct{} `json:"metadata,omitempty"`
 }
 

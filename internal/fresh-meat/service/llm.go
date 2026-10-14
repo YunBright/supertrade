@@ -1,14 +1,15 @@
 // Package service / llm.go —— 同步调 Dapr Conversation API(LLM)做整猪分割预测。
 //
 // 设计:
-//     RecordWholePig → insert → 调 PredictFn(pig, history) →
-//       ├─ 成功 → update whole_pig llm_advice_json = result.RawJSON, data_source = "llm"
-//       └─ 失败 / 超时 → fallbackToHistoryAvg → update whole_pig llm_advice_json + data_source = "history_avg"
 //
-//   - **失败不视为业务错误**:返回 200 给仓管,data_source 标注降级来源。
-//   - 默认 PredictFn 是 "history_avg";生产注入 DaprConversationPredictFn。
-//   - ConvName 默认 "conversation";env FRESHMEAT_CONVERSATION 覆盖。
-//   - LLMTimeout 默认 30s;env FRESHMEAT_LLM_TIMEOUT 覆盖。
+//	  RecordWholePig → insert → 调 PredictFn(pig, history) →
+//	    ├─ 成功 → update whole_pig llm_advice_json = result.RawJSON, data_source = "llm"
+//	    └─ 失败 / 超时 → fallbackToHistoryAvg → update whole_pig llm_advice_json + data_source = "history_avg"
+//
+//	- **失败不视为业务错误**:返回 200 给仓管,data_source 标注降级来源。
+//	- 默认 PredictFn 是 "history_avg";生产注入 DaprConversationPredictFn。
+//	- ConvName 默认 "conversation";env FRESHMEAT_CONVERSATION 覆盖。
+//	- LLMTimeout 默认 30s;env FRESHMEAT_LLM_TIMEOUT 覆盖。
 package service
 
 import (
@@ -22,8 +23,8 @@ import (
 	"time"
 
 	"github.com/YunBright/supertrade/internal/fresh-meat/model"
-	"github.com/shopspring/decimal"
 	dapr "github.com/dapr/go-sdk/client"
+	"github.com/shopspring/decimal"
 )
 
 // LLMResult 是 PredictFn 的返回值 — 仓管期望的整猪分割建议。
@@ -32,7 +33,7 @@ import (
 // Cuts 是解析后的预期 cuts(供后续 BI 复用 / 校验)。
 type LLMResult struct {
 	Cuts    []PredictedCut `json:"cuts"`
-	RawJSON []byte        `json:"-"`
+	RawJSON []byte         `json:"-"`
 	Source  string         `json:"source"` // "llm" 或 "history_avg"
 }
 

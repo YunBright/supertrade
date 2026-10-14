@@ -28,19 +28,19 @@ import (
 //   - "active"  = 启用
 //   - "inactive" = 停用(软删,DeletedAt 才是硬删)
 type Supplier struct {
-	ID        string    `gorm:"primaryKey;column:id;type:varchar(64)"`
-	BranchID  string    `gorm:"primaryKey;column:branch_id;type:varchar(64)"`
-	Name      string    `gorm:"column:name;type:varchar(255);not null;index:idx_supplier_branch_name"`
-	Type      string    `gorm:"column:type;type:varchar(16);not null;default:'0'"`
-	Contact   string    `gorm:"column:contact;type:varchar(128)"`
-	Phone     string    `gorm:"column:phone;type:varchar(32);index:idx_supplier_phone"`
-	Email     string    `gorm:"column:email;type:varchar(255)"`
-	Address   string    `gorm:"column:address;type:text"`
-	Status    string    `gorm:"column:status;type:varchar(16);not null;index:idx_supplier_status"`
-	CreatedBy string    `gorm:"column:created_by;type:varchar(64);not null"`
-	UpdatedBy string    `gorm:"column:updated_by;type:varchar(64)"`
-	CreatedAt time.Time `gorm:"column:created_at;not null"`
-	UpdatedAt time.Time `gorm:"column:updated_at;not null"`
+	ID        string     `gorm:"primaryKey;column:id;type:varchar(64)"`
+	BranchID  string     `gorm:"primaryKey;column:branch_id;type:varchar(64)"`
+	Name      string     `gorm:"column:name;type:varchar(255);not null;index:idx_supplier_branch_name"`
+	Type      string     `gorm:"column:type;type:varchar(16);not null;default:'0'"`
+	Contact   string     `gorm:"column:contact;type:varchar(128)"`
+	Phone     string     `gorm:"column:phone;type:varchar(32);index:idx_supplier_phone"`
+	Email     string     `gorm:"column:email;type:varchar(255)"`
+	Address   string     `gorm:"column:address;type:text"`
+	Status    string     `gorm:"column:status;type:varchar(16);not null;index:idx_supplier_status"`
+	CreatedBy string     `gorm:"column:created_by;type:varchar(64);not null"`
+	UpdatedBy string     `gorm:"column:updated_by;type:varchar(64)"`
+	CreatedAt time.Time  `gorm:"column:created_at;not null"`
+	UpdatedAt time.Time  `gorm:"column:updated_at;not null"`
 	DeletedAt *time.Time `gorm:"column:deleted_at;index"`
 }
 

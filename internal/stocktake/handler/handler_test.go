@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	dapr "github.com/dapr/go-sdk/client"
 	"github.com/YunBright/authkit/claims"
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/YunBright/supertrade/internal/cubeclient/cubeclientfake"
@@ -20,6 +19,7 @@ import (
 	"github.com/YunBright/supertrade/internal/stocktake/service"
 	"github.com/YunBright/supertrade/internal/stocktake/testdb"
 	"github.com/YunBright/supertrade/pkg/middleware"
+	dapr "github.com/dapr/go-sdk/client"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
@@ -535,7 +535,7 @@ func TestHandler_ListHeaders_FilteredByType(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/stocktake-headers", bytes.NewBufferString(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Test-Claims", claimsHeader("u-1"))
-	req.Header.Set("X-Branch-ID", testBranchID)
+		req.Header.Set("X-Branch-ID", testBranchID)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusCreated {

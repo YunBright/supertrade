@@ -40,9 +40,9 @@ var SubscribeTopics = []string{
 
 // Subscription 是 /dapr/subscribe 返回结构。
 type Subscription struct {
-	PubsubName string `json:"pubsubname"`
-	Topic      string `json:"topic"`
-	Route      string `json:"route"`
+	PubsubName string   `json:"pubsubname"`
+	Topic      string   `json:"topic"`
+	Route      string   `json:"route"`
 	Metadata   struct{} `json:"metadata,omitempty"`
 }
 

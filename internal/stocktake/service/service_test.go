@@ -631,7 +631,7 @@ func TestService_RecheckAutoRemark(t *testing.T) {
 		ActualQty: decimal.NewFromInt(95),
 		Remark:    "用户填的备注",
 		ActorID:   "u-1", ActorName: "张三",
-		Method:    model.MethodManual,
+		Method: model.MethodManual,
 	})
 	if err != nil {
 		t.Fatalf("AddLine recheck: %v", err)

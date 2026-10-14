@@ -24,11 +24,11 @@ import (
 	"fmt"
 	"net/http"
 
-	dapr "github.com/dapr/go-sdk/client"
 	"github.com/YunBright/authkit/claims"
 	"github.com/YunBright/authkit/rbac"
 	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/pkg/middleware"
+	dapr "github.com/dapr/go-sdk/client"
 	"github.com/gin-gonic/gin"
 )
 

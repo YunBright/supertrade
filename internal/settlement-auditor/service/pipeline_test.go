@@ -772,7 +772,7 @@ func TestRescanStuck(t *testing.T) {
 	db.Create(&model.ApprovalInstance{
 		ID: "ap-stuck", BranchID: "B1", Status: model.StatusReceived,
 		ApplicantUserID: "u-1", ApplicantWecomID: "wecom-u1",
-		ApproverUserIDs: datatypes.JSON([]byte(`["apr1"]`)),
+		ApproverUserIDs:  datatypes.JSON([]byte(`["apr1"]`)),
 		ManualAmountYuan: dec("1"), CreatedAt: old, UpdatedAt: old,
 	})
 	db.Create(&model.ApprovalInstance{

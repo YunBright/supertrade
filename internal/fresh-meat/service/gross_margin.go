@@ -1,33 +1,34 @@
 // Package service / gross_margin.go —— 按门店 + 营业日汇总鲜肉毛利。
 //
 // 算法:
-//   per cut:
 //
-//     purchased_kg   = pig_cuts(weight_kg) + llm_advice(expected_kg) - pig_cuts(同上)
-//                     （= llm_advice 中"未录入 pig_cuts"的 cut 的兜底）
-//     sold_kg        = Σ line_sales_by_pig.qty_kg WHERE OrderStatus='S' and qty_kg>0
-//     waste_kg       = Σ waste_logs.qty_kg
-//     opening_kg     = 上一营业日 is_complete=true stocktake 的 ActualRemainKg
-//     expected_kg    = opening + purchased - sold - waste(裁到 >= 0)
-//     actual_kg      = 当日 is_complete=true stocktake 的 ActualRemainKg(若无 → 空)
+//	 per cut:
 //
-//     revenue_yuan   = Σ line_sales_by_pig.amount_yuan WHERE OrderStatus='S' and qty_kg>0
-//     purchase_cost_yuan
-//                    = (本 cut 来源 pig 的 purchase_cost_yuan 按 in_kg 比例摊销) ×
-//                      min(1, sold_kg / max(purchased_kg, sold_kg))
+//	   purchased_kg   = pig_cuts(weight_kg) + llm_advice(expected_kg) - pig_cuts(同上)
+//	                   （= llm_advice 中"未录入 pig_cuts"的 cut 的兜底）
+//	   sold_kg        = Σ line_sales_by_pig.qty_kg WHERE OrderStatus='S' and qty_kg>0
+//	   waste_kg       = Σ waste_logs.qty_kg
+//	   opening_kg     = 上一营业日 is_complete=true stocktake 的 ActualRemainKg
+//	   expected_kg    = opening + purchased - sold - waste(裁到 >= 0)
+//	   actual_kg      = 当日 is_complete=true stocktake 的 ActualRemainKg(若无 → 空)
 //
-//     gross_margin_yuan = revenue - purchase_cost_yuan
-//     gross_margin_pct  = gross_margin / revenue × 100(无 revenue 时 0)
+//	   revenue_yuan   = Σ line_sales_by_pig.amount_yuan WHERE OrderStatus='S' and qty_kg>0
+//	   purchase_cost_yuan
+//	                  = (本 cut 来源 pig 的 purchase_cost_yuan 按 in_kg 比例摊销) ×
+//	                    min(1, sold_kg / max(purchased_kg, sold_kg))
 //
-//  cost_allocation 细节:
-//     - 同一 cut 可能来自多 pig;每 pig 的 purchase_cost 按 (pig_in_kg_for_cut / pig_total_in_kg) 比例分摊
-//     - pig_total_in_kg = 该 pig 当日 LLM 给出所有 cut 的 expected_kg 之和
-//     - 实际消耗比例 = min(1, sold_kg / purchased_kg);purchased=0 时 100%(LLM 兜底成本照样算)
+//	   gross_margin_yuan = revenue - purchase_cost_yuan
+//	   gross_margin_pct  = gross_margin / revenue × 100(无 revenue 时 0)
 //
-//  data_source:
-//     - is_complete=true stocktake 存在 → "actual"(含 actual_kg / variance_kg)
-//     - 仅部分 stocktake → "partial"
-//     - 无 stocktake → "estimated"(expected - actual 字段缺失)
+//	cost_allocation 细节:
+//	   - 同一 cut 可能来自多 pig;每 pig 的 purchase_cost 按 (pig_in_kg_for_cut / pig_total_in_kg) 比例分摊
+//	   - pig_total_in_kg = 该 pig 当日 LLM 给出所有 cut 的 expected_kg 之和
+//	   - 实际消耗比例 = min(1, sold_kg / purchased_kg);purchased=0 时 100%(LLM 兜底成本照样算)
+//
+//	data_source:
+//	   - is_complete=true stocktake 存在 → "actual"(含 actual_kg / variance_kg)
+//	   - 仅部分 stocktake → "partial"
+//	   - 无 stocktake → "estimated"(expected - actual 字段缺失)
 //
 // 退货行(OrderStatus='R' 或 qty<0):**不计入** revenue/sold_kg/cost。
 //
@@ -47,13 +48,13 @@ import (
 
 // GrossMarginReport 单店单日毛利总览。
 type GrossMarginReport struct {
-	BranchID            string                `json:"branch_id"`
-	Date                string                `json:"date"`                  // YYYY-MM-DD(bizTZ)
-	IsStocktakeComplete bool                  `json:"is_stocktake_complete"`
-	DataSource          string                `json:"data_source"`           // actual | partial | estimated
-	PerCut              []PerCutGrossMargin   `json:"per_cut"`
-	Total               TotalGrossMargin      `json:"total"`
-	GeneratedAt         time.Time             `json:"generated_at"`
+	BranchID            string              `json:"branch_id"`
+	Date                string              `json:"date"` // YYYY-MM-DD(bizTZ)
+	IsStocktakeComplete bool                `json:"is_stocktake_complete"`
+	DataSource          string              `json:"data_source"` // actual | partial | estimated
+	PerCut              []PerCutGrossMargin `json:"per_cut"`
+	Total               TotalGrossMargin    `json:"total"`
+	GeneratedAt         time.Time           `json:"generated_at"`
 }
 
 // PerCutGrossMargin 单 cut 的毛利明细。
@@ -74,10 +75,10 @@ type PerCutGrossMargin struct {
 
 // TotalGrossMargin 全店汇总。
 type TotalGrossMargin struct {
-	RevenueYuan       decimal.Decimal `json:"revenue_yuan"`
-	PurchaseCostYuan  decimal.Decimal `json:"purchase_cost_yuan"`
-	GrossMarginYuan decimal.Decimal `json:"gross_margin_yuan"`
-	GrossMarginPct    float64        `json:"gross_margin_pct"`
+	RevenueYuan      decimal.Decimal `json:"revenue_yuan"`
+	PurchaseCostYuan decimal.Decimal `json:"purchase_cost_yuan"`
+	GrossMarginYuan  decimal.Decimal `json:"gross_margin_yuan"`
+	GrossMarginPct   float64         `json:"gross_margin_pct"`
 }
 
 // ComputeGrossMargin 按 (branchID, day) 算毛利。
@@ -366,10 +367,10 @@ func (s *Service) ComputeGrossMargin(ctx context.Context, branchID string, day t
 		DataSource:          dataSource,
 		PerCut:              perCut,
 		Total: TotalGrossMargin{
-			RevenueYuan:       totRev,
-			PurchaseCostYuan:  totCost,
-			GrossMarginYuan: totGM,
-			GrossMarginPct:    totGMPct,
+			RevenueYuan:      totRev,
+			PurchaseCostYuan: totCost,
+			GrossMarginYuan:  totGM,
+			GrossMarginPct:   totGMPct,
 		},
 		GeneratedAt: s.now(),
 	}, nil

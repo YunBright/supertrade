@@ -7,6 +7,7 @@
 //  1. nginx `location ^~ /api/v1/stocktake/internal/ { return 404; }`
 //     (deployer/nginx/yun-bright.conf)—— 公网路径直接 404;
 //  2. dapr 内网 invoke 不经 nginx,sidecar mTLS + 内网边界。
+//
 // 与 auth userd 的 /internal/users/* 不同范式(那套现在由 authn 应用层验签保护,
 // 2026-10-12 起 auth-internal 已合并进 userd)。
 package handler

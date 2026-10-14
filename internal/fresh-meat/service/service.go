@@ -50,7 +50,7 @@ type Service struct {
 	userInfo  *userinfo.Client
 	pubLogger *slog.Logger
 	now       func() time.Time
-	predictFn PredictFn // SetPredictFn 覆盖
+	predictFn PredictFn      // SetPredictFn 覆盖
 	bizTZ     *time.Location // 营业日界时区(默认 Asia/Shanghai UTC+8)
 
 	scopeMu    sync.RWMutex
@@ -160,15 +160,15 @@ func (s *Service) SetScopeTTL(ttl time.Duration) {
 // ---- 业务错误(供 handler 映射 HTTP 状态码) ----
 
 var (
-	ErrWholePigNotFound         = errors.New("service: 整猪不存在")
-	ErrPigCutNotFound           = errors.New("service: pig_cut 不存在")
+	ErrWholePigNotFound          = errors.New("service: 整猪不存在")
+	ErrPigCutNotFound            = errors.New("service: pig_cut 不存在")
 	ErrPorkCutsStocktakeNotFound = errors.New("service: pork_cuts_stocktake 不存在")
-	ErrBranchCutMappingNotFound = errors.New("service: 门店 cut 部位映射不存在")
-	ErrInvalidInput             = errors.New("service: 输入校验失败")
-	ErrBranchMismatch           = errors.New("service: 跨店访问禁止")
-	ErrBranchCutMappingConflict = errors.New("service: (branch_id, cut_type) 映射已存在")
-	ErrCubeUnavailable          = errors.New("service: cube client 未配置")
-	ErrUserInfoUnavailable      = errors.New("service: userd 不可用,无法校验 effective scopes")
+	ErrBranchCutMappingNotFound  = errors.New("service: 门店 cut 部位映射不存在")
+	ErrInvalidInput              = errors.New("service: 输入校验失败")
+	ErrBranchMismatch            = errors.New("service: 跨店访问禁止")
+	ErrBranchCutMappingConflict  = errors.New("service: (branch_id, cut_type) 映射已存在")
+	ErrCubeUnavailable           = errors.New("service: cube client 未配置")
+	ErrUserInfoUnavailable       = errors.New("service: userd 不可用,无法校验 effective scopes")
 )
 
 // ---- 整猪录入(RecordWholePig) ----

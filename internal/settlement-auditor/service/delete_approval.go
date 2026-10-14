@@ -48,7 +48,7 @@ var terminalStatuses = map[string]bool{
 //
 // ## 级联范围：主表 + 5 张从表
 //
-//	approval_instances          主表（带 created_by_run_id 溯源列）
+//	approval_instances          主表
 //	approval_settlements        审批 ↔ 结算单快照
 //	audit_signals               核对信号
 //	audit_logs                  推理分步日志

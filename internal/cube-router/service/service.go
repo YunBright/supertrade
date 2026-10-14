@@ -30,12 +30,12 @@ const DefaultTTL = 60 * time.Second
 
 // Service 是 cube-router 的业务服务。
 type Service struct {
-	db   *gorm.DB
-	ttl  time.Duration
-	now  func() time.Time // 可注入(测试用)
+	db  *gorm.DB
+	ttl time.Duration
+	now func() time.Time // 可注入(测试用)
 
-	mu       sync.RWMutex
-	cache    map[string]cacheEntry // branch_id → entry
+	mu    sync.RWMutex
+	cache map[string]cacheEntry // branch_id → entry
 }
 
 // cacheEntry 是 router 缓存的单个 entry。

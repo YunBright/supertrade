@@ -42,9 +42,9 @@ import (
 
 func main() {
 	cmdbootstrap.Run(cmdbootstrap.Options{
-		AppID:   "catalog",
-		Port:    cmdbootstrap.AppPort(":8103"),
-		OnStart: initApp,
+		AppID:    "catalog",
+		Port:     cmdbootstrap.AppPort(":8103"),
+		OnStart:  initApp,
 		Register: registerRoutes,
 	})
 }

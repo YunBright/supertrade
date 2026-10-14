@@ -20,12 +20,12 @@ import (
 	"time"
 
 	"github.com/YunBright/authkit/userinfo"
+	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/cubehttp"
 	freshmeat "github.com/YunBright/supertrade/internal/fresh-meat"
 	"github.com/YunBright/supertrade/internal/fresh-meat/handler"
 	"github.com/YunBright/supertrade/internal/fresh-meat/model"
 	"github.com/YunBright/supertrade/internal/fresh-meat/service"
-	"github.com/YunBright/supertrade/internal/cubeclient"
-	"github.com/YunBright/supertrade/internal/cubehttp"
 	"github.com/YunBright/supertrade/pkg/cmdbootstrap"
 	"github.com/YunBright/supertrade/pkg/middleware"
 	dapr "github.com/dapr/go-sdk/client"
@@ -180,8 +180,8 @@ func registerRoutes(r *gin.Engine) {
 
 // registerDaprRoutes 在 auth 中间件**之前**注册 Dapr 订阅端点。
 //
-//   GET  /dapr/subscribe  → 订阅清单
-//   POST /events/<topic>  → 事件分发(本服务订阅 auth.user.access_changed + sale.completed)
+//	GET  /dapr/subscribe  → 订阅清单
+//	POST /events/<topic>  → 事件分发(本服务订阅 auth.user.access_changed + sale.completed)
 //
 // 必须早于 claims.GinMiddleware + rbac.RequireAudience:sidecar 调这两个端点
 // 不带 Authorization 头,带上鉴权中间件就会 401(sidecar 于是永远拿不到订阅)。

@@ -19,19 +19,19 @@ import (
 
 // Product 是 catalog 服务的商品本地表(本期 entry)。
 type Product struct {
-	ID         string    `gorm:"primaryKey;column:id;type:varchar(64)"`
-	BranchID   string    `gorm:"primaryKey;column:branch_id;type:varchar(64)"`
-	Name       string    `gorm:"column:name;type:varchar(255);not null;index:idx_product_branch_name"`
-	CategoryID string    `gorm:"column:category_id;type:varchar(64);index:idx_product_branch_category"`
-	SupplierID string    `gorm:"column:supplier_id;type:varchar(64)"`
-	Barcode    string    `gorm:"column:barcode;type:varchar(64);index:idx_product_branch_barcode"`
-	Unit       string    `gorm:"column:unit;type:varchar(32)"`
-	Spec       string    `gorm:"column:spec;type:varchar(255)"`
-	Status     string    `gorm:"column:status;type:varchar(16);not null;index:idx_product_branch_status"`
-	CreatedBy  string    `gorm:"column:created_by;type:varchar(64);not null"`
-	UpdatedBy  string    `gorm:"column:updated_by;type:varchar(64)"`
-	CreatedAt  time.Time `gorm:"column:created_at;not null"`
-	UpdatedAt  time.Time `gorm:"column:updated_at;not null"`
+	ID         string     `gorm:"primaryKey;column:id;type:varchar(64)"`
+	BranchID   string     `gorm:"primaryKey;column:branch_id;type:varchar(64)"`
+	Name       string     `gorm:"column:name;type:varchar(255);not null;index:idx_product_branch_name"`
+	CategoryID string     `gorm:"column:category_id;type:varchar(64);index:idx_product_branch_category"`
+	SupplierID string     `gorm:"column:supplier_id;type:varchar(64)"`
+	Barcode    string     `gorm:"column:barcode;type:varchar(64);index:idx_product_branch_barcode"`
+	Unit       string     `gorm:"column:unit;type:varchar(32)"`
+	Spec       string     `gorm:"column:spec;type:varchar(255)"`
+	Status     string     `gorm:"column:status;type:varchar(16);not null;index:idx_product_branch_status"`
+	CreatedBy  string     `gorm:"column:created_by;type:varchar(64);not null"`
+	UpdatedBy  string     `gorm:"column:updated_by;type:varchar(64)"`
+	CreatedAt  time.Time  `gorm:"column:created_at;not null"`
+	UpdatedAt  time.Time  `gorm:"column:updated_at;not null"`
 	DeletedAt  *time.Time `gorm:"column:deleted_at;index"`
 }
 

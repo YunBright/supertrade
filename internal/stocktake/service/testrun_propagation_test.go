@@ -12,23 +12,18 @@ import (
 	"gorm.io/gorm"
 )
 
-// 本文件锁的是一条**静默**缺陷：溯源记账的 gorm 回调读的是
-// `Statement.Context` 里的 run_id，而 `s.db` 自带的 context 是
-// context.Background()。于是 service 里任何 `s.db.Create(...)` ——
-// 哪怕方法签名**已经收了 ctx** —— 都会让回调第一行拿到空串返回：
+// 本文件锁的是一条**静默**缺陷：溯源记账的 gorm 回调读 `Statement.Context` 里的
+// run_id，而 `s.db` 自带的 context 是 context.Background()。于是 service 里任何
+// `s.db.Create(...)`——哪怕方法签名**已经收了 ctx**——都会让回调第一行拿到空串
+// 返回：
 //
 //	行照样写进生产库，旁表一条账都不记，收尾 sweep 永远找不到它。
 //
-// 2026-10-13 首次全量契约回归的实测后果：
-//
-//	stocktake_headers  98 → 105（+7 行残留）
-//	testrun_rows       0        （一个都没记上）
-//
 // 而 sweep 报的是 "OK"。**没有任何一行报错。**
 //
-// 判据：凡是"把请求上下文带进 DB 调用"这类修复，
-// 测试必须断言**带上了之后的结果**（账记上了），
-// 而不是断言代码里写了 WithContext —— 后者挡不住下一个调用点再漏一次。
+// 判据：凡是"把请求上下文带进 DB 调用"这类修复，测试必须断言**带上了之后的
+// 结果**（账记上了），而不是断言代码里写了 WithContext——后者挡不住下一个
+// 调用点再漏一次。
 
 const propagationRunID = "ctr-20261013-135959-prop01"
 
@@ -62,8 +57,8 @@ func newLedgerService(t *testing.T) (*service.Service, *gorm.DB, *cubeclientfake
 // TestService_CreateHeader_RecordsProvenance —— 建盘点单必须进旁表。
 //
 // 反证：把 service.go 里的 `s.db.WithContext(ctx).Create(h)` 退回
-// `s.db.Create(h)`，本测试立刻红（其他所有 service 测试仍然全绿 ——
-// 它们只断言业务结果，不关心溯源）。
+// `s.db.Create(h)`，本测试立刻红（其他 service 测试仍全绿——它们只断言业务
+// 结果，不关心溯源）。
 func TestService_CreateHeader_RecordsProvenance(t *testing.T) {
 	svc, db, _ := newLedgerService(t)
 

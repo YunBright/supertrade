@@ -459,7 +459,7 @@ func TestHandler_Retry_202(t *testing.T) {
 	db.Create(&model.ApprovalInstance{
 		ID: "ap-1", BranchID: testBranchID, Status: model.StatusFailed, Error: "cube 抖动",
 		ApplicantUserID: "u-1", ApplicantWecomID: "wecom-u1",
-		ApproverUserIDs: datatypes.JSON([]byte(`["apr1"]`)),
+		ApproverUserIDs:  datatypes.JSON([]byte(`["apr1"]`)),
 		ManualAmountYuan: decimal.NewFromInt(100),
 	})
 	db.Create(&model.ApprovalSettlement{ID: "snap-1", ApprovalID: "ap-1", SettlementID: "S1"})

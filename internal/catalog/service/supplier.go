@@ -25,7 +25,7 @@ import (
 
 // SupplierService 是 catalog 的供应商服务。
 type SupplierService struct {
-	db *gorm.DB
+	db  *gorm.DB
 	now func() time.Time
 }
 
@@ -138,14 +138,30 @@ type UpdateSupplierInput struct {
 // Update 改一个供应商;按 (id, branch_id) 定位。
 func (s *SupplierService) Update(ctx context.Context, branchID, id string, in UpdateSupplierInput) (*model.Supplier, error) {
 	updates := map[string]any{"updated_at": s.now()}
-	if in.Name != nil { updates["name"] = *in.Name }
-	if in.Type != nil { updates["type"] = *in.Type }
-	if in.Contact != nil { updates["contact"] = *in.Contact }
-	if in.Phone != nil { updates["phone"] = *in.Phone }
-	if in.Email != nil { updates["email"] = *in.Email }
-	if in.Address != nil { updates["address"] = *in.Address }
-	if in.Status != nil { updates["status"] = *in.Status }
-	if in.UpdatedBy != "" { updates["updated_by"] = in.UpdatedBy }
+	if in.Name != nil {
+		updates["name"] = *in.Name
+	}
+	if in.Type != nil {
+		updates["type"] = *in.Type
+	}
+	if in.Contact != nil {
+		updates["contact"] = *in.Contact
+	}
+	if in.Phone != nil {
+		updates["phone"] = *in.Phone
+	}
+	if in.Email != nil {
+		updates["email"] = *in.Email
+	}
+	if in.Address != nil {
+		updates["address"] = *in.Address
+	}
+	if in.Status != nil {
+		updates["status"] = *in.Status
+	}
+	if in.UpdatedBy != "" {
+		updates["updated_by"] = in.UpdatedBy
+	}
 
 	res := s.db.WithContext(ctx).
 		Model(&model.Supplier{}).

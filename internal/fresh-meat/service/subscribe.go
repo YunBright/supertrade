@@ -10,7 +10,7 @@
 //   - line 缺 pig_id 但有 cube_product_id 时,新规则 resolvePigForSaleLine:
 //     1. 若 payload 含 sale_time → 在 sale_time 之前到达的当日 pig 候选;
 //     2. 按 purchase_group_id 圈定:同 group 的猪按 arrived_at 升序分配;
-//        LLM advice 含目标 cut 的猪优先;LLM 该 cut 售罄后轮到下个 pig;
+//     LLM advice 含目标 cut 的猪优先;LLM 该 cut 售罄后轮到下个 pig;
 //     3. 无 group → 选当日到达时间最早的 pig。
 //   - 同一 (branch_id, pos_line_id) 二次投递 → idempotent(UNIQUE 约束 + DO NOTHING)。
 //   - 时区:用 service.bizTZ 划日界,4:30 北京时间场内的猪触发当日 in_kg > 0。
@@ -33,9 +33,9 @@ import (
 
 // SaleLine 是 sale.completed 内 lines[] 的元素(EVENT-CATALOG §2.3)。
 type SaleLine struct {
-	LineID        string          `json:"line_id"`    // pos_line_id,idempotent 键
-	SKUID         string          `json:"sku_id"`     // 即 cube product id
-	Qty           decimal.Decimal `json:"qty"`        // kg
+	LineID        string          `json:"line_id"` // pos_line_id,idempotent 键
+	SKUID         string          `json:"sku_id"`  // 即 cube product id
+	Qty           decimal.Decimal `json:"qty"`     // kg
 	UnitPriceYuan decimal.Decimal `json:"unit_price_yuan"`
 	AmountYuan    decimal.Decimal `json:"amount_yuan"`
 	FreshType     string          `json:"fresh_type"` // "none" | "produce" | "meat"
@@ -166,11 +166,14 @@ func (s *Service) OnSaleCompleted(ctx context.Context, p SaleCompletedPayload) (
 // resolvePigByCubeProduct 通过 cube_product_id 反查 (branch, biz-day) 候选 pig。
 //
 // 算法(2026-10-01 优化):
+//
 //  1. branch_cut_mapping 找 cube_product_id 对应的 cut_type;
+//
 //  2. 候选 pig 圈选:
 //     - 限定 bizTZ 当日窗口(默认 Asia/Shanghai);
 //     - 若 line 有 purchase_group_id(本服务外推):先按 group 匹配;
 //     - 否则:所有当日 whole_pig 按 arrived_at ASC(早到仓的优先)。
+//
 //  3. 在候选集里:LLM advice 含该 cut_type 的 pig 优先(精匹配);
 //
 //     兜底:取 arrived_at 最早的候选 pig(场景一/二的单头/半头猪)。
