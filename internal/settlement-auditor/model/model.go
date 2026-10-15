@@ -170,3 +170,77 @@ type ApprovalApproverPreference struct {
 }
 
 func (ApprovalApproverPreference) TableName() string { return "approval_approver_preferences" }
+
+// ---- 结算付款状态台账(初始化记账 / 已付款过滤的共同事实源) ----
+
+// 付款状态的**设置方式**。
+//
+// 这一列是本功能存在的理由:同一个 paid 状态有两个来源,业务含义完全不同 ——
+//
+//	init     初始化记账。管理员批量补录「本系统上线之前就已经付掉款」的结算单。
+//	          这些单在思迅源库里查不到任何付款痕迹(hbposv7 的
+//	          t_fm_account_sum.pay_flag 实测恒 0,ysx 根本没有这张表),
+//	          只能由人按账面补录。补录的人、时刻、筛选口径全部留痕。
+//	approval 正常审批流程。审批实例终审通过(human_approved)时由流水线写入,
+//	          带上 ApprovalID 关联回那次审批。
+//
+// 两者混在一起就分不清"这张单是走流程付的,还是有人手工补的",而这正是
+// 初始化页要回答的第一个问题。
+const (
+	PayMethodInit     = "init"
+	PayMethodApproval = "approval"
+)
+
+// 付款状态取值。
+const (
+	PayStatusUnpaid = "unpaid"
+	PayStatusPaid   = "paid"
+)
+
+// SettlementPayState 一张结算单的付款状态(按门店 + 结算单号唯一)。
+//
+// # 为什么台账在 PG,而不是写回思迅
+//
+// 实测两个思迅源库都没有可用的付款标记(2026-10-15):
+//   - t_fm_recpay_gx_master 的 settle_date 全表有值、get_amt 恒 0、com_flag 恒 0;
+//   - 真正登记付款的 t_fm_account_sum(voucher_no=结款单号,fk_sheet_no=付款单号,
+//     pay_flag)hbposv7 有这张表但 776 行 pay_flag 全 0、fk_sheet_no 全空;
+//   - ysx(hbposv10)**没有** t_fm_account_sum 这张表。
+//
+// 而 supertrade 的 go.mod 里没有任何 SQL Server 驱动(cube 只读),应用层根本
+// 没有写回思迅的通路。所以"已付款"这件事在本系统只能、也只应该落在 PG。
+type SettlementPayState struct {
+	ID string `gorm:"primaryKey;size:36" json:"id"`
+	// BranchID + SettlementID 唯一:cube 的结算单号只在单个门店内唯一,
+	// 且源表 sheet_no 是 char(20)(hbposv7 尾部补空格),写入前统一 Trim。
+	BranchID     string `gorm:"size:32;uniqueIndex:ux_pay_branch_settlement,priority:1" json:"branch_id"`
+	SettlementID string `gorm:"size:64;uniqueIndex:ux_pay_branch_settlement,priority:2" json:"settlement_id"`
+	SupplierID   string `gorm:"size:64" json:"supplier_id"`
+	DocumentType string `gorm:"size:8" json:"document_type"` // DP/CP
+	PaidStatus   string `gorm:"size:16;index" json:"paid_status"`
+	SetMethod    string `gorm:"size:16;index" json:"set_method"`
+	// OperatorID / OperatorName 是**设置人**:初始化时为当前登录管理员,
+	// 审批流程写入时为该审批的发起人(auth user id)。
+	OperatorID   string `gorm:"size:64;index" json:"operator_id"`
+	OperatorName string `gorm:"size:64" json:"operator_name"`
+	// ApprovalID 仅 SetMethod=approval 时有值,用于回溯到具体哪次审批付的款。
+	ApprovalID string `gorm:"size:32;index" json:"approval_id,omitempty"`
+	// GoodsAmountYuan 是标记那一刻的货款净额快照(cube 口径 total_goods_yuan)。
+	// 快照而非引用:初始化页要按金额回显"本次影响 N 张、合计 ¥X",而源单金额
+	// 之后可能变化,审计要能还原当时看到的数字。
+	GoodsAmountYuan decimal.Decimal `gorm:"type:numeric(14,2)" json:"goods_amount_yuan"`
+	Note            string          `gorm:"size:512" json:"note"`
+	PaidAt          *time.Time      `json:"paid_at"`
+	// RevertedAt / RevertedBy 记录撤销初始化的时间与人。
+	// 撤销**不删行**:改了 paid_status 但保留原 operator / set_method,
+	// 这样"谁在什么时候把哪张单补录成已付款"永远查得到。
+	RevertedAt *time.Time `json:"reverted_at"`
+	RevertedBy string     `gorm:"size:64" json:"reverted_by"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `gorm:"index" json:"updated_at"`
+}
+
+func (SettlementPayState) TableName() string { return "settlement_pay_states" }
+
+// IsPaid 是唯一判据:撤销后 PaidStatus 回到 unpaid,行仍在表里。
+func (p *SettlementPayState) IsPaid() bool { return p.PaidStatus == PayStatusPaid }

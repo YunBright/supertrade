@@ -94,6 +94,18 @@ func (h *Handler) rawForward(c *gin.Context, cubeSourceName string, body []byte)
 		//   cube 404 → gRPC NotFound → ErrCubeNotFound → ErrProductNotFound → 200 [] →
 		//   Flutter 显示「本门店没有条码 XXX 的商品」
 		// 把基础设施故障显示成业务结论,是比 502 更糟的失败模式。
+		//
+		// ⚠️ 这条日志不是装饰。2026-10-15 排查 sales-agg 报表 503 时,
+		//   上层只看得到 gRPC 折叠后的 "Unknown: Bad Gateway" —— 目标 cube app-id、
+		//   上游真实错误、走的哪个 method 全部被 classigyInvokeError 压成一句状态文本。
+		//   没有这一行,同一个故障只能靠"逐跳 curl"来二分,每跳都要重造一遍探针。
+		h.logger.Error("cube invoke failed",
+			"target_app_id", cubeSourceName,
+			"method", cubeQueryMethod,
+			"branch_id", branchIDOf(c),
+			"bytes", len(body),
+			"body_preview", preview(body),
+			"err", err)
 		code, status, msg := classifyInvokeError(err)
 		c.AbortWithStatusJSON(status, gin.H{
 			"code":    code,
@@ -102,4 +114,26 @@ func (h *Handler) rawForward(c *gin.Context, cubeSourceName string, body []byte)
 		return
 	}
 	c.Data(http.StatusOK, "application/json", resp)
+}
+
+// branchIDOf 只为日志取值;拿不到就空字符串,不参与任何判据。
+func branchIDOf(c *gin.Context) string {
+	return middleware.SingleBranchFromCtx(c)
+}
+
+// preview 截断 body 供日志查看。
+//
+// ⚠️ 截断是必须的:body 是调用方原样转发过来的,长度不可控。
+// 口径是"前 512 字节 + 总长",因为排查"转发出去的到底是什么"只需要开头,
+// 而 JSON 的 measures/dimensions/filters 通常就在开头。
+//
+// ⚠️ 这里会打印查询内容。它是 cube query 的 JSON(维度/度量/过滤条件),
+// 不含凭证 —— 凭证走 Authorization 头,不进 body。如果将来 body 形态变了
+// (例如有人把 token 塞进 body),这条日志会变成泄漏点,改 body 形态时必须回来复查这里。
+func preview(b []byte) string {
+	const max = 512
+	if len(b) <= max {
+		return string(b)
+	}
+	return string(b[:max]) + "...(truncated)"
 }

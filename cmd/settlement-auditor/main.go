@@ -85,6 +85,7 @@ func initApp() error {
 		&model.LLMVerdict{},
 		&model.ApprovalStocktakeLink{},
 		&model.ApprovalApproverPreference{},
+		&model.SettlementPayState{},
 	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
 	}
@@ -162,7 +163,7 @@ func initApp() error {
 	// 注册 dapr job:扫卡死实例(@every 5m)。best-effort,失败仅 warn。
 	registerRescanJob()
 
-	slog.Info("settlement-auditor app initialized", "db_driver", "postgres", "tables", 6)
+	slog.Info("settlement-auditor app initialized", "db_driver", "postgres", "tables", 7)
 	return nil
 }
 

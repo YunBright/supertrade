@@ -218,6 +218,7 @@ func newTestService(t *testing.T) (*Service, *gorm.DB, *fakeCube, *fakePublisher
 	if err := db.AutoMigrate(
 		&model.ApprovalInstance{}, &model.ApprovalSettlement{}, &model.AuditSignal{},
 		&model.AuditLog{}, &model.LLMVerdict{}, &model.ApprovalStocktakeLink{},
+		&model.SettlementPayState{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

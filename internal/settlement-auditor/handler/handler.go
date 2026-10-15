@@ -10,8 +10,16 @@
 //	GET    /settlement-approvals/export          打印对账 HTML(?from&to)        scope settlement:view
 //	GET    /settlement-approvals/cube/settlements 可勾选结算单(cube 透传)       scope settlement:view
 //
+// 初始化记账(财务批量把历史已付款结算单补录成已付款,PR 见 service/pay_state.go):
+//
+//	GET    /settlement-init/records              台账审计列表                   scope settlement:view
+//	POST   /settlement-init/preview              回显影响面(不落库)             scope settlement:audit
+//	POST   /settlement-init/apply                批量补录(设置方式=init)        scope settlement:audit
+//	POST   /settlement-init/revert                撤销补录                       scope settlement:audit
+//
 // 错误映射:ErrApprovalNotFound→404,ErrInvalidInput/ErrInvalidStatus→400,
-// ErrCubeUnavailable→503 cube_unavailable,ErrUserInfoUnavailable→503 userd_unavailable。
+// ErrApprovalInFlight/ErrResultTruncated→409,ErrCubeUnavailable→503
+// cube_unavailable,ErrUserInfoUnavailable→503 userd_unavailable。
 package handler
 
 import (
@@ -59,6 +67,155 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	// 此前本服务零 DELETE 路由，契约测试每跑一次就往生产留一整套审批残留。
 	// 流水线在途时会返 409 让调用方稍后重试 —— 详见 service.ErrApprovalInFlight。
 	r.DELETE("/settlement-approvals/:id", requireBranch, h.Delete)
+
+	// ---- 初始化记账(财务把历史已付款结算单批量补录成已付款) ----
+	//
+	// 独立前缀而不是挂在 /settlement-approvals 下：那一族已经有一个 `:id`
+	// 参数段,再往里塞静态段只会让"路由注册顺序决定谁先命中"变成隐式契约。
+	// 读(scope settlement:view)与写(scope settlement:audit)分开。
+	r.GET("/settlement-init/records", requireBranch, h.ListPayStates)
+	r.POST("/settlement-init/preview", requireBranch, h.PreviewInit)
+	r.POST("/settlement-init/apply", requireBranch, h.ApplyInit)
+	r.POST("/settlement-init/revert", requireBranch, h.RevertInit)
+}
+
+// settlementInitReq 是初始化记账三个写端点共用的请求体。
+//
+// 主体是**筛选条件**而不是 id 列表 —— 一次可能涉及上千张单,而客户端只看得见
+// 自己加载过的那几页。集合由服务端解析(见 service.ResolveSettlementSet),
+// preview 先回显"将影响 N 张、合计 ¥X",apply 才落库。
+//
+// 唯一的例外是 SettlementIDs(显式勾选):「勾这几张」与「全选搜索结果」是
+// 两个不同意图,只支持后者的话界面上的复选框就成了装饰。
+type settlementInitReq struct {
+	From          string   `json:"from"` // 账期结束日 [from,to)
+	To            string   `json:"to"`
+	SupplierID    string   `json:"supplier_id"`    // 精确匹配
+	Query         string   `json:"query"`          // 单号/供应商包含匹配
+	DocumentType  string   `json:"document_type"`  // 空 = DP+CP
+	PayStatus     string   `json:"pay_status"`     // unpaid / paid / all
+	SettlementIDs []string `json:"settlement_ids"` // 显式勾选;非空时与筛选结果取交集
+	Limit         int      `json:"limit"`          // 只影响回显样本,不影响落库集合
+	Note          string   `json:"note"`           // 补录备注(apply 用)
+}
+
+// filterOf 收敛成 service 层的筛选条件。
+func (r settlementInitReq) filterOf() service.SettlementFilter {
+	return service.SettlementFilter{
+		From:         r.From,
+		To:           r.To,
+		SupplierID:   r.SupplierID,
+		Query:        r.Query,
+		DocumentType: r.DocumentType,
+		PayStatus:    r.PayStatus,
+		Ids:          r.SettlementIDs,
+		Limit:        r.Limit,
+	}
+}
+
+// bindInitReq 绑定并校验请求体。
+func bindInitReq(c *gin.Context) (settlementInitReq, bool) {
+	var req settlementInitReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_request", "请求体非法: "+err.Error())
+		return req, false
+	}
+	return req, true
+}
+
+// operatorOf 取"设置人"= 当前登录管理员。
+//
+// 取 claims.Sub(auth user id),显示名尽力解析 —— 服务端不信任客户端自称的
+// operator,否则审计字段等于谁都能填。
+func (h *Handler) operatorOf(c *gin.Context) service.PayStateOperator {
+	cl, _ := claims.FromContext(c.Request.Context())
+	if cl == nil || cl.Sub == "" {
+		return service.PayStateOperator{}
+	}
+	return service.PayStateOperator{
+		UserID: cl.Sub,
+		Name:   h.svc.ResolveOperatorName(c.Request.Context(), cl.Sub),
+	}
+}
+
+// PreviewInit POST /settlement-init/preview → 200 {count,total_goods_yuan,...}
+//
+// 只读:解析筛选条件并回显影响面,**不写任何数据**。前端必须先调它弹确认框。
+func (h *Handler) PreviewInit(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "settlement:audit") {
+		return
+	}
+	req, ok := bindInitReq(c)
+	if !ok {
+		return
+	}
+	pv, err := h.svc.PreviewSettlementInit(c.Request.Context(), branchID, req.filterOf())
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, pv)
+}
+
+// ApplyInit POST /settlement-init/apply → 200 {matched,changed,already_paid,...}
+//
+// 设置方式恒为 init(常量在 service 层,请求体没有这个字段);
+// 设置人恒为当前登录管理员。集合触到拉取上限时 409,拒绝执行。
+func (h *Handler) ApplyInit(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "settlement:audit") {
+		return
+	}
+	req, ok := bindInitReq(c)
+	if !ok {
+		return
+	}
+	res, err := h.svc.ApplySettlementInit(c.Request.Context(), branchID,
+		req.filterOf(), h.operatorOf(c), req.Note)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
+// RevertInit POST /settlement-init/revert → 200
+//
+// 撤销初始化:只退回 set_method=init 且仍为 paid 的单,保留原设置人并记录撤销人。
+func (h *Handler) RevertInit(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "settlement:audit") {
+		return
+	}
+	req, ok := bindInitReq(c)
+	if !ok {
+		return
+	}
+	res, err := h.svc.RevertSettlementInit(c.Request.Context(), branchID,
+		req.filterOf(), h.operatorOf(c))
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
+// ListPayStates GET /settlement-init/records?method&pay_status&supplier_id&limit&offset
+func (h *Handler) ListPayStates(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "settlement:view") {
+		return
+	}
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
+	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	rows, total, err := h.svc.ListPayStateRecords(c.Request.Context(), branchID,
+		c.Query("method"), c.Query("pay_status"), c.Query("supplier_id"), limit, offset)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": rows, "total": total})
 }
 
 // ---- 错误响应 ----
@@ -84,6 +241,11 @@ func mapErr(c *gin.Context, err error) {
 		// 只能等流水线自己跑完。400 会让清理脚本把它当成参数错误而放弃,
 		// 或者 endless 重试。
 		writeError(c, http.StatusConflict, "approval_in_flight", err.Error())
+	case errors.Is(err, service.ErrResultTruncated):
+		// 同样是 409 而不是 400:请求本身合法,但**照原样重试永远不会成功**,
+		// 必须收窄筛选条件。批量写入下尤其不能放行 —— 预览说"影响 800 张"、
+		// 实际只处理 500 张,剩下 300 张既没标记也没跳过,事后对不上账。
+		writeError(c, http.StatusConflict, "result_truncated", err.Error())
 	case errors.Is(err, service.ErrCubeUnavailable):
 		writeError(c, http.StatusServiceUnavailable, "cube_unavailable", err.Error())
 	case errors.Is(err, service.ErrUserInfoUnavailable):
@@ -271,22 +433,29 @@ func (h *Handler) Delete(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"deleted": true, "id": c.Param("id")})
 }
 
-// ListCubeSettlements GET /settlement-approvals/cube/settlements?from&to&supplier_id
+// ListCubeSettlements GET /settlement-approvals/cube/settlements?from&to&supplier_id&include_paid
 //
 // H5 勾选数据源:透传 cube 已审核采购结款单(DP/CP)。
+//
+// include_paid 缺省 false —— 已付款的单**不再出现**在发起勾选列表里。
+// hidden_paid_count 把被剔除的张数回给前端,让页面能说明"为什么少了"。
 func (h *Handler) ListCubeSettlements(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "settlement:view") {
 		return
 	}
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "200"))
-	rows, err := h.svc.ListCubeSettlements(c.Request.Context(), branchID,
-		c.Query("from"), c.Query("to"), c.Query("supplier_id"), limit)
+	includePaid := c.Query("include_paid") == "1" || c.Query("include_paid") == "true"
+	rows, hidden, err := h.svc.ListCubeSettlements(c.Request.Context(), branchID,
+		c.Query("from"), c.Query("to"), c.Query("supplier_id"), limit, includePaid)
 	if err != nil {
 		mapErr(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"items": rows})
+	c.JSON(http.StatusOK, gin.H{
+		"items":             rows,
+		"hidden_paid_count": hidden,
+	})
 }
 
 // ---- 打印对账 ----

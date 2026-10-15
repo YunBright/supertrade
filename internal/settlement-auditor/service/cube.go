@@ -467,11 +467,34 @@ func (q *DaprCubeQuerier) GetStocks(ctx context.Context, branchID string, produc
 }
 
 // ListCubeSettlements H5 勾选数据源:透传 cube 已审核采购结款单(cube 未配置 → 503)。
-func (s *Service) ListCubeSettlements(ctx context.Context, branchID, from, to, supplierID string, limit int) ([]SettlementRow, error) {
+//
+// includePaid=false(**默认**)时剔除台账里已付款的单 —— 这就是"过滤已结算的
+// 结算单":付款审批上线之前门店已经付掉的单,不能再出现在发起勾选列表里。
+// includePaid=true 给初始化结算页用(它要看的就是已付款的那些)。
+//
+// 第二个返回值是被剔除的张数,handler 原样回给前端 —— 列表突然少了一堆单,
+// 店长会以为是系统出错,必须能告诉他"这里隐藏了 N 张已付款的"。
+func (s *Service) ListCubeSettlements(ctx context.Context, branchID, from, to, supplierID string, limit int, includePaid bool) ([]SettlementRow, int, error) {
 	if s.cube == nil {
-		return nil, ErrCubeUnavailable
+		return nil, 0, ErrCubeUnavailable
 	}
-	return s.cube.ListAuditedSettlements(ctx, branchID, from, to, supplierID, limit)
+	rows, err := s.cube.ListAuditedSettlements(ctx, branchID, from, to, supplierID, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	if includePaid {
+		return rows, 0, nil
+	}
+	ids := make([]string, 0, len(rows))
+	for _, r := range rows {
+		ids = append(ids, strings.TrimSpace(r.ID))
+	}
+	paid, err := s.ListPaidSettlementIDsOf(ctx, branchID, ids)
+	if err != nil {
+		return nil, 0, err
+	}
+	kept, hidden := FilterOutPaidSettlements(rows, paid)
+	return kept, hidden, nil
 }
 
 // saleWindowDates 计算销售回看窗口 [from, to)(to = 今天,YYYY-MM-DD)。

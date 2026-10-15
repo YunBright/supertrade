@@ -51,6 +51,13 @@ func (s *Service) OnStatusChanged(ctx context.Context, ev *WecomStatusChanged) e
 	}
 	ap.SpStatus = ev.SpStatus
 	ap.Status = newStatus
+	// 终审通过 = 这批结算单的付款被批准了。落付款台账(set_method=approval),
+	// 让它们不再出现在发起审批的勾选列表里。
+	//
+	// best-effort:失败只 log,不影响审批状态 —— 审批已经通过是外部既成事实。
+	if newStatus == model.StatusHumanApproved {
+		s.markApprovalSettlementsPaid(ctx, &ap)
+	}
 	s.publishStatusEvent(ctx, &AuditStatusEvent{
 		ApprovalID: ap.ID, BranchID: ap.BranchID, UserID: ap.ApplicantUserID,
 		Status: ap.Status, SpNo: ap.SpNo, SpStatus: ap.SpStatus, At: s.now(),

@@ -31,6 +31,7 @@ func newPurgeDB(t *testing.T) *gorm.DB {
 	require.NoError(t, db.AutoMigrate(
 		&model.ApprovalInstance{}, &model.ApprovalSettlement{}, &model.AuditSignal{},
 		&model.AuditLog{}, &model.LLMVerdict{}, &model.ApprovalStocktakeLink{},
+		&model.SettlementPayState{},
 	))
 	require.NoError(t, testrun.RegisterGorm(db))
 	return db
@@ -181,6 +182,59 @@ func TestPurge_LeavesRealAndOtherRuns(t *testing.T) {
 			assert.NotZero(t, childCount(t, db, m, id), "%s 的 %s 被误删", id, name)
 		}
 	}
+}
+
+// TestPurge_NeverDeletesPayStateLedger —— 付款台账不在清理范围内。
+//
+// settlement_pay_states 记的是「哪张结算单付过、谁付的、什么时候付的」。
+// 它不是测试残留，是**财务事实**。一旦被加进 registry，一句"清理测试数据"
+// 就能把整本台账删光，随后「已付款过滤」静默失效 —— 店长重新看到几千张
+// 早已付清的单，而系统零报错。
+//
+// 这条用例的判据是**集合相等**：断言 registry 恰好包含这 6 张表。
+// 只写 `assert.NotContains(t, tables, "settlement_pay_states")` 的话，
+// 有人顺手多注册一张表照样绿。
+func TestPurge_NeverDeletesPayStateLedger(t *testing.T) {
+	db := newPurgeDB(t)
+	seedApproval(t, db, "AP-DONE", model.StatusRejected, purgeRunID)
+	now := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+	create(t, db, purgeRunID, &model.SettlementPayState{
+		ID: "ps1", BranchID: "B1", SettlementID: "DP1", SupplierID: "sup1",
+		DocumentType: "DP", PaidStatus: model.PayStatusPaid,
+		SetMethod: model.PayMethodInit, OperatorID: "u-admin",
+		GoodsAmountYuan: decimal.RequireFromString("100.00"),
+		CreatedAt:       now, UpdatedAt: now,
+	})
+
+	rep, err := handler.PurgeRegistry().Purge(context.Background(), db, purgeRunID, false)
+	require.NoError(t, err)
+	require.True(t, rep.OK(), "清理报错: %v", rep.Errors)
+
+	assert.NotContains(t, rep.Deleted, "settlement_pay_states",
+		"付款台账是财务事实,绝不能被 sweep 掉")
+	assert.Zero(t, rep.Skipped["settlement_pay_states"])
+
+	var n int64
+	require.NoError(t, db.Model(&model.SettlementPayState{}).Count(&n).Error)
+	assert.EqualValues(t, 1, n, "台账行必须还在")
+}
+
+// TestPurgeRegistry_TableSetIsExact —— 清理范围用集合相等锁住。
+//
+// 少注册一张表 = 清理留下孤儿行(approval_id 无外键,不会报错);
+// 多注册一张表 = 误删财务数据。两类错误都只在事后发现,所以两头一起锁。
+func TestPurgeRegistry_TableSetIsExact(t *testing.T) {
+	want := []string{
+		"approval_settlements",
+		"audit_signals",
+		"audit_logs",
+		"llm_verdicts",
+		"approval_stocktake_links",
+		"approval_instances",
+	}
+	got := handler.PurgeRegistry().Tables()
+	assert.ElementsMatch(t, want, got,
+		"清理表集合变了:少一张会留孤儿行,多一张可能误删财务数据(尤其 settlement_pay_states)")
 }
 
 // TestPurgeRoute_DefaultsToDryRunAndIsUnauthenticated —— 端点层行为。

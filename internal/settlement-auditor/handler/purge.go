@@ -21,6 +21,16 @@
 // approval_approver_preferences **不在范围内**：主键是
 // `<branchID>:<applicantUserID>`，记的是"这人上次选了谁当审批人"，
 // 与某一次审批无关，是按人的偏好缓存。
+//
+// settlement_pay_states **同样不在范围内**，而且是硬性的：那张表是**付款台账**
+// （哪些结算单付过款、谁付的、什么时候付的）。它不是测试残留，是财务事实。
+// 把它加进 registry 意味着一句"清理测试数据"就能把整本台账删掉，而付款审批
+// 的"已付款过滤"会随之静默失效 —— 店长重新看到几千张早已付清的单，
+// 且没有任何报错。回归锁见 handler/purge_test.go 的 TestPurgeRegistryKeepsPayStateLedger。
+//
+// 代价是契约测试**不能**用真实结算单号跑 apply（会把真单标成已付款、
+// 让它们从发起页消失）。所以 apply 的生产契约测试只跑空集合，
+// 非空集合由 service 层单测（fake cube + sqlite）覆盖。
 package handler
 
 import (

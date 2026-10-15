@@ -187,6 +187,7 @@ func buildTestHandler(t *testing.T, withCube bool) (*gin.Engine, *gorm.DB, *fake
 	if err := db.AutoMigrate(
 		&model.ApprovalInstance{}, &model.ApprovalSettlement{}, &model.AuditSignal{},
 		&model.AuditLog{}, &model.LLMVerdict{}, &model.ApprovalStocktakeLink{},
+		&model.SettlementPayState{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -489,6 +490,56 @@ func TestHandler_CubeSettlements_200(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), `"S1"`) {
 		t.Errorf("应含 S1: %s", w.Body.String())
+	}
+	// 台账为空时 hidden 必须是 0 —— 这个字段是前端说明"列表少了 N 张"的唯一来源,
+	// 缺了它前端会退化成 undefined 拼接。
+	if !strings.Contains(w.Body.String(), `"hidden_paid_count":0`) {
+		t.Errorf("台账为空时 hidden_paid_count 应为 0: %s", w.Body.String())
+	}
+}
+
+// TestHandler_CubeSettlements_HidesPaidByDefault —— 「过滤已结算」这条需求的
+// HTTP 层判据。
+//
+// 只在 service 层测不够:HTTable handler 有没有把 include_paid 读对、
+// 有没有把 hidden_paid_count 吐出来,只有这一层能看见。
+// 两步都要断 —— 只断"已付款不出现"的话,把过滤写成"永远返回空"也能绿。
+func TestHandler_CubeSettlements_HidesPaidByDefault(t *testing.T) {
+	r, db, _ := buildTestHandler(t, true)
+	now := time.Now()
+	if err := db.Create(&model.SettlementPayState{
+		ID: "ps1", BranchID: testBranchID, SettlementID: "S1",
+		PaidStatus: model.PayStatusPaid, SetMethod: model.PayMethodInit,
+		OperatorID: "u-admin", CreatedAt: now, UpdatedAt: now,
+	}).Error; err != nil {
+		t.Fatalf("seed pay state: %v", err)
+	}
+
+	call := func(path string) (int, string) {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		adminReq(req)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		return w.Code, w.Body.String()
+	}
+
+	code, body := call("/settlement-approvals/cube/settlements")
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", code, body)
+	}
+	if strings.Contains(body, `"S1"`) {
+		t.Errorf("默认不该返回已付款的 S1: %s", body)
+	}
+	if !strings.Contains(body, `"hidden_paid_count":1`) {
+		t.Errorf("应回显隐藏了 1 张,否则店长不知道列表为什么空了: %s", body)
+	}
+
+	code, body = call("/settlement-approvals/cube/settlements?include_paid=1")
+	if code != http.StatusOK {
+		t.Fatalf("include_paid status = %d, body=%s", code, body)
+	}
+	if !strings.Contains(body, `"S1"`) {
+		t.Errorf("include_paid=1 应返回已付款的 S1(初始化页要看): %s", body)
 	}
 }
 
