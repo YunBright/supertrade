@@ -32,11 +32,12 @@ import (
 
 // Client 是测试替身,实现 cubeclient.Client。
 type Client struct {
-	mu        sync.RWMutex
-	products  map[string]cubeclient.ProductDTO
-	stock     map[string]map[string]cubeclient.StockSnapshotDTO // branch_id → product_id → snapshot
-	suppliers map[string]cubeclient.SupplierDTO
-	clock     func() time.Time
+	mu         sync.RWMutex
+	products   map[string]cubeclient.ProductDTO
+	stock      map[string]map[string]cubeclient.StockSnapshotDTO // branch_id → product_id → snapshot
+	suppliers  map[string]cubeclient.SupplierDTO
+	promotions []cubeclient.PromotionDTO
+	clock      func() time.Time
 }
 
 // 编译期确认实现完整接口。
@@ -57,10 +58,11 @@ var _ cubeclient.Client = (*Client)(nil)
 //	SUP-001 可口可乐华南 / SUP-002 农夫山泉代理 / SUP-101 鲜肉供应商
 func New() *Client {
 	c := &Client{
-		products:  make(map[string]cubeclient.ProductDTO),
-		stock:     make(map[string]map[string]cubeclient.StockSnapshotDTO),
-		suppliers: make(map[string]cubeclient.SupplierDTO),
-		clock:     func() time.Time { return time.Now().UTC() },
+		products:   make(map[string]cubeclient.ProductDTO),
+		stock:      make(map[string]map[string]cubeclient.StockSnapshotDTO),
+		suppliers:  make(map[string]cubeclient.SupplierDTO),
+		promotions: nil,
+		clock:      func() time.Time { return time.Now().UTC() },
 	}
 	c.seed()
 	return c
@@ -137,6 +139,32 @@ func (c *Client) seed() {
 		ID: "SUP-101", Name: "鲜肉供应商", Type: "0",
 		Contact: "王经理", Phone: "13800000003",
 	}
+
+	// 促销 seed。日期锚在 seed 基准日 2026-09-17 前后,让"生效 / 已过期 /
+	// 未开始"三种状态都有样本,而不必依赖运行时的今天。
+	//
+	// P-1001 有**两条**同期生效的促销(11.00 与 9.90),用来锁"取最低价"这条规则;
+	// P-1002 只有一条已过期的(2026-08-01~2026-08-31),用来锁"过期不算生效";
+	// 其余商品无促销 —— 这是绝大多数商品的常态。
+	p1001Orig := decimal.NewFromFloat(3.5)
+	p1002Orig := decimal.NewFromFloat(3.5)
+	c.promotions = []cubeclient.PromotionDTO{
+		{
+			ItemNo: "P-1001", PlanNo: "PS-001", PlanName: "可口可乐促销 A",
+			Price: decimal.NewFromFloat(11.00), OrigPrice: &p1001Orig,
+			BeginDay: "2026-09-01", EndDay: "2026-09-30",
+		},
+		{
+			ItemNo: "P-1001", PlanNo: "PS-002", PlanName: "可口可乐促销 B",
+			Price: decimal.NewFromFloat(9.90), OrigPrice: &p1001Orig,
+			BeginDay: "2026-09-01", EndDay: "2026-09-30",
+		},
+		{
+			ItemNo: "P-1002", PlanNo: "PS-003", PlanName: "雪碧过期促销",
+			Price: decimal.NewFromFloat(2.50), OrigPrice: &p1002Orig,
+			BeginDay: "2026-08-01", EndDay: "2026-08-31",
+		},
+	}
 }
 
 // UpsertStock 模拟库存变化(测试用)。
@@ -166,6 +194,26 @@ func (c *Client) UpsertProductPrice(productID string, price *decimal.Decimal) {
 	}
 	p.PriceYuan = price
 	c.products[productID] = p
+}
+
+// UpsertPromotions 覆盖某商品的促销集合(测试用)。
+//
+// 传空切片表示"该商品没有任何促销"。
+func (c *Client) UpsertPromotions(itemNo string, promos ...cubeclient.PromotionDTO) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	kept := make([]cubeclient.PromotionDTO, 0, len(c.promotions))
+	for _, p := range c.promotions {
+		if p.ItemNo != itemNo {
+			kept = append(kept, p)
+		}
+	}
+	for i := range promos {
+		p := promos[i]
+		p.ItemNo = itemNo
+		kept = append(kept, p)
+	}
+	c.promotions = kept
 }
 
 func (c *Client) GetProduct(_ context.Context, productID string) (*cubeclient.ProductDTO, error) {
@@ -258,4 +306,33 @@ func (c *Client) SearchSuppliers(_ context.Context, query string, limit int) ([]
 		}
 	}
 	return out, nil
+}
+
+// GetActivePromotion 与真实实现同语义:活动期**包含** onDate 且促销价 > 0,
+// 多单覆盖取**最低价**那一条;没有则返 (nil, nil) 而不是 error。
+func (c *Client) GetActivePromotion(_ context.Context, itemNo, onDate string) (*cubeclient.PromotionDTO, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	day := onDate
+	if day == "" {
+		day = c.clock().Format("2006-01-02")
+	}
+	var best *cubeclient.PromotionDTO
+	for _, p := range c.promotions {
+		if p.ItemNo != itemNo {
+			continue
+		}
+		if p.BeginDay > day || p.EndDay < day {
+			continue
+		}
+		if p.Price.LessThanOrEqual(decimal.Zero) {
+			continue
+		}
+		if best == nil || p.Price.LessThan(best.Price) {
+			cp := p
+			best = &cp
+		}
+	}
+	return best, nil
 }

@@ -66,6 +66,13 @@ var ErrCubeAuthRejected = errors.New("cubeclient: cube 拒绝调用者凭证")
 // 对应到终端用户 = 权限不足(403),不是服务故障(503)。
 var ErrCubeForbidden = errors.New("cubeclient: 调用者缺少该门店的 cube 读权限")
 
+// ErrPromotionNotFound 表示该商品**当前没有生效的促销**。
+//
+// ⚠️ 这不是错误,是一个正常的业务结论(绝大多数商品都没有促销),
+// 所以 GetActivePromotion 用 (nil, nil) 表示"无促销",不用 ErrPromotionNotFound。
+// 后者只留给"调用方明确要区分'查不到'与'故障'"的场景。
+var ErrPromotionNotFound = errors.New("cubeclient: 该商品当前没有生效促销")
+
 // ---- cube 响应 DTO(非 GORM,只作类型契约 / 响应类型) ----
 
 // ProductDTO 是 cube `product` model 的响应子集,作为本系统的响应类型契约。
@@ -148,4 +155,30 @@ type SupplierDTO struct {
 type ProductWithStock struct {
 	Product *ProductDTO       `json:"product"`
 	Stock   *StockSnapshotDTO `json:"stock,omitempty"` // 可能 nil(该门店无 stock 数据)
+}
+
+// PromotionDTO 是某个商品**当前生效**的一条促销(cube `promotion` model)。
+//
+// 字段对应 cube F:\go\src\github.com\YunBright\cube\sixun-models\promotion\schema.yaml。
+//
+// # ⚠️ Price 是**促销价**,OrigPrice 是**原价** —— 源库列名是反的
+//
+// 思迅 t_pub_plan_flow 里 `sale_price` 是原价、`price` 是促销价。
+// cube 的 mapping 已经把它们翻译成 canonical 的 orig_price / promo_price,
+// 这里再翻成 Go 字段名。**不要**按源列名直觉去赋值 —— 写反了价签会印出
+// 「原价 ¥3.50 / 促销价 ¥9.90」,而且全程不报错。
+//
+// # 日期用 begin_day / end_day 而不是 begin_date / end_date
+//
+// cube 给维度列统一包 RTRIM,真 datetime 会以 "Jul  1 2026 12:00AM" 这种
+// **依赖 DB language** 的串回来。begin_day / end_day 是 schema 里
+// CONVERT(...,23) 出来的固定 ISO 串,才是能安全下发的形态。
+type PromotionDTO struct {
+	ItemNo    string           `json:"item_no"`              // cube promotion.item_no(= 思迅 item_no = 商品条码)
+	PlanNo    string           `json:"plan_no"`              // 促销单号
+	PlanName  string           `json:"plan_name,omitempty"`  // 促销单名称
+	Price     decimal.Decimal  `json:"price"`                // **促销价**(元)
+	OrigPrice *decimal.Decimal `json:"orig_price,omitempty"` // **原价**(元);源列为 NULL 时不返
+	BeginDay  string           `json:"begin_day"`            // 活动起始日 ISO yyyy-mm-dd
+	EndDay    string           `json:"end_day"`              // 活动截止日 ISO yyyy-mm-dd
 }

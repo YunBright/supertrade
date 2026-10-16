@@ -76,6 +76,16 @@ func (h *Handler) searchProducts(c *gin.Context) {
 			"category":     r.Product.CategoryID,
 			"unit":         r.Product.Unit,
 		}
+		// 2026-10-15 新增零售价。POP 价签打印要的就是这个值,而之前
+		// GetProduct 明明查了 product.avg_price_yuan(PopulateDTO 里也有
+		// PriceYuan),这里却**没有放进响应** —— 于是"扫一个码拿到价签数据"
+		// 这条链路上售价恒为空,前端只能显示 0。
+		//
+		// nil 与 0 必须能区分:0 = 该商品确实卖 0 元 / 未维护价,
+		// 前者要显示「未维护售价」而不是印 ¥0.00(会被当真价贴出去)。
+		if r.Product.PriceYuan != nil {
+			row["price_yuan"] = r.Product.PriceYuan.InexactFloat64()
+		}
 		if r.Stock != nil {
 			row["stock_qty"] = r.Stock.Quantity
 			row["avg_cost_yuan"] = r.Stock.AvgCostYuan

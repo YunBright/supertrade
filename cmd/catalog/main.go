@@ -112,7 +112,7 @@ func registerRoutes(r *gin.Engine) {
 	handler.New(appSup, appProd, appCube, appUser, nil).RegisterRoutes(r)
 }
 
-// forwardBearerToOutgoing 把 gin request 的 Authorization header 注入 ctx。
+// forwardBearerToOutgoing 把 gin request 的 Authorization / X-Branch-ID header 注入 ctx。
 //
 // 用 cubeclient.WithBearer + userinfo.WithBearer 双写,两者各自的 dapr 调用路径里
 // 会读 ctx 拼到 outgoing gRPC metadata → sidecar 转 outgoing HTTP Authorization 给
@@ -120,15 +120,40 @@ func registerRoutes(r *gin.Engine) {
 // cubeclient.WithBearer 模式)。
 //
 // 空 header 表示无 token(内部 job 路径),下游会以 401 拒绝,符合预期。
+//
+// # ⚠️ X-Branch-ID 必须一起注入(2026-10-16 修复的生产故障)
+//
+// middleware.XBranchID() 只把门店写进 **gin.Context**,不动 Go 的 request.Context。
+// 而 cubeclient.LoadCubeQuery 是从 **request.Context** 里读门店,再拼成 outgoing
+// gRPC metadata `x-branch-id` 发给 cube-router。两者不是同一个 context ——
+// 少注入一次,cube-router 就收不到 X-Branch-ID,直接返 400 `branch_required`,
+// dapr sidecar 把这个 400 折叠成 gRPC `Internal: Bad Request`,catalog 的错误
+// 分类器再把它当成基础设施故障翻成 502 `cube_error`。
+//
+// 对外表现:`GET /catalog/products/search?barcode=X` 对**任何**条码都失败,
+// 报"库存服务暂不可用",而 cube / cube-router / 源库全部健康 ——
+// curl 直连 cube-router 打**同样的 body** 却 200。
+//
+// 这是 catalog 独有的:inventory / stocktake / sales-agg / settlement-auditor
+// 四个服务都注入了(见各自 handler 的 cubeclient.WithBranchID 调用点),
+// 只有 catalog 漏了,于是盘点扫码能查商品、价签扫码查不了。
+//
+// 为什么不把 branchID 作为函数参数传下去:SearchProductsByBarcode 的 branchID
+// 参数只用于填返回的 DTO,真正决定"路由到哪家门店的 cube"的是这个 outgoing
+// metadata,两者必须同源,否则会出现"DTO 说 01、实际查了 01 的 cube"之外的
+// 不一致组合(请求头与单记录不一致时,stocktake 的注释已记录过这个坑)。
 func forwardBearerToOutgoing() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		bearer := c.Request.Header.Get("Authorization")
-		if bearer != "" {
-			ctx := c.Request.Context()
+		ctx := c.Request.Context()
+		if bearer := c.Request.Header.Get("Authorization"); bearer != "" {
 			ctx = cubeclient.WithBearer(ctx, bearer)
 			ctx = userinfo.WithBearer(ctx, bearer)
-			c.Request = c.Request.WithContext(ctx)
 		}
+		// 原样透传(含 `*` / `01,02` 多店),解析语义交给 cube-router。
+		if branchID := c.Request.Header.Get("X-Branch-ID"); branchID != "" {
+			ctx = cubeclient.WithBranchID(ctx, branchID)
+		}
+		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	}
 }

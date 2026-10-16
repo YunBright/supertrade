@@ -94,6 +94,15 @@ func branchFromCtx(ctx context.Context) string {
 	return ""
 }
 
+// BranchFromContext 是 [branchFromCtx] 的导出读侧。
+//
+// 存在的理由:调用方(cmd/*/main.go 里的透传中间件)只能**写** WithBranchID,
+// 却无法**读**,于是没法给自己的中间件写回归测试 —— 而 2026-10-16 那次生产
+// 故障正是"中间件忘了写"造成的:漏注入没有任何编译错误、没有单测变红,
+// 只有线上所有条码查询报「库存服务暂不可用」。
+// 有了读侧,"这个中间件到底有没有把门店写进 ctx"才是一条可以断言的事实。
+func BranchFromContext(ctx context.Context) string { return branchFromCtx(ctx) }
+
 // daprInvoker 是 DaprCubeClient 对 dapr SDK 的**全部**依赖面。
 //
 // 为什么收窄:go-sdk v1.10.1 只带 actor/mock,**没有 client/mock**,
@@ -253,7 +262,16 @@ func (c *DaprCubeClient) GetProduct(ctx context.Context, productID string) (*Pro
 		// PriceYuan 走指针:nil = cube 没给售价(旧数据 / 该商品未维护价),
 		// 与"售价为 0"是两件事,前端要能区分(0 元商品 vs 没维护价)。
 		PriceYuan: asDecimalPtr(row["product.avg_price_yuan"]),
-		// Barcode: cube product schema 本期不含,留空;后续 cube 仓库扩展后补
+		// Barcode = product.id(2026-10-15 修正)。
+		//
+		// 此前这里**恒为空**,而 catalog 的 /products/search 直接把它当响应字段
+		// 返回 —— 于是该字段对每个商品都是 ""。前端扫码拿到的商品没有条码,
+		// 只能回显自己输入的那串;一旦走了列表选择而非扫码,就彻底对不上号。
+		//
+		// 依据是本包 SearchProductsByBarcode 里那条已确认的领域事实:
+		// **item_no 就是条码**(实测 6957583900828 → item_no 同值)。
+		// 所以 barcode 与 id 同源,填上它不会引入新的假设。
+		Barcode: productID,
 	}, nil
 }
 
@@ -399,8 +417,89 @@ func (c *DaprCubeClient) SearchSuppliers(ctx context.Context, query string, limi
 	return out, nil
 }
 
-// ---- helpers ----
+// GetActivePromotion 查 itemNo 在 onDate 当天(或今天)生效的促销,返回**最低价**那一条。
+//
+// # 为什么时间窗用 inDateRange 而不是 gte / lte(踩过的坑)
+//
+// begin_date / end_date 是真 datetime。cube 的 gte / lte 编译成
+//
+//	RTRIM(col) >= ?      ← 字符串比较
+//
+// 对 datetime 做字符串比较恒不匹配,**返回 0 行且不报错**。
+// inDateRange 走的是另一条路,它会把列 CAST 成 DATE 再比:
+//
+//	CAST(RTRIM(begin_date) AS DATE) >= @p1
+//
+// 2026-10-15 真机实测:同一张表同一批数据,gte/lte 返 0 行、inDateRange 返 731 行。
+//
+// "活动期包含今天"要拆成两个半开判断,因为 inDateRange 是**闭区间**:
+//
+//	begin_date <= today   →  inDateRange ['1900-01-01', today]
+//	end_date   >= today   →  inDateRange [today, '2999-12-31']
+//
+// 下界用 1900-01-01 / 上界用 2999-12-31 只是"够宽的哨兵",不代表业务边界。
+//
+// # 为什么在 Go 里挑最低价而不是让 cube 挑
+//
+// cube 侧 GROUP BY 已含 plan_no / begin_day / end_day,所以**每个促销单一行**,
+// 每行各自带 min_promo_price(单行上 MIN 恒等于该值)。
+// 同一商品被多单覆盖时(实测存在),哪个单生效是业务规则,所以在 Go 里排序取最小。
+func (c *DaprCubeClient) GetActivePromotion(ctx context.Context, itemNo, onDate string) (*PromotionDTO, error) {
+	day := onDate
+	if day == "" {
+		day = time.Now().Format("2006-01-02")
+	}
+	data, err := c.LoadCubeQuery(ctx, "promotion", CubeQuery{
+		// min_promo_price 是 measure —— cube 不给 measure 包 RTRIM(否则破坏聚合),
+		// 所以它是**真的 number**,不像维度那样以字符串回来。
+		Measures: []string{"promotion.count", "promotion.min_promo_price"},
+		Dimensions: []string{
+			"promotion.item_no", "promotion.plan_no", "promotion.plan_name",
+			"promotion.orig_price", "promotion.begin_day", "promotion.end_day",
+		},
+		Filters: []CubeFilter{
+			{Member: "promotion.item_no", Operator: "equals", Values: []any{itemNo}},
+			{Member: "promotion.begin_date", Operator: "inDateRange",
+				Values: []any{"1900-01-01", day}},
+			{Member: "promotion.end_date", Operator: "inDateRange",
+				Values: []any{day, "2999-12-31"}},
+		},
+		// 多促销单时全取回来在 Go 里挑,给足余量。
+		Limit: 20,
+	})
+	if err != nil {
+		// ⚠️ 只把"确实没有该 model 的数据"降级成无促销;链路故障原样上抛。
+		if errors.Is(err, ErrCubeNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
 
+	var best *PromotionDTO
+	for _, row := range data {
+		cand := &PromotionDTO{
+			ItemNo:    asStr(row["promotion.item_no"]),
+			PlanNo:    asStr(row["promotion.plan_no"]),
+			PlanName:  asStr(row["promotion.plan_name"]),
+			Price:     asDecimal(row["promotion.min_promo_price"]),
+			OrigPrice: asDecimalPtr(row["promotion.orig_price"]),
+			BeginDay:  asStr(row["promotion.begin_day"]),
+			EndDay:    asStr(row["promotion.end_day"]),
+		}
+		// 促销价 <= 0 的单等于"没打折",不进候选 —— 否则一条 0 元促销
+		// 会盖掉真正有效的促销,并让价签印出 ¥0.00。
+		if cand.Price.LessThanOrEqual(decimal.Zero) {
+			continue
+		}
+		if best == nil || cand.Price.LessThan(best.Price) {
+			best = cand
+		}
+	}
+	// 没有候选 = 该商品当前没有生效促销。这是正常业务结论,不是错误。
+	return best, nil
+}
+
+// ---- helpers ----
 func asStr(v any) string {
 	if v == nil {
 		return ""

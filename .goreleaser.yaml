@@ -42,12 +42,17 @@
 #         components/{pubsub,conversation}.yaml
 #
 # 端口约定:catalog :8101, inventory :8102, master-data :8103, cube-router :8116,
-# stocktake :8106, fresh-meat :8108, settlement-auditor :8109;
-# 其它 10 个 binary 默认监听 :8080(其中 pos/pricing/procurement/sales-agg/
+# stocktake :8106, fresh-meat :8108, settlement-auditor :8109, sales-agg :8110,
+# pricing :8111;
+# 其它 binary 默认监听 :8080(其中 pos/pricing/procurement/sales-agg/
 # fresh-produce/fresh-meat/erp-connector/bi-gateway/master-data 当前
 # 只响应 /healthz placeholder;stocktake 需要 POSTGRES_DSN,真正使用 PG;
 # pos-gateway 与 notification-gateway 是真实业务进程;cube-router 需要
 # POSTGRES_DSN,真正使用 PG)。
+# ⚠️ 2026-10-15:pricing **不再是** placeholder —— 它已实现 POP 价签的
+#    价格/促销查询(cube product + cube promotion),并有 systemd unit +
+#    nginx map 行,见 deployer/systemd/supertrade-pricing.service。
+#    它仍**不需要 POSTGRES_DSN**(不拥有任何表)。
 # 远端 :8080 端口冲突由 Dapr sidecar 端口分配 + nginx map 规则解决,
 # 具体路由规则见 .claude/rules/00-app-catalog.md,本脚本不涉及。
 #

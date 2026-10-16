@@ -33,4 +33,14 @@ type Client interface {
 
 	// SearchSuppliers 按 name 模糊查供应商(用于品类 / 供应商下拉)。
 	SearchSuppliers(ctx context.Context, query string, limit int) ([]SupplierDTO, error)
+
+	// GetActivePromotion 查某商品**当前生效**的促销(取最低促销价那一条)。
+	//
+	// itemNo 用商品条码 / product id(cube product.id = 思迅 item_no,见
+	// SearchProductsByBarcode 的领域事实)。onDate 是判定基准日,格式
+	// yyyy-mm-dd;留空表示今天。
+	//
+	// **无生效促销返回 (nil, nil)** —— 这是绝大多数商品的正常状态,不是错误。
+	// 调用方因此不能靠 err != nil 判断"有没有促销"。
+	GetActivePromotion(ctx context.Context, itemNo, onDate string) (*PromotionDTO, error)
 }
