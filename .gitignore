@@ -26,6 +26,21 @@ go.work.sum
 
 # env file
 .env
+# 服务运行时的密钥与门店配置。
+# ⚠️ 这一条是**必须**的，不是顺手加的：`deploy/<service>.env` 会被
+#   deploy-supertrade.ps1 的 `-Step env` 直接 scp 到生产服务器，
+#   里面是与数据库口令同级暴露面的 API key。
+#   只有 `*.env.example` 进版本库 —— 它的作用是说明"要配哪些键"，
+#   不是提供默认值。
+/deploy/*.env
+
+# ⚠️ 本地调试留下的**真 token**（取 token 的中转脚本会 scp 到仓库根）。
+#   它是 JWT，1 小时过期，但内容是一次完整的登录凭证 ——
+#   `git add -A` 一次就进了历史，而 git 历史里的凭证必须轮换才能清干净。
+#   只有 `.token.example` 之类的模板才允许进库。
+*.token
+si.token
+.tmp-*
 
 # Editor/IDE
 # .idea/

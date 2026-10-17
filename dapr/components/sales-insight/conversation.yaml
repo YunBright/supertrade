@@ -1,0 +1,42 @@
+# sales-insight 的 conversation 组件（AI 解读用）。
+#
+# 形态与 fresh-meat / settlement-auditor 的 conversation.yaml **逐字一致** ——
+# 三者共用同一份 deepseek 凭据（local-secret-store 里的 deepseek.key / deepseek.model），
+# 组件内容不该按服务分叉：分叉就会出现「fresh-meat 的模型是 X，sales-insight 的
+# 是 Y」而没人知道哪个对。
+#
+# ⚠️ 缺这个组件的后果**不是报错**，而是**静默降级**：
+#   insight 引擎拿不到 conversation 组件 → 走规则模式 → 日报照发，
+#   卡片底部写「本卡为规则模式（LLM 不可用：…）」。
+#   所以「日报发得出去」完全不能证明 LLM 通着 —— 判据要看卡片标注，
+#   或 GET /insights/health 后再看 insight.generated_by。
+#
+# ⚠️ systemd unit 必须带**两个** --resources-path：
+#   本目录（拿 conversation）+ /opt/YunBright/.dapr/shared-components（拿 authkey）。
+#   只写前者 → 读不到 JWKS → 所有 token 验签失败 → 401 零报错；
+#   只写后者 → 本文件根本不被加载 → LLM 永远降级。
+#   少任何一个的症状都是"看起来正常"，这是本组件最需要盯的地方。
+#
+# 凭据不进版本库：key/model 在服务器上的 local secret store 里。
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: conversation
+  namespace: default
+spec:
+  type: conversation.openai
+  metadata:
+  - name: key
+    secretKeyRef:
+      name: deepseek.key
+      key: deepseek.key
+  - name: model
+    secretKeyRef:
+      name: deepseek.model
+      key: deepseek.model
+  - name: endpoint
+    value: 'https://api.deepseek.com'
+  - name: responseCacheTTL
+    value: 10m
+auth:
+  secretStore: local-secret-store

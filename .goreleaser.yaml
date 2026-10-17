@@ -43,12 +43,19 @@
 #
 # 端口约定:catalog :8101, inventory :8102, master-data :8103, cube-router :8116,
 # stocktake :8106, fresh-meat :8108, settlement-auditor :8109, sales-agg :8110,
-# pricing :8111;
+# pricing :8111, sales-insight :8112;
 # 其它 binary 默认监听 :8080(其中 pos/pricing/procurement/sales-agg/
 # fresh-produce/fresh-meat/erp-connector/bi-gateway/master-data 当前
 # 只响应 /healthz placeholder;stocktake 需要 POSTGRES_DSN,真正使用 PG;
 # pos-gateway 与 notification-gateway 是真实业务进程;cube-router 需要
 # POSTGRES_DSN,真正使用 PG)。
+# ⚠️ 2026-10-17 新增 sales-insight(AI 销售日报/周报/月报,cmd/sales-insight):
+#    纯只读查询 + LLM 解读,**不需要 POSTGRES_DSN**(报告与审计由
+#    wechat-bot 落 dapr state,本服务无状态)。无自有 components 目录
+#    (不订阅任何 topic),形态对齐 sales-agg。
+#    ⚠️ 它会调 cube,所以与 sales-agg 一样 **Requires=cube-gateway.service**。
+#    ⚠️ 端口 8112 是 2026-10-17 实测后定的:8111 已被 pricing 占用
+#    (deployer/tests/contract 的 TestPricingPortIsNotTaken 会报冲突)。
 # ⚠️ 2026-10-15:pricing **不再是** placeholder —— 它已实现 POP 价签的
 #    价格/促销查询(cube product + cube promotion),并有 systemd unit +
 #    nginx map 行,见 deployer/systemd/supertrade-pricing.service。
@@ -162,6 +169,19 @@ builds:
   - main: ./cmd/pricing
     id: "pricing"
     binary: "pricing"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./cmd/sales-insight
+    id: "sales-insight"
+    binary: "sales-insight"
     env:
       - CGO_ENABLED=0
     goos:
@@ -357,6 +377,22 @@ archives:
       - pricing
     wrap_in_directory: false
     name_template: 'apps/pricing/pricing_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  - id: "sales-insight"
+    format: tar.gz
+    builds:
+      - sales-insight
+    wrap_in_directory: false
+    name_template: 'apps/sales-insight/sales-insight_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+    # 2026-10-17：除二进制外还打包 conversation 组件（AI 解读要用）。
+    # 缺它不会报错，只会**静默降级**成规则模式 —— 日报照发，只是没有归因叙述，
+    # 所以「日报发得出去」不能证明 LLM 通着。
+    # 源路径放 dapr/components/<service>/ 与 fresh-meat 一致（deploy-supertrade.ps1
+    # 按这条路径 stage 单服务部署）。
+    # 无 pubsub.yaml：本服务不订阅任何 topic。
+    files:
+      - src: dapr/components/sales-insight/*
+        dst: components
 
   - id: "procurement"
     format: tar.gz

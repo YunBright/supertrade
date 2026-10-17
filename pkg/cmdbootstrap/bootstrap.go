@@ -18,6 +18,12 @@
 //
 // 不集成 dapr SDK:pub/sub 订阅与 service invocation 由 dapr sidecar 代理。
 // 后续真要落地 pub/sub 订阅,加个 /dapr/subscribe 端点 + 业务 handler 即可。
+//
+// ⚠️ 被异步 job 调用方注意:本包验签意味着**定时任务等无用户上下文的
+// 调用方必须携带机器人身份 token**(authd 服务账号 client credentials)。
+// 如果你在开发新的异步 job 调本服务:先读 deployer/docs/service-accounts.md
+// 的接入步骤,并确认 authd JWT_AUDIENCE 含本服务的 AppID(不是 dapr app-id),
+// 否则调用方会收到 401 invalid_audience。
 package cmdbootstrap
 
 import (
