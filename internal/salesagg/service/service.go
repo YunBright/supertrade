@@ -241,7 +241,6 @@ func (s *Service) Report(ctx context.Context, q Query) (*SalesReport, error) {
 		To:      q.To,
 		Rows:    make([]ReportRow, 0, len(raw.Rows)),
 	}
-	var sumAmt, sumQty, sumCost, sumCosted, sumRows float64
 	for _, r := range raw.Rows {
 		cov := coverage(r.CostedRows, r.TotalRows)
 		row := ReportRow{
@@ -265,11 +264,6 @@ func (s *Service) Report(ctx context.Context, q Query) (*SalesReport, error) {
 			}
 		}
 		out.Rows = append(out.Rows, row)
-		sumAmt += r.NetAmount
-		sumQty += r.NetQty
-		sumCost += r.RefCost
-		sumCosted += float64(r.CostedRows)
-		sumRows += float64(r.TotalRows)
 	}
 
 	// 明细按销售额倒序 —— 这是报表打开时用户最先看的顺序。
@@ -277,25 +271,43 @@ func (s *Service) Report(ctx context.Context, q Query) (*SalesReport, error) {
 		return numOf(out.Rows[i].NetAmount) > numOf(out.Rows[j].NetAmount)
 	})
 
+	out.Summary = buildSummary(raw.Rows)
+	return out, nil
+}
+
+// buildSummary 把一组原始行汇成顶部汇总指标。
+//
+// 从 Report 中抽出供门店对比复用（CompareData 对每个 ok 门店都要算一份
+// **同口径**的汇总 —— 口径不一致的话，"单店报表"与"对比列"对不上数，
+// 还没人说得清哪份对）。口径改动只允许发生在这里。
+func buildSummary(rows []RawReport) Summary {
+	var sumAmt, sumQty, sumCost, sumCosted, sumRows float64
+	for _, r := range rows {
+		sumAmt += r.NetAmount
+		sumQty += r.NetQty
+		sumCost += r.RefCost
+		sumCosted += float64(r.CostedRows)
+		sumRows += float64(r.TotalRows)
+	}
 	sumCov := 0.0
 	if sumRows > 0 {
 		sumCov = sumCosted / sumRows
 	}
-	out.Summary = Summary{
+	out := Summary{
 		NetAmount:       fmtAmount(sumAmt),
 		NetQty:          fmtAmount(sumQty),
 		RefCost:         fmtAmount(sumCost),
 		CostCoverage:    fmtPct(sumCov),
 		MarginAvailable: sumCov >= MinCostCoverage,
 	}
-	if out.Summary.MarginAvailable {
+	if out.MarginAvailable {
 		m := sumAmt - sumCost
-		out.Summary.RefMargin = fmtAmount(m)
+		out.RefMargin = fmtAmount(m)
 		if sumAmt != 0 {
-			out.Summary.RefMarginPct = fmtPct(m / sumAmt)
+			out.RefMarginPct = fmtPct(m / sumAmt)
 		}
 	}
-	return out, nil
+	return out
 }
 
 // TodayByCategory 是每日群推送用的口径：**只到今天，按类别**。

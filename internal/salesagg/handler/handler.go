@@ -41,11 +41,11 @@ func New(svc *service.Service) *Handler {
 	return &Handler{svc: svc, now: time.Now}
 }
 
-// RegisterRoutes 注册路由。
+// RegisterRoutes 注册销售报表路由。
 //
-// ⚠️ 本服务**没有** /dapr/subscribe 端点，也不需要 RegisterDapr 窗口：
-// 它只被调用，不订阅任何 topic。开窗只会无谓扩大"能连到 app 端口就能
-// 伪造请求"的暴露面（见 pkg/cmdbootstrap 文档第 2 段）。
+// ⚠️ 本服务**没有** /dapr/subscribe 端点，不订阅任何 topic。RegisterDapr
+// 窗口存在但只挂了兜底清理端点（purge.go）—— 那是契约测试收尾清理的
+// 需求，不是订阅需求；业务路由全部走本方法（带 auth 中间件）。
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.GET("/reports/sales", h.Report)
 	r.GET("/reports/sales/today", h.TodayByCategory)

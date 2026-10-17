@@ -16,7 +16,9 @@
 //   - 不发企业微信消息 —— 企微出口唯一在 wechat-bot 仓（见 docs/16 §5 服务边界表）。
 //     本服务只提供 GET /reports/sales/today，wechat-bot 经 dapr service
 //     invocation 取数后自己渲染并发送。
-//   - 不存业务数据 —— 报表是即席查询，没有自己的库，也不需要。
+//   - 存储只有**一张表** sales_compare_templates（门店对比模板，2026-10-17
+//     门店对比功能引入的唯一持久化）—— 报表本体仍是即席查询。模板是
+//     全局共享配置，不是业务流水；POSTGRES_DSN 由此而来。
 //   - 不做门店到 cube 实例的路由 —— 那是 cube-router 的职责，
 //     本服务只带 X-Branch-ID 过去。
 //
@@ -36,8 +38,10 @@ import (
 
 	dapr "github.com/dapr/go-sdk/client"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/salesagg/compare"
 	"github.com/YunBright/supertrade/internal/salesagg/handler"
 	"github.com/YunBright/supertrade/internal/salesagg/service"
 	"github.com/YunBright/supertrade/pkg/cmdbootstrap"
@@ -46,12 +50,11 @@ import (
 
 func main() {
 	cmdbootstrap.Run(cmdbootstrap.Options{
-		AppID: "sales-agg",
-		Port:  cmdbootstrap.AppPort(":8109"),
-		OnStart: func() error {
-			return initApp()
-		},
-		Register: registerRoutes,
+		AppID:        "sales-agg",
+		Port:         cmdbootstrap.AppPort(":8109"),
+		OnStart:      initApp,
+		RegisterDapr: registerDaprRoutes,
+		Register:     registerRoutes,
 	})
 }
 
@@ -59,7 +62,11 @@ func main() {
 //
 // 用 package var 是因为 cmdbootstrap 的 OnStart / Register 回调签名不返回
 // 外部状态；与 supertrade 其余服务（stocktake / settlement-auditor）一致。
-var appSvc *service.Service
+var (
+	appSvc   *service.Service
+	appDB    *gorm.DB
+	appStore *compare.Store
+)
 
 func initApp() error {
 	// ⚠️ 这里**不能**用 cubehttp.NewClient()：它返回的是窄接口
@@ -77,9 +84,26 @@ func initApp() error {
 		cubeclient.DefaultCubeQueryPath(),
 	)
 	appSvc = service.New(service.NewDaprCubeQuerier(cube))
+
+	// 门店对比模板的持久化（唯一一张表）。DSN 必填 fail-fast，
+	// 与 stocktake / settlement-auditor 同口径 —— 不允许"起来但存不了"。
+	dsn := os.Getenv("POSTGRES_DSN")
+	if dsn == "" {
+		return fmt.Errorf("POSTGRES_DSN 必填(sales-agg 门店对比模板需要持久化,无 fallback)")
+	}
+	appDB, err = compare.OpenDB(dsn)
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+	if err := appDB.AutoMigrate(&compare.Template{}); err != nil {
+		return fmt.Errorf("auto migrate: %w", err)
+	}
+	appStore = compare.NewStore(appDB)
+
 	slog.Info("sales-agg app initialized",
 		"cube_app_id", cubeclient.DefaultCubeAppID(),
 		"cube_query_path", cubeclient.DefaultCubeQueryPath(),
+		"db_driver", "postgres",
 	)
 	return nil
 }
@@ -90,6 +114,7 @@ func registerRoutes(r *gin.Engine) {
 	}
 	// 读 X-Branch-ID，供 handler 透传给 cube-router 做 per-branch 路由。
 	// 不强求存在：报表允许"该 cube 实例内全部门店"（branch 留空）。
+	// 门店对比 handler 不读它 —— 那组端点的授权只认 token claims。
 	r.Use(middleware.XBranchID())
 	// 把 caller 的 Authorization 注入 ctx，向 cube 透传 JWT。
 	//
@@ -100,6 +125,18 @@ func registerRoutes(r *gin.Engine) {
 	// 而不是让本服务在无 token 时伪造一个。
 	r.Use(forwardBearerToOutgoing())
 	handler.New(appSvc).RegisterRoutes(r)
+	// 门店对比（模板 CRUD + 逐店取数）。依赖 appStore（OnStart 已建）。
+	handler.NewCompare(appSvc, appStore).RegisterRoutes(r)
+}
+
+// registerDaprRoutes 在 auth 中间件**之前**注册免鉴权端点。
+//
+// 本服务不订阅任何 topic（无 /dapr/subscribe），开这个窗口只为挂兜底
+// 清理端点：契约测试收尾清理时未必持有 token。公网安全由 nginx 的
+// `location ^~ /api/v1/sales-agg/internal/ { return 404; }` 承担
+// （回归锁见 deployer/tests/config/nginx_internal_test.go）。
+func registerDaprRoutes(r *gin.Engine) {
+	handler.RegisterPurgeRoutes(r, appDB)
 }
 
 // forwardBearerToOutgoing 把 gin request 的 Authorization header 注入 ctx。
