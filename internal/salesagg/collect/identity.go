@@ -135,6 +135,22 @@ func (s *StoreCipherIssuer) Bearer(ctx context.Context, branchID string) (string
 //	handler 要据此判"是未开启/已关停"还是"是真的出错"，
 //	因为前两者不该被统计成"采集失败"—— 前者在报表里应当显示
 //	"该门店未开启采集"，而不是一个 503 加一句"去重试"。
+//
+// ⚠️⚠️ **必须自己补上 "Bearer " 前缀**（2026-10-19 端到端实测抓出来的）：
+//
+//	cubeclient.WithBearer 的约定是"值 = Authorization 头的完整内容"
+//	（它直接塞进 gRPC metadata "authorization"，sidecar 转成 HTTP 头）。
+//	本仓其余九个调用方无一例外传 `Header.Get("Authorization")`，
+//	即都带前缀；而 [BearerResolver.Bearer] 按契约返回**裸 token**。
+//	直接透传 ⇒ 目标 app 收到 `Authorization: eyJ...`（没有 Bearer 前缀）
+//	⇒ 验签中间件判"缺少已签 token" → 401 → dapr 转成 gRPC Unauthenticated
+//	⇒ 报成 `cube 拒绝调用者凭证`。
+//
+//	症状极具误导性：它把人一路引向 cube / 网关 / token 有效期 / 权限，
+//	而真因（少一个前缀）不在这条链路上的任何一行日志里。
+//
+//	→ 前缀在**这个边界**上补：解析器保持"返回裸 token"的契约
+//	  （换 token 的返回值本就是裸的），由负责放进 HTTP 语义位置的一方补。
 func WithBranchBearer(ctx context.Context, r BearerResolver, branchID string) (context.Context, error) {
 	if r == nil {
 		return ctx, fmt.Errorf("采集凭据：bearer 解析器未装配")
@@ -142,6 +158,15 @@ func WithBranchBearer(ctx context.Context, r BearerResolver, branchID string) (c
 	tok, err := r.Bearer(ctx, strings.TrimSpace(branchID))
 	if err != nil {
 		return ctx, err
+	}
+	tok = strings.TrimSpace(tok)
+	if tok == "" {
+		// 空 token 不能当成功：那会让 cube 收到**完全没有** Authorization，
+		// 症状同样是 Unauthenticated，而真因（解析器给了空串）被吞掉。
+		return ctx, fmt.Errorf("采集凭据：门店 %s 的 bearer 解析器返回了空 token", branchID)
+	}
+	if !strings.HasPrefix(strings.ToLower(tok), "bearer ") {
+		tok = "Bearer " + tok
 	}
 	return cubeclient.WithBearer(ctx, tok), nil
 }
