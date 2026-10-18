@@ -44,6 +44,33 @@ var ErrServiceAccountExists = errors.New("服务账号已存在")
 //	症状是"创建服务账号连不上"，而服务照常启动。
 const AuthAccountAppID = AuthAppID
 
+// AuthDeniedError 表示 auth **拒绝**了这次调用（403）。
+//
+// # 为什么单独一个类型，而不是包成普通 error
+//
+// auth 的 403 message 里是「你没有开启门店采集的权限，缺少：
+// 00:service-account:grant、00:cube:read」——
+// **缺哪几条权限**是用户唯一能照着去申请的东西。
+//
+// 普通 error 包装会把这句话埋在一堆前缀里，handler 只能把它当"未知失败"
+// 统一回 400/503，前端于是只能弹一句"操作失败，请重试"，
+// 而重试一万次也是同样结果。
+//
+// → 用这个类型把 code 与 message **原样**带到响应里。
+type AuthDeniedError struct {
+	// Code 是后端的业务码（通常是 "forbidden"）。
+	Code string
+	// Message 是后端原话（缺哪几条权限就在里面）。
+	Message string
+}
+
+func (e *AuthDeniedError) Error() string {
+	if e.Message == "" {
+		return "auth 拒绝：缺少操作权限"
+	}
+	return "auth 拒绝：" + e.Message
+}
+
 // DaprServiceAccountClient 经 dapr 调 auth userd 的服务账号端点。
 type DaprServiceAccountClient struct {
 	sidecarBase string
@@ -122,17 +149,21 @@ func (c *DaprServiceAccountClient) postJSON(ctx context.Context, url, userBearer
 		}
 		return nil, fmt.Errorf("auth 返回 409: %s", env.Message)
 	case resp.StatusCode/100 != 2:
-		// auth 的权限错误里带**具体缺哪条权限**（assertMayGrant 会列全），
-		// 这段 message 必须原样带回前端 —— 用户要靠它知道自己缺什么。
+		// auth 的错误信封：{"code":"forbidden","message":"..."}
 		var env struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
 		}
 		_ = json.Unmarshal(payload, &env)
+		if resp.StatusCode == http.StatusForbidden {
+			// ⚠️ 403 要**原样**带到调用方：message 里是"缺哪几条权限"，
+			//   那是用户唯一能照着去申请的东西。
+			return nil, &AuthDeniedError{Code: env.Code, Message: env.Message}
+		}
 		if env.Message == "" {
 			return nil, fmt.Errorf("auth 返回 %d", resp.StatusCode)
 		}
-		return nil, fmt.Errorf("auth 拒绝（%d）：%s", resp.StatusCode, env.Message)
+		return nil, fmt.Errorf("auth 返回 %d：%s", resp.StatusCode, env.Message)
 	}
 
 	var out map[string]any

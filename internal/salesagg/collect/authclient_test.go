@@ -137,6 +137,74 @@ func TestAuthClientPassesThroughPermissionErrorMessage(t *testing.T) {
 	}
 }
 
+// TestAuthClientRecognisesForbiddenAsDenied ⭐
+//
+// 403 必须翻译成**可判别的类型** *AuthDeniedError，而不是一串带前缀的字符串。
+//
+// 退化症状：handler 只能把它当"未知失败"统一回 503，
+// 而前端于是把"你没有这个权限"显示成"上游暂不可用，请重试"。
+// 用户缺的是权限不是网络 —— 他重试一万次结果完全一样。
+//
+// ⚠️ 与 TestAuthClientPassesThroughPermissionErrorMessage 构成对照：
+//   那条只断言 err.Error() 里**含**缺哪条权限（加前缀也过），
+//   这条断言的是**类型**。只有类型才能让 handler 分流出 403。
+func TestAuthClientRecognisesForbiddenAsDenied(t *testing.T) {
+	const message = "你没有开启门店采集的权限，缺少：00:service-account:grant"
+	c, _ := newTestAuthClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"code":"forbidden","message":"` + message + `"}`))
+	})
+
+	_, err := c.CreateScoped(context.Background(), "Bearer u", "sdc-00", "店 00", "00", []string{"cube:read"})
+	if err == nil {
+		t.Fatal("403 却没报错")
+	}
+	var denied *AuthDeniedError
+	if !errors.As(err, &denied) {
+		t.Fatalf("错误 = %#v，期望 errors.As 能取到 *AuthDeniedError", err)
+	}
+	if denied.Code != "forbidden" {
+		t.Errorf("denied.Code = %q，期望沿用 auth 的 forbidden", denied.Code)
+	}
+	// ⚠️ message 要**逐字**是 auth 原话：下游 handler 靠 errors.As 拿到的
+	//   是这里存的这一份，任何一层前缀都会被用户看到。
+	if denied.Message != message {
+		t.Errorf("denied.Message = %q，期望逐字等于 %q", denied.Message, message)
+	}
+}
+
+// TestAuthClientKeepsOtherStatusesOutOfDeniedType ⭐
+//
+// **只有 403** 才进 AuthDeniedError。
+//
+// 把 401 / 500 也塞进去的话：401 是"登录态过期"（该去刷新 token），
+// 500 是"auth 自己坏了"（该去查 auth 日志）——
+// 混进 403 分支后前端一律显示"你没权限"，于是永远找不到真因。
+func TestAuthClientKeepsOtherStatusesOutOfDeniedType(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+	}{
+		{"401", http.StatusUnauthorized},
+		{"500", http.StatusInternalServerError},
+		{"503", http.StatusServiceUnavailable},
+	} {
+		c, _ := newTestAuthClient(t, func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(tc.status)
+			_, _ = w.Write([]byte(`{"code":"boom","message":"auth 侧故障"}`))
+		})
+
+		_, err := c.CreateScoped(context.Background(), "Bearer u", "sdc-00", "店 00", "00", []string{"cube:read"})
+		if err == nil {
+			t.Fatalf("%s 却没报错", tc.name)
+		}
+		var denied *AuthDeniedError
+		if errors.As(err, &denied) {
+			t.Errorf("%s 被误判成 AuthDeniedError，前端会一律显示「你没权限」", tc.name)
+		}
+	}
+}
+
 // TestAuthClientNeverEchoesSecretInErrors
 //
 // 出错时**不得**回显请求体（里面有 client_secret）。

@@ -99,7 +99,7 @@ func (h *CollectControlHandler) Enable(c *gin.Context) {
 	if err != nil {
 		c.JSON(controlStatus(err), gin.H{
 			"code":    controlCode(err),
-			"message": err.Error(),
+			"message": controlMessage(err),
 			"branch":  branch,
 		})
 		return
@@ -140,7 +140,7 @@ func (h *CollectControlHandler) Disable(c *gin.Context) {
 	if err != nil {
 		c.JSON(controlStatus(err), gin.H{
 			"code":    controlCode(err),
-			"message": err.Error(),
+			"message": controlMessage(err),
 			"branch":  branch,
 		})
 		return
@@ -175,7 +175,7 @@ func (h *CollectControlHandler) State(c *gin.Context) {
 	if err != nil {
 		c.JSON(controlStatus(err), gin.H{
 			"code":    controlCode(err),
-			"message": err.Error(),
+			"message": controlMessage(err),
 			"branch":  branch,
 		})
 		return
@@ -200,7 +200,17 @@ func controlStatus(err error) int {
 	case errors.Is(err, collect.ErrServiceAccountExists):
 		return http.StatusConflict
 	default:
-		return http.StatusBadRequest
+		// ⚠️ auth 的 403 必须**原样**变成 403：
+		//   前端靠状态码/错误码分流"没权限"与"上游挂了"，
+		//   而 auth 的 message（缺哪几条权限）必须原样透出。
+		var denied *collect.AuthDeniedError
+		if errors.As(err, &denied) {
+			return http.StatusForbidden
+		}
+		// 其余是上游/基础设施故障 ⇒ 503（可重试）。
+		// 绝不用 400：那会让前端把它当"参数错"，于是弹一个
+		// "请重试"按钮，而重试解决不了上游故障。
+		return http.StatusServiceUnavailable
 	}
 }
 
@@ -216,8 +226,30 @@ func controlCode(err error) string {
 	case errors.Is(err, collect.ErrServiceAccountExists):
 		return "service_account_exists"
 	default:
+		var denied *collect.AuthDeniedError
+		if errors.As(err, &denied) {
+			// ⚠️ 用 auth 的原 code（通常是 "forbidden"），
+			//   不用自己编一个 —— 前端与后端对同一个语义用同一个码。
+			if denied.Code != "" {
+				return denied.Code
+			}
+			return "forbidden"
+		}
 		return "collect_control_failed"
 	}
+}
+
+// controlMessage 取给用户看的文案。
+//
+// ⚠️ auth 的 403 要用它的**原话**（缺哪几条权限），
+//   而不是包一层"auth 拒绝：..." —— 那层前缀会让前端在按 code 分流后
+//   仍然显示一句用户看不懂的话。
+func controlMessage(err error) string {
+	var denied *collect.AuthDeniedError
+	if errors.As(err, &denied) && denied.Message != "" {
+		return denied.Message
+	}
+	return err.Error()
 }
 
 // callerSubject 取调用者标识（仅用于审计与 created_by）。
