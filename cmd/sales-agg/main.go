@@ -46,6 +46,9 @@ import (
 	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/internal/salesagg/collect"
 	"github.com/YunBright/supertrade/internal/salesagg/compare"
+	// ⚠️ 别名：internal/salesagg/service 也叫 service，不加别名编译不过。
+	//	（别名本身不是风格问题，是两个同名包的必然冲突。）
+	cubesrvsvc "github.com/YunBright/supertrade/internal/cube-router/service"
 	"github.com/YunBright/supertrade/internal/salesagg/handler"
 	"github.com/YunBright/supertrade/internal/salesagg/service"
 	"github.com/YunBright/supertrade/internal/salesdaily"
@@ -81,6 +84,11 @@ var (
 	// appBearer 为某门店换机器 token。主密钥缺失时为 nil，
 	// 此时采集会明确失败而不是无声地不带 token 去打 cube。
 	appBearer collect.BearerResolver
+	// appCipher 是凭据的加解密器（主密钥来自环境变量）。
+	// 主密钥缺失时为 nil ⇒ 采集开关端点会明确拒绝开启。
+	appCipher *collect.Cipher
+	// appCtl 是采集开关的编排器（开启 / 关停 / 查状态）。
+	appCtl *collect.Control
 )
 
 func initApp() error {
@@ -172,9 +180,23 @@ func initApp() error {
 		if err != nil {
 			return fmt.Errorf("采集凭据主密钥不可用（拒绝以降级密钥继续）: %w", err)
 		}
+		appCipher = ci
 		appBearer = collect.NewStoreCipherIssuer(appCreds, ci,
 			collect.NewDaprTokenIssuer(sidecarBaseURL(), envStr("AUTH_TOKEN_APP_ID", collect.TokenAuthAppID)))
 	}
+
+	// ---- 采集开关（开启 / 关停）----
+	//
+	// 前置校验用 cube-router 的数据源映射（同一个 PG 的 cube_router schema），
+	// 所以本服务直接建一个只读解析器。
+	appCtl = collect.NewControl(
+		collect.NewCubeSourceChecker(cubesrvsvc.NewService(appDB)),
+		collect.NewDaprServiceAccountClient(sidecarBaseURL(), envStr("AUTH_USERD_APP_ID", collect.AuthAppID)),
+		appCreds,
+		appCipher,
+		collect.NewBranchJobRegistrar(collect.NewDaprJobClient(sidecarBaseURL()), collectCallbackAddress()),
+		nil,
+	)
 
 	slog.Info("sales-agg app initialized",
 		"cube_app_id", cubeclient.DefaultCubeAppID(),
@@ -321,6 +343,13 @@ func registerRoutes(r *gin.Engine) {
 	handler.New(appSvc).RegisterRoutes(r)
 	// 门店对比（模板 CRUD + 逐店取数）。依赖 appStore（OnStart 已建）。
 	handler.NewCompare(appSvc, appStore).RegisterRoutes(r)
+	// 采集开关（开启 / 关停 / 查状态）。
+	//
+	// ⚠️ 这些端点在**鉴权链内**（走 users 组的 JWT 校验），
+	//	而采集端点 /sales/daily/collect 在免鉴权窗口（registerDaprRoutes）。
+	//	两者身份来源不同（真人 vs 服务账号），挂错窗口的后果分别是
+	//	"任何人都能开/关采集" 与 "每晚采集必 401"。
+	handler.NewCollectControlHandler(appCtl).RegisterRoutes(r)
 }
 
 // registerDaprRoutes 在 auth 中间件**之前**注册免鉴权端点。
