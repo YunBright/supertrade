@@ -32,6 +32,12 @@ func (b *Builder) buildSuppliers(
 	f fact.Fact,
 	topN int,
 	sufficiency *fact.Sufficiency,
+	// src 是**请求级**数据源（见 Builder.route）。
+	// ⚠️ 必须由调用方传进来而不是在这里取 b.src：
+	//   取 b.src 会绕过按区间的 PG/cube 路由，
+	//   于是同一份报告里"品类来自 PG、供应商来自 cube"——
+	//   那正是这个路由要消灭的口径分叉。
+	src DataSource,
 ) ([]fact.Supplier, []fact.ExcludedSupplier) {
 	cur, err := b.src.SupplierSales(ctx, opt.StoreBranchID, f.Meta.From, f.Meta.To, supplierScanCount(topN))
 	if err != nil {
@@ -111,26 +117,28 @@ func (b *Builder) buildSuppliers(
 				"（请在 App 的销售报表 → 供应商忽略名单 中配置）")
 	}
 
-	// 排除依据：编码 → 原因（可能为空串）。
-	// 仅用 Code 匹配，名称会变（见 ignore.Codes 的说明）。
-	reasonByCode := map[string]string{}
+	// 排除依据：销售编码 → 名单条目。
+	//
+	// ⚠️ 必须走 IndexForSales 对齐，而不是拿名单编码直接查表：
+	//   名单录的是字典侧编码，流水侧可能少一个前导零
+	//   （线上实测：名单 `029 猪肉自营` vs 流水 `29`），
+	//   直接查表会让全店最大的供应商静默逃过排除。
+	//   详见 ignore.IndexForSales 的三条硬约束。
+	ignoredByCode := map[string]ignore.Entry{}
 	if cfgErr == nil {
-		for _, e := range ignored.Entries {
-			reasonByCode[strings.TrimSpace(e.Code)] = strings.TrimSpace(e.Reason)
-		}
+		ignoredByCode = ignore.IndexForSales(ignored.Entries, codes)
 	}
 
 	for _, c := range cur {
-		name := strings.TrimSpace(dict[c.Code].Name)
+		name := strings.TrimSpace(c.Name)
 		if name == "" {
-			// 没有字典记录时用编码占位，而不是丢弃 ——
+			// 字典里没有记录时用编码占位，而不是丢弃 ——
 			// 丢弃会让这家供应商的销量凭空从大盘里消失。
 			name = "供应商" + c.Code
 		}
 
-		_, isIgnored := reasonByCode[c.Code]
-		if isIgnored {
-			reason := reasonByCode[c.Code]
+		if e, isIgnored := ignoredByCode[c.Code]; isIgnored {
+			reason := strings.TrimSpace(e.Reason)
 			if reason == "" {
 				reason = "已加入本门店的供应商忽略名单"
 			}
@@ -169,7 +177,7 @@ func (b *Builder) buildSuppliers(
 
 // ignoredSuppliers 读该门店的人工忽略名单。
 //
-// ⚠️ 返回值里 Configured 必���被调用方使用 ——
+// ⚠️ 返回值里 Configured 必须被调用方使用 ——
 //
 //	"没配过"与"配了空的"必须能被区分，否则前者会静默地
 //	让自用供应商涌回榜单（见 buildSuppliers 里的 switch）。

@@ -44,6 +44,32 @@ func (f *fakeCube) LoadSalesReport(
 	return &service.RawSalesReport{Rows: f.rows[groupBy]}, nil
 }
 
+// LoadSalesTotals 满足 service.CubeQuerier：按全部明细行求和。
+//
+// ⚠️ 与 service 包的 fakeCube 同策略：**默认等于行求和**。
+//
+//	若让它恒定返回一个"独立"的值，本组用例就只断言了状态码，
+//	而"汇总到底来自哪条路"这个真正的问题会失去判别力。
+//	验证那条改造的是 service 包的 TestSummaryComesFromTotalsQuery。
+func (f *fakeCube) LoadSalesTotals(
+	_ context.Context, _, _, _ string,
+) (service.RawReport, error) {
+	if f.err != nil {
+		return service.RawReport{}, f.err
+	}
+	var sum service.RawReport
+	for _, rs := range f.rows {
+		for _, r := range rs {
+			sum.NetAmount += r.NetAmount
+			sum.NetQty += r.NetQty
+			sum.RefCost += r.RefCost
+			sum.CostedRows += r.CostedRows
+			sum.TotalRows += r.TotalRows
+		}
+	}
+	return sum, nil
+}
+
 func newRouter(f *fakeCube) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()

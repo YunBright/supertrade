@@ -35,6 +35,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/salesdaily"
 	"github.com/YunBright/supertrade/internal/salesinsight/build"
 	"github.com/YunBright/supertrade/internal/salesinsight/handler"
 	"github.com/YunBright/supertrade/internal/salesinsight/ignore"
@@ -88,6 +89,30 @@ func initApp() error {
 	builder := build.NewBuilder(src, weatherProvider(daprCli)).
 		WithIgnores(ignores)
 
+	// ---- 已定稿销售事实（PG 只读）----
+	//
+	// ⚠️ 读侧**只**读 PG，不写、不 AutoMigrate、不回补：
+	//
+	//	写者是 sales-agg（唯一写者，见 internal/salesdaily 的包注释）。
+	//	两边的模型是**同一份 Go 定义**，所以写侧加字段而读侧没跟上
+	//	会在编译期就炸，而不是上线后读出零值。
+	//
+	// ⚠️ 装配失败**不阻止启动**：
+	//
+	//	DSN 缺失时本服务退化成"每次现查源库"，报告照出（只是数字会随
+	//	源库补写而变）。那比"起不来"好 —— 而"PG 没接"这件事由
+	//	health 端点显式暴露（pg_ready=false），不会被静默。
+	//	读侧与写侧对"缺失"的处理在这里是**刻意不同**的：
+	//	写侧不启动会让采集静默失败（数据永远攒不出来），
+	//	读侧不启动会让日报发不出去。
+	dailyStore, dailyErr := openDailyStore()
+	if dailyErr != nil {
+		slog.Warn("sales-insight: 未接入每日销售事实库，销售数字将现查源库"+
+			"（同一营业日可能两次查到不同的数）", "reason", dailyErr)
+	} else {
+		builder = builder.WithRangeLoader(dailyStore)
+	}
+
 	// ---- 推理引擎 ----
 	//
 	// ⚠️ **没有 dapr client 也要能跑**：
@@ -110,7 +135,8 @@ func initApp() error {
 	engine := insight.NewEngine(enableAI && conv != nil, timeout, conv)
 
 	appSvc = handler.NewServiceImpl(builder, engine)
-	appH = handler.New(appSvc).WithIgnores(ignores).WithDict(src)
+	appH = handler.New(appSvc).WithIgnores(ignores).WithDict(src).
+		WithDailyStore(dailyErr == nil)
 
 	slog.Info("sales-insight app initialized",
 		"cube_app_id", cubeclient.DefaultCubeAppID(),
@@ -119,8 +145,39 @@ func initApp() error {
 		"llm_timeout", timeout.String(),
 		"store_city", os.Getenv("STORE_CITY"),
 		"ignore_store_dir", ignores.Dir(),
+		"daily_store_ready", dailyErr == nil,
 	)
 	return nil
+}
+
+// openDailyStore 打开每日销售事实库的**只读**通道。
+//
+// ⚠️ 这里返回 nil, nil 表示"没接"，而不是"接了但表不存在"：
+//
+//	两者在调用方那里需要不同的处置 —— 前者是一次性部署问题，
+//	后者说明 sales-agg 那个进程没起来或 DSN 没配，
+//	而排查方向完全不同。所以这里只把"打不开库"折叠成同一个错误，
+//	表存在性交由实际查询去暴露（那条路径上有明确的 ErrRangeIncomplete / SQL 错）。
+func openDailyStore() (*salesdaily.Store, error) {
+	dsn := strings.TrimSpace(os.Getenv("POSTGRES_DSN"))
+	if dsn == "" {
+		return nil, fmt.Errorf("POSTGRES_DSN 未配置")
+	}
+	db, err := salesdaily.OpenDB(dsn)
+	if err != nil {
+		return nil, err
+	}
+	// ⚠️ 只 Ping 不 AutoMigrate：表归写侧管。
+	//   读侧建表会把"写侧忘了跑"这件事永久掩盖掉 ——
+	//   而那恰恰是最需要被发现的情况。
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+	if err := sqlDB.Ping(); err != nil {
+		return nil, fmt.Errorf("ping: %w", err)
+	}
+	return salesdaily.NewStore(db, nil), nil
 }
 
 // newIgnoreStore 构造供应商忽略名单存储。

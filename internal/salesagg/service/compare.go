@@ -148,7 +148,25 @@ func (s *Service) CompareData(ctx context.Context, in CompareInput) (*CompareDat
 		if raw != nil {
 			rows = raw.Rows
 		}
-		out.Summary[store] = buildSummary(rows)
+		// ⚠️ 汇总走**独立的无分组查询**，与 Report 同源同口径。
+		//
+		//	原来这里用 buildSummary(rows) —— 而 rows 是"按维度分组后的子集"，
+		//	对未归类商品/被 Limit 截断的部分会偏低。
+		//	症状是同一家的「对比列」与「单店报表」对不上数，
+		//	而两边各自看起来都正常（TestCompareData_SummaryMatchesReport 守这条）。
+		//
+		// ⚠️ 门店对比**只能**现查源库，不能走已定稿事实库：
+		//
+		//	对比模板的每一行按**类别 id**（item_cls_parent.id）索引各店的编码，
+		//	而每日快照的品类行存的是**类别名**（它是主键）。
+		//	拿名字去匹配模板里的 id 会全部落空 —— 表里全是空白格子，
+		//	而这看起来像"模板没配数据"。
+		//
+		//	要补齐这件事得让快照同时存 id，那是**另一个取舍**：
+		//	类别 id 在不同门店不通用（它是该门店 DuckDB 里的主键），
+		//	落进跨门店共用的表反而会误导。保持"对比走源库"。
+		totals, _, _ := s.totalsViaCube(ctx, store, in.From, in.To, rows)
+		out.Summary[store] = summaryOf(totals)
 
 		// 按编码建索引，逐行把该店的原始行映射成单元格。
 		idx := make(map[string]RawReport, len(rows))

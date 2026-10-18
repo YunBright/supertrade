@@ -62,6 +62,13 @@ type Handler struct {
 	//   dict 是**数据查询**（cube）。两者生命周期与故障模式都不同，
 	//   合成一个字段会让"磁盘写坏了"与"cube 查不到"报同一个错。
 	dict DictProvider
+	// dailyStoreReady 表示"已定稿销售事实库（PG）"是否已接入。
+	//
+	// ⚠️ 它必须在 health 里显式暴露，因为未接入时的**症状完全正常**：
+	//   报告照出、数字大体对，只是同一个营业日两次查可能不同。
+	//   没有这个字段，运维只有翻启动日志才能发现，
+	//   而"落库改造上线了吗"恰恰是第一个要回答的问题。
+	dailyStoreReady bool
 }
 
 // New 构造 Handler。svc 为 nil 时所有端点返回 503。
@@ -76,6 +83,12 @@ func (h *Handler) WithIgnores(s *ignore.Store) *Handler {
 // WithDict 注入供应商字典查询（返回自身便于链式）。
 func (h *Handler) WithDict(d DictProvider) *Handler {
 	h.dict = d
+	return h
+}
+
+// WithDailyStore 声明"已定稿销售事实库"是否已接入（只影响 health 输出）。
+func (h *Handler) WithDailyStore(ready bool) *Handler {
+	h.dailyStoreReady = ready
 	return h
 }
 
@@ -349,7 +362,10 @@ func (h *Handler) health(c *gin.Context) {
 		"calendar_data_coverage": calendar.CoverageEnd,
 		"prompt_version":         insight.PromptVersion,
 		"service_ready":          h.svc != nil,
-		"checked_at":             time.Now().Format(time.RFC3339),
+		// daily_store_ready=false 时销售数字**现查源库**：
+		// 报告仍会出，但同一个营业日可能两次查到不同的数。
+		"daily_store_ready": h.dailyStoreReady,
+		"checked_at":        time.Now().Format(time.RFC3339),
 	}
 	c.JSON(http.StatusOK, out)
 }

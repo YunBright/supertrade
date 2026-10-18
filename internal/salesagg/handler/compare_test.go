@@ -44,6 +44,31 @@ func (f *cmpCube) LoadSalesReport(
 	return &service.RawSalesReport{Rows: f.rows[storeBranchID]}, nil
 }
 
+// LoadSalesTotals 满足 service.CubeQuerier。
+//
+// ⚠️ 这里按明细求和，而不是另造一个独立总额 ——
+//
+//	对比功能的既有口径就是"从各店同一份明细行汇总"，
+//	而 handler 层只断言列状态与单元格，汇总一致性由
+//	service 包的 TestCompareData_SummaryMatchesReport 负责。
+//	在这里造一个不同的总额，只会让那条不变量测试失去意义。
+func (f *cmpCube) LoadSalesTotals(
+	_ context.Context, storeBranchID, _, _ string,
+) (service.RawReport, error) {
+	if err, ok := f.errs[storeBranchID]; ok {
+		return service.RawReport{}, err
+	}
+	var sum service.RawReport
+	for _, r := range f.rows[storeBranchID] {
+		sum.NetAmount += r.NetAmount
+		sum.NetQty += r.NetQty
+		sum.RefCost += r.RefCost
+		sum.CostedRows += r.CostedRows
+		sum.TotalRows += r.TotalRows
+	}
+	return sum, nil
+}
+
 // claimsStub 是验签中间件的替身：生产里 cmdbootstrap 的 authn verifier
 // 在验签后用 claims.WithClaims 注入；测试里凡带 Authorization 头的请求
 // 注入固定身份（S001/S002 有权限，ZZZZ 没有）。

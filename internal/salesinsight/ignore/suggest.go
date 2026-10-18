@@ -64,7 +64,7 @@ func Suggest(recs []supplier.Record) []Suggestion {
 			out = append(out, s)
 		}
 	}
-	// 置信度高��前 —— 运营先看最可能的那几条。
+	// 置信度高优先 —— 运营先看最可能的那几条。
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Confidence != out[j].Confidence {
 			return out[i].Confidence > out[j].Confidence

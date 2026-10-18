@@ -21,6 +21,45 @@ type fakeCube struct {
 	calls             int
 	rows              map[string][]RawReport
 	err               error
+
+	// totals 是大盘总额的独立返回值；**nil 时按明细行求和**。
+	//
+	// ⚠️ 它**刻意不**默认等于 rows 的和，而是留一个显式开关：
+	//
+	//	如果 fake 恒定返回"行求和"，那么"汇总来自独立查询"与
+	//	"汇总来自明细求和"两种实现的输出**逐字相同**，
+	//	本组既有断言全绿却什么也测不到。
+	//	所以：老用例保持 nil（求和，断言不变），
+	//	而 TestSummaryComesFromTotalsQuery 显式给一个**不同的**值，
+	//	用来证明汇总确实取自总额查询。
+	totals *RawReport
+	// totalsCalls 记录总额查询被调了几次。
+	totalsCalls int
+	// totalsErr 非 nil 时总额查询失败（触发降级路径）。
+	totalsErr error
+}
+
+func (f *fakeCube) LoadSalesTotals(
+	_ context.Context, _, _, _ string,
+) (RawReport, error) {
+	f.totalsCalls++
+	if f.totalsErr != nil {
+		return RawReport{}, f.totalsErr
+	}
+	if f.totals != nil {
+		return *f.totals, nil
+	}
+	var sum RawReport
+	for _, rs := range f.rows {
+		for _, r := range rs {
+			sum.NetAmount += r.NetAmount
+			sum.NetQty += r.NetQty
+			sum.RefCost += r.RefCost
+			sum.CostedRows += r.CostedRows
+			sum.TotalRows += r.TotalRows
+		}
+	}
+	return sum, nil
 }
 
 func (f *fakeCube) LoadSalesReport(

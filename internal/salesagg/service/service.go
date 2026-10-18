@@ -68,6 +68,19 @@ type CubeQuerier interface {
 	// SalesReport：格式化与"毛利覆盖率够不够"的判断属于业务口径，
 	// 必须留在本包而不是泄到 cube 适配层。
 	LoadSalesReport(ctx context.Context, storeBranchID, groupBy, from, to string, limit int) (*RawSalesReport, error)
+
+	// LoadSalesTotals 取**大盘总额**：不带任何维度、不限量。
+	//
+	// ⚠️ 它**不能**由"把 LoadSalesReport 的行加起来"代替。
+	//
+	//	分组的行是"按维度分组后的子集"，求和在两种情况下偏低：
+	//	  ① cube 侧带 Limit（topN 截断）；
+	//	  ② 空类目名/空编码的行被丢弃，而未分组的总额保留同一批行。
+	//	线上实测门店 00 / 2026-10-16：品类口径 2024.6 元 vs
+	//	供应商口径 13003.8 元 —— 顶部数字只统计到 **15.6%**，零报错。
+	//
+	// → 顶部汇总必须是**独立一次无分组查询**的结果。
+	LoadSalesTotals(ctx context.Context, storeBranchID, from, to string) (RawReport, error)
 }
 
 // SalesReport 是一次报表查询的完整结果（汇总 + 明细）。
@@ -77,6 +90,19 @@ type SalesReport struct {
 	To      string      `json:"to"`
 	Summary Summary     `json:"summary"`
 	Rows    []ReportRow `json:"rows"`
+
+	// DataSource 是 "daily_store"（已定稿事实库）或 "cube"（现查源库）。
+	//
+	// ⚠️ 它必须随每次响应回传：改造前卡片与报表页各自现查源库，
+	//	而两边算出来的汇总口径不同（一个少 85%）却**零报错**。
+	//	把这个字段暴露出去，"今天这个数从哪来"才有答案。
+	DataSource string `json:"data_source,omitempty"`
+
+	// FallbackReason 是"没走已定稿事实库"时的可读原因。
+	//
+	// ⚠️ 省略（而不是给空串）是为了让**正常路径的响应逐字不变** ——
+	//	wechat-bot 的卡片按固定字段解析，多一个空串字段也可能进 diff。
+	FallbackReason string `json:"fallback_reason,omitempty"`
 }
 
 // Summary 是顶部 4 个汇总指标。
@@ -112,7 +138,13 @@ type ReportRow struct {
 // Service 是销售报表服务。
 type Service struct {
 	cube CubeQuerier
-	now  func() time.Time
+	// daily 是已定稿销售事实库（PG）；为 nil 时全部现查源库。
+	//
+	// ⚠️ 它与 cube 是**二选一**，不是"PG 优先、失败再查 cube 的每一维"——
+	//	逐维回退会让同一份报表里的总额与明细来自两套口径。
+	//	整段统一选源见 loadRaw。
+	daily DailyRangeLister
+	now   func() time.Time
 }
 
 // New 构造 Service。
@@ -220,28 +252,50 @@ type Query struct {
 }
 
 // Report 执行一次报表查询并做后处理（排序 + 毛利可用性判定）。
+//
+// # ⚠️ 顶部汇总**不**由明细行求和
+//
+// 明细是"按维度分组后的子集"，求和会偏低（见 CubeQuerier.LoadSalesTotals
+// 的注释与线上实测）。所以汇总一律取**独立的无分组查询** / 已定稿事实里的
+// totals 字段。
+//
+// ⚠️ 总额取不到时退回"按明细求和"，但**必须在响应里标出来**：
+//
+//	降级值非零却偏低 85%，拿它当权威基去算环比会得到一个
+//	"看起来正常、实则全错"的百分比。
 func (s *Service) Report(ctx context.Context, q Query) (*SalesReport, error) {
-	if s.cube == nil {
-		return nil, fmt.Errorf("salesagg: cube 未配置")
+	if s.cube == nil && s.daily == nil {
+		return nil, fmt.Errorf("salesagg: 数据源未配置")
 	}
 	if !ValidDimension(q.GroupBy) {
 		return nil, fmt.Errorf("%w: %q", ErrInvalidDimension, q.GroupBy)
 	}
-	raw, err := s.cube.LoadSalesReport(ctx, q.StoreBranchID, q.GroupBy, q.From, q.To, q.Limit)
+	if s.cube == nil {
+		// ⚠️ 装配了事实库但没装 cube（测试/只读部署形态）时，
+		//   回退路径不存在，覆盖不全只能当错误返回 ——
+		//   静默返回空报表会被读成"这家店这段时间没生意"。
+		if s.daily == nil {
+			return nil, fmt.Errorf("salesagg: cube 未配置")
+		}
+		if _, err := s.daily.LoadRange(ctx, q.StoreBranchID, q.From, q.To); err != nil {
+			return nil, err
+		}
+	}
+
+	src, err := s.loadRaw(ctx, q)
 	if err != nil {
 		return nil, err
 	}
-	if raw == nil {
-		return &SalesReport{GroupBy: q.GroupBy, From: q.From, To: q.To}, nil
-	}
 
 	out := &SalesReport{
-		GroupBy: q.GroupBy,
-		From:    q.From,
-		To:      q.To,
-		Rows:    make([]ReportRow, 0, len(raw.Rows)),
+		GroupBy:        q.GroupBy,
+		From:           q.From,
+		To:             q.To,
+		Rows:           make([]ReportRow, 0, len(src.rows)),
+		DataSource:     string(src.source),
+		FallbackReason: src.reason,
 	}
-	for _, r := range raw.Rows {
+	for _, r := range src.rows {
 		cov := coverage(r.CostedRows, r.TotalRows)
 		row := ReportRow{
 			Code:         r.Code,
@@ -271,8 +325,33 @@ func (s *Service) Report(ctx context.Context, q Query) (*SalesReport, error) {
 		return numOf(out.Rows[i].NetAmount) > numOf(out.Rows[j].NetAmount)
 	})
 
-	out.Summary = buildSummary(raw.Rows)
+	out.Summary = summaryOf(*src.totals)
 	return out, nil
+}
+
+// summaryOf 把一行大盘汇总渲染成顶部汇总指标。
+//
+// ⚠️ 口径改动只允许发生在这里 —— 门店对比（CompareData）会为每家店
+//
+//	算**同口径**的汇总，口径不一致就会出现
+//	「单店报表」与「对比列」对不上数，且没人说得清哪份对。
+func summaryOf(t RawReport) Summary {
+	cov := coverage(t.CostedRows, t.TotalRows)
+	out := Summary{
+		NetAmount:       fmtAmount(t.NetAmount),
+		NetQty:          fmtAmount(t.NetQty),
+		RefCost:         fmtAmount(t.RefCost),
+		CostCoverage:    fmtPct(cov),
+		MarginAvailable: cov >= MinCostCoverage,
+	}
+	if out.MarginAvailable {
+		m := t.NetAmount - t.RefCost
+		out.RefMargin = fmtAmount(m)
+		if t.NetAmount != 0 {
+			out.RefMarginPct = fmtPct(m / t.NetAmount)
+		}
+	}
+	return out
 }
 
 // buildSummary 把一组原始行汇成顶部汇总指标。

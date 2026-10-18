@@ -2,9 +2,9 @@ package service
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/salesagg/cubeq"
 )
 
 // RawRow 是从 cube 拿到的**未格式化**聚合行。
@@ -102,6 +102,13 @@ var salesReportMeasures = []string{
 //
 // 抽成纯函数是为了能在不接 cube 的情况下断言"发出去的 query 长什么样"——
 // 这是本仓对 cube 集成的既有纪律（见 cubeclient.query_shape_test.go）。
+//
+// ⚠️ 骨架（measures / 日期过滤）委托给 internal/salesagg/cubeq，
+//
+//	与"每日落 PG 采集"那条链共用同一份定义。
+//	两处各自定义时，2026-10-16 曾出现同一营业日两个口径（2024.6 vs 13003.8）。
+//	维度成员仍留在本包：报表与采集要的维度组合本来就不同，
+//	统一它们会让两个调用方都开始依赖对方的字段需求。
 func BuildSalesReportQuery(groupBy, from, to string, limit int) (cubeclient.CubeQuery, error) {
 	spec, ok := dimSpecs[groupBy]
 	if !ok {
@@ -111,25 +118,7 @@ func BuildSalesReportQuery(groupBy, from, to string, limit int) (cubeclient.Cube
 	if spec.extraMember != "" {
 		dims = append(dims, spec.extraMember)
 	}
-	// 日期过滤：oper_date 在源库是 char(10) 字符串，且 cube 侧标了
-	// time 类型。走 gte/lte 的字面值比较（不走 CAST），实测 7 天区间 225ms。
-	filters := []cubeclient.CubeFilter{}
-	if from != "" {
-		filters = append(filters, cubeclient.CubeFilter{
-			Member: "sales_report.oper_date", Operator: "gte", Values: []any{from},
-		})
-	}
-	if to != "" {
-		filters = append(filters, cubeclient.CubeFilter{
-			Member: "sales_report.oper_date", Operator: "lte", Values: []any{to},
-		})
-	}
-	return cubeclient.CubeQuery{
-		Measures:   salesReportMeasures,
-		Dimensions: dims,
-		Filters:    filters,
-		Limit:      limit,
-	}, nil
+	return cubeq.Query(dims, from, to, limit), nil
 }
 
 // rowFloat 从 cube 返回的行里取 float64。
@@ -143,14 +132,7 @@ func rowFloat(row map[string]any, key string) float64 {
 
 // rowStr 取字符串，nil / 缺字段返空串。
 func rowStr(row map[string]any, key string) string {
-	v, ok := row[key]
-	if !ok || v == nil {
-		return ""
-	}
-	if s, ok := v.(string); ok {
-		return strings.TrimSpace(s)
-	}
-	return strings.TrimSpace(fmt.Sprint(v))
+	return cubeq.Str(row, key)
 }
 
 // ParseSalesReportRows 把 cube 的返回行转成 RawReport。

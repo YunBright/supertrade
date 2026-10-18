@@ -50,10 +50,18 @@
 # pos-gateway 与 notification-gateway 是真实业务进程;cube-router 需要
 # POSTGRES_DSN,真正使用 PG)。
 # ⚠️ 2026-10-17 新增 sales-insight(AI 销售日报/周报/月报,cmd/sales-insight):
-#    纯只读查询 + LLM 解读,**不需要 POSTGRES_DSN**(报告与审计由
-#    wechat-bot 落 dapr state,本服务无状态)。无自有 components 目录
-#    (不订阅任何 topic),形态对齐 sales-agg。
-#    ⚠️ 它会调 cube,所以与 sales-agg 一样 **Requires=cube-gateway.service**。
+#    LLM 解读 + **读取**每日销售事实库。
+#    ⚠️ 2026-10-18 起它**需要 POSTGRES_DSN**:每天 22:45 由 sales-agg
+#    采集落 PG 的 sales_daily_*(见 internal/salesdaily),AI 日报与月报
+#    优先读那一行、覆盖不全才整段回退查 cube。
+#    **它只读不写**:不 AutoMigrate、不补采 —— 写者唯一是 sales-agg。
+#    DSN 缺失时**不阻止启动**,退化成每次现查 cube(功能仍在,只是
+#    同一个营业日可能两次查到不同的数),healthz 的
+#    `daily_store_ready=false` 会显式暴露这件事。
+#    报告与审计仍由 wechat-bot 落 dapr state。
+#    无自有 components 目录(不订阅任何 topic)。
+#    ⚠️ 它会调 cube(库存/天气/回退路径),与 sales-agg 一样
+#    **Requires=cube-gateway.service**。
 #    ⚠️ 端口 8112 是 2026-10-17 实测后定的:8111 已被 pricing 占用
 #    (deployer/tests/contract 的 TestPricingPortIsNotTaken 会报冲突)。
 # ⚠️ 2026-10-15:pricing **不再是** placeholder —— 它已实现 POP 价签的

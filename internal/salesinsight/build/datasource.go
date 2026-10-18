@@ -23,6 +23,26 @@ import (
 // 结构性地把全量商品塞进上下文，因为组装逻辑只能走这五个查询，
 // 而它们的 Limit 都由 TopN 夹住。
 type DataSource interface {
+	// TotalsSales 取**大盘总额**：不分组、不限量、不做任何行过滤。
+	//
+	// ⚠️ 这条**不能**由"把所有品类加起来"代替（2026-10-17 修复）。
+	//
+	//	原来的 `f.Totals = sumCategories(catCur)` 有两个各自都会漏的口子：
+	//
+	//	  1. catCur 来自 CategorySales(…, topN)，cube 侧带 `Limit: topN`
+	//	     ⇒ 排在 topN 之外的类目根本没回来，求和自然缺一块；
+	//	  2. CategorySales 对 `item_cls_parent.name` 为空的行**直接 continue**
+	//	     ⇒ 没有归类的商品整行消失，而供应商侧同一批行是**保留**的
+	//	     （suppliers.go 的注释明说"丢弃会让销量凭空从大盘里消失"）。
+	//
+	//	线上实测（门店 00，2026-10-16）：品类口径 2024.6 元，
+	//	供应商口径 13003.8 元 —— 头条只统计到 **15.6%**，
+	//	而 LLM 只能把它写成一条"自营贡献高于总销售额"的软警告。
+	//
+	//	→ 所以大盘必须是**独立的一次无分组查询**：不分组就不会因空类目丢行，
+	//	  不限量就不会被 topN 截断。
+	//	  多一次查询的成本，换的是"头条数字是对的"。
+	TotalsSales(ctx context.Context, storeBranchID, from, to string) (TotalsRow, error)
 	// CategorySales 按父类别聚合，from/to 闭区间，返回 TopN。
 	CategorySales(ctx context.Context, storeBranchID, from, to string, topN int) ([]CategoryRow, error)
 	// ProductSales 按商品聚合，返回 TopN。
@@ -53,6 +73,18 @@ type CategoryRow struct {
 	TotalRow  int64
 }
 
+// TotalsRow 是大盘总额（未格式化）。
+//
+// ⚠️ 它与 CategoryRow 的差别不是"少了个 Name"，而是**行集不同**：
+// 品类是"按父类别分组后的子集"，总额是"全部行"。
+type TotalsRow struct {
+	Amount    float64
+	Qty       float64
+	Cost      float64
+	CostedRow int64
+	TotalRow  int64
+}
+
 // ProductRow 是商品聚合行（未格式化）。
 type ProductRow struct {
 	ItemNo    string
@@ -67,7 +99,21 @@ type ProductRow struct {
 
 // SupplierSalesRow 是供应商聚合行（未格式化）。
 type SupplierSalesRow struct {
-	Code         string
+	Code string
+	// Name 是供应商名称，**可能为空**。
+	//
+	// ⚠️ 两条取数路径的差别就在这里，而它必须显式建模：
+	//
+	//	PG 路径（已落库的每日快照）：采集时补过字典，Name 有值；
+	//	cube 路径：supplier 是 storage: duck 模型，与 sales_report（live）
+	//	           **不能 join**（cube 的 join checkStorage 在构造期就拒绝
+	//	           live→duck），所以必须另查一次字典，Name 永远是空的。
+	//
+	// 调用方要两条都处理：有 Name 就用，没有就查字典。
+	// ⚠️ 早期实现让 cube 侧返回空 Name 却不写注释，
+	//   后来"PG 路径"接进来时很容易被当成 bug 去"修"成查字典，
+	//   于是每份报告都多打一次无用的字典请求。
+	Name         string
 	Amount       float64
 	Qty          float64
 	ProductCount int
@@ -160,6 +206,35 @@ func str(row map[string]any, key string) string {
 		return strings.TrimSpace(s)
 	}
 	return strings.TrimSpace(fmt.Sprint(v))
+}
+
+// TotalsSales 实现 DataSource。
+//
+// ⚠️ 这里**刻意不带 Dimensions，也不带 Limit** ——
+//
+//	带了任何一项，这次查询就退化成"某一维度的子集求和"，
+//	于是 DataSource.TotalsSales 注释里那两个漏点会原样复现。
+//	判据见 builder_test.go 的 TestTotalsQueryHasNoDimensionNorLimit。
+func (s *DaprSource) TotalsSales(ctx context.Context, storeBranchID, from, to string) (TotalsRow, error) {
+	data, err := s.c.LoadCubeQuery(withBranch(ctx, storeBranchID), "sales_report", cubeclient.CubeQuery{
+		Measures: measures,
+		Filters:  dateFilters(from, to),
+	})
+	if err != nil {
+		return TotalsRow{}, fmt.Errorf("build: cube totals query: %w", err)
+	}
+	if len(data) == 0 {
+		// 无数据与"有数据但全为 0"是两回事：前者不该报成功。
+		return TotalsRow{}, fmt.Errorf("build: cube totals query 返回空结果（%s~%s）", from, to)
+	}
+	row := data[0]
+	return TotalsRow{
+		Amount:    num(row, "sales_report.total_net_amount"),
+		Qty:       num(row, "sales_report.total_net_qty"),
+		Cost:      num(row, "sales_report.total_ref_cost"),
+		CostedRow: int64(num(row, "sales_report.costed_rows")),
+		TotalRow:  int64(num(row, "sales_report.count")),
+	}, nil
 }
 
 // CategorySales 实现 DataSource。

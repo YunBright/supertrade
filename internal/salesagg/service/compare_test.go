@@ -28,6 +28,29 @@ func (f *perStoreCube) LoadSalesReport(
 	return &RawSalesReport{Rows: f.rows[storeBranchID]}, nil
 }
 
+// LoadSalesTotals 满足 CubeQuerier。
+//
+// ⚠️ 这里**故意让总额等于按行求和**：对比功能的既有口径就是
+// "从明细行汇总"，而门店对比读的是各店**同一次**结果，
+// 不存在"分组行求和偏低"的问题（见 service.go 的 CubeQuerier 注释）。
+// 改成独立查询会让本组既有断言全部失效且掩盖真正的问题。
+func (f *perStoreCube) LoadSalesTotals(
+	_ context.Context, storeBranchID, _, _ string,
+) (RawReport, error) {
+	if err, ok := f.errs[storeBranchID]; ok {
+		return RawReport{}, err
+	}
+	var sum RawReport
+	for _, r := range f.rows[storeBranchID] {
+		sum.NetAmount += r.NetAmount
+		sum.NetQty += r.NetQty
+		sum.RefCost += r.RefCost
+		sum.CostedRows += r.CostedRows
+		sum.TotalRows += r.TotalRows
+	}
+	return sum, nil
+}
+
 // TestCompareData_ForbiddenNoCubeCall 无权限门店：整列 forbidden、
 // summary / cells 无该店 key，且**一次 cube 调用都不发生**。
 //
@@ -186,7 +209,7 @@ func TestCompareData_SummaryMatchesReport(t *testing.T) {
 }
 
 // TestCompareData_InvalidDimension 维度在 service 层再拒一次
-//（存储层白名单之外的第二道闸）。
+// （存储层白名单之外的第二道闸）。
 func TestCompareData_InvalidDimension(t *testing.T) {
 	s := New(&perStoreCube{})
 	_, err := s.CompareData(context.Background(), CompareInput{

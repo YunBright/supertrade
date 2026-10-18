@@ -86,6 +86,93 @@ func (l List) Codes() map[string]bool {
 //   所以只去空白，不做任何数值转换。
 func normalizeCode(s string) string { return strings.TrimSpace(s) }
 
+// IndexForSales 把名单对齐到「本期销售数据里实际出现的编码」，
+// 返回 销售编码 → Entry 的映射（只含真正命中的）。
+//
+// # 为什么需要它
+//
+// 名单里的编码是**从字典侧**（t_bd_supcust_info）录的，
+// 而运行时过滤用的是**流水侧**（t_rm_daysum.supcust_no）。
+// 思迅这两个表对同一个供应商的前导零并不总是一致 ——
+// 线上实测（2026-10-17，门店 00）：名单里是 `029 猪肉自营`，
+// 流水里却是 `29 猪肉自营`，于是**全店最大的供应商（3378.3 元，占 26%）
+// 静默逃过排除**，继续出现在"外部优质货源"榜单里，
+// 而报告里没有任何异常信号。
+//
+// # ⚠️ 为什么不能简单地"两边都补零"
+//
+// 本包的既有约定明确记着：`019` 与 `19` 是两个不同的供应商。
+// 无条件补零会把它们合并，等于用"匹配上了"换来"排错了"。
+//
+// → 所以对齐有三条硬约束：
+//
+//  1. **精确命中优先**：名单编码与销售编码逐字相同时直接采用；
+//  2. **变体必须在销售数据里真实存在**才考虑补零/去零，
+//     于是"019"与"19"都在流水里时各自保持原样，不会被合并；
+//  3. **多个变体同时命中 = 判为歧义，不排除** ——
+//     漏排除的代价（榜单含自采）远小于错排除的代价（真供应商凭空消失）。
+//
+// 歧义时保守不排除，与本包其它分支的取向一致。
+func IndexForSales(entries []Entry, salesCodes []string) map[string]Entry {
+	present := make(map[string]bool, len(salesCodes))
+	widths := make(map[int]bool, 4)
+	for _, c := range salesCodes {
+		c = normalizeCode(c)
+		if c == "" {
+			continue
+		}
+		present[c] = true
+		widths[len(c)] = true
+	}
+
+	out := make(map[string]Entry, len(entries))
+	for _, e := range entries {
+		code := normalizeCode(e.Code)
+		if code == "" {
+			continue
+		}
+		if present[code] { // 约束 1：精确命中
+			out[code] = e
+			continue
+		}
+		// 约束 2 + 3：候选变体必须在销售数据里存在，且唯一。
+		//
+		// ⚠️ 候选**必须去重**：同一编码带多个前导零时
+		//   不同宽度会塌缩成同一个字符串（`0029` 在 w=2 与 w=3 下都是 `29`），
+		//   不去重就会把"同一个候选"数成两个 → 误判歧义 → 静默不排除。
+		var hits []string
+		seenHit := make(map[string]bool, 4)
+		for w := range widths {
+			v := fitWidth(code, w)
+			if v == code || !present[v] || seenHit[v] {
+				continue
+			}
+			seenHit[v] = true
+			hits = append(hits, v)
+		}
+		if len(hits) == 1 {
+			out[hits[0]] = e
+		}
+	}
+	return out
+}
+
+// fitWidth 把编码调整到指定宽度：不足补前导 0，过长去前导 0。
+//
+// ⚠️ 宽度**相等时必须原样返回**：若也走去零分支，
+//   `029` 在 w=3 时会变成 `29`，与 w=2 的候选重复，
+//   于是同一个候选被数成两个 → 误判为"歧义" → 静默不排除。
+func fitWidth(code string, w int) string {
+	switch {
+	case w == len(code):
+		return code
+	case w < len(code):
+		return strings.TrimLeft(code, "0")
+	default:
+		return strings.Repeat("0", w-len(code)) + code
+	}
+}
+
 // Store 是名单的持久化。
 //
 // # 为什么按门店存成独立文件

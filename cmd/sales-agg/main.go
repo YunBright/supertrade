@@ -16,9 +16,10 @@
 //   - 不发企业微信消息 —— 企微出口唯一在 wechat-bot 仓（见 docs/16 §5 服务边界表）。
 //     本服务只提供 GET /reports/sales/today，wechat-bot 经 dapr service
 //     invocation 取数后自己渲染并发送。
-//   - 存储只有**一张表** sales_compare_templates（门店对比模板，2026-10-17
-//     门店对比功能引入的唯一持久化）—— 报表本体仍是即席查询。模板是
-//     全局共享配置，不是业务流水；POSTGRES_DSN 由此而来。
+//   - 存储是 **sales_compare_templates**（门店对比模板，全局共享配置）
+//     与 **sales_daily_*（每日销售事实包，2026-10-17 新增）**。
+//     报表本体仍是即席查询；每日事实包是**唯一被物化的销售数据**，
+//     写者只有本服务，读者是 sales-insight（见 internal/salesdaily）。
 //   - 不做门店到 cube 实例的路由 —— 那是 cube-router 的职责，
 //     本服务只带 X-Branch-ID 过去。
 //
@@ -35,15 +36,19 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
+	"time"
 
 	dapr "github.com/dapr/go-sdk/client"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/salesagg/collect"
 	"github.com/YunBright/supertrade/internal/salesagg/compare"
 	"github.com/YunBright/supertrade/internal/salesagg/handler"
 	"github.com/YunBright/supertrade/internal/salesagg/service"
+	"github.com/YunBright/supertrade/internal/salesdaily"
 	"github.com/YunBright/supertrade/pkg/cmdbootstrap"
 	"github.com/YunBright/supertrade/pkg/middleware"
 )
@@ -66,6 +71,11 @@ var (
 	appSvc   *service.Service
 	appDB    *gorm.DB
 	appStore *compare.Store
+	// appDaily 是每日销售事实包的存储（**唯一写者**）。
+	appDaily *salesdaily.Store
+	// appCube 是采集用的 cube 数据源（报表用 service.NewDaprCubeQuerier，
+	// 采集用 collect.NewDaprSource —— 两者要查的维度组合不同）。
+	appCube *cubeclient.DaprCubeClient
 )
 
 func initApp() error {
@@ -83,6 +93,7 @@ func initApp() error {
 		cubeclient.DefaultCubeAppID(),
 		cubeclient.DefaultCubeQueryPath(),
 	)
+	appCube = cube
 	appSvc = service.New(service.NewDaprCubeQuerier(cube))
 
 	// 门店对比模板的持久化（唯一一张表）。DSN 必填 fail-fast，
@@ -100,12 +111,150 @@ func initApp() error {
 	}
 	appStore = compare.NewStore(appDB)
 
+	// ---- 每日销售事实包落库（唯一写者）----
+	//
+	// ⚠️ 写者只能是 sales-agg，不能是 sales-insight：
+	//
+	//	每日销售统计卡片与 AI 销售日报是**同一份销售事实的两种呈现**。
+	//	改造前两边各自现查 cube，于是 2026-10-16 出现同一个营业日的
+	//	两个口径（品类 2024.6 元 vs 供应商 13003.8 元），差 6 倍、零报错。
+	//	→ 只采一次、只落一次，两个消费方读同一行。
+	//
+	// AutoMigrate 放在**写者**这里：读侧（sales-insight）不建表，
+	// 缺表时它会明确报错，而不会被静默地 AutoMigrate 成一个空壳。
+	appDaily = salesdaily.NewStore(appDB, nil)
+	if err := appDB.AutoMigrate(salesdaily.Models()...); err != nil {
+		return fmt.Errorf("auto migrate sales_daily_*: %w", err)
+	}
+
+	// 报表服务**优先读已定稿事实库**，覆盖不全才整段现查源库。
+	//
+	// ⚠️ 换的是**数据来源**而不是接口：wechat-bot 的每日销售统计卡片与
+	// Flutter 报表页调的都是 /reports/sales 与 /reports/sales/today，
+	// 另开一个"读 PG"的端点就必须改两个调用方 ——
+	// 而只要有一个没改，就又出现"卡片读 PG、报表页读 cube"的口径分叉。
+	//
+	// 这样一来，**卡片与 AI 日报读的是同一行**（两边都经过 PG）。
+	appSvc = appSvc.WithDailyRange(appDaily)
+
 	slog.Info("sales-agg app initialized",
 		"cube_app_id", cubeclient.DefaultCubeAppID(),
 		"cube_query_path", cubeclient.DefaultCubeQueryPath(),
 		"db_driver", "postgres",
+		"daily_collect", true,
 	)
+
+	// ---- 采集定时任务：sales-agg 自己注册，与 wechat-bot 无关 ----
+	//
+	// ⚠️ 为什么**不**由 wechat-bot 注册（这是 2026-10-18 的一次修正）：
+	//
+	//	采集的触发不能依赖推送服务。wechat-bot 挂了 / 配置写错 / 企微侧故障
+	//	⇒ 数据不再落库，而**所有报表看起来完全正常**
+	//	（消费侧会回退查源库）—— 这正是"静默降级让问题永远不被发现"
+	//	的又一个结构性实例。
+	//
+	//	门店清单来自 auth 的 GET /auth/branches（在营门店），
+	//	而不是 wechat-bot 的应用配置（推送开关）——
+	//	后者回答的是"谁想看报告"，而采集是"在营门店级"的事。
+	//
+	// ⚠️ 注册失败**不阻断启动**：sidecar 可能比 app 晚几百毫秒就绪，
+	//	auth 也可能还没起。让整个服务起不来只会得到一个没有线索的崩溃。
+	startJobReconciler()
 	return nil
+}
+
+// reconcileInterval 是重新对齐采集 job 的周期。
+//
+// ⚠️ 不能只在启动时注册一次：
+//
+//	auth 里新增一家门店后，没有人会再去通知 sales-agg。
+//	每小时一次足够（门店开通不是分钟级的事），
+//	而每次只是"按清单重注册"，幂等，代价可忽略。
+const reconcileInterval = time.Hour
+
+// startJobReconciler 启动采集 job 的对账循环。
+func startJobReconciler() {
+	// ⚠️ 门店清单走 **dapr service invocation** 打 app-id=login
+	//   （auth 的 login 引擎），不直连 :8081 ——
+	//   直连会绕过 dapr 的 accessControl 白名单，
+	//   而本仓其它跨服务调用一律走 dapr，这里保持一致。
+	sidecar := sidecarBaseURL()
+	branchLister := collect.NewAuthBranchLister(sidecar, envStr("AUTH_LOGIN_APP_ID", collect.LoginAppID))
+	if branchLister == nil {
+		slog.Warn("sales-agg: 没有 sidecar（DAPR_HTTP_PORT 未设置），采集定时任务不会注册" +
+			"（销售数字仍会实时查源库，只是不落库）")
+		return
+	}
+	jobs := collect.NewDaprJobClient(sidecar)
+	if jobs == nil {
+		slog.Warn("sales-agg: 没有 sidecar，采集定时任务不会注册")
+		return
+	}
+	rec := collect.NewReconciler(branchLister, jobs, collectCallbackAddress())
+
+	ctx := context.Background()
+	runOnce := func() {
+		res, err := rec.Reconcile(ctx)
+		if err != nil {
+			// ⚠️ 只 Warn 不 panic：一次对账失败不该拖垮报表服务。
+			//	而"采集没注册"这件事由 health 端点与 PG 里有没有新行暴露。
+			slog.Warn("sales-agg: 采集定时任务对账失败", "err", err)
+			return
+		}
+		lvl := slog.LevelInfo
+		if len(res.Failed) > 0 {
+			lvl = slog.LevelWarn
+		}
+		slog.Log(ctx, lvl, "sales-agg: 采集定时任务已对齐",
+			"branches", res.Branches, "jobs", res.Jobs, "failed", res.Failed)
+	}
+	runOnce()
+
+	go func() {
+		t := time.NewTicker(reconcileInterval)
+		defer t.Stop()
+		for range t.C {
+			runOnce()
+		}
+	}()
+}
+
+// collectCallbackAddress 是 job 回调打到的地址。
+//
+// ⚠️ 用 **app 端口**（APP_PORT），不是 DAPR_HTTP_PORT：
+//
+//	后者是 sidecar 端口，填进去会打到自己都打不通的地方。
+//	（wechat-bot 的 job.go 有同样的告警，踩过一次。）
+func collectCallbackAddress() string {
+	port := strings.TrimPrefix(strings.TrimSpace(os.Getenv("APP_PORT")), ":")
+	if port == "" {
+		port = strings.TrimPrefix(defaultPort(), ":")
+	}
+	return "http://127.0.0.1:" + port + "/sales/daily/collect"
+}
+
+// defaultPort 是本地裸跑（无 sidecar）时的回退端口。
+//
+// ⚠️ 生产端口是 **8110**（8109 已被 settlement-auditor 占用），
+//
+//	线上以 unit 注入的 APP_PORT 为准。
+func defaultPort() string { return ":8110" }
+
+// sidecarBaseURL 是 sidecar 的 HTTP 根地址。
+func sidecarBaseURL() string {
+	port := strings.TrimSpace(os.Getenv("DAPR_HTTP_PORT"))
+	if port == "" {
+		return ""
+	}
+	return "http://127.0.0.1:" + port
+}
+
+// envStr 取环境变量，非空时返回它，否则返回默认值。
+func envStr(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
 }
 
 func registerRoutes(r *gin.Engine) {
@@ -127,6 +276,13 @@ func registerRoutes(r *gin.Engine) {
 	handler.New(appSvc).RegisterRoutes(r)
 	// 门店对比（模板 CRUD + 逐店取数）。依赖 appStore（OnStart 已建）。
 	handler.NewCompare(appSvc, appStore).RegisterRoutes(r)
+	// 每日销售事实落库。依赖 appDaily + appCube（OnStart 已建）。
+	//
+	// ⚠️ 注册在**鉴权链之内**（与上面两组一致），因为它同样会经
+	//   forwardBearerToOutgoing 向 cube 发起调用 —— 侧写一条绕过它的路径
+	//   会让这条调用缺 api-token，症状是"采集永远 401"而不是"没权限"。
+	handler.NewDailyCollectHandler(collect.NewCollector(collect.NewDaprSource(appCube), appDaily)).
+		RegisterRoutes(r)
 }
 
 // registerDaprRoutes 在 auth 中间件**之前**注册免鉴权端点。

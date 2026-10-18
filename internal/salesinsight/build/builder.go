@@ -55,7 +55,12 @@ type Builder struct {
 	// ⚠️ 它是**唯一**的供应商排除依据；为 nil 时所有自用供应商
 	//   都会回到榜单，且上层会产生一条可见告警（不会静默）。
 	ignores *ignore.Store
-	now     func() time.Time
+	// loader 是"按区间读已定稿销售事实"的通道（PG）。
+	//
+	// ⚠️ 为 nil 时本服务**只**查 cube —— 那是未装配 PG 的形态，
+	//   不是"PG 里没数据"，两者在健康检查与告警上必须区分。
+	loader RangeLoader
+	now    func() time.Time
 }
 
 // NewBuilder 构造组装器。
@@ -66,11 +71,40 @@ func NewBuilder(src DataSource, wx weather.Provider) *Builder {
 	return &Builder{src: src, wx: wx, now: time.Now}
 }
 
+// WithRangeLoader 注入"已定稿销售事实"的读通道（PG）。
+//
+// ⚠️ 注入后，同一个营业日的销售数字会**优先**读已落库的那一份，
+//
+//	而不是现查源库 —— 因为源库在营业时段内还在被 POS 补写，
+//	同一个营业日两次查询会得到两个数，而用户会把两次看到的数
+//	当成"系统算错了"。
+//
+// 未覆盖整个区间时**整段**回退查源库，并在事实包里显式说明缺了几天；
+// 绝不逐天混用（那会让同一份报告里的总额与品类合计来自两套口径）。
+func (b *Builder) WithRangeLoader(l RangeLoader) *Builder {
+	b.loader = l
+	return b
+}
+
+// route 返回本次报告用的数据源。
+//
+// ⚠️ 未装配 loader 时**原样返回 b.src**，不做任何包装 ——
+//
+//	这样"没接 PG"这条路径的行为与改造前逐字相同，
+//	而它的测试（builder_test.go 里那套 fakeSource）也继续有效。
+func (b *Builder) route() DataSource {
+	if b.loader == nil {
+		return b.src
+	}
+	return newRoutedSource(b.loader, b.src)
+}
+
 // WithIgnores 注入人工忽略名单存储。
 //
 // ⚠️ 不注入也能跑，但那时供应商榜单**不排除任何自用渠道**，
-//   且会在事实包里留下"尚未配置名单"的告警 ——
-//   这是刻意的：改造后若没装配名单，宁可让人看见问题，也别静默出错。
+//
+//	且会在事实包里留下"尚未配置名单"的告警 ——
+//	这是刻意的：改造后若没装配名单，宁可让人看见问题，也别静默出错。
 func (b *Builder) WithIgnores(s *ignore.Store) *Builder {
 	b.ignores = s
 	return b
@@ -107,6 +141,10 @@ func (b *Builder) Build(ctx context.Context, opt Options) (*fact.Fact, error) {
 	if opt.StoreBranchID == "" {
 		return nil, fmt.Errorf("build: 缺少门店（store = X-Branch-ID）")
 	}
+
+	// ⚠️ 请求级数据源：装配了 PG 读通道时，销售四维按**区间**统一选路
+	//   （见 routedSource 的注释）。未装配时它就是 b.src 本身。
+	src := b.route()
 
 	topN := fact.TopN(opt.TopN)
 	if opt.SelfUseKeywords != nil {
@@ -167,15 +205,24 @@ func (b *Builder) Build(ctx context.Context, opt Options) (*fact.Fact, error) {
 	}
 
 	// ---- 3. 品类（本期 + 上期）----
-	catCur, err := b.src.CategorySales(ctx, opt.StoreBranchID, f.Meta.From, f.Meta.To, topN)
+	catCur, err := src.CategorySales(ctx, opt.StoreBranchID, f.Meta.From, f.Meta.To, topN)
 	if err != nil {
 		return nil, fmt.Errorf("build: 取本期品类销售: %w", err)
 	}
-	catPrev, err := b.src.CategorySales(ctx, opt.StoreBranchID, f.Meta.PrevFrom, f.Meta.PrevTo, topN)
+	catPrev, err := src.CategorySales(ctx, opt.StoreBranchID, f.Meta.PrevFrom, f.Meta.PrevTo, topN)
 	if err != nil {
 		// 上期拿不到不算致命：没有环比的报告仍然有用。
+		//
+		// ⚠️ 文案必须精确到"**品类**环比"，不能说"本次不做环比"。
+		//
+		//	2026-10-17 之前这句话是对的（大盘由品类求和，品类没了环比就没了）。
+		//	大盘改成独立查询之后，两条查询有了各自的成败 ——
+		//	本分支失败而总额查询成功时，报告**仍然有大盘环比**。
+		//	若沿用旧文案，就会出现同一份报告里
+		//	"销售额 +30%（上期 10000 元）"与"本次不做环比"并存。
 		sufficiency.Sufficient = false
-		sufficiency.Issues = append(sufficiency.Issues, "上期数据获取失败，本次不做环比")
+		sufficiency.Issues = append(sufficiency.Issues,
+			"上期品类数据获取失败，品类环比不可用（大盘环比不受影响）")
 		// ⚠️ **仍然要用本期数据组装品类**，只是没有环比。
 		//   最初写成 `if err != nil { ... } else { f.Categories = ... }`，
 		//   于是上期查询一失败，本期排行也一起消失 ——
@@ -187,23 +234,65 @@ func (b *Builder) Build(ctx context.Context, opt Options) (*fact.Fact, error) {
 		f.Categories = buildCategories(catCur, catPrev)
 	}
 
-	// 大盘由**品类**求和 —— 顶层分类覆盖了全部销售额。
+	// 大盘总额：**独立一次无分组查询**（2026-10-17 从"品类求和"改过来）。
 	//
-	// ⚠️ 这里刻意不用"单独查一次总额"：那会是第六次查询，
-	//   而品类求和与总额一致（实测 salesagg 的类别口径已与既有报表对账）。
-	//   多一次查询的成本换来的是"两个口径可能不一致"的风险。
-	f.Totals = sumCategories(catCur)
-	if len(catCur) == 0 {
+	// ⚠️ 原来这里写的是"大盘由品类求和 —— 顶层分类覆盖了全部销售额，
+	//   刻意不用单独查一次总额，省一次查询"。那条推理**是错的**：
+	//   "顶层分类覆盖全部销售额"这个前提只在**不截断、不丢行**时成立，
+	//   而 CategorySales 恰恰带 Limit:topN 且丢弃空类目行。
+	//   线上实测门店 00 / 2026-10-16：品类口径 2024.6 元 vs 供应商口径
+	//   13003.8 元 —— 头条只统计到 15.6%，且**零报错**。
+	//
+	// → 省一次查询的成本，换头条数字错，不划算。
+	curTotals, _ := b.loadTotals(ctx, opt.StoreBranchID, f.Meta.From, f.Meta.To, catCur, &sufficiency, src)
+	f.Totals = curTotals
+
+	// ---- 环比：与上期的对比 ----
+	//
+	// ⚠️ 这一段以前**整段不存在**（2026-10-17 修复）。
+	//
+	//	Deltas 全仓只有 engine_test.go 里被赋过值，生产代码从不赋值，
+	//	于是它永远是零值：prev_net_amount=0、has_prev=false。
+	//	后果不是"数字难看"，而是**报告自相矛盾**：
+	//
+	//	  prompt.go 走 `else if f.Deltas.HasPrev` 的 else 分支 →
+	//	  头条写「销售额 X 元（无上期数据，不做环比）」，
+	//	  而同一次生成的品类却带着真实环比（蛋类 +36.1%）——
+	//	  因为品类环比来自 catPrev，与 Deltas 是两条独立通路。
+	//	  LLM 于是把矛盾当成一条 warning 写进报告
+	//	  （"本期无上期销售额数据，环比仅有百分比，缺基数参考"）。
+	//
+	// → 所以 has_prev 必须与上期**是否真的取到数据**一致，
+	//   而不是恒为 false；缺它时环比无法在总览层解释，
+	//   用户会以为"这家店第一天开张"。
+	//
+	// ⚠️ 上期查询失败（catPrev 为 nil）时保持 has_prev=false，
+	//   与上面 sufficiency 里那条「上期数据获取失败」呼应 ——
+	//   这两处必须同时成立，否则一条说有数据、一条说没数据。
+	prevTotals, prevAuthentic := b.loadTotals(ctx, opt.StoreBranchID, f.Meta.PrevFrom, f.Meta.PrevTo, catPrev, &sufficiency, src)
+	f.Deltas.PrevNetAmount = prevTotals.NetAmount
+	f.Deltas.PrevNetQty = prevTotals.NetQty
+	// ⚠️ 必须要求 prevAuthentic：降级求和值非零但偏低 85%，
+	//   拿它当基会算出一个看起来正常、实则全错的环比。
+	f.Deltas.HasPrev = prevAuthentic && prevTotals.NetAmount != 0
+	if f.Deltas.HasPrev {
+		f.Deltas.AmountAbs = f.Totals.NetAmount - prevTotals.NetAmount
+		// pctChange 在 prev==0 时返回 0 而不是 +Inf，
+		// 与 fact.Deltas.AmountPct 的注释一致。
+		f.Deltas.AmountPct = pctChange(f.Totals.NetAmount, prevTotals.NetAmount)
+	}
+
+	if len(catCur) == 0 && f.Totals.NetAmount == 0 {
 		sufficiency.Sufficient = false
 		sufficiency.Issues = append(sufficiency.Issues, "本期无销售数据")
 	}
 
 	// ---- 4. 商品（本期 + 上期）----
-	prodCur, err := b.src.ProductSales(ctx, opt.StoreBranchID, f.Meta.From, f.Meta.To, topN)
+	prodCur, err := src.ProductSales(ctx, opt.StoreBranchID, f.Meta.From, f.Meta.To, topN)
 	if err != nil {
 		return nil, fmt.Errorf("build: 取本期商品销售: %w", err)
 	}
-	prodPrev, err := b.src.ProductSales(ctx, opt.StoreBranchID, f.Meta.PrevFrom, f.Meta.PrevTo, topN)
+	prodPrev, err := src.ProductSales(ctx, opt.StoreBranchID, f.Meta.PrevFrom, f.Meta.PrevTo, topN)
 	if err != nil {
 		sufficiency.Sufficient = false
 		sufficiency.Issues = append(sufficiency.Issues, "上期商品数据获取失败，商品环比不可用")
@@ -229,7 +318,7 @@ func (b *Builder) Build(ctx context.Context, opt Options) (*fact.Fact, error) {
 		prodCur = prodCur[:topN]
 		itemNos = itemNos[:topN]
 	}
-	if s, err := b.src.StockByItems(ctx, opt.StoreBranchID, itemNos); err != nil {
+	if s, err := src.StockByItems(ctx, opt.StoreBranchID, itemNos); err != nil {
 		sufficiency.Sufficient = false
 		sufficiency.Issues = append(sufficiency.Issues, "库存数据获取失败，缺货判断不可用")
 	} else {
@@ -237,7 +326,7 @@ func (b *Builder) Build(ctx context.Context, opt Options) (*fact.Fact, error) {
 	}
 
 	// ---- 6. 供应商 ----
-	f.Suppliers, f.ExcludedSuppliers = b.buildSuppliers(ctx, opt, f, topN, &sufficiency)
+	f.Suppliers, f.ExcludedSuppliers = b.buildSuppliers(ctx, opt, f, topN, &sufficiency, src)
 
 	// ---- 7. 商品排行 + 归因（依赖品类与库存）----
 	f.TopProducts = buildProducts(prodCur, prodPrev, f.Categories, stocks)
@@ -245,6 +334,26 @@ func (b *Builder) Build(ctx context.Context, opt Options) (*fact.Fact, error) {
 
 	// ---- 8. 规则摘要 ----
 	f.RuleInsights = buildRuleInsights(f, stocks)
+
+	// ---- 9. 取数来源说明 ----
+	//
+	// ⚠️ 装配了 PG 读通道时，这里会写清"哪一段没走已定稿数据、为什么"。
+	//
+	//	它是**面向使用者**的（店长/运维在 App 与审计里都能看到），
+	//	不是给开发者的日志 —— 所以措辞要能回答一个运营问题：
+	//	"这份报告的数字是哪儿来的、少了哪几天"。
+	//
+	// ⚠️ 但它**不**把 sufficient 置为 false：
+	//
+	//	"PG 没覆盖全、已回退查源库"并不代表这份报告不可信 ——
+	//	回退路径取到的数字是完整的。把它算成"数据不足"会让
+	//	"落库没跑起来"变成一条长期挂着的红色告警，
+	//	反而把真正需要立刻处理的情况淹没掉。
+	if rs, ok := src.(*routedSource); ok {
+		for _, line := range rs.reportLines() {
+			sufficiency.Issues = append(sufficiency.Issues, line)
+		}
+	}
 
 	return &f, nil
 }
@@ -308,16 +417,65 @@ func buildCategories(cur, prev []CategoryRow) []fact.Category {
 }
 
 // sumCategories 求和出大盘与毛利可用性。
-func sumCategories(cats []CategoryRow) fact.Totals {
-	var t fact.Totals
-	var costed, totalRows float64
-	for _, c := range cats {
-		t.NetAmount += c.Amount
-		t.NetQty += c.Qty
-		t.RefCost += c.Cost
-		costed += float64(c.CostedRow)
-		totalRows += float64(c.TotalRow)
+// loadTotals 取大盘总额，查询失败时退回"品类求和"并**显式降级**。
+//
+// ⚠️ 第二个返回值 authoritative 必须在调用点参与判定，不能只读第一个：
+//
+//	降级求和值是**非零的**（线上实测偏低 85%），
+//	若把它当权威基去算环比，会得到一个看起来正常、实则全错的百分比。
+//	——这正是本函数要显式回报成败的原因。
+//
+// ⚠️ 退回而不是直接失败：总额拿不到时，一份带明确告警的报告
+//
+//	仍然比"没有报告"有用 —— 店长至少知道今天该去查源库。
+//	但**必须**降级标记，否则数字偏低会被当成真实经营结果。
+func (b *Builder) loadTotals(
+	ctx context.Context,
+	storeBranchID, from, to string,
+	fallback []CategoryRow,
+	suff *fact.Sufficiency,
+	src DataSource,
+) (fact.Totals, bool) {
+	row, err := src.TotalsSales(ctx, storeBranchID, from, to)
+	if err == nil {
+		return totalsOf(row), true
 	}
+	suff.Sufficient = false
+	suff.Issues = append(suff.Issues,
+		"大盘总额查询失败，本次销售额可能偏低（已退回按品类求和）："+err.Error())
+	return sumCategories(fallback), false
+}
+
+// sumCategories 把品类行汇成大盘 —— **仅作为总额查询失败时的降级路径**。
+//
+// ⚠️ 它天生带两个漏点（被 Limit 截断、被丢弃空类目行），
+//
+//	详见 DataSource.TotalsSales 的注释。正常路径**不要**用它当大盘。
+func sumCategories(cats []CategoryRow) fact.Totals {
+	var r TotalsRow
+	for _, c := range cats {
+		r.Amount += c.Amount
+		r.Qty += c.Qty
+		r.Cost += c.Cost
+		r.CostedRow += c.CostedRow
+		r.TotalRow += c.TotalRow
+	}
+	return totalsOf(r)
+}
+
+// totalsOf 把原始汇总行补上成本覆盖率与毛利。
+//
+// ⚠️ 毛利/覆盖率的推算**只允许在这里发生** ——
+//
+//	大盘走独立查询、降级路径走品类求和，两者必须共用这一段，
+//	否则"查询成功时"与"降级时"会给出两套毛利口径。
+func totalsOf(r TotalsRow) fact.Totals {
+	t := fact.Totals{
+		NetAmount: r.Amount,
+		NetQty:    r.Qty,
+		RefCost:   r.Cost,
+	}
+	costed, totalRows := float64(r.CostedRow), float64(r.TotalRow)
 	if totalRows > 0 {
 		t.CostCoverage = costed / totalRows
 	}

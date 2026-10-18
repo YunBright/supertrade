@@ -42,6 +42,10 @@ type fakeSource struct {
 
 	errCategory, errProduct, errSupplier error
 	errDict, errStock                    error
+	errTotals                            error
+	// hasTotals 为 true 时用 totCur/totPrev 覆盖总额，否则复刻品类求和。
+	hasTotals       bool
+	totCur, totPrev TotalsRow
 	// calls 记录每个方法被调了几次，用于验证"只查 TopN 商品的库存"。
 	calls map[string]int
 	// stockAsked 记录实际问了哪些商品。
@@ -70,7 +74,44 @@ func (f *fakeSource) CategorySales(_ context.Context, _, from, _ string, _ int) 
 	return f.catCur, nil
 }
 
+// TotalsSales 是 2026-10-17 新增的大盘总额查询。
+//
+// ⚠️ 默认**复刻旧的品类求和结果**，这样既有断言（总额 13000 等）
+//
+//	不需要改 —— 它们本来就是在验证"品类与总额一致"这个当时的假设。
+//	真正的判别力在 setTotals 覆盖：用例会给出与品类求和**不同**的总额，
+//	断言大盘取的是覆盖值而不是求和值。
+func (f *fakeSource) TotalsSales(_ context.Context, _, from, _ string) (TotalsRow, error) {
+	f.calls["totals"]++
+	if f.errTotals != nil {
+		return TotalsRow{}, f.errTotals
+	}
+	if f.hasTotals {
+		if from == "2026-10-14" {
+			return f.totPrev, nil
+		}
+		return f.totCur, nil
+	}
+	if from == "2026-10-14" {
+		return sumAsRow(f.catPrev), nil
+	}
+	return sumAsRow(f.catCur), nil
+}
+
+func sumAsRow(cats []CategoryRow) TotalsRow {
+	var r TotalsRow
+	for _, c := range cats {
+		r.Amount += c.Amount
+		r.Qty += c.Qty
+		r.Cost += c.Cost
+		r.CostedRow += c.CostedRow
+		r.TotalRow += c.TotalRow
+	}
+	return r
+}
+
 func (f *fakeSource) ProductSales(_ context.Context, _, from, _ string, _ int) ([]ProductRow, error) {
+
 	f.calls["prod"]++
 	if f.errProduct != nil {
 		return nil, f.errProduct
@@ -544,8 +585,8 @@ func TestPrevPeriodFailureStillProducesReport(t *testing.T) {
 	if f.Categories[0].HasPrev {
 		t.Error("上期失败时不得给出环比")
 	}
-	if !containsSub(f.DataSufficiency.Issues, "不做环比") {
-		t.Errorf("必须说明不做环比: %v", f.DataSufficiency.Issues)
+	if !containsSub(f.DataSufficiency.Issues, "品类环比不可用") {
+		t.Errorf("必须说明品类环比不可用: %v", f.DataSufficiency.Issues)
 	}
 }
 
