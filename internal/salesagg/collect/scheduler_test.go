@@ -182,6 +182,35 @@ func TestJobNameEmptyBranchIsStillDistinct(t *testing.T) {
 	}
 }
 
+// fakeEnabledLister 模拟凭据存储的 ListEnabled（已开启采集的门店）。
+type fakeEnabledLister struct {
+	ids  []string
+	err  error
+	calls int
+}
+
+func (f *fakeEnabledLister) ListEnabled(context.Context) ([]string, error) {
+	f.calls++
+	return f.ids, f.err
+}
+
+// allEnabled 让「在营门店」全部视为已开启。
+//
+// ⚠️ 这是**显式**表达原有用例的前提，不是随手写的便利函数：
+//
+//	注册范围从「在营」收窄成「在营 ∩ 已开启」之后，
+//	"这家店会拿到 job" 就成了两个条件的交集。
+//	把交集的第二项藏进默认行为里，等于让用例名不副实 ——
+//	而「关停之后 job 真的被删了」正是本轮最要紧的断言之一，
+//	它的反面（开启之后 job 真的被注册）同样不能含糊。
+func allEnabled(bl *fakeBranchLister) *fakeEnabledLister {
+	ids := make([]string, 0, len(bl.branches))
+	for _, b := range bl.branches {
+		ids = append(ids, b.ID)
+	}
+	return &fakeEnabledLister{ids: ids}
+}
+
 // ---- 对账 ----
 
 // TestReconcileRegistersTwoJobsPerBranch ⭐
@@ -195,7 +224,7 @@ func TestJobNameEmptyBranchIsStillDistinct(t *testing.T) {
 func TestReconcileRegistersTwoJobsPerBranch(t *testing.T) {
 	bl := &fakeBranchLister{branches: []Branch{{ID: "00"}, {ID: "01"}}}
 	jc := newFakeJobClient()
-	r := NewReconciler(bl, jc, "http://127.0.0.1:8110/sales/daily/collect")
+	r := NewReconciler(bl, allEnabled(bl), jc, "http://127.0.0.1:8110/sales/daily/collect")
 
 	res, err := r.Reconcile(context.Background())
 	if err != nil {
@@ -244,7 +273,7 @@ func TestReconcileUsesCorrectTimes(t *testing.T) {
 
 	bl := &fakeBranchLister{branches: []Branch{{ID: "00"}}}
 	jc := newFakeJobClient()
-	r := NewReconciler(bl, jc, "http://addr")
+	r := NewReconciler(bl, allEnabled(bl), jc, "http://addr")
 
 	if _, err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile：%v", err)
@@ -278,7 +307,7 @@ func TestReconcileUsesCorrectTimes(t *testing.T) {
 func TestReconcilePassesBranchAndSourceToJob(t *testing.T) {
 	bl := &fakeBranchLister{branches: []Branch{{ID: "branch-7"}}}
 	jc := newFakeJobClient()
-	r := NewReconciler(bl, jc, "http://addr")
+	r := NewReconciler(bl, allEnabled(bl), jc, "http://addr")
 	if _, err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile：%v", err)
 	}
@@ -302,7 +331,7 @@ func TestReconcileReportsFailuresWithoutGivingUp(t *testing.T) {
 	bl := &fakeBranchLister{branches: []Branch{{ID: "00"}, {ID: "01"}}}
 	jc := newFakeJobClient()
 	jc.failOn["sales-daily-collect-00-corrected"] = errors.New("sidecar 502")
-	r := NewReconciler(bl, jc, "http://addr")
+	r := NewReconciler(bl, allEnabled(bl), jc, "http://addr")
 
 	res, err := r.Reconcile(context.Background())
 	if err != nil {
@@ -324,7 +353,7 @@ func TestReconcileReportsFailuresWithoutGivingUp(t *testing.T) {
 func TestReconcileFailsLoudlyWhenListerBroken(t *testing.T) {
 	bl := &fakeBranchLister{err: errors.New("auth 不可达")}
 	jc := newFakeJobClient()
-	r := NewReconciler(bl, jc, "http://addr")
+	r := NewReconciler(bl, allEnabled(bl), jc, "http://addr")
 	if _, err := r.Reconcile(context.Background()); err == nil {
 		t.Fatal("读不到门店列表必须报错")
 	}
@@ -341,7 +370,7 @@ func TestReconcileFailsLoudlyWhenListerBroken(t *testing.T) {
 func TestReconcileEmptyBranchListIsNotAnError(t *testing.T) {
 	bl := &fakeBranchLister{branches: nil}
 	jc := newFakeJobClient()
-	r := NewReconciler(bl, jc, "http://addr")
+	r := NewReconciler(bl, allEnabled(bl), jc, "http://addr")
 	res, err := r.Reconcile(context.Background())
 	if err != nil {
 		t.Fatalf("空门店清单不该报错：%v", err)

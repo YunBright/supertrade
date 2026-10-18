@@ -76,6 +76,11 @@ var (
 	// appCube 是采集用的 cube 数据源（报表用 service.NewDaprCubeQuerier，
 	// 采集用 collect.NewDaprSource —— 两者要查的维度组合不同）。
 	appCube *cubeclient.DaprCubeClient
+	// appCreds 是门店采集的服务账号凭据存储（**共享 PG**，非本机文件）。
+	appCreds *collect.CredentialStore
+	// appBearer 为某门店换机器 token。主密钥缺失时为 nil，
+	// 此时采集会明确失败而不是无声地不带 token 去打 cube。
+	appBearer collect.BearerResolver
 )
 
 func initApp() error {
@@ -137,6 +142,40 @@ func initApp() error {
 	// 这样一来，**卡片与 AI 日报读的是同一行**（两边都经过 PG）。
 	appSvc = appSvc.WithDailyRange(appDaily)
 
+	// ---- 门店采集的服务账号凭据（机器身份）----
+	//
+	// dapr 的 job 回调不带 Authorization 头（实测 job spec 无 headers 字段），
+	// 而 cube-gateway 侧有 auth-validator（aud=userd）⇒ 无 token 必 401。
+	// 这正是本轮改造前的真实故障：
+	//	collect_failed: cube 拒绝调用者凭证: Unauthenticated: Unauthorized
+	//
+	// 凭据存在**共享 PG** 而不是本机文件，理由是 dapr scheduler 的投递语义
+	// （HA 3 副本、无 leader election、触发投递到**随机**副本）：
+	// 本机文件在多副本下会变成"有的节点有、有的没有"，
+	// 症状是**随机 401**，而一天两次采集落在哪个副本不确定 ⇒ 极难排查。
+	appCreds = collect.NewCredentialStore(appDB)
+	if err := appDB.AutoMigrate(collect.CredentialModels()...); err != nil {
+		return fmt.Errorf("auto migrate branch_collect_credentials: %w", err)
+	}
+
+	// 主密钥缺失**不阻断启动**，但必须响亮地 Warn：
+	// 报表、对比、实时查询都不依赖它，起来了才能让用户看到界面与报错；
+	// 而采集会以"换不到 token"失败，真因指向这里的一行日志。
+	//
+	// ⚠️ 绝不把主密钥写进日志（只写长度）。
+	if raw := envStr("SALES_COLLECT_SECRET_KEY", ""); raw == "" {
+		slog.Warn("sales-agg: 未配置 SALES_COLLECT_SECRET_KEY —— 门店采集的定时任务无法换机器 token，" +
+			"每日销售事实将采集失败（报表仍可实时查源库）。开启「每日销售数据」前必须先配置它")
+		appBearer = nil
+	} else {
+		ci, err := collect.CipherFromEnvKey(raw)
+		if err != nil {
+			return fmt.Errorf("采集凭据主密钥不可用（拒绝以降级密钥继续）: %w", err)
+		}
+		appBearer = collect.NewStoreCipherIssuer(appCreds, ci,
+			collect.NewDaprTokenIssuer(sidecarBaseURL(), envStr("AUTH_TOKEN_APP_ID", collect.TokenAuthAppID)))
+	}
+
 	slog.Info("sales-agg app initialized",
 		"cube_app_id", cubeclient.DefaultCubeAppID(),
 		"cube_query_path", cubeclient.DefaultCubeQueryPath(),
@@ -196,7 +235,7 @@ func startJobReconciler() {
 		slog.Warn("sales-agg: 没有 sidecar，采集定时任务不会注册")
 		return
 	}
-	rec := collect.NewReconciler(branchLister, jobs, collectCallbackAddress())
+	rec := collect.NewReconciler(branchLister, appCreds, jobs, collectCallbackAddress())
 
 	ctx := context.Background()
 	runOnce := func() {
@@ -282,23 +321,56 @@ func registerRoutes(r *gin.Engine) {
 	handler.New(appSvc).RegisterRoutes(r)
 	// 门店对比（模板 CRUD + 逐店取数）。依赖 appStore（OnStart 已建）。
 	handler.NewCompare(appSvc, appStore).RegisterRoutes(r)
-	// 每日销售事实落库。依赖 appDaily + appCube（OnStart 已建）。
-	//
-	// ⚠️ 注册在**鉴权链之内**（与上面两组一致），因为它同样会经
-	//   forwardBearerToOutgoing 向 cube 发起调用 —— 侧写一条绕过它的路径
-	//   会让这条调用缺 api-token，症状是"采集永远 401"而不是"没权限"。
-	handler.NewDailyCollectHandler(collect.NewCollector(collect.NewDaprSource(appCube), appDaily)).
-		RegisterRoutes(r)
 }
 
 // registerDaprRoutes 在 auth 中间件**之前**注册免鉴权端点。
 //
-// 本服务不订阅任何 topic（无 /dapr/subscribe），开这个窗口只为挂兜底
-// 清理端点：契约测试收尾清理时未必持有 token。公网安全由 nginx 的
-// `location ^~ /api/v1/sales-agg/internal/ { return 404; }` 承担
-// （回归锁见 deployer/tests/config/nginx_internal_test.go）。
+// # 两类端点共用这个窗口
+//
+// ① 兜底清理端点（契约测试收尾未必持有 token）；
+// ② **每日销售事实采集端点**。
+//
+// # ⚠️ 为什么采集端点必须在窗口内（2026-10-18 上线前发现，之前挂错了）
+//
+// ✅ MEASURED 2026-10-18（gyy 生产实测）：
+//
+//	curl http://127.0.0.1:8110/sales/daily/collect?store=00
+//	→ 401 {"code":"unauthenticated","message":"缺少已签 token"}
+//
+// 而 dapr scheduler 的回调**不带任何凭据**（job 注册体只有
+// schedule/data/address 三项，dapr scheduler 的 job spec 也没有 headers 字段），
+// wechat-bot 的同类回调端点同样是"挂 engine 根且不挂 JWT"。
+//
+// → 挂在鉴权链内的后果是：每晚 22:45 与次日 01:05 的采集**每一次都 401**，
+//
+//	而症状极其安静：服务照常启动、healthz 200、job 注册成功
+//	（"采集定时任务已对齐 branches=7 jobs=14"）、
+//	报表照出（sales-insight 回退 cube）。**没有任何一行说采集没跑过。**
+//
+// # ⚠️ 之前那条"必须挂在鉴权链内否则 cube 调用缺 api-token"的推理是**错的**
+//
+// 它假设 cube 拒绝无 token 调用，但 `cubeclient.WithBearer` 的注释写着
+// 「空字符串表示"无 token"(**e.g. 内部定时任务**)」——
+// 内部定时任务调 cube 本来就不带凭据，那条路径是设计内支持的。
+//
+// ⚠️ 保留一条真实边界说明（不要自我安慰）：开窗后本端点不要求 token，
+//
+//	**同网段（172.12.1.0/24）内任何主机**都能触发一次采集
+//	（app 绑 0.0.0.0:8110，`--app-channel-address` 约束的是 sidecar 出站、
+//	**不约束 app 绑在哪** —— 同 pkg/cmdbootstrap 对 /events/* 的说明）。
+//	公网侧由 nginx 挡住：
+//	    location = /api/v1/sales-agg/sales/daily/collect { return 404; }
+//	（回归锁见 deployer/tests/config/nginx_internal_test.go）。
+//	最坏后果是浪费一次 cube 查询并覆盖同一个 (branch, oper_date) 的行 ——
+//	采集本身幂等，不会写坏数据。
 func registerDaprRoutes(r *gin.Engine) {
 	handler.RegisterPurgeRoutes(r, appDB)
+	// 每日销售事实落库。依赖 appDaily + appCube + appBearer（OnStart 已建）。
+	//
+	// ⚠️ appBearer 可能为 nil（主密钥没配）：那样每次采集都会明确返回
+	//	"采集凭据：bearer 解析器未装配"，而不是无声地不带 token 打 cube。
+	handler.NewDailyCollectHandler(collect.NewCollector(collect.NewDaprSource(appCube), appDaily), appBearer).
+		RegisterRoutes(r)
 }
 
 // forwardBearerToOutgoing 把 gin request 的 Authorization header 注入 ctx。

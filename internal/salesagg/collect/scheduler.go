@@ -255,45 +255,74 @@ func twoDigits(s string) (int, error) {
 
 // ReconcileResult 是一次对账的结果。
 type ReconcileResult struct {
-	Branches  int
-	Jobs      int
-	Failed    []string
+	Branches int
+	Jobs     int
+	Failed   []string
+	// Registers / Deletes 让"这次对账到底动了哪些 job"一眼可见。
 	Registers int
+	Deletes   int
+	// Enabled / Disabled 是门店数（不是 job 数），便于人读。
+	Enabled  int
+	Disabled int
 }
 
-// Reconciler 按 auth 的在营门店清单，注册/重注册每家门店的两个采集 job。
+// EnabledBranchLister 列出**已开启采集**的门店。
 //
-// # dapr 没有 list API —— 所以孤儿 job 清不掉（已知限制）
+// # 为什么不能继续用"在营门店清单"当注册范围
+//
+// 采集的身份来自服务账号，而服务账号是**用户在 App 里点开启**时才建的。
+// 若按在营门店全量注册：
+//
+//   - 没开的门店照样每天跑两次，换 token 必然失败 → 每天两条无意义错误日志；
+//   - 更糟的是它让"开启采集"这个动作**看不出效果** ——
+//     用户开了之后 job 数没变（本来就全注册了），
+//     于是会去怀疑"这个功能是不是没做"。
+//
+// → 注册范围 = 在营 ∩ 已开启。
+type EnabledBranchLister interface {
+	ListEnabled(ctx context.Context) ([]string, error)
+}
+
+// Reconciler 按「在营 ∩ 已开启」注册/重注册每家门店的两个采集 job，
+// 并对**在营但已关停**的门店删除 job。
+//
+// # dapr 没有 list API —— 所以"门店被删除"留下的孤儿 job 清不掉（已知限制）
 //
 // ✅ MEASURED 2026-10-14：`GET /v1.0-alpha1/jobs`（不带名字）返回
 // 404 ERR_DIRECT_INVOKE，这一版没有列举形态。
 //
-// → 无法枚举"曾经给哪些门店建过 job"，所以门店停用后它的 job
-// 不会被自动删除，会继续每天跑两次并（很可能）因该门店已从
-// `branch_cube_sources` 摘掉而失败。
-//
-// **为什么接受**：代价是每天两次失败日志 + 两次无效 cube 调用；
-// 而要修它就得引入一张"我们自己建过哪些 job"的表 ——
-// 为此多一张表和一套删除逻辑，收益不抵。
-// 真要清理，运维按 `sales-daily-collect-<门店>-initial` 手工 DELETE 即可。
+// 但**关停采集**不受影响：关停的门店仍在在营清单里，
+// 它的 job 名是可**纯函数算出来**的，所以能精确删除。
+// 只有"门店从 auth 里被删掉"才会留下孤儿 job ——
+// 那种情况按 `sales-daily-collect-<门店>-initial` 手工 DELETE 即可。
 type Reconciler struct {
 	branches BranchLister
+	enabled  EnabledBranchLister
 	jobs     JobClient
 	// address 是 job 回调地址（app 自己的 127.0.0.1:port）。
 	address string
 }
 
-// NewReconciler 构造。任一依赖为 nil 时 Reconcile 返回明确错误。
-func NewReconciler(branches BranchLister, jobs JobClient, address string) *Reconciler {
-	return &Reconciler{branches: branches, jobs: jobs, address: strings.TrimRight(strings.TrimSpace(address), "/")}
+// NewReconciler 构造。enabled 为 nil 时 Reconcile 明确报错 ——
+// 那会让"没有凭据存储"退化成"不注册任何 job"，症状是采集静默停摆。
+func NewReconciler(branches BranchLister, enabled EnabledBranchLister, jobs JobClient, address string) *Reconciler {
+	return &Reconciler{
+		branches: branches,
+		enabled:  enabled,
+		jobs:     jobs,
+		address:  strings.TrimRight(strings.TrimSpace(address), "/"),
+	}
 }
 
-// Reconcile 对齐 job 与在营门店清单。
+// Reconcile 对齐 job 与「在营 ∩ 已开启」清单。
 //
 // ⚠️ 幂等：注册一律走 DELETE → POST，所以重复调用不会累积。
 func (r *Reconciler) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	if r == nil || r.branches == nil {
 		return ReconcileResult{}, fmt.Errorf("collect: 门店列表未配置")
+	}
+	if r.enabled == nil {
+		return ReconcileResult{}, fmt.Errorf("collect: 已开启门店清单未配置（凭据存储不可用）")
 	}
 	if r.jobs == nil {
 		return ReconcileResult{}, fmt.Errorf("collect: dapr scheduler 不可用（没有 sidecar）")
@@ -301,6 +330,10 @@ func (r *Reconciler) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	branches, err := r.branches.ListActiveBranches(ctx)
 	if err != nil {
 		return ReconcileResult{}, err
+	}
+	enabledIDs, err := r.enabled.ListEnabled(ctx)
+	if err != nil {
+		return ReconcileResult{}, fmt.Errorf("collect: 读取已开启门店清单: %w", err)
 	}
 
 	initialCron, err := CronExpr(InitialCollectTime)
@@ -312,18 +345,59 @@ func (r *Reconciler) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		return ReconcileResult{}, err
 	}
 
+	enabledSet := make(map[string]struct{}, len(enabledIDs))
+	for _, id := range enabledIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			enabledSet[id] = struct{}{}
+		}
+	}
+
 	res := ReconcileResult{Branches: len(branches)}
 	for _, b := range branches {
-		for _, spec := range []struct{ source, cron string }{
+		specs := []struct{ source, cron string }{
 			{string(salesdaily.CollectSourceInitial), initialCron},
 			{string(salesdaily.CollectSourceCorrected), correctedCron},
-		} {
+		}
+		_, on := enabledSet[b.ID]
+		if !on {
+			res.Disabled++
+			// 关停 = 删 job。只删"在营但未开启"的：门店被从 auth 删除后
+			// 不在 branches 里，那种孤儿 job 无法枚举（见类型注释）。
+			for _, spec := range specs {
+				if err := r.jobs.Delete(ctx, JobName(b.ID, spec.source)); err != nil {
+					res.Failed = append(res.Failed, JobName(b.ID, spec.source))
+					continue
+				}
+				res.Deletes++
+			}
+			continue
+		}
+		// client_id 推不出来 ⇒ 这家门店的凭据行一定是脏的。
+		// 绝不能"随便注册个 job 让它每天失败"：那会每天两条
+		// 换 token 失败的错误日志，而真因（门店 id 含非法字符）
+		// 会被完全淹没。宁可这家店不采、并在 Failed 里点名。
+		saID, err := ClientIDFor(b.ID)
+		if err != nil {
+			res.Failed = append(res.Failed, b.ID+": 无法推导 client_id")
+			continue
+		}
+		res.Enabled++
+		for _, spec := range specs {
 			name := JobName(b.ID, spec.source)
 			data := map[string]any{
 				"trigger": "dapr-job",
 				"job":     name,
 				"branch":  b.ID,
 				"source":  spec.source,
+				// service_account 是**关联锚点**：job 名里有门店，
+				// 但把 client_id 也显式写进 data，运维一眼能把
+				// "这个 job" 与 "这台机器身份" 对上。
+				//
+				// ⚠️ 这里**绝不能**写 client_secret：
+				//   job data 会明文进 scheduler 的存储后端（ETCD），
+				//   多副本下每副本一份，备份与运维 cat 都会泄露。
+				//   运行时按 branch 去 PG 现取 secret。
+				"service_account": saID,
 			}
 			if err := r.jobs.Register(ctx, name, spec.cron, r.address, data); err != nil {
 				res.Failed = append(res.Failed, name)
