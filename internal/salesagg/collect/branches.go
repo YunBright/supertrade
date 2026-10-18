@@ -36,32 +36,42 @@ type BranchLister interface {
 	ListActiveBranches(ctx context.Context) ([]Branch, error)
 }
 
-// LoginAppID 是 auth 的 **login 引擎**在 dapr 里的 app-id。
+// AuthAppID 是 auth 的 **userd 引擎**在 dapr 里的 app-id。
 //
-// ⚠️ 它必须与 deployer/systemd/auth-login.service 里的 `--app-id login` 完全一致。
+// ⚠️ 必须与 deployer/systemd/auth-userd.service 里的 `--app-id userd` 完全一致。
 //
 //	两边各写一份字符串常量，改了一边**不会**编译报错 ——
 //	症状是"采集任务一条都注册不上"，而服务照常启动、报表照出。
-const LoginAppID = "login"
+//
+// # ⚠️ 为什么是 **userd** 而不是 login（2026-10-18 实测后改）
+//
+// `/auth/branches` **两个 engine 都挂了**（同一个 handler 实例，
+// 所以门店模型天然一致），但**能不能按 app-id 寻址到**完全是另一回事。
+//
+// ✅ MEASURED 2026-10-18（baiyuan-i + gyy）：
+//
+//	auth-login  的 systemd unit **没有** `--config`
+//	            ⇒ dapr 用**默认** nameResolution，注册不进 gyy 用的 consul
+//	            ⇒ 从 gyy 按 app-id=login 寻址必然失败：
+//	               ERR_DIRECT_INVOKE: no healthy services found with AppID 'login'
+//	auth-userd 的 unit **传了** `--config /opt/.dapr/config.yaml`（consul）
+//	            ⇒ Consul 服务目录里有 "userd"（✅ 实测 catalog 里有）
+//
+// 直连 `http://172.12.1.1:8081/auth/branches` 是通的（✅ 实测返回 7 个在营门店），
+// 但那绕过了 dapr 的寻址边界 —— 本仓其它跨服务调用一律走 dapr，
+// 这里保持一致，所以选 userd。
+//
+// ⚠️ 之前这里写的是 `login` 并附了一段"打 userd 会 404"的注释 ——
+//	**那段注释是错的**，而且它会在下一个人想改回 login 时把人带偏。
+//	错在把"端点挂在哪个 engine"当成了"能被谁寻址到"。
+const AuthAppID = "userd"
 
 // AuthBranchLister 经 dapr service invocation 读 auth 的门店清单。
 //
-// # 为什么是 login 引擎而不是 userd
+// # 为什么经 dapr 而不是直连
 //
-// auth 内部是**三个独立的 gin engine**（见 auth 的 internal/router 包注释）：
-//
-//	login    —— 公网入口 :8081，无 token 校验；JWKS / login / refresh / SSE
-//	userd    —— app-id=userd；/users/* /admin/* /me
-//	internal —— app-id=auth-internal，S2S-only
-//
-// `/auth/branches` 挂在 **login** engine 上（无 token，设计用途是
-// 注册页/选门店页），所以必须打 app-id=login。
-// 打 userd 会 404 —— 而 404 在这里很容易被误读成"auth 里没有门店"，
-// 于是所有采集任务一条都不注册，且没有任何报错。
-//
-// ⚠️ 直连 http://host:8081 也可行，但**不走 dapr** 就意味着
-//
-//	绕过了 accessControl 白名单这条边界。本仓其它跨服务调用
+//	直连 http://host:8081 也可行，但**不走 dapr** 就意味着
+//	绕过了服务寻址这条边界。本仓其它跨服务调用
 //	（如 wechat-bot 调 sales-agg）一律走 dapr，这里保持一致。
 type AuthBranchLister struct {
 	sidecarBase string
@@ -77,7 +87,7 @@ func NewAuthBranchLister(sidecarBase, appID string) *AuthBranchLister {
 	}
 	id := strings.TrimSpace(appID)
 	if id == "" {
-		id = LoginAppID
+		id = AuthAppID
 	}
 	return &AuthBranchLister{
 		sidecarBase: base,

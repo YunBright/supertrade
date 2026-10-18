@@ -367,7 +367,11 @@ func TestAuthBranchListerParsesAndSorts(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// ⚠️ 必须走 dapr service invocation：
 		//	打错 app-id 会 404，而 404 在这里极易被误读成"auth 里没有门店"。
-		want := "/v1.0/invoke/" + LoginAppID + "/method/auth/branches"
+		//
+		// ⚠️ 这里用**字面量 "userd"** 而不是 AuthAppID：
+		//	期望值一旦由被测常量推导，把 AuthAppID 改回 "login"
+		//	测试照样全绿 —— 而那正是 2026-10-18 上线失败的真实原因。
+		want := "/v1.0/invoke/userd/method/auth/branches"
 		if r.URL.Path != want {
 			t.Errorf("请求路径 = %s，期望 %s", r.URL.Path, want)
 		}
@@ -379,7 +383,7 @@ func TestAuthBranchListerParsesAndSorts(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	l := NewAuthBranchLister(srv.URL, LoginAppID)
+	l := NewAuthBranchLister(srv.URL, "userd")
 	got, err := l.ListActiveBranches(context.Background())
 	if err != nil {
 		t.Fatalf("ListActiveBranches：%v", err)
@@ -406,14 +410,44 @@ func TestAuthBranchListerErrors(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if _, err := NewAuthBranchLister(srv.URL, LoginAppID).ListActiveBranches(context.Background()); err == nil {
+	if _, err := NewAuthBranchLister(srv.URL, "userd").ListActiveBranches(context.Background()); err == nil {
 		t.Fatal("500 必须报错，不能当成空列表")
 	}
 }
 
 // TestAuthBranchListerNilWhenUnconfigured 没配地址时返回 nil（而不是空实现）。
 func TestAuthBranchListerNilWhenUnconfigured(t *testing.T) {
-	if l := NewAuthBranchLister("   ", LoginAppID); l != nil {
+	if l := NewAuthBranchLister("   ", "userd"); l != nil {
 		t.Error("未配置地址时应返回 nil，让调用方明确知道没接")
+	}
+}
+
+// TestAuthAppIDIsUserd 把 app-id 用字面量钉死。
+//
+// ⚠️ 单靠上面那条路径断言**不够**：
+//
+//	路径断言写的是 "/v1.0/invoke/userd/..."（字面量），
+//	但 NewAuthBranchLister(srv.URL, "userd") 是**显式传参**，
+//	完全绕过了默认值这条路径。
+//	而生产装配传的正是一个可能为空的值：
+//	envStr("AUTH_USERD_APP_ID", collect.AuthAppID) ——
+//	env 没配时**落回 AuthAppID**。所以 AuthAppID 错了没人拦。
+//
+//	症状：注册 0 个 job、服务照常启动、报表照出，
+//	只有"明天起没有新数据"会被发现。
+func TestAuthAppIDIsUserd(t *testing.T) {
+	if AuthAppID != "userd" {
+		t.Fatalf("AuthAppID = %q，期望 %q", AuthAppID, "userd")
+	}
+}
+
+// TestNewAuthBranchListerDefaultsToUserd 空 app-id 必须落回 userd。
+func TestNewAuthBranchListerDefaultsToUserd(t *testing.T) {
+	l := NewAuthBranchLister("http://x", "  ")
+	if l == nil {
+		t.Fatal("配了地址就不该返回 nil")
+	}
+	if l.appID != "userd" {
+		t.Errorf("默认 app-id = %q，期望 %q", l.appID, "userd")
 	}
 }

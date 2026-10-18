@@ -174,12 +174,18 @@ const reconcileInterval = time.Hour
 
 // startJobReconciler 启动采集 job 的对账循环。
 func startJobReconciler() {
-	// ⚠️ 门店清单走 **dapr service invocation** 打 app-id=login
-	//   （auth 的 login 引擎），不直连 :8081 ——
-	//   直连会绕过 dapr 的 accessControl 白名单，
+	// ⚠️ 门店清单走 **dapr service invocation** 打 app-id=userd
+	//   （auth 的 userd 引擎），不直连 :8082 ——
+	//   直连会绕过服务寻址这条边界，
 	//   而本仓其它跨服务调用一律走 dapr，这里保持一致。
+	//
+	// ⚠️ app-id 必须是 **userd** 而不是 login（2026-10-18 实测）：
+	//   auth-login 的 systemd unit 没有 `--config`，dapr 用默认 nameResolution，
+	//   注册不进 gyy 用的 consul ⇒ 按 app-id=login 寻址必然失败
+	//   （ERR_DIRECT_INVOKE: no healthy services found with AppID 'login'）。
+	//   详见 collect.AuthAppID 的注释。
 	sidecar := sidecarBaseURL()
-	branchLister := collect.NewAuthBranchLister(sidecar, envStr("AUTH_LOGIN_APP_ID", collect.LoginAppID))
+	branchLister := collect.NewAuthBranchLister(sidecar, envStr("AUTH_USERD_APP_ID", collect.AuthAppID))
 	if branchLister == nil {
 		slog.Warn("sales-agg: 没有 sidecar（DAPR_HTTP_PORT 未设置），采集定时任务不会注册" +
 			"（销售数字仍会实时查源库，只是不落库）")
