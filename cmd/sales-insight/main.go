@@ -138,6 +138,18 @@ func initApp() error {
 	appH = handler.New(appSvc).WithIgnores(ignores).WithDict(src).
 		WithDailyStore(dailyErr == nil)
 
+	// ---- 营业时区（决定 daily 算哪天的「今日」）----
+	//
+	// ⚠️ 必须注入：calendar.ResolvePeriod 用 `now.Location()` 推算日期，
+	//   time.Now 默认 UTC；早班 0:30 CST = 16:30 UTC（前一日），
+	//   不注入会让 daily 落到「昨日」(现场 2026-10-19 22:50 推送 → 区间 2026-10-18)。
+	//
+	// 装配 + env 解析抽到 wireBizTZ，便于 cmd/sales-insight 的单测覆盖
+	// (main.go 主路径不可达 —— dapr.NewClient 需要 sidecar)。
+	if err := wireBizTZ(appSvc); err != nil {
+		return err
+	}
+
 	slog.Info("sales-insight app initialized",
 		"cube_app_id", cubeclient.DefaultCubeAppID(),
 		"ai_enabled", enableAI,
@@ -146,7 +158,33 @@ func initApp() error {
 		"store_city", os.Getenv("STORE_CITY"),
 		"ignore_store_dir", ignores.Dir(),
 		"daily_store_ready", dailyErr == nil,
+		"biz_tz", appSvc.BizTZ().String(),
 	)
+	return nil
+}
+
+// wireBizTZ 把营业时区装配到 ServiceImpl。
+//
+// ⚠️ **必须注入**：calendar.ResolvePeriod 用 `now.Location()` 推算日期，
+//   time.Now 默认 UTC；早班 0:30 CST = 16:30 UTC（前一日），
+//   不注入会让 daily 落到「昨日」(现场 2026-10-19 22:50 推送 → 区间 2026-10-18)。
+//
+// env SALESINSIGHT_BIZ_TZ 可覆盖（默认 Asia/Shanghai UTC+8），
+// 与 fresh-meat 的 FRESHMEAT_BIZ_TZ 同语义。
+//
+// 反证（详见 main_test.go）：
+//   - 默认值改成 "UTC" → TestWireBizTZDefaultsToShanghai 红
+//   - 删 env 读取          → TestWireBizTZRespectsEnv 红
+//   - 删 WithBizTZ 调用     → TestWireBizTZInjectsShanghai 红
+//   - LoadLocation 失败不报错 → TestWireBizTZInvalidEnvErrors 红
+func wireBizTZ(svc *handler.ServiceImpl) error {
+	name := strings.TrimSpace(envStr("SALESINSIGHT_BIZ_TZ", "Asia/Shanghai"))
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		return fmt.Errorf("sales-insight: 加载营业时区 %q 失败: %w", name, err)
+	}
+	svc.WithBizTZ(loc)
+	slog.Info("sales-insight: 营业时区已注入", "tz", name)
 	return nil
 }
 

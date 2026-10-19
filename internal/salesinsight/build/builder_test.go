@@ -68,7 +68,7 @@ func (f *fakeSource) CategorySales(_ context.Context, _, from, _ string, _ int) 
 	if f.errCategory != nil {
 		return nil, f.errCategory
 	}
-	if from == "2026-10-14" {
+	if from == "2026-10-15" {
 		return f.catPrev, nil
 	}
 	return f.catCur, nil
@@ -87,12 +87,12 @@ func (f *fakeSource) TotalsSales(_ context.Context, _, from, _ string) (TotalsRo
 		return TotalsRow{}, f.errTotals
 	}
 	if f.hasTotals {
-		if from == "2026-10-14" {
+		if from == "2026-10-15" {
 			return f.totPrev, nil
 		}
 		return f.totCur, nil
 	}
-	if from == "2026-10-14" {
+	if from == "2026-10-15" {
 		return sumAsRow(f.catPrev), nil
 	}
 	return sumAsRow(f.catCur), nil
@@ -116,7 +116,7 @@ func (f *fakeSource) ProductSales(_ context.Context, _, from, _ string, _ int) (
 	if f.errProduct != nil {
 		return nil, f.errProduct
 	}
-	if from == "2026-10-14" {
+	if from == "2026-10-15" {
 		return f.prodPrev, nil
 	}
 	return f.prodCur, nil
@@ -126,7 +126,7 @@ func (f *fakeSource) SupplierSales(_ context.Context, _, from, _ string, _ int) 
 	if f.errSupplier != nil {
 		return nil, f.errSupplier
 	}
-	if from == "2026-10-14" {
+	if from == "2026-10-15" {
 		return f.supPrev, nil
 	}
 	return f.supCur, nil
@@ -175,7 +175,8 @@ func newFake() *fakeSource {
 }
 
 func testOptions() Options {
-	// 2026-10-16 生成日报 ⇒ 本期 10-15，上期 10-14
+	// 2026-10-16 生成日报 ⇒ 本期 10-16（今日），上期 10-15（昨日）。
+	// daily 走「今日」语义（2026-10-19 现场实测后改，见 calendar.ResolvePeriod 注释）。
 	now, _ := time.Parse("2006-01-02", "2026-10-16")
 	p, _ := calendar.ResolvePeriod(calendar.PeriodDaily, now)
 	return Options{
@@ -216,7 +217,7 @@ func TestBuildProducesCompleteFact(t *testing.T) {
 		t.Fatalf("Build 失败: %v", err)
 	}
 
-	if f.Meta.PeriodKind != "daily" || f.Meta.From != "2026-10-15" || f.Meta.PrevFrom != "2026-10-14" {
+	if f.Meta.PeriodKind != "daily" || f.Meta.From != "2026-10-16" || f.Meta.PrevFrom != "2026-10-15" {
 		t.Errorf("周期元信息错误: %+v", f.Meta)
 	}
 	if f.Totals.NetAmount != 13000 {
@@ -566,7 +567,7 @@ func TestStockQueryIsLimitedToTopProducts(t *testing.T) {
 //	而"整个推送停掉"是最难排查的失败形态
 //	（排查起点变成"它到底跑没跑"，而 dapr 不提供 job 执行历史）。
 //
-// 用 prevOnlyFailSource：只在查上期（from=2026-10-14）时报错。
+// 用 prevOnlyFailSource：只在查上期（from=2026-10-15）时报错。
 func TestPrevPeriodFailureStillProducesReport(t *testing.T) {
 	fs := &prevOnlyFailSource{fakeSource: newFake()}
 	fs.catCur = []CategoryRow{{Name: "生鲜联营", Amount: 8000, CostedRow: 100, TotalRow: 100}}
@@ -596,7 +597,7 @@ type prevOnlyFailSource struct {
 }
 
 func (p *prevOnlyFailSource) CategorySales(ctx context.Context, b, from, to string, n int) ([]CategoryRow, error) {
-	if from == "2026-10-14" {
+	if from == "2026-10-15" {
 		return nil, errors.New("上期数据不可用")
 	}
 	return p.fakeSource.CategorySales(ctx, b, from, to, n)

@@ -27,6 +27,13 @@ type ServiceImpl struct {
 	// branchName 解析：把 X-Branch-ID 变成可读名称（可选）。
 	branchNames BranchNamer
 	now         func() time.Time
+	// bizTZ 是营业时区（默认 Asia/Shanghai UTC+8），决定「今日」是哪一天。
+	//
+	// ⚠️ **必须**由 cmd/sales-insight/main.go 注入：
+	//   time.Now 默认 location 是 UTC，早班 0:30 CST = 前一日 16:30 UTC，
+	//   若不注入，daily 会被算成「昨天」+「前天」(详见 calendar.ResolvePeriod 注释)。
+	// 测试里保持 nil 即可 —— 测试自己注入 now，location 跟随 now。
+	bizTZ *time.Location
 }
 
 // NewServiceImpl 构造。
@@ -45,12 +52,39 @@ func (s *ServiceImpl) WithBranchNamer(n BranchNamer) *ServiceImpl {
 }
 
 // WithNow 注入时钟。
+//
+// ⚠️ **只用于测试**：生产路径走 WithBizTZ，让 now 自然带 location。
+// 一旦 WithNow 注入，WithBizTZ 的 location 会被忽略 ——
+// 这是测试套件需要的灵活性（fixed clock 不带 location），
+// 不是生产期望行为。
 func (s *ServiceImpl) WithNow(f func() time.Time) *ServiceImpl {
 	if f != nil {
 		s.now = f
 	}
 	return s
 }
+
+// WithBizTZ 注入营业时区（如 Asia/Shanghai）。
+//
+// 注入后 `now` 会被替换为 `time.Now().In(loc)`：
+// calendar.ResolvePeriod 用 `now.Location()` 算日期，
+// 早班（00:00~08:00 CST）若不注入，UTC 视角会少 8 小时。
+//
+// 反证：删掉 s.now = func() ... → 早班那条路径下 daily 仍然走 time.Now()
+// 的 UTC location，2026-10-19 现场 bug 复现。
+func (s *ServiceImpl) WithBizTZ(loc *time.Location) *ServiceImpl {
+	if loc == nil {
+		return s
+	}
+	s.bizTZ = loc
+	s.now = func() time.Time { return time.Now().In(loc) }
+	return s
+}
+
+// BizTZ 返回营业时区（未注入时为 nil）。
+//
+// 用于 health 端点暴露 —— 运维一眼能看出 daily 算的是哪个时区的"今天"。
+func (s *ServiceImpl) BizTZ() *time.Location { return s.bizTZ }
 
 // Generate 生成一期报告。
 //

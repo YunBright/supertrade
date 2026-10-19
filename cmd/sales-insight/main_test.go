@@ -12,6 +12,7 @@ import (
 
 	dapr "github.com/dapr/go-sdk/client"
 
+	"github.com/YunBright/supertrade/internal/salesinsight/handler"
 	"github.com/YunBright/supertrade/internal/salesinsight/weather"
 )
 
@@ -172,5 +173,56 @@ func TestNewQuotaGuardProbeLeavesNoCounter(t *testing.T) {
 		if strings.Contains(k, "probe") {
 			t.Errorf("探针写进了 key 空间: %s（每天凭空少 1 次配额）", k)
 		}
+	}
+}
+
+// ⚠️ wireBizTZ 默认必须是 Asia/Shanghai ——
+// 现场 2026-10-19 22:50 推送 → 区间 2026-10-18 的根因就是这里。
+//
+// 反证：把默认改成 "UTC"（或任何其它）→ 本用例 fail。
+//
+// 期望值用字面量 "Asia/Shanghai"，不由 `time.Local.String()` 推导：
+// 测试机器本身可能是 Local，但 daily 必须落在 CST。
+func TestWireBizTZDefaultsToShanghai(t *testing.T) {
+	t.Setenv("SALESINSIGHT_BIZ_TZ", "")
+	svc := handler.NewServiceImpl(nil, nil)
+	if err := wireBizTZ(svc); err != nil {
+		t.Fatalf("wireBizTZ 失败: %v", err)
+	}
+	if got := svc.BizTZ().String(); got != "Asia/Shanghai" {
+		t.Errorf("默认时区 = %v, 期望 Asia/Shanghai", got)
+	}
+}
+
+// env SALESINSIGHT_BIZ_TZ 必须能覆盖默认 ——
+// 与 fresh-meat 的 FRESHMEAT_BIZ_TZ 同语义，便于跨机房搬迁。
+//
+// 反证：删掉 envStr(envStr 那一段 → env 被忽略，Asia/Tokyo 不生效，
+// 本用例 fail（仍走 Asia/Shanghai）。
+func TestWireBizTZRespectsEnv(t *testing.T) {
+	t.Setenv("SALESINSIGHT_BIZ_TZ", "Asia/Tokyo")
+	svc := handler.NewServiceImpl(nil, nil)
+	if err := wireBizTZ(svc); err != nil {
+		t.Fatalf("wireBizTZ 失败: %v", err)
+	}
+	if got := svc.BizTZ().String(); got != "Asia/Tokyo" {
+		t.Errorf("env 覆盖 = %v, 期望 Asia/Tokyo", got)
+	}
+}
+
+// LoadLocation 失败时必须 fail-fast —— 不许静默退化成 time.Local
+// 或 time.UTC（那会复现 2026-10-19 现场 bug）。
+//
+// 反证：删掉 err 检查，svc.WithBizTZ 不会被调用，本用例 fail（err == nil）。
+func TestWireBizTZInvalidEnvErrors(t *testing.T) {
+	t.Setenv("SALESINSIGHT_BIZ_TZ", "NotAReal/Zone")
+	svc := handler.NewServiceImpl(nil, nil)
+	if err := wireBizTZ(svc); err == nil {
+		t.Errorf("无效时区应 fail-fast，实际 err = nil —— 那会落入 time.Local，" +
+			"把现场 2026-10-19 bug 又带回来")
+	}
+	if svc.BizTZ() != nil {
+		t.Errorf("加载失败时 bizTZ 字段必须保持 nil（不注入），实际 = %v",
+			svc.BizTZ())
 	}
 }

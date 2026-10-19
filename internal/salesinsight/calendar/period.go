@@ -74,7 +74,15 @@ func (p Period) Label() string {
 //
 // 这是本函数存在的全部理由：
 //
-//   - 日报：昨天 vs 前天。正确。
+//   - 日报：**今天 vs 昨天**。
+//     wechat-bot 默认在 22:50 推送（每门店 SendTime 可配），这是营业日中段、
+//     不是结账后 —— 所以日报应当反映「当日实况」，而不是「昨日结账数」。
+//     注意今天的销售额是**部分日**的（22:50 抓取 ≈ 88% 完整度，
+//     视门店营业时长而定），环比「完整昨天」会出现「跌」的观感。
+//     这是产品取舍：22:50 的报告本来就该反映「当日」，
+//     等关店后再出一份收口日报是后续工作的方向。
+//     ⚠️ **不要**把 today 改成 yesterday 来「解决」这个下跌观感 ——
+//     那只会把 bug 重新引入（用户期望是「今日」，不是「昨日」）。
 //   - 周报：本周一~今天 vs **上周一~上周同一天**。
 //     若取自然上期（上周一~上周日），当今天是周四时就是 4 天 vs 7 天，
 //     金额必然跌 43%，而这只是"还没过完周三"。
@@ -83,12 +91,21 @@ func (p Period) Label() string {
 //
 // 这个错误极其常见且极具误导性：它每次都"看起来像一个坏消息"，
 // 而实际上只是口径错了。店长会照着它砍品。
+//
+// # ⚠️ **now 必须带营业时区（Asia/Shanghai）**，否则早期早班（0:00~08:00 CST）
+//
+//	会被 time.Now 默认的 UTC 误算成前一天 —— 例如 0:30 CST = 16:30 UTC，
+//	若用 UTC 则 daily 落到「昨日」，再 +1 偏移后今天变成「昨天的昨天」。
+//
+// 调用本函数前用 `s.now().Location()` 检查；若不是 `Asia/Shanghai`，
+// 应通过 ServiceImpl.WithBizTZ 注入（见 cmd/sales-insight/main.go）。
 func ResolvePeriod(kind PeriodKind, now time.Time) (Period, error) {
 	d := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	switch kind {
 	case PeriodDaily:
-		cur := Range{Start: d.AddDate(0, 0, -1), End: d.AddDate(0, 0, -1)}
-		prev := Range{Start: d.AddDate(0, 0, -2), End: d.AddDate(0, 0, -2)}
+		// today vs yesterday（与周报/月报"本期 = 在走周期"口径保持一致）
+		cur := Range{Start: d, End: d}
+		prev := Range{Start: d.AddDate(0, 0, -1), End: d.AddDate(0, 0, -1)}
 		return Period{Kind: kind, Cur: cur, Prev: prev}, nil
 
 	case PeriodWeekly:

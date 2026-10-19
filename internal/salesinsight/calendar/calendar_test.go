@@ -77,11 +77,16 @@ func TestMakeupWorkdayBeatsWeekend(t *testing.T) {
 	}
 }
 
-// ⚠️ 本包的**核心**防回归测试：周报/月报的上期必须是"同期口径"。
+// ⚠️ 本包的**核心**防回归测试：周报/月报的上期必须是"同期口径"，
+// 日报本期必须是"今日"（22:50 推送默认 DailySendTime）。
 //
 // 如果上期退化成自然上期（上周一~上周日 / 上月1号~上月底），
 // 在周中/月中就会拿 4 天比 7 天，金额必然显示"大幅下滑"，
 // 而那只是"本周还没过完"。这个错误每次都像坏消息，但毫无经营含义。
+//
+// 日报退化成"昨天"会让 22:50 在 D 推送的报告变成 D-1，而店长看的就是 D 当下 ——
+// 那条 bug 在 2026-10-19 现场实测：用户看到「现在是 2026-10-19 23:30，
+// 但日报显示 2026-10-18」，根因就是这里。
 func TestResolvePeriodUsesSameLengthComparison(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -91,10 +96,11 @@ func TestResolvePeriodUsesSameLengthComparison(t *testing.T) {
 		wantPrev [2]string
 	}{
 		{
-			name: "日报取昨天比前天", kind: PeriodDaily, now: "2026-10-16",
-			wantCur: [2]string{"2026-10-15", "2026-10-15"},
-			// 10-15 是昨天，10-14 是前天
-			wantPrev: [2]string{"2026-10-14", "2026-10-14"},
+			// 22:50 推送 = 当日营业中段，「今日」反映当下实况。
+			// 上期是「完整昨日」，口径是「部分 vs 完整」，是产品取舍。
+			name: "日报今日(22:50推送) vs 昨日", kind: PeriodDaily, now: "2026-10-16",
+			wantCur:  [2]string{"2026-10-16", "2026-10-16"},
+			wantPrev: [2]string{"2026-10-15", "2026-10-15"},
 		},
 		{
 			// 周四：本周一(10-12)~今天(10-16) = 5 天
@@ -234,5 +240,68 @@ func TestRangeDaysNeverNegative(t *testing.T) {
 	}
 	if d := r.Dates(); d != nil {
 		t.Fatalf("空区间不应产生日期列表，实际 %v", d)
+	}
+}
+
+// ⚠️ daily 必须走「今日」语义 —— 22:50 推送时营业日中段。
+//
+// 反证：把 `d` 改成 `d.AddDate(0, 0, -1)`（即变回「昨日」）→
+// 22:50 在 D 推送会显示 D-1 的"完整昨日"销售，
+// 用户实测 2026-10-19 看到的正是这个 bug。
+//
+// 期望值用字面量（"2026-10-16"），而不是由 now 推导，
+// 避免「改了 now 测试照样过」的判别力塌陷。
+func TestDailyCurIsTodayNotYesterday(t *testing.T) {
+	now := time.Date(2026, 10, 16, 22, 50, 0, 0, time.UTC)
+	p, err := ResolvePeriod(PeriodDaily, now)
+	if err != nil {
+		t.Fatalf("ResolvePeriod 失败: %v", err)
+	}
+	if got := Format(p.Cur.Start); got != "2026-10-16" {
+		t.Errorf("daily cur = %q, 期望 2026-10-16（今日，不是 2026-10-15 昨日）", got)
+	}
+	if got := Format(p.Cur.End); got != "2026-10-16" {
+		t.Errorf("daily cur.End = %q, 期望 2026-10-16", got)
+	}
+	if got := Format(p.Prev.Start); got != "2026-10-15" {
+		t.Errorf("daily prev = %q, 期望 2026-10-15（昨日）", got)
+	}
+}
+
+// ⚠️ now 的 Location 直接决定「今天是哪一天」 ——
+// 早班 0:30 CST = 16:30 UTC（前一日），两条视角下的 daily 必不同。
+//
+// 这是 2026-10-19 现场 bug 的根因：sales-insight 没注入 Asia/Shanghai，
+// time.Now() 默认 UTC，于是 daily 把"今天"算成了 UTC 那天的真实日。
+//
+// 反证：删掉 `now.Location()`（统一用 time.UTC 算 d.Year/Month/Day）→
+// 早班那条路径下 daily 仍然显示「昨日」，
+// 即 UTC 视角的"今天"≠ CST 视角的"今天"，店长看到的就是错的日期。
+//
+// 注意：本测试**只**验证 ResolvePeriod 用 now.Location() 而**不**验证
+// 调用方是否注入了 Asia/Shanghai —— 那条契约由 ServiceImpl.WithBizTZ 测试覆盖。
+func TestDailyNowBoundaryRespectsTimezone(t *testing.T) {
+	cst, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatalf("LoadLocation(Asia/Shanghai) 失败: %v", err)
+	}
+	// 16:30 UTC 2026-10-15 = 00:30 CST 2026-10-16
+	utcNow := time.Date(2026, 10, 15, 16, 30, 0, 0, time.UTC)
+	cstNow := utcNow.In(cst)
+
+	pUTC, err := ResolvePeriod(PeriodDaily, utcNow)
+	if err != nil {
+		t.Fatalf("ResolvePeriod(utcNow) 失败: %v", err)
+	}
+	if got := Format(pUTC.Cur.Start); got != "2026-10-15" {
+		t.Errorf("UTC 视角 daily = %q, 期望 2026-10-15", got)
+	}
+
+	pCST, err := ResolvePeriod(PeriodDaily, cstNow)
+	if err != nil {
+		t.Fatalf("ResolvePeriod(cstNow) 失败: %v", err)
+	}
+	if got := Format(pCST.Cur.Start); got != "2026-10-16" {
+		t.Errorf("CST 视角 daily = %q, 期望 2026-10-16（注入 Asia/Shanghai 才是对的）", got)
 	}
 }

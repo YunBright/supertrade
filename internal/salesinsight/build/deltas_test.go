@@ -128,7 +128,7 @@ type prevTotalsFailSource struct {
 }
 
 func (p *prevTotalsFailSource) TotalsSales(ctx context.Context, b, from, to string) (TotalsRow, error) {
-	if from == "2026-10-14" {
+	if from == "2026-10-15" {
 		return TotalsRow{}, errors.New("上期总额不可用")
 	}
 	return p.fakeSource.TotalsSales(ctx, b, from, to)
