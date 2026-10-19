@@ -62,9 +62,16 @@ var ErrResultTruncated = errors.New("service: 筛选结果达到拉取上限,可
 // 语义与"传一批 id"最重要的区别:同一组条件在 preview 与 apply 里解析出的
 // 集合必须一致 —— 所以两端都走 ResolveSettlementSet,不允许 apply 再收窄。
 type SettlementFilter struct {
-	// From / To 是**账期结束日**闭开区间 [From, To),与既有
-	// GET /settlement-approvals/cube/settlements 的 settled_at 过滤同一口径。
+	// From / To 是**账期结束日**(period_end)闭开区间 [From, To),
 	// 传空串表示不限。
+	//
+	// ⚠️ 2026-10-19 更正:这段注释原先写的是"与 GET cube/settlements 的
+	// settled_at 过滤同一口径" —— 后半句没错,但前半句是错的:当时的实现
+	// 真的把 from/to 打在 settled_at 上,而 settled_at 是**结算日**,
+	// 另一个列(源列 settle_date,period_end 则是 end_date)。
+	// ysx 源库 4379 张已审核结款单里 settled_at 只有 1 张有值,
+	// 所以那次筛选恒返 0 张 —— 日期范围在页面上等于完全不起作用。
+	// 现已改回 period_end,见 DaprCubeQuerier.ListAuditedSettlements 的注释。
 	From string
 	To   string
 	// SupplierID 精确匹配供应商。

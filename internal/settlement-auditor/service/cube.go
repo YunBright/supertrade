@@ -180,20 +180,54 @@ func (q *DaprCubeQuerier) ListSettlements(ctx context.Context, branchID string, 
 // "自然序前 5000 张内排序",对当前数据量(4353)无影响。
 const cubeSettlementFetchCap = 5000
 
+// settlementPeriodFilters 构造账期区间过滤。
+//
+// 提成纯函数只为让"用哪一列"能被单测钉住 —— 这是本页最容易被人顺手改回去的
+// 地方,而改错了**不报错、不降级**,只是日期筛选静默失效(见
+// TestSettlementPeriodFilters_UsesPeriodEndNotSettledAt)。
+//
+// 语义:[from, to),打 `settlement.period_end`(账期结束日)。
+// 空串 = 不限,该端不产生 filter。
+func settlementPeriodFilters(from, to string) []cubeclient.CubeFilter {
+	var out []cubeclient.CubeFilter
+	if from != "" {
+		out = append(out, cubeclient.CubeFilter{Member: "settlement.period_end", Operator: "gte", Values: []any{from}})
+	}
+	if to != "" {
+		out = append(out, cubeclient.CubeFilter{Member: "settlement.period_end", Operator: "lt", Values: []any{to}})
+	}
+	return out
+}
+
 // ListAuditedSettlements H5 勾选数据源:approve_status=1 且 document_type in (DP,CP)。
 //
 // 返回按账期结束日倒序(新的在前),最多 limit 张。
+//
+// # [from, to) 筛的是 **period_end(账期结束日)**,不是 settled_at
+//
+// 2026-10-19 改。之前筛的是 `settled_at`(结算日),两处都是错的:
+//
+//  1. **列选错了**。`settled_at` 在 ysx 源库 4379 张已审核结款单里**只有 1 张**
+//     有值(其余为 NULL)—— 思迅的 CP 购销返利单根本不走结算日。
+//     实测同一账期窗口:settled_at 命中 0 张,period_end 命中 113 张。
+//     UI 上写的是「账期范围」,运营说的"9 月这些单我付过了"指的也是账期。
+//
+//  2. **算子选错了**(已在上游 cube 修掉,但这里必须记着为什么不能改回去):
+//     `gte`/`lt` 打在真 datetime 列上,历史版本会生成 `RTRIM(end_date) >= ?`
+//     —— 拿 RTRIM 之后的**文本**跟 ISO 字面量比大小。MSSQL 隐式把 datetime
+//     转成 "09  1 2026 12:00AM" 再比,结果取决于 SET LANGUAGE,实测恒返 0 张。
+//     cube 现在对 `type: time` 且非 char_date 的列自动 CAST 成 DATETIME 再比;
+//     `settlement.period_end` 正属于这一类(char_date 才是 char 存 ISO,
+//     那种列保持字符串比较才对,见 cube pkg/cubequery 的 cmp 用例)。
+//
+// ⚠️ 改这一行之前先确认列名:period_end(账期结束日)与 settled_at(结算日)
+// 在思迅源表里是两个不同的列(end_date / settle_date),语义不可互换。
 func (q *DaprCubeQuerier) ListAuditedSettlements(ctx context.Context, branchID, from, to, supplierID string, limit int) ([]SettlementRow, error) {
 	filters := []cubeclient.CubeFilter{
 		{Member: "settlement.approve_status", Operator: "equals", Values: []any{"1"}},
 		{Member: "settlement.document_type", Operator: "in", Values: []any{"DP", "CP"}},
 	}
-	if from != "" {
-		filters = append(filters, cubeclient.CubeFilter{Member: "settlement.settled_at", Operator: "gte", Values: []any{from}})
-	}
-	if to != "" {
-		filters = append(filters, cubeclient.CubeFilter{Member: "settlement.settled_at", Operator: "lt", Values: []any{to}})
-	}
+	filters = append(filters, settlementPeriodFilters(from, to)...)
 	if supplierID != "" {
 		filters = append(filters, cubeclient.CubeFilter{Member: "settlement.supplier_id", Operator: "equals", Values: []any{supplierID}})
 	}
