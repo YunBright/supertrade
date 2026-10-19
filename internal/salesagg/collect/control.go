@@ -237,7 +237,19 @@ func (c *Control) Enable(ctx context.Context, userBearer, branchID, createdBy st
 		if err := c.accounts.SetDisabled(ctx, userBearer, clientID, false); err != nil {
 			return nil, fmt.Errorf("启用失败：取消 auth 侧禁用时出错: %w", err)
 		}
+		// ⚠️ 2026-10-19 真事故就在这一行附近：
+		//   上一版下面直接 `Put(ctx, row)` —— 拿到的 `row` 仍是 disabled，
+		//   而 `Put` 是全量覆盖 ⇒ 写回 PG 的还是 disabled。
+		//   Flutter 那头拿到 200 + status="disabled" 显示"已关停"，
+		//   加上 toast 仍然报"操作成功"，完全看不出问题。
+		//
+		//   进一步的后果：Reconcile 凭 enabled ∩ 在营 决定注册 job，
+		//   行 status 仍 disabled ⇒ job 不会重新注册 ⇒ 用户的"重新开启"
+		//   瞬间又回到起点，且没有任何告警。
+		row.Status = string(StatusEnabled)
 		if err := c.store.Put(ctx, row); err != nil {
+			// 这一步若失败：auth 已 enabled / 本地仍 disabled ⇒ 漂移。
+			// 与"建号后落库失败"那条同族，本轮先不展开修，记在 dbt。
 			return nil, err
 		}
 		if c.jobs != nil {
@@ -378,7 +390,7 @@ func (c *Control) requireCubeSource(ctx context.Context, branchID string) error 
 // cubeSourceHint 按哨兵给出不同的下一步提示。
 //
 // ⚠️ 两种情况给的提示**必须不同**：让"数据源被禁用"的用户去点「配置数据源」
-//   是纯粹的误导 —— 他配了也没用，那要管理员启用。
+// 是纯粹的误导 —— 他配了也没用，那要管理员启用。
 func cubeSourceHint(err error) string {
 	if errors.Is(err, ErrCubeSourceDisabled) {
 		return "请在「数据源」里启用该门店的 cube 数据源后重试（若找不到该门店的映射，请联系管理员）。"

@@ -268,6 +268,98 @@ func TestEnableCreatesAccountGrantsCubeReadAndStoresCiphertext(t *testing.T) {
 	}
 }
 
+// TestReenableFromDisabled ⭐⭐
+//
+// "已关停 → 重新开启" 必须真把状态翻回 enabled。
+//
+// 2026-10-19 线上事故：上一版 Enable 在这一路径里只 `Put(ctx, row)`，
+// 而 `row` 是从 Get 拿的、`row.Status` 仍是 disabled —— `Put` 是
+// 全量覆盖 ⇒ 写回 PG 的还是 disabled。Flutter 拿到 200 + status="disabled"
+// 显示"已关停"，toast 仍然"操作成功"，完全看不出问题。
+//
+// 进一步后果：Reconcile 按 enabled ∩ 在营 决定注册 job，
+// 行 status 仍 disabled ⇒ job 不会重新注册 ⇒ 用户的"重新开启"
+// 瞬间又回到起点，且没有任何告警。
+//
+// ⚠️ 这条是 2026-10-19 用户在 Flutter 里点"重新开启采集"后看到的 bug：
+// toast 报"操作成功"，但状态没变化。
+//
+// ⚠️ 期望值用**字面量**（string(StatusEnabled)），不用任何被测常量推导。
+func TestReenableFromDisabled(t *testing.T) {
+	cubes := &fakeCubes{name: "src", enabled: true}
+	accts := &fakeAccounts{secret: "s3cret"}
+	jobs := &fakeJobs{}
+	ctl, st := newTestControl(t, cubes, accts, jobs)
+	ctx := context.Background()
+
+	// 1) 首次开启 —— 走「建号 → 加密 → 落库 → 注册」全新路径。
+	first, err := ctl.Enable(ctx, "Bearer u", "00", "u1")
+	if err != nil {
+		t.Fatalf("首次 Enable: %v", err)
+	}
+	if first.Status != "enabled" {
+		t.Fatalf("首次 Enable 返回 status=%q, 期望 \"enabled\"", first.Status)
+	}
+	if accts.created != 1 {
+		t.Fatalf("首次应 Create 一次账号, got %d", accts.created)
+	}
+	if len(jobs.registered) != 1 || jobs.registered[0] != "00" {
+		t.Fatalf("首次应注册 00 的 job, got %v", jobs.registered)
+	}
+
+	// 2) 模拟关停：把行 status 翻成 disabled，并清掉 job。
+	if err := st.SetStatus(ctx, "00", StatusDisabled); err != nil {
+		t.Fatalf("SetStatus(disabled): %v", err)
+	}
+	jobs.registered = nil
+	jobs.deleted = nil
+	accts.enableSet = 0 // 关停自己也会调 SetDisabled(true)，清掉计数
+
+	// 3) **重新开启** —— 这才是 bug 现场。
+	again, err := ctl.Enable(ctx, "Bearer u", "00", "u1")
+	if err != nil {
+		t.Fatalf("重新 Enable: %v", err)
+	}
+
+	// 返回的 State 必须为 enabled。
+	if again.Status != "enabled" {
+		t.Fatalf("重新 Enable 返回 status=%q, 期望 \"enabled\"", again.Status)
+	}
+
+	// 关键的：落库行**本身**必须翻回 enabled。
+	//
+	// 拿这一步的 fromJson 取法被 fix 前是 disabled ⇒ UI 显示"已关停"
+	// ⇒ toast 仍说"操作成功" ⇒ 用户没法察觉。
+	row, err := st.Get(ctx, "00")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if row == nil {
+		t.Fatal("重新启用后行居然不存在")
+	}
+	if row.Status != string(StatusEnabled) {
+		t.Fatalf("行 status = %q, 期望 %q（bug 现场：旧版只 Put 没翻状态）",
+			row.Status, StatusEnabled)
+	}
+
+	// 副作用核对：不应再建号 / 轮换密钥（明文我们还有）。
+	// 计数是**累积**的，所以"重新开启不该多调"= 与首次调用后相等。
+	if accts.created != 1 {
+		t.Errorf("重新启用不该再 Create 账号, got %d (期望 1，与首次开启后相同)", accts.created)
+	}
+	if accts.reset != 0 {
+		t.Errorf("重新启用不该轮换密钥, got %d", accts.reset)
+	}
+	// auth 侧：SetDisabled(false) 必须被调一次。
+	if accts.enableSet != 1 {
+		t.Errorf("auth 侧取消禁用应被调一次, got %d", accts.enableSet)
+	}
+	// job 必须被注册（不然 Reconcile 看不到 enabled ⇒ 不会自己补）。
+	if len(jobs.registered) != 1 || jobs.registered[0] != "00" {
+		t.Errorf("重新启用应注册 00 的 job, got %v", jobs.registered)
+	}
+}
+
 // TestEnableIsIdempotent ⭐
 //
 // 已是 enabled 时再点一次开启，必须**什么都不做**。
