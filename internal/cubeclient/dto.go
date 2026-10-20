@@ -147,6 +147,117 @@ type SupplierDTO struct {
 	Email   string `json:"email,omitempty"`   // 邮箱
 	Address string `json:"address,omitempty"` // 地址
 	Status  string `json:"status,omitempty"`  // cube supplier.status
+	// CustFlag 是"是不是供应商"的第一道闸(S=供应商 / C=客户 / A=其他)。
+	//
+	// 2026-10-20 新增:商品选择控件的供应商摘要要把它带出来,便于以后按
+	// 供应商口径收窄(本期不过滤 —— picker 回答的是"这家店在卖什么",
+	// 客户条目也挂在商品上)。
+	CustFlag string `json:"cust_flag,omitempty"`
+	// SupplyWay 是供应商的**销售方式**代码(思迅 t_bd_supcust_info.sale_way,
+	// cube 维度 supplier.supply_way),指向 sale_way model 的 id。
+	//
+	// 2026-10-20 实测口径:业务要的「购销 / 联营 / 代销 / 租赁 / 自产 / 扣率代销」
+	// 就是这个字段(思迅 t_bd_base_code 里 type_no='SW' 的那几行)。
+	// 两个生产库的供应商**全部有值**(ysx 219 / hbposv7 300)。
+	//
+	// ⚠️ **别用 cust_clsno(客户类别)当"供应商类别"**:实测 ysx 219 个供应商里
+	// 170 个是 NULL(78% 没归类),用它做第一级的话下拉框里大部分供应商
+	// 挤在"未分类"里。名字在另一张表(sale_way),cube 的 duck 模型之间不能
+	// join,所以这里只带**代码**,名字由上层(supertrade catalog)Go 侧 join 补。
+	SupplyWay string `json:"supply_way,omitempty"`
+}
+
+// SaleWayDTO 是 cube `sale_way` model 的响应子集。
+//
+// 「销售方式」字典(思迅 t_bd_base_code,type_no='SW'):
+// 商品选择控件的供应商两级结构的**第一层**。
+type SaleWayDTO struct {
+	ID   string `json:"id"`   // cube sale_way.id(思迅 code_id:A/B/C/D/E/F)
+	Name string `json:"name"` // cube sale_way.name(思迅 code_name:购销/联营/…)
+}
+
+// CategoryDTO 是 cube `category` model 的响应子集。
+//
+// 商品分类(思迅 t_bd_item_cls):picker 侧栏第一行的数据源。
+type CategoryDTO struct {
+	ID       string `json:"id"`        // cube category.id(思迅 item_clsno)
+	Name     string `json:"name"`      // cube category.name(思迅 item_clsname)
+	ParentID string `json:"parent_id"` // 父分类 id(NULL = 顶级)
+}
+
+// ProductPageDTO 是一页商品 + 过滤后的总条数。
+//
+// Total 来自 cube 响应顶层的 total(需要 CubeQuery.Total = true 才拿得到真值)。
+type ProductPageDTO struct {
+	Rows  []ProductDTO
+	Total int
+}
+
+// CategoryListDTO 是分类字典 + 字典总条数。
+type CategoryListDTO struct {
+	Rows  []CategoryDTO
+	Total int
+}
+
+// SupplierListDTO 是供应商字典 + 字典总条数。
+type SupplierListDTO struct {
+	Rows  []SupplierDTO
+	Total int
+}
+
+// SaleWayListDTO 是「销售方式」字典 + 字典总条数。
+type SaleWayListDTO struct {
+	Rows  []SaleWayDTO
+	Total int
+}
+
+// ProductQuery 是商品列表 / 搜索的查询条件(cube 侧口径)。
+//
+// Offset / Limit 直接落到 cube 的 offset / limit;Offset > 0 时实现方**必须**
+// 同时给 order(见 CubeQuery.Offset 的注释)。
+type ProductQuery struct {
+	// Keyword 是子串关键词,命中 product.id 或 product.name。
+	//
+	// 空 = 不过滤(纯浏览模式)。
+	Keyword string
+	// CategoryID / SupplierID 是精确过滤(空 = 不过滤)。
+	CategoryID string
+	SupplierID string
+	// CategoryIDs 是**一组**分类 id。
+	//
+	// 2026-10-20 新增:分类改成树之后,"按某个分类看商品"的语义是
+	// **该分类 + 它的所有子孙分类**。上层把树展开成一组 id 传下来,
+	// 这里用 cube 的 `in` 算子一次查完(而不是 N 次 equals)。
+	//
+	// ⚠️ CategoryIDs 优先于 CategoryID:两者都给了时以它为准。
+	//
+	// ⚠️ **nil 与空切片的语义不同**:
+	//
+	//	nil    = 不过滤(没有这个筛选维度)
+	//	空切片 = "按这个集合过滤",而集合是空的 ⇒ **命中 0 行**
+	//
+	// 空集合当成"不过滤"会返回**全店商品**(实测门店 00 是 27565 个),
+	// 而且**全程不报错**。实现方判断"要不要加过滤"必须用 `!= nil`。
+	CategoryIDs []string
+	// SupplierIDs 是**一组**供应商 id。
+	//
+	// 供应商也是两级(类别 → 供应商),所以"按某个供应商类别看商品"的语义
+	// 是「该类别下的全部供应商」。上层把类别展开成一组 id 传下来。
+	//
+	// ⚠️ **SupplierIDs 与 SupplierID 是 AND,不是"优先"**:
+	// 两个都给就取交集("属于这组 且 属于这个供应商")。
+	// 真实实现是两个独立的 if,不是 switch。
+	//
+	// ⚠️ nil / 空切片的语义与 CategoryIDs **完全一样**
+	// (nil = 不过滤;空切片 = 命中 0 行)。
+	//
+	// 这一条不是洁癖:实测门店 00 的"扣率代销"类别**一个供应商都没有**
+	// (销售方式字典有 6 个码,那个门店没有扣率代销的供应商),
+	// 展开出来是空集 —— 当成"不过滤"的话,用户点这个类别会看到
+	// **全店 27565 个商品**。
+	SupplierIDs []string
+	Offset      int
+	Limit       int
 }
 
 // ProductWithStock 是 product + 该门店 stock 的复合(用于一次性聚合接口)。

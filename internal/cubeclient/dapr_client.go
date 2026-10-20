@@ -31,6 +31,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -158,11 +159,38 @@ func NewDaprCubeClient(daprClient daprInvoker, appID, queryPath string) *DaprCub
 }
 
 // CubeQuery 是 cube /v1/load body 的最小子集。
+//
+// # 2026-10-20 扩展:offset / order / total
+//
+// 之前只有 measures / dimensions / filters / limit,而 cube 的分页有两条硬约束:
+//
+//  1. **offset 必须配 order**。offset>0 且没给 order 时 cube 直接 400:
+//     「offset=2 需要显式 order:分页必须建立在稳定排序上,否则每页可能重复或漏行」。
+//     没有 order 的 limit 是**任意截取**,翻页会重复 / 漏行。
+//  2. **不给 total 时响应里的 total 恒为 0**。total=true 才返回"不受
+//     limit/offset 影响的总行数"(响应顶层 total)。
+//
+// ⇒ 之前这个结构体**根本表达不了分页**,只能"一次全取"。
 type CubeQuery struct {
 	Measures   []string
 	Dimensions []string
 	Filters    []CubeFilter
 	Limit      int
+	// Offset 是偏移量。**必须同时给 Order**,否则 cube 返 400。
+	Offset int
+	// Order 是排序。id 必须写全限定名("<model>.<ref>")且**同时在本次 SELECT 里**
+	// (ORDER BY 只能引用输出列,否则 GROUP BY 查询会在 DB 层报 "not a grouped column")。
+	Order []CubeOrder
+	// Total 为 true 时 cube 返回不受 limit/offset 影响的总行数(响应顶层 total)。
+	Total bool
+}
+
+// CubeOrder 是 cube 的排序项。
+//
+// ID 写全限定名("product.id"),Order 取 asc / desc(大小写不敏感,省略按 asc)。
+type CubeOrder struct {
+	ID    string `json:"id"`
+	Order string `json:"order"`
 }
 
 // CubeFilter 是 where 条件。
@@ -172,6 +200,26 @@ type CubeFilter struct {
 	Values   []any  `json:"values"`
 }
 
+// cube 的 filter 算子名(拼错会得到 400 `unsupported operator`,不会静默返回空)。
+//
+// 这里只把**用到的**列成常量:算子名是**跨仓契约**(cube 编译成 SQL 语义),
+// 散落在调用点写裸字符串时,拼错了只有到运行时才知道 —— 而那时已经在生产上了。
+const (
+	// OperatorEquals 等值匹配。
+	OperatorEquals = "equals"
+	// OperatorContains 子串匹配,**大小写敏感**。
+	//
+	// ⚠️ DuckDB 的 LIKE 大小写敏感(实测 "Face" 命中、"face" 不命中),
+	// 所以商品名里有拉丁品牌名(洁柔Face / C&S)时,用户打出小写就搜不到。
+	// 要大小写无关用 [OperatorContainsCI]。
+	OperatorContains = "contains"
+	// OperatorContainsCI 子串匹配,**大小写无关**(2026-10-20 cube 新增)。
+	//
+	// cube 侧把列与模式都转小写再比;模式在**编译期** lower,值仍走参数绑定。
+	// 只影响 ASCII 字母,中文与数字原样通过。
+	OperatorContainsCI = "containsCI"
+)
+
 // LoadCubeQuery 调 cube /v1/load,返回 data[] 数组。
 //
 // 每行 key 形如 "<model>.<field>",例如 "product.id"、"stock.total_quantity"。
@@ -179,7 +227,28 @@ type CubeFilter struct {
 // 错误映射:
 //   - gRPC NotFound → ErrCubeNotFound(各 GetX 方法 wrap 成具体 error)
 //   - 其它错误 → 普通 wrap error
+//
+// 响应顶层的 total 本方法**不返回** —— 需要它的调用方用 LoadCubeQueryPage。
 func (c *DaprCubeClient) LoadCubeQuery(ctx context.Context, modelName string, q CubeQuery) ([]map[string]any, error) {
+	data, _, err := c.loadCubeQuery(ctx, modelName, q)
+	return data, err
+}
+
+// LoadCubeQueryPage 调 cube /v1/load,返回 data[] **和**响应顶层的 total。
+//
+// total 只有在 CubeQuery.Total = true 时才是真值(不给时 cube 恒返 0 ——
+// 那是"没问",不是"总共 0 条")。
+func (c *DaprCubeClient) LoadCubeQueryPage(ctx context.Context, modelName string, q CubeQuery) ([]map[string]any, int, error) {
+	return c.loadCubeQuery(ctx, modelName, q)
+}
+
+// loadCubeQuery 是两个 Load* 方法的共同实现。
+//
+// body 的字段是**按需**加的:offset / order / total 只在真的要用时才写进去,
+// 这样既有调用方(GetProduct / GetStock / SearchSuppliers / GetActivePromotion
+// 以及 salesagg / salesinsight / settlement-auditor 的查询)发出去的 body
+// 与升级前**逐字节相同**,不会因为"多了一个字段"改变下游行为。
+func (c *DaprCubeClient) loadCubeQuery(ctx context.Context, modelName string, q CubeQuery) ([]map[string]any, int, error) {
 	body := map[string]any{
 		"measures":   q.Measures,
 		"dimensions": q.Dimensions,
@@ -187,6 +256,15 @@ func (c *DaprCubeClient) LoadCubeQuery(ctx context.Context, modelName string, q 
 	}
 	if q.Limit > 0 {
 		body["limit"] = q.Limit
+	}
+	if q.Offset > 0 {
+		body["offset"] = q.Offset
+	}
+	if len(q.Order) > 0 {
+		body["order"] = q.Order
+	}
+	if q.Total {
+		body["total"] = true
 	}
 	b, _ := json.Marshal(body)
 
@@ -205,15 +283,20 @@ func (c *DaprCubeClient) LoadCubeQuery(ctx context.Context, modelName string, q 
 	resp, err := c.dapr.InvokeMethodWithContent(ctx, c.appID, c.queryPath, "POST",
 		&dapr.DataContent{ContentType: "application/json", Data: b})
 	if err != nil {
-		return nil, classifyCubeError(err)
+		return nil, 0, classifyCubeError(err)
 	}
 	var out struct {
 		Data []map[string]any `json:"data"`
+		// Total 是"不受 limit/offset 影响的总行数"。
+		//
+		// ⚠️ 不给 total:true 时 cube 恒返 0 —— 那是"没问",不是"总共 0 条"。
+		// 调用方必须自己知道有没有问。
+		Total int `json:"total"`
 	}
 	if err := json.Unmarshal(resp, &out); err != nil {
-		return nil, fmt.Errorf("cube decode: %w", err)
+		return nil, 0, fmt.Errorf("cube decode: %w", err)
 	}
-	return out.Data, nil
+	return out.Data, out.Total, nil
 }
 
 // ---- Client interface 实现 ----
@@ -512,6 +595,39 @@ func asStr(v any) string {
 
 func asDecimal(v any) decimal.Decimal {
 	return ParseDecimal(v)
+}
+
+// asInt 把 cube 返回的计数字段转成 int。
+//
+// 为什么需要它:duckdb 驱动返回的数值类型不统一(int64 / float64 / []byte /
+// json.Number 都见过),直接 type assert 会静默拿到 0 —— 而 0 在"按分类统计
+// 商品数"这种场景里意味着"这个分类有 0 个商品",是个**看起来正常的错数**。
+func asInt(v any) int {
+	switch x := v.(type) {
+	case nil:
+		return 0
+	case int:
+		return x
+	case int32:
+		return int(x)
+	case int64:
+		return int(x)
+	case float64:
+		return int(x)
+	case json.Number:
+		i, err := x.Int64()
+		if err != nil {
+			return 0
+		}
+		return int(i)
+	case string:
+		i, err := strconv.Atoi(strings.TrimSpace(x))
+		if err != nil {
+			return 0
+		}
+		return i
+	}
+	return int(ParseDecimal(v).IntPart())
 }
 
 // asDecimalPtr 与 asDecimal 的区别:缺失(nil)时返回 nil 而不是 decimal.Zero。

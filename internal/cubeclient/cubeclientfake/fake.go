@@ -21,6 +21,7 @@ package cubeclientfake
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +37,13 @@ type Client struct {
 	products   map[string]cubeclient.ProductDTO
 	stock      map[string]map[string]cubeclient.StockSnapshotDTO // branch_id → product_id → snapshot
 	suppliers  map[string]cubeclient.SupplierDTO
+	categories map[string]cubeclient.CategoryDTO
+	// saleWays 是「销售方式」字典(思迅 t_bd_base_code,type_no='SW')。
+	//
+	// 默认给**生产实测的那 6 行**(A 购销 / B 代销 / C 联营 / D 租赁 /
+	// E 自产 / F 扣率代销)—— 这不是编的,是两个生产库里的真实字典。
+	// 取值来源见 sixun-models/sale_way/schema.yaml。
+	saleWays map[string]cubeclient.SaleWayDTO
 	promotions []cubeclient.PromotionDTO
 	clock      func() time.Time
 }
@@ -61,6 +69,8 @@ func New() *Client {
 		products:   make(map[string]cubeclient.ProductDTO),
 		stock:      make(map[string]map[string]cubeclient.StockSnapshotDTO),
 		suppliers:  make(map[string]cubeclient.SupplierDTO),
+		categories: make(map[string]cubeclient.CategoryDTO),
+		saleWays:   make(map[string]cubeclient.SaleWayDTO),
 		promotions: nil,
 		clock:      func() time.Time { return time.Now().UTC() },
 	}
@@ -129,15 +139,51 @@ func (c *Client) seed() {
 
 	c.suppliers["SUP-001"] = cubeclient.SupplierDTO{
 		ID: "SUP-001", Name: "可口可乐华南", Type: "0",
-		Contact: "张经理", Phone: "13800000001",
+		Contact: "张经理", Phone: "13800000001", SupplyWay: "A",
 	}
 	c.suppliers["SUP-002"] = cubeclient.SupplierDTO{
 		ID: "SUP-002", Name: "农夫山泉代理", Type: "0",
-		Contact: "李经理", Phone: "13800000002",
+		Contact: "李经理", Phone: "13800000002", SupplyWay: "C",
 	}
 	c.suppliers["SUP-101"] = cubeclient.SupplierDTO{
 		ID: "SUP-101", Name: "鲜肉供应商", Type: "0",
-		Contact: "王经理", Phone: "13800000003",
+		Contact: "王经理", Phone: "13800000003", SupplyWay: "A",
+	}
+	// SUP-201 是 P-3001(大白菜)的供应商 —— 必须存在,否则 seed 数据自相矛盾
+	//(商品指向一个字典里没有的供应商,join 出来是 null)。
+	//
+	// ⚠️ 它刻意**没有**销售方式(SUP-201 的 SupplyWay 是空):
+	// 实测生产里 sale_way 全都有值,但"某个供应商没有类别"这条降级路径
+	// 仍然必须被走到 —— 症状是它落进"未分类"组,而不是被丢掉。
+	c.suppliers["SUP-201"] = cubeclient.SupplierDTO{
+		ID: "SUP-201", Name: "蔬菜供应商", Type: "0",
+		Contact: "赵经理", Phone: "13800000004",
+	}
+
+	// 「销售方式」字典:生产实测的那 6 行(思迅 t_bd_base_code,type_no='SW')。
+	// 两个生产库内容一致;取值见 sixun-models/sale_way/schema.yaml。
+	c.saleWays["A"] = cubeclient.SaleWayDTO{ID: "A", Name: "购销"}
+	c.saleWays["B"] = cubeclient.SaleWayDTO{ID: "B", Name: "代销"}
+	c.saleWays["C"] = cubeclient.SaleWayDTO{ID: "C", Name: "联营"}
+	c.saleWays["D"] = cubeclient.SaleWayDTO{ID: "D", Name: "租赁"}
+	c.saleWays["E"] = cubeclient.SaleWayDTO{ID: "E", Name: "自产"}
+	c.saleWays["F"] = cubeclient.SaleWayDTO{ID: "F", Name: "扣率代销"}
+
+	// 分类字典。真实实现从 cube 的 category model 取(有真名字);
+	// fake 给的是可读名字,这样"join 出来的是不是一个占位名"这类断言才有意义。
+	//
+	// ⚠️ 这里给的是**树**,不是平铺列表(2026-10-20):
+	//
+	//	CAT-01 饮料            (顶级)
+	//	CAT-02 生鲜            (顶级)
+	//	  └ CAT-03 生鲜蔬果     (CAT-02 的子节点)
+	//
+	// 分类改成树之后,"按 CAT-02 看商品"的语义是「CAT-02 + CAT-03」——
+	// fake 必须能表达这个,否则子树展开那条路径在单测里等于没覆盖。
+	c.categories["CAT-01"] = cubeclient.CategoryDTO{ID: "CAT-01", Name: "饮料"}
+	c.categories["CAT-02"] = cubeclient.CategoryDTO{ID: "CAT-02", Name: "生鲜"}
+	c.categories["CAT-03"] = cubeclient.CategoryDTO{
+		ID: "CAT-03", Name: "生鲜蔬果", ParentID: "CAT-02",
 	}
 
 	// 促销 seed。日期锚在 seed 基准日 2026-09-17 前后,让"生效 / 已过期 /
@@ -193,6 +239,21 @@ func (c *Client) UpsertProductPrice(productID string, price *decimal.Decimal) {
 		return
 	}
 	p.PriceYuan = price
+	c.products[productID] = p
+}
+
+// UpsertProductCategory 改某商品的分类 id(测试用)。
+//
+// 用来造"商品的分类在字典里查不到"这种场景 —— 生产里 join 不到名字时
+// 必须给 null,而不是编一个"分类-<id>"占位名。
+func (c *Client) UpsertProductCategory(productID, categoryID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p, ok := c.products[productID]
+	if !ok {
+		return
+	}
+	p.CategoryID = categoryID
 	c.products[productID] = p
 }
 
@@ -335,4 +396,222 @@ func (c *Client) GetActivePromotion(_ context.Context, itemNo, onDate string) (*
 		}
 	}
 	return best, nil
+}
+
+// ---- 商品选择控件(ProductPicker)用的只读查询 ----
+//
+// 语义与真实实现(cubeclient/catalog.go)对齐:
+//
+//   - 排序按 id 升序(product.id 是主键 ⇒ 全序,分页不会重复/漏行)
+//   - 商品**编码**与**名称**的关键词匹配都是**大小写无关**
+//     (cube 的 containsCI:列与模式都转小写再比)
+//   - total 是"过滤后的总条数",不是本页条数
+
+// ListProducts 分页查商品。
+func (c *Client) ListProducts(_ context.Context, q cubeclient.ProductQuery) (*cubeclient.ProductPageDTO, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	matched := c.matchProducts(q)
+	return &cubeclient.ProductPageDTO{
+		Rows:  sliceProducts(matched, q.Offset, q.Limit),
+		Total: len(matched),
+	}, nil
+}
+
+// SearchProducts 按关键词查商品(编码命中 + 名称命中,按 id 去重合并)。
+func (c *Client) SearchProducts(_ context.Context, q cubeclient.ProductQuery) (*cubeclient.ProductPageDTO, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	kw := strings.TrimSpace(q.Keyword)
+	if kw == "" {
+		matched := c.matchProducts(q)
+		return &cubeclient.ProductPageDTO{
+			Rows:  sliceProducts(matched, q.Offset, q.Limit),
+			Total: len(matched),
+		}, nil
+	}
+
+	lower := strings.ToLower(kw)
+	seen := map[string]bool{}
+	var merged []cubeclient.ProductDTO
+	for _, p := range c.matchProducts(q) {
+		// 编码与名称都是**大小写无关**匹配(对齐 cube 的 containsCI)。
+		hit := strings.Contains(strings.ToLower(p.ID), lower) ||
+			strings.Contains(strings.ToLower(p.Name), lower)
+		if !hit || seen[p.ID] {
+			continue
+		}
+		seen[p.ID] = true
+		merged = append(merged, p)
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].ID < merged[j].ID })
+	return &cubeclient.ProductPageDTO{
+		Rows:  sliceProducts(merged, q.Offset, q.Limit),
+		Total: len(merged),
+	}, nil
+}
+
+// ListCategories 取分类字典。
+func (c *Client) ListCategories(_ context.Context) (*cubeclient.CategoryListDTO, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	out := make([]cubeclient.CategoryDTO, 0, len(c.categories))
+	for _, cat := range c.categories {
+		out = append(out, cat)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return &cubeclient.CategoryListDTO{Rows: out, Total: len(out)}, nil
+}
+
+// ListSuppliers 取供应商字典。
+func (c *Client) ListSuppliers(_ context.Context) (*cubeclient.SupplierListDTO, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	out := make([]cubeclient.SupplierDTO, 0, len(c.suppliers))
+	for _, s := range c.suppliers {
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return &cubeclient.SupplierListDTO{Rows: out, Total: len(out)}, nil
+}
+
+// ListSaleWays 取「销售方式」字典。
+//
+// fake 默认给**生产实测的那 6 行**(A 购销 / B 代销 / C 联营 / D 租赁 /
+// E 自产 / F 扣率代销)—— 不是编的,是两个生产库 t_bd_base_code 里
+// type_no='SW' 的真实字典。
+func (c *Client) ListSaleWays(_ context.Context) (*cubeclient.SaleWayListDTO, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	out := make([]cubeclient.SaleWayDTO, 0, len(c.saleWays))
+	for _, t := range c.saleWays {
+		out = append(out, t)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return &cubeclient.SaleWayListDTO{Rows: out, Total: len(out)}, nil
+}
+
+// SetSupplier 覆盖/新增一个供应商(测试用来构造特定场景)。
+func (c *Client) SetSupplier(s cubeclient.SupplierDTO) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.suppliers[s.ID] = s
+}
+
+// SetSaleWays 覆盖整个「销售方式」字典(测试用来构造"字典为空"或
+// "字典里没有某个代码"这两种降级场景)。
+func (c *Client) SetSaleWays(rows []cubeclient.SaleWayDTO) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.saleWays = make(map[string]cubeclient.SaleWayDTO, len(rows))
+	for _, r := range rows {
+		c.saleWays[r.ID] = r
+	}
+}
+
+// CountProductsByCategory 返回「每个分类下的商品数」。
+func (c *Client) CountProductsByCategory(_ context.Context) (map[string]int, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	out := map[string]int{}
+	for _, p := range c.products {
+		if p.CategoryID == "" {
+			continue
+		}
+		out[p.CategoryID]++
+	}
+	return out, nil
+}
+
+// CountProductsBySupplier 返回「每个供应商下的商品数」。
+func (c *Client) CountProductsBySupplier(_ context.Context) (map[string]int, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	out := map[string]int{}
+	for _, p := range c.products {
+		if p.SupplierID == "" {
+			continue
+		}
+		out[p.SupplierID]++
+	}
+	return out, nil
+}
+
+// matchProducts 返回过滤后的商品(按 id 升序)。
+//
+// # ⚠️ 这里必须与真实实现(cubeclient/catalog.go 的 productPageQuery)**逐条对齐**
+//
+// fake 最大的风险不是"数据是假的",而是**语义分叉**:真实实现改了而 fake 没跟着改,
+// 于是单测全绿、生产是错的。2026-10-20 就踩过一次:
+// 真实实现把"空集合"从"不过滤"改成"命中 0 行"(供应商类别展开成空集),
+// fake 还在按"不过滤"处理 —— 症状是服务层单测说 total=5、
+// 生产上那个端点返回的是全店 27565 个商品。
+//
+// 三条要对齐的规则:
+//
+//  1. **分类**:CategoryIDs 优先(集合成员判断),否则 CategoryID 精确等于;
+//  2. **供应商**:SupplierIDs(集合成员)**与** SupplierID(精确等于)是 **AND**,
+//     两者都给就取交集(真实实现是两个独立的 if,不是 switch);
+//  3. **nil 与空切片语义不同**:nil = 不过滤;空切片 = 按空集合过滤 ⇒ 命中 0 行。
+//
+// 调用方必须已持有读锁。
+func (c *Client) matchProducts(q cubeclient.ProductQuery) []cubeclient.ProductDTO {
+	catSet := make(map[string]bool, len(q.CategoryIDs))
+	for _, id := range q.CategoryIDs {
+		if id != "" {
+			catSet[id] = true
+		}
+	}
+	supSet := make(map[string]bool, len(q.SupplierIDs))
+	for _, id := range q.SupplierIDs {
+		if id != "" {
+			supSet[id] = true
+		}
+	}
+	out := make([]cubeclient.ProductDTO, 0, len(c.products))
+	for _, p := range c.products {
+		// 分类:switch(CategoryIDs 优先)。
+		switch {
+		case q.CategoryIDs != nil:
+			if !catSet[p.CategoryID] {
+				continue
+			}
+		case q.CategoryID != "":
+			if p.CategoryID != q.CategoryID {
+				continue
+			}
+		}
+		// 供应商:两个过滤**都生效**(交集),不是二选一。
+		if q.SupplierIDs != nil && !supSet[p.SupplierID] {
+			continue
+		}
+		if q.SupplierID != "" && p.SupplierID != q.SupplierID {
+			continue
+		}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// sliceProducts 切出 [offset, offset+limit) 这一段(越界安全)。
+func sliceProducts(rows []cubeclient.ProductDTO, offset, limit int) []cubeclient.ProductDTO {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(rows) {
+		return []cubeclient.ProductDTO{}
+	}
+	end := len(rows)
+	if limit > 0 && offset+limit < len(rows) {
+		end = offset + limit
+	}
+	return rows[offset:end]
 }

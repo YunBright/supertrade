@@ -43,4 +43,59 @@ type Client interface {
 	// **无生效促销返回 (nil, nil)** —— 这是绝大多数商品的正常状态,不是错误。
 	// 调用方因此不能靠 err != nil 判断"有没有促销"。
 	GetActivePromotion(ctx context.Context, itemNo, onDate string) (*PromotionDTO, error)
+
+	// ---- 商品选择控件(ProductPicker)用的只读查询 ----
+	//
+	// 这几个方法是一组:每个方法发**固定条数**的 cube 查询,分类名 / 供应商名
+	// 由调用方在 Go 侧 join(cube 的 join 引擎只支持 live 模型之间的 join,
+	// product / category / supplier 都是 duck 模型,跨 model join 直接 400)。
+	//
+	// 每个方法实际发出去的 cube 查询见 catalog.go 里同名方法的注释。
+
+	// ListProducts 分页查商品(不过滤关键词)。
+	//
+	// 返回的 Total 是"过滤后的总条数"(来自 cube 响应顶层的 total,
+	// 需要查询带 total:true),不是本页条数。
+	ListProducts(ctx context.Context, q ProductQuery) (*ProductPageDTO, error)
+
+	// SearchProducts 按关键词查商品(命中 product.id 或 product.name)。
+	//
+	// 关键词为空时等价于 ListProducts。
+	//
+	// ⚠️ 商品**编码**与**名称**的匹配都是**大小写无关**的
+	// (cube 的 containsCI 算子:列侧 LOWER、模式侧编译期 lower,值仍走参数绑定)。
+	// cube 的 contains 本身大小写敏感(`RTRIM(col) LIKE '%v%'`),
+	// 所以这里不能退回用 contains —— 用户打出小写 "face" 就搜不到 "洁柔Face"。
+	SearchProducts(ctx context.Context, q ProductQuery) (*ProductPageDTO, error)
+
+	// ListCategories 取分类字典(全量:id / name / parent_id)。
+	//
+	// parent_id 是分类**树**的边(思迅 t_bd_item_cls.cls_parent),
+	// 上层(supertrade catalog)用它把平铺的分类拼成树。
+	ListCategories(ctx context.Context) (*CategoryListDTO, error)
+
+	// ListSuppliers 取供应商字典(全量:id / name / type / cust_flag / status / supply_way)。
+	//
+	// 本期不过滤 cust_flag / type(picker 回答的是"这家店在卖什么")。
+	ListSuppliers(ctx context.Context) (*SupplierListDTO, error)
+
+	// ListSaleWays 取「销售方式」字典(思迅 t_bd_base_code,type_no='SW':id / name)。
+	//
+	// 供应商两级结构的**第一层**。cube 侧取数时已按 type_no='SW' 过滤,
+	// 所以拿到的就是销售方式那几行(A 购销 / B 代销 / C 联营 / …)。
+	//
+	// ⚠️ 字典查不到**不算失败**:那只是"没有类别名"这一层信息缺失,
+	// 供应商本身还在(上层降级成"全部进未分类")。
+	ListSaleWays(ctx context.Context) (*SaleWayListDTO, error)
+
+	// CountProductsByCategory 返回「每个分类下的商品数」。
+	//
+	// 与 ListProducts(category_id=X) 的 Total 必然相等(同一个 product 模型、
+	// 同一套过滤口径),这是"侧栏 count == 列表 total"这条契约的基础。
+	CountProductsByCategory(ctx context.Context) (map[string]int, error)
+
+	// CountProductsBySupplier 返回「每个供应商下的商品数」。
+	//
+	// 与 ListProducts(supplier_id=X) 的 Total 必然相等。
+	CountProductsBySupplier(ctx context.Context) (map[string]int, error)
 }

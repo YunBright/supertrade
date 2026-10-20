@@ -3,16 +3,21 @@
 // 路由(nginx 已剥过 /api/v1/catalog/):
 //
 //	GET    /suppliers?q=&limit=                  供应商列表(supplier:view,per branch)
+//	GET    /suppliers/summary                     供应商摘要(supplier:view,商品选择控件)
 //	GET    /suppliers/:id                        查单个供应商(supplier:view)
 //	POST   /suppliers                            新增供应商(supplier:manage)
 //	PUT    /suppliers/:id                        改供应商(supplier:manage)
 //	DELETE /suppliers/:id                        软删供应商(supplier:manage)
-//	GET    /products/search?barcode=             按条码查商品(product:view)
+//	GET    /products?category_id=&page=           商品列表(product:view,商品选择控件)
+//	GET    /products/search?barcode=             按条码查商品(product:view,老路径)
+//	GET    /products/search?q=&page=             关键字搜商品(product:view,商品选择控件)
 //	GET    /products/:id                         查单个商品(product:view)
+//	GET    /categories?with_counts=              分类字典(supplier:view,商品选择控件)
 //
 // 中间件:
 //   - middleware.XBranchID() 全局挂(由 cmd/catalog/main.go::registerRoutes)
 //   - 业务端点全部走 rbac.RequireScopeWithBranch(userd per-branch)
+//   - 商品选择控件的 4 条端点额外走"严格单店"守门(见 catalog.go)
 //
 // 错误映射:
 //   - model.ErrSupplierNotFound        → 404
@@ -41,6 +46,7 @@ import (
 type Handler struct {
 	suppliers *service.SupplierService
 	products  *service.ProductService
+	catalog   *service.CatalogService
 	cube      cubeclient.Client // 兜底,本地表无数据时转发 cube
 	users     *userinfo.Client  // per-branch scope 守门用
 	logger    *slog.Logger
@@ -58,6 +64,7 @@ func New(suppliers *service.SupplierService, products *service.ProductService, c
 	return &Handler{
 		suppliers: suppliers,
 		products:  products,
+		catalog:   service.NewCatalogService(cube, logger),
 		cube:      cube,
 		users:     users,
 		logger:    logger,
@@ -103,12 +110,52 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 		h.deleteSupplier)
 
 	// 商品
-	r.GET("/products/search",
-		rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver),
-		h.searchProducts)
+	//
+	// ⚠️ `/products/search` **不在这里**注册:它同时承载老路径(?barcode=)与
+	// 新路径(?q=,商品选择控件),由 RegisterProductPickerRoutes 统一注册 ——
+	// 同一条路径注册两次 gin 会直接 panic("handlers are already registered")。
 	r.GET("/products/:id",
 		rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver),
 		h.getProduct)
+
+	// 商品选择控件(ProductPicker)的 4 条端点。
+	//
+	// 它们的守门链比上面多一条"严格单店":picker 一次只服务一家门店,
+	// 通配 / 多店必须 400(而不是像 SingleBranchFromCtx 那样静默取第一项)。
+	h.RegisterProductPickerRoutes(r, func(scope string) []gin.HandlerFunc {
+		return []gin.HandlerFunc{
+			h.requireSingleBranch(),
+			rbac.RequireScopeWithBranch(scope, branchFromHeader, resolver),
+		}
+	})
+}
+
+// RegisterProductPickerRoutes 挂商品选择控件的 4 条路由:
+//
+//	GET /products          商品列表
+//	GET /products/search   关键字搜索(与老路径 ?barcode= 共用 URL)
+//	GET /categories        分类字典
+//	GET /suppliers/summary 供应商摘要
+//
+// guard 由调用方给(生产是"严格单店 + scope 守门"两条链)。
+//
+// ⚠️ `/suppliers/summary` 与 `/suppliers/:id` **必须并存**:只注册 :id 时,
+// `/suppliers/summary` 会被 :id 吃掉并返 404 supplier_not_found(实测)。
+// gin 的路由树里静态段优先于参数段(与注册顺序无关),但这条依赖 gin 版本 ——
+// 必须实测,不能假设(见 handler_test.go 的 TestSuppliersSummaryRouteWinsOverParam)。
+//
+// 单独暴露是为了让**路由本身**能在没有 userd 的情况下被验证 ——
+// "/suppliers/summary 与 /suppliers/:id 谁先命中"是纯路由问题,
+// 不该被权限依赖挡住(见 handler_test.go)。
+func (h *Handler) RegisterProductPickerRoutes(r gin.IRouter, guard func(scope string) []gin.HandlerFunc) {
+	r.GET("/products",
+		append(guard("product:view"), h.listProducts)...)
+	r.GET("/products/search",
+		append(guard("product:view"), h.searchProducts)...)
+	r.GET("/categories",
+		append(guard("supplier:view"), h.listCategories)...)
+	r.GET("/suppliers/summary",
+		append(guard("supplier:view"), h.listSuppliersSummary)...)
 }
 
 // ---- helpers ----
