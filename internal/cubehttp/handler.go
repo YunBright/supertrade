@@ -25,10 +25,10 @@ import (
 	"net/http"
 
 	"github.com/YunBright/authkit/claims"
+	"github.com/YunBright/authkit/daprclient"
 	"github.com/YunBright/authkit/rbac"
 	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/pkg/middleware"
-	dapr "github.com/dapr/go-sdk/client"
 	"github.com/gin-gonic/gin"
 )
 
@@ -172,14 +172,19 @@ func (h *Handler) mapErr(c *gin.Context, err error) {
 // 默认走 cube-router 是因为只有它读 branch_cube_sources 做 per-branch 路由;
 // 直连某个 cube app 会绕过分门店隔离,拿到全部门店的数据。
 //
-// 不需要 DAPR_ENDPOINT —— dapr.NewClient() 自动读 DAPR_GRPC_PORT (默认 :50001);
+// 不需要 DAPR_ENDPOINT —— daprclient.New() 自动读 DAPR_GRPC_PORT (默认 :50001);
 // dapr run 自动注入 DAPR_GRPC_PORT 到 app 进程 env。
 //
 // 调用方:catalog / inventory / fresh-meat / stocktake.SearchProducts 等所有需转发 cube 的服务。
 func NewClient() (cubeclient.Client, error) {
-	daprCli, err := dapr.NewClient()
+	// ⚠️ 用 daprclient.New() 而不是 dapr.NewClient():
+	//   go-sdk 的 api-token 拦截器会**整块替换** outgoing metadata,
+	//   把本客户端转发给 cube 的 Authorization 头抹掉
+	//   (2026-10-20 全网加 DAPR_API_TOKEN 之后暴露的)。
+	//   详见 authkit/daprclient 的包注释。
+	daprCli, err := daprclient.New()
 	if err != nil {
-		return nil, fmt.Errorf("dapr.NewClient: %w (确认 dapr run 已起)", err)
+		return nil, fmt.Errorf("创建 dapr 客户端失败: %w (确认 dapr run 已起)", err)
 	}
 	return cubeclient.NewDaprCubeClient(
 		daprCli,

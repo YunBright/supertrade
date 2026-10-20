@@ -3,6 +3,7 @@ package collect
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -28,18 +29,18 @@ func (f *fakeCubes) ResolveCubeSource(context.Context, string) (string, bool, er
 }
 
 type fakeAccounts struct {
-	created   int
-	reset     int
-	disabled  int
-	enableSet int
-	secret    string
-	createErr error
-	resetErr  error
+	created    int
+	reset      int
+	disabled   int
+	enableSet  int
+	secret     string
+	createErr  error
+	resetErr   error
 	disableErr error
-	gotClient string
-	gotBranch string
-	gotPerms  []string
-	gotBearer string
+	gotClient  string
+	gotBranch  string
+	gotPerms   []string
+	gotBearer  string
 }
 
 func (f *fakeAccounts) CreateScoped(_ context.Context, bearer, clientID, _, branchID string, perms []string) (string, error) {
@@ -101,9 +102,10 @@ func (f *fakeJobs) DeleteBranchJobs(_ context.Context, branchID string) error {
 // memStore 是凭据存储的**内存实现**（测试用）。
 //
 // ⚠️ 之所以要它：*CredentialStore 依赖 *gorm.DB，本仓没有 DB harness。
-//   而编排层的全部语义（"前置没过 ⇒ 不建号"、"重复开启 ⇒ 什么都不做"、
-//   "auth 拒绝 ⇒ 本地状态不改"）都落在这个存储的读写顺序上 ——
-//   没有它，这些分支就结构上测不到。
+//
+//	而编排层的全部语义（"前置没过 ⇒ 不建号"、"重复开启 ⇒ 什么都不做"、
+//	"auth 拒绝 ⇒ 本地状态不改"）都落在这个存储的读写顺序上 ——
+//	没有它，这些分支就结构上测不到。
 type memStore struct {
 	rows map[string]*Credential
 	// cipher 让测试能解开落库的密文，验证「存的是密文且能解回来」。
@@ -136,6 +138,17 @@ func (m *memStore) SetStatus(_ context.Context, branchID string, st CredentialSt
 	return nil
 }
 
+// ListAll 实现 credentialStore.ListAll：全量、按门店 id 升序。
+func (m *memStore) ListAll(context.Context) ([]*Credential, error) {
+	out := make([]*Credential, 0, len(m.rows))
+	for _, r := range m.rows {
+		cp := *r
+		out = append(out, &cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].BranchID < out[j].BranchID })
+	return out, nil
+}
+
 // newTestControl 造一个装配齐全的 Control（主密钥固定，便于断言密文可解）。
 func newTestControl(t *testing.T, cubes *fakeCubes, accts *fakeAccounts, jobs *fakeJobs) (*Control, *memStore) {
 	t.Helper()
@@ -159,6 +172,7 @@ func newTestControl(t *testing.T, cubes *fakeCubes, accts *fakeAccounts, jobs *f
 // 没绑定 cube 数据源就**不能**开启。
 //
 // ⚠️ 这一条是用户明确要求的（"开启时检查是否在 cube-router 设置绑定了数据源，
+//
 //	否则不予以开启并前端报错反馈用户"）。
 //
 // 放过它的后果：用户看到"开启成功"，但采集每次都失败（cube 报
@@ -580,5 +594,196 @@ func TestDisableFailsLoudlyWhenAuthRefuses(t *testing.T) {
 	}
 	if len(jobs.deleted) != 0 {
 		t.Errorf("auth 拒绝却删了 job %v", jobs.deleted)
+	}
+}
+
+// ---- 主密钥被换过：必须自愈（2026-10-20 生产事故） ----
+//
+// 事故形态：
+//
+//	主密钥（SALES_COLLECT_SECRET_KEY）被换过 ⇒ 旧密文永久解不开
+//	⇒ 采集端点每次 503 collect_identity_unavailable
+//	⇒ 而"开启采集"返回成功（旧的 ② 幂等分支根本不看密文能不能解开）
+//	⇒ 用户点了多少次重试都没用，且没有任何日志指向"主密钥被换过"。
+//
+// 而 unit 注释里写的恢复姿势"把所有门店关停再重开（重新授权）"
+// 走的是 ③ 分支 —— 旧 ③ 也从不重新加密 ⇒ **那条恢复姿势根本不成立**。
+
+// sealWithOtherKey 用**另一把**主密钥把 secret 封成密文，模拟"主密钥被换过"。
+func sealWithOtherKey(t *testing.T, secret, branchID string) string {
+	t.Helper()
+	other := make([]byte, 32)
+	for i := range other {
+		other[i] = byte(200 - i) // 与 newTestControl 的主密钥不同
+	}
+	ci, err := NewCipher(other)
+	if err != nil {
+		t.Fatalf("NewCipher: %v", err)
+	}
+	c, err := ci.Seal(secret, branchID)
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	return c
+}
+
+// TestEnableSelfHealsUndecryptableCredential ⭐⭐
+//
+// 密文解不开（主密钥被换过）时，Enable 必须**自己修好**：
+// 轮换服务账号密钥 → 用当前主密钥重新加密 → 落库 → 重新注册 job。
+//
+// ⚠️ 判别力：不修的话（旧的 ② 幂等返回），
+// 用户点"开启采集"永远得到"已开启"，而采集一直 503 —— 且零报错。
+func TestEnableSelfHealsUndecryptableCredential(t *testing.T) {
+	cubes := &fakeCubes{name: "cube-00", enabled: true}
+	accts := &fakeAccounts{secret: "new-secret"}
+	jobs := &fakeJobs{}
+	ctl, store := newTestControl(t, cubes, accts, jobs)
+
+	// 预置一行：状态 enabled，但密文是**别的**主密钥封的。
+	store.rows["00"] = &Credential{
+		BranchID:     "00",
+		ClientID:     "sdc-00",
+		SecretCipher: sealWithOtherKey(t, "old-secret", "00"),
+		Status:       string(StatusEnabled),
+	}
+
+	st, err := ctl.Enable(context.Background(), "Bearer user", "00", "user-1")
+	if err != nil {
+		t.Fatalf("Enable: %v", err)
+	}
+	if accts.reset != 1 {
+		t.Errorf("轮换服务账号密钥次数 = %d，期望 1（密文解不开 ⇒ 必须换一枚新的明文）", accts.reset)
+	}
+	if accts.created != 0 {
+		t.Errorf("建号次数 = %d，期望 0（client_id 已存在，轮换即可）", accts.created)
+	}
+	if st.Status != StatusEnabled {
+		t.Errorf("状态 = %q，期望 enabled", st.Status)
+	}
+
+	// 落库的密文必须能用**当前**主密钥解开，且解出的是新轮换出来的明文。
+	row := store.rows["00"]
+	plain, err := ctl.cipher.Open(row.SecretCipher, "00")
+	if err != nil {
+		t.Fatalf("自愈后仍然解不开（说明没有用当前主密钥重新加密）: %v", err)
+	}
+	if plain != "new-secret-rotated" {
+		t.Errorf("落库的明文 = %q，期望 %q", plain, "new-secret-rotated")
+	}
+	if len(jobs.registered) != 1 || jobs.registered[0] != "00" {
+		t.Errorf("注册 job = %v，期望 [00]", jobs.registered)
+	}
+}
+
+// TestEnableSelfHealsUndecryptableCredentialOnDisabledBranch ⭐⭐
+//
+// 关停（disabled）的门店同样可能带着解不开的密文。
+//
+// ⚠️ 这一条对应 unit 注释里写的恢复姿势"关停再重开"——
+// 旧 ③ 分支只翻状态位、从不重新加密 ⇒ 那条恢复姿势**根本不成立**。
+// 现在 ③ 也必须自愈。
+func TestEnableSelfHealsUndecryptableCredentialOnDisabledBranch(t *testing.T) {
+	cubes := &fakeCubes{name: "cube-00", enabled: true}
+	accts := &fakeAccounts{secret: "new-secret"}
+	jobs := &fakeJobs{}
+	ctl, store := newTestControl(t, cubes, accts, jobs)
+
+	store.rows["00"] = &Credential{
+		BranchID:     "00",
+		ClientID:     "sdc-00",
+		SecretCipher: sealWithOtherKey(t, "old-secret", "00"),
+		Status:       string(StatusDisabled),
+	}
+
+	st, err := ctl.Enable(context.Background(), "Bearer user", "00", "user-1")
+	if err != nil {
+		t.Fatalf("Enable: %v", err)
+	}
+	if accts.enableSet != 1 {
+		t.Errorf("取消禁用次数 = %d，期望 1", accts.enableSet)
+	}
+	if accts.reset != 1 {
+		t.Errorf("轮换次数 = %d，期望 1（disabled 分支也必须自愈）", accts.reset)
+	}
+	if st.Status != StatusEnabled {
+		t.Errorf("状态 = %q，期望 enabled", st.Status)
+	}
+	plain, err := ctl.cipher.Open(store.rows["00"].SecretCipher, "00")
+	if err != nil {
+		t.Fatalf("自愈后仍然解不开: %v", err)
+	}
+	if plain != "new-secret-rotated" {
+		t.Errorf("落库的明文 = %q，期望 %q", plain, "new-secret-rotated")
+	}
+}
+
+// TestEnableKeepsUsableCredentialUntouched ⭐
+//
+// 密文**能**解开时，Enable 必须保持幂等：
+// 不轮换、不重建号、不改落库的密文。
+//
+// ⚠️ 反过来做（每次 Enable 都轮换一次）会让用户的每一次点击
+// 都把服务账号密钥换掉 ⇒ 正在跑的采集会突然 401。
+func TestEnableKeepsUsableCredentialUntouched(t *testing.T) {
+	cubes := &fakeCubes{name: "cube-00", enabled: true}
+	accts := &fakeAccounts{secret: "new-secret"}
+	jobs := &fakeJobs{}
+	ctl, store := newTestControl(t, cubes, accts, jobs)
+
+	good, err := ctl.cipher.Seal("good-secret", "00")
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	store.rows["00"] = &Credential{
+		BranchID:     "00",
+		ClientID:     "sdc-00",
+		SecretCipher: good,
+		Status:       string(StatusEnabled),
+	}
+
+	if _, err := ctl.Enable(context.Background(), "Bearer user", "00", "user-1"); err != nil {
+		t.Fatalf("Enable: %v", err)
+	}
+	if accts.reset != 0 {
+		t.Errorf("轮换次数 = %d，期望 0（密文可用时不得动密钥）", accts.reset)
+	}
+	if accts.created != 0 {
+		t.Errorf("建号次数 = %d，期望 0", accts.created)
+	}
+	if store.rows["00"].SecretCipher != good {
+		t.Error("密文被改写了 —— 可用的凭据不该被动")
+	}
+}
+
+// TestBrokenCredentialsReportsOnlyEnabledUndecryptable ⭐
+//
+// 健康检查要报的是"**现在就是坏的**"那些行：
+//   - 已开启且密文解不开 ⇒ 报（采集会 503）
+//   - 已开启但密文能解开 ⇒ 不报
+//   - 未开启且密文解不开 ⇒ 不报（没有 job，采集不跑；重新开启时会自愈）
+func TestBrokenCredentialsReportsOnlyEnabledUndecryptable(t *testing.T) {
+	cubes := &fakeCubes{name: "cube", enabled: true}
+	accts := &fakeAccounts{secret: "s"}
+	jobs := &fakeJobs{}
+	ctl, store := newTestControl(t, cubes, accts, jobs)
+
+	good, err := ctl.cipher.Seal("good", "01")
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	store.rows["00"] = &Credential{BranchID: "00", ClientID: "sdc-00",
+		SecretCipher: sealWithOtherKey(t, "old", "00"), Status: string(StatusEnabled)}
+	store.rows["01"] = &Credential{BranchID: "01", ClientID: "sdc-01",
+		SecretCipher: good, Status: string(StatusEnabled)}
+	store.rows["02"] = &Credential{BranchID: "02", ClientID: "sdc-02",
+		SecretCipher: sealWithOtherKey(t, "old", "02"), Status: string(StatusDisabled)}
+
+	broken, err := ctl.BrokenCredentials(context.Background())
+	if err != nil {
+		t.Fatalf("BrokenCredentials: %v", err)
+	}
+	if len(broken) != 1 || broken[0] != "00" {
+		t.Errorf("报出的门店 = %v，期望 [00]", broken)
 	}
 }

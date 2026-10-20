@@ -35,8 +35,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/YunBright/authkit/daprclient"
 	"github.com/YunBright/authkit/userinfo"
-	dapr "github.com/dapr/go-sdk/client"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
@@ -110,9 +110,15 @@ func initApp() error {
 	appSvc = service.New(appDB, cfg)
 
 	// dapr client(pub/sub + conversation + invoke 共用)。
-	daprCli, err := dapr.NewClient()
+	//
+	// ⚠️ 用 daprclient.New() 而不是 dapr.NewClient():
+	//   go-sdk 的 api-token 拦截器会**整块替换** outgoing metadata,
+	//   把本客户端转发给 cube 的 Authorization 头抹掉
+	//   (2026-10-20 全网加 DAPR_API_TOKEN 之后暴露的)。
+	//   详见 authkit/daprclient 的包注释。
+	daprCli, err := daprclient.New()
 	if err != nil {
-		return fmt.Errorf("dapr client: %w (确认 dapr run 已起)", err)
+		return fmt.Errorf("创建 dapr 客户端失败: %w (确认 dapr run 已起)", err)
 	}
 
 	// pub/sub publisher(fail-fast:命令/事件是本服务核心输出)。

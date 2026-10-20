@@ -1,12 +1,15 @@
 // 本文件覆盖 2026-10-08 线上故障的根因:userd 拒绝调用者 token 时,stocktake
 // 必须返回 401 而不是 503「userd 不可用」。
 //
-// 背景:本服务 sidecar **没有** middleware.http.bearer,而
+// 背景:**当时**本服务 sidecar **没有** middleware.http.bearer,而
 // authkit/claims.GinMiddleware 明确"不验签、只解析 payload" —— 所以 userd 是
 // 这条链路上唯一的验签点。access_token 过期时 stocktake 照常放行,把过期 token
 // 转发给 userd,userd 返 401。旧代码把任何 userd 错误一律包成
 // ErrUserInfoUnavailable(503),于是一个"重新登录就能解决"的问题被伪装成
 // "依赖服务故障",排查时所有人都会去看 userd 健不健康。
+//
+// ⚠️ 2026-10-20: stocktake 已改为应用层真验签(cmdbootstrap 用 authn.Verifier),
+// 但"userd 401 ⇒ 对外 401 而不是 503"这条区分不变,下面的用例继续有效。
 //
 // 下面每条用例锁的是**具体 sentinel error**,不是"返回了某个 error"。
 // 将来有人把 ErrCallerTokenRejected 换成别的包装,测试必须立刻红。
@@ -76,7 +79,7 @@ const (
 )
 
 func TestGetEffectiveScopes_TokenRejectedByUserd_IsNotUserdUnavailable(t *testing.T) {
-	// userd 端 middleware.http.bearer 拒收 → dapr 映射成 gRPC Unauthenticated。
+	// userd 端的应用层验签拒收 → dapr 映射成 gRPC Unauthenticated。
 	// 这正是"access_token 过期"在服务调用链上的真实表现。
 	svc := setupWithErrUserd(t, status.Error(codes.Unauthenticated, "Unauthorized"))
 

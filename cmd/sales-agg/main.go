@@ -39,7 +39,7 @@ import (
 	"strings"
 	"time"
 
-	dapr "github.com/dapr/go-sdk/client"
+	"github.com/YunBright/authkit/daprclient"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
@@ -97,9 +97,15 @@ func initApp() error {
 	// 而报表要用的是 DaprCubeClient.LoadCubeQuery —— 那个方法不在窄接口上。
 	// 窄接口存在的意义是"只暴露业务真正用到的那几个方法"，
 	// 报表服务用到的是更底层的通用查询，所以自己构造完整客户端。
-	daprCli, err := dapr.NewClient()
+	// ⚠️ 用 daprclient.New() 而不是 dapr.NewClient():
+	//   go-sdk 的 api-token 拦截器会**整块替换** outgoing metadata,
+	//   把本客户端转发给 cube 的 Authorization 头抹掉
+	//   (2026-10-20 全网加 DAPR_API_TOKEN 之后暴露的)。
+	//   采集身份(门店服务账号的 bearer)正是靠这个头过去的。
+	//   详见 authkit/daprclient 的包注释。
+	daprCli, err := daprclient.New()
 	if err != nil {
-		return fmt.Errorf("dapr.NewClient: %w (确认 dapr run 已起)", err)
+		return fmt.Errorf("创建 dapr 客户端失败: %w (确认 dapr run 已起)", err)
 	}
 	cube := cubeclient.NewDaprCubeClient(
 		daprCli,
@@ -205,6 +211,18 @@ func initApp() error {
 		"daily_collect", true,
 	)
 
+	// 采集凭据健康自检：**点名**报出解不开的门店。
+	//
+	// ⚠️ 为什么必须在启动时做:
+	//
+	//	主密钥被换过 ⇒ 旧密文永久解不开 ⇒ 采集端点每次 503,
+	//	而"开启采集"在旧代码里一直返回成功 ⇒ 用户点了没反应、
+	//	界面显示"已开启"、采集永远坏着,而且**没有任何一行日志**指向
+	//	"主密钥被换过"这件事。
+	//
+	//	⇒ 把它放到启动日志的第一行,而不是让人从 503 的密码学文案反推。
+	logBrokenCredentials(appCtl)
+
 	// ---- 采集定时任务：sales-agg 自己注册，与 wechat-bot 无关 ----
 	//
 	// ⚠️ 为什么**不**由 wechat-bot 注册（这是 2026-10-18 的一次修正）：
@@ -222,6 +240,33 @@ func initApp() error {
 	//	auth 也可能还没起。让整个服务起不来只会得到一个没有线索的崩溃。
 	startJobReconciler()
 	return nil
+}
+
+// logBrokenCredentials 记录"已开启但密文解不开"的门店。
+//
+// ⚠️ 用 Error 级别而不是 Warn：这不是"可能有风险"，而是
+//
+//	"这个门店的采集**现在就是坏的**"——每次采集都会 503，
+//	而报表还能实时查源库 ⇒ 数字看起来正常，只是没落库。
+//
+//	文案必须点出"主密钥被更换"这个真因：采集端点返的
+//	"cipher: message authentication failed" 指向密码学，
+//	会让人去查密文有没有被改，而真因是运维换了 EnvironmentFile 里的主密钥。
+func logBrokenCredentials(ctl *collect.Control) {
+	if ctl == nil {
+		return
+	}
+	broken, err := ctl.BrokenCredentials(context.Background())
+	if err != nil {
+		slog.Warn("sales-agg: 检查采集凭据可解密性失败", "err", err)
+		return
+	}
+	if len(broken) == 0 {
+		return
+	}
+	slog.Error("sales-agg: 这些门店的采集凭据解不开（主密钥可能已被更换）—— 采集会持续 503，"+
+		"请对它们重新开启一次采集（会自动轮换服务账号密钥并用当前主密钥重新加密落库）",
+		"branches", broken)
 }
 
 // reconcileInterval 是重新对齐采集 job 的周期。
@@ -274,6 +319,10 @@ func startJobReconciler() {
 		}
 		slog.Log(ctx, lvl, "sales-agg: 采集定时任务已对齐",
 			"branches", res.Branches, "jobs", res.Jobs, "failed", res.Failed)
+		// ⚠️ 每次对账都顺手查一次凭据可解密性:
+		//	主密钥是在**运行期**被换的(换 unit + 重启)⇒ 只在启动时查一次不够,
+		//	而对账每小时跑一次,正好覆盖"服务没重启但密钥换了"的情况。
+		logBrokenCredentials(appCtl)
 	}
 	runOnce()
 

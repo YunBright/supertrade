@@ -70,7 +70,14 @@ func AuthVerifier() *authn.Verifier {
 	return verifierV
 }
 
-// JWKSReloadError 返回最近一次 JWKS 刷新错误(nil = 健康),供 /healthz 上报。
+// RevocationReloadError 返回最近一次**撤销列表**读取错误(nil = 健康),供 /healthz 上报。
+//
+// ⚠️ 它**不**等于"鉴权不可用"：撤销列表读不到时是 fail-open(照常放行),
+// 所以它只说明"撤销暂时不生效"(登出后的 access token 仍可用到过期)。
+//
+// 为什么要单独暴露:撤销列表**读不到**与**读到空列表**在读侧看起来一样,
+// 而后者是正常状态(还没人登出过)—— 没有这个字段,
+// "撤销静默不生效"这件事在 /healthz 上完全看不出来。
 //
 // 可观测性要求:公钥读不到时服务是**fail-closed** 的(所有请求 401),
 // 但 healthz 仍应 200(否则侧车会认为 app 挂了并反复重启,掩盖真正的故障面)。
@@ -83,6 +90,17 @@ func JWKSReloadError() error {
 		return nil
 	}
 	return src.Source.LastError()
+}
+
+// RevocationReloadError 见上。
+func RevocationReloadError() error {
+	verifierMu.RLock()
+	src := setupV
+	verifierMu.RUnlock()
+	if src == nil {
+		return nil
+	}
+	return src.RevocationError()
 }
 
 // SetAuthVerifier 注入验签器(供 NewRouter 使用)。
@@ -117,6 +135,15 @@ func SetupJWTVerifier(logger *slog.Logger) error {
 		RefreshInterval: jwksRefreshInterval,
 		StaleGrace:      jwksStaleGrace,
 		AppID:           os.Getenv("DAPR_APP_ID"),
+		// 撤销列表（access token 的 jti 黑名单）。
+		//
+		// ⚠️ 键名用 authkit 的**共享常量**，不提供 env 覆盖：
+		// 写侧（auth 的发布器）与读侧（这里）必须逐字一致，而 env 覆盖
+		// 正是"写侧改了、读侧没改"这种漂移的来源。
+		// 漂移的后果最危险：读侧读到**空列表** ⇒ 撤销**静默不生效**，零报错。
+		//
+		// 不配它 ⇒ 不做撤销检查（登出后 token 仍可用到过期）。
+		RevocationKey: authn.DefaultRevocationKey,
 	})
 	if err != nil {
 		return err

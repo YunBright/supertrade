@@ -7,11 +7,12 @@
 // 而 auth 侧只存 bcrypt 哈希、**永远回显不出明文**。
 //
 // → 明文必须有一份由我们自己保管。放哪是本文件要回答的核心问题，
-//   约束是 dapr scheduler 的投递语义（见 dapr 官方 scheduler.md）：
 //
-//	HA 形态是 3 副本 StatefulSet，无 leader election，全是对等节点；
-//	触发投递到 app-id 匹配的**随机一个副本**，官方明说
-//	"不保证 job 在创建它的那个副本上执行"。
+//	  约束是 dapr scheduler 的投递语义（见 dapr 官方 scheduler.md）：
+//
+//		HA 形态是 3 副本 StatefulSet，无 leader election，全是对等节点；
+//		触发投递到 app-id 匹配的**随机一个副本**，官方明说
+//		"不保证 job 在创建它的那个副本上执行"。
 //
 // 由此有两条**确定会坏**的存法：
 //
@@ -22,7 +23,8 @@
 //	   而日志里只有一行 401，这种 bug 排起来最费时间。
 //
 // → 存在**运行时按 branch_id 现取的共享存储**（PG）里。
-//   任何副本都能独立完成 token 交换，加副本不改代码。
+//
+//	任何副本都能独立完成 token 交换，加副本不改代码。
 //
 // # 三层存储的职责边界
 //
@@ -361,6 +363,31 @@ func (s *CredentialStore) ListEnabled(ctx context.Context) ([]string, error) {
 		if id := strings.TrimSpace(r.BranchID); id != "" {
 			out = append(out, id)
 		}
+	}
+	return out, nil
+}
+
+// ListAll 列出全部凭据行（**含未开启的**），按门店 id ASC。
+//
+// # 为什么需要它
+//
+//	健康检查要回答"哪些门店的密文解不开" —— 而 ListEnabled 只给 enabled 的，
+//	缺了"未开启但密文已死"这一类（它们在重新开启时才会爆）。
+//	⇒ 这里给全量，由调用方决定要不要按状态过滤。
+//
+// ⚠️ 返回的是**行拷贝**，调用方改它不会影响库。
+func (s *CredentialStore) ListAll(ctx context.Context) ([]*Credential, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("采集凭据存储未装配（没有 PG 连接）")
+	}
+	var rows []Credential
+	if err := s.db.WithContext(ctx).Order("branch_id ASC").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	out := make([]*Credential, 0, len(rows))
+	for i := range rows {
+		cp := rows[i]
+		out = append(out, &cp)
 	}
 	return out, nil
 }

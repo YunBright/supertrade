@@ -334,6 +334,17 @@ func healthzHandler(appID string) gin.HandlerFunc {
 		} else {
 			body["auth_ok"] = true
 		}
+		// 撤销列表（access token 的 jti 黑名单）的读状态。
+		//
+		// ⚠️ 与 auth_ok 分开：撤销列表读不到是 **fail-open**（照常放行），
+		// 所以它**不**表示"鉴权不可用"。
+		// 单独暴露是因为"撤销静默不生效"在别处完全看不出来。
+		if err := RevocationReloadError(); err != nil {
+			body["revocation_ok"] = false
+			body["revocation_error"] = err.Error()
+		} else {
+			body["revocation_ok"] = true
+		}
 		c.JSON(http.StatusOK, body)
 	}
 }

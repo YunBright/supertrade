@@ -31,6 +31,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/YunBright/authkit/daprclient"
 	dapr "github.com/dapr/go-sdk/client"
 	"github.com/gin-gonic/gin"
 
@@ -66,9 +67,14 @@ func main() {
 }
 
 func initApp() error {
-	daprCli, err := dapr.NewClient()
+	// ⚠️ 用 daprclient.New() 而不是 dapr.NewClient():
+	//   go-sdk 的 api-token 拦截器会**整块替换** outgoing metadata,
+	//   把本客户端转发给 cube 的 Authorization 头抹掉
+	//   (2026-10-20 全网加 DAPR_API_TOKEN 之后暴露的)。
+	//   详见 authkit/daprclient 的包注释。
+	daprCli, err := daprclient.New()
 	if err != nil {
-		return fmt.Errorf("dapr.NewClient: %w (确认 dapr run 已起)", err)
+		return fmt.Errorf("创建 dapr 客户端失败: %w (确认 dapr run 已起)", err)
 	}
 
 	cube := cubeclient.NewDaprCubeClient(
@@ -166,8 +172,9 @@ func initApp() error {
 // wireBizTZ 把营业时区装配到 ServiceImpl。
 //
 // ⚠️ **必须注入**：calendar.ResolvePeriod 用 `now.Location()` 推算日期，
-//   time.Now 默认 UTC；早班 0:30 CST = 16:30 UTC（前一日），
-//   不注入会让 daily 落到「昨日」(现场 2026-10-19 22:50 推送 → 区间 2026-10-18)。
+//
+//	time.Now 默认 UTC；早班 0:30 CST = 16:30 UTC（前一日），
+//	不注入会让 daily 落到「昨日」(现场 2026-10-19 22:50 推送 → 区间 2026-10-18)。
 //
 // env SALESINSIGHT_BIZ_TZ 可覆盖（默认 Asia/Shanghai UTC+8），
 // 与 fresh-meat 的 FRESHMEAT_BIZ_TZ 同语义。

@@ -32,7 +32,7 @@
 | 用户 / 角色 / 权限 / 登录 | `F:\go\src\github.com\YunBright\auth` 项目 | 已有 `userd` dapr app(JWT 签发 + RBAC) |
 | 业务侧解析 claims / 角色 / scope | `github.com/YunBright/authkit`(authkit 公开包) | `claims.GinMiddleware` + `rbac.*` |
 | 跨服务查用户信息 | `authkit/userinfo.New("userd")` | 走 dapr invocation |
-| 验签 | **dapr middleware.http.bearer**(sidecar 验签) | 各 dapr app **不重验签** |
+| 验签 | **应用层 `authkit/authn.Verifier`**(RS256 + JWKS) | 各 dapr app **自己验签**。⚠️ 2026-10-20：原写「dapr middleware.http.bearer(sidecar 验签)，各 dapr app 不重验签」——该 sidecar 组件 2026-10-12 已全网移除；只解 payload 不验签会让伪造签名的 JWT 读到真实数据(生产实证) |
 
 ### 1.2 权限模型(本项目约束,2026-09 重构后)
 

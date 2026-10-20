@@ -143,10 +143,12 @@ var (
 	// ErrCallerTokenRejected userd **拒绝了这个调用者的 token**(401)。
 	// handler 映射 401,前端据此提示"登录已失效/权限不足"而不是"服务不可用"。
 	//
-	// 2026-10-08 新增。起因:本服务 sidecar **没有** middleware.http.bearer
+	// 2026-10-08 新增。起因:**当时**本服务 sidecar **没有** middleware.http.bearer
 	// (components/ 下只有 pubsub.yaml + localSecretStore.yaml),而
 	// authkit/claims.GinMiddleware 明确"不验签、只解析 payload",于是
 	// stocktake 自己一个 token 都不验 —— userd 是这条链路上**唯一**的验签点。
+	// ⚠️ 2026-10-20 起 stocktake 已改为**应用层真验签**(cmdbootstrap 用
+	// authn.Verifier),但下面这条区分**依然要保留**:
 	// 后果是 access_token 过期时:
 	//   stocktake 照常放行 → 拿过期 token 调 userd → userd 返 401
 	//   → 旧代码一律包成 ErrUserInfoUnavailable → 对外 503「userd 不可用」
@@ -161,7 +163,7 @@ var (
 // authRejectedErr 判断 err 是否表示"userd 拒绝了调用者的 token"。
 //
 // 只认 gRPC codes.Unauthenticated —— dapr 的 service invocation 在目标 app 的
-// middleware.http.bearer 拒收时映射成这个码(userinfo.Warmup 也在用它判断
+// **应用层验签**拒收时映射成这个码(userinfo.Warmup 也在用它判断
 // "链路已通、只是没带 token")。其它码(Unavailable / DeadlineExceeded / NotFound …)
 // 一律不算,否则网络抖动会被再次误报成登录态问题。
 //

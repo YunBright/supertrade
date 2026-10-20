@@ -23,6 +23,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/YunBright/authkit/daprclient"
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/YunBright/supertrade/internal/cube-router/db"
 	"github.com/YunBright/supertrade/internal/cube-router/handler"
@@ -74,9 +75,14 @@ func initApp() error {
 	if err != nil {
 		return fmt.Errorf("userinfo client: %w", err)
 	}
-	appDapr, err = dapr.NewClient()
+	// ⚠️ 用 daprclient.New() 而不是 dapr.NewClient():
+	//   go-sdk 的 api-token 拦截器会**整块替换** outgoing metadata,
+	//   把本服务转发给 cube 的 Authorization 头抹掉
+	//   (2026-10-20 全网加 DAPR_API_TOKEN 之后暴露的)。
+	//   详见 authkit/daprclient 的包注释。
+	appDapr, err = daprclient.New()
 	if err != nil {
-		return fmt.Errorf("dapr.NewClient: %w (确认 dapr run 已起)", err)
+		return fmt.Errorf("创建 dapr 客户端失败: %w (确认 dapr run 已起)", err)
 	}
 
 	// Warmup userd 跨主机冷握手(Consul DNS + mTLS + HTTP/2 SETTINGS + userd 进程

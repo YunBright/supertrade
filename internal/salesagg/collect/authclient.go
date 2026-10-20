@@ -118,6 +118,7 @@ func (c *DaprServiceAccountClient) postJSON(ctx context.Context, url, userBearer
 		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
+	setAPIToken(req)
 	if err != nil {
 		return nil, err
 	}

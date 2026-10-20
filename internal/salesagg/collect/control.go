@@ -131,6 +131,8 @@ type credentialStore interface {
 	Get(ctx context.Context, branchID string) (*Credential, error)
 	Put(ctx context.Context, row *Credential) error
 	SetStatus(ctx context.Context, branchID string, st CredentialStatus) error
+	// ListAll 列出全部凭据行（健康检查要"哪些密文解不开"，不是只要 enabled 的）。
+	ListAll(ctx context.Context) ([]*Credential, error)
 }
 
 // Control 是开启/关停编排器。
@@ -225,9 +227,20 @@ func (c *Control) Enable(ctx context.Context, userBearer, branchID, createdBy st
 	}
 
 	// ② 已是开启 ⇒ 幂等返回。
+	//
+	// ⚠️ 但"幂等"的前提是**密文当前还能解开**。
+	//
+	//	主密钥被换过（轮换）⇒ 旧密文永久解不开 ⇒ 采集端点每次 503，
+	//	而这里若无脑返回"已开启" ⇒ 用户的「重试」按钮点了多少次都没用，
+	//	而界面上"采集已开启"一直显示正常。
+	//
+	//	⇒ 解不开就必须当场自愈（轮换服务账号密钥 + 用当前主密钥重新加密落库）。
 	if row, err := c.store.Get(ctx, branchID); err != nil {
 		return nil, err
 	} else if row != nil && CredentialStatus(row.Status) == StatusEnabled {
+		if _, err := c.ensureUsableCredential(ctx, userBearer, clientID, branchID, row); err != nil {
+			return nil, err
+		}
 		return c.State(ctx, branchID)
 	}
 
@@ -236,6 +249,17 @@ func (c *Control) Enable(ctx context.Context, userBearer, branchID, createdBy st
 		CredentialStatus(row.Status) == StatusDisabled {
 		if err := c.accounts.SetDisabled(ctx, userBearer, clientID, false); err != nil {
 			return nil, fmt.Errorf("启用失败：取消 auth 侧禁用时出错: %w", err)
+		}
+		// ⚠️ 2026-10-20 新增：密文解不开（主密钥被换过）时**必须连密钥一起重建**。
+		//
+		//	"明文我们还有"这句话只在**服务账号密钥没被换**时成立；
+		//	主密钥被换 ⇒ 我们连密文都读不出来 ⇒ 手里没有任何明文。
+		//
+		//	⚠️ 而这一段之前**没有任何补救**：文档里写的恢复姿势
+		//	"先把所有门店关停再重开（重新授权）"走的就是 ③，
+		//	而 ③ 从不重新加密 ⇒ 那条恢复姿势**根本不成立**。
+		if _, err := c.ensureUsableCredential(ctx, userBearer, clientID, branchID, row); err != nil {
+			return nil, err
 		}
 		// ⚠️ 2026-10-19 真事故就在这一行附近：
 		//   上一版下面直接 `Put(ctx, row)` —— 拿到的 `row` 仍是 disabled，
@@ -291,6 +315,105 @@ func (c *Control) Enable(ctx context.Context, userBearer, branchID, createdBy st
 		}
 	}
 	return c.State(ctx, branchID)
+}
+
+// ensureUsableCredential 保证已存的凭据**当前**能用主密钥解开；
+// 解不开就现场自愈。返回 repaired=true 表示做过自愈。
+//
+// # 什么时候会解不开
+//
+//	**主密钥**（SALES_COLLECT_SECRET_KEY）被换过/被轮换 ⇒ 旧密文永久解不开。
+//	症状是采集端点 503 collect_identity_unavailable（"cipher: message authentication failed"），
+//	而"开启采集"却一直返回成功 ⇒ 用户点了没反应，而采集永远坏着。
+//
+//	⚠️ 与"服务账号密钥被换"是**两回事**：那种情况密文解得开，
+//	但换 token 会 401（远端症状）。这里只管"密文解不开"这一种。
+//
+// # 为什么自愈靠"轮换服务账号密钥"而不是"找回旧主密钥"
+//
+//	旧主密钥只存在于 systemd Environment，没有第二份 ⇒ 丢了就是丢了。
+//	而服务账号密钥的明文我们也**本来就没有**：它只存在两处 ——
+//	auth 的创建响应里（一次）与本行的密文里。密文死了 ⇒ 明文没了。
+//	⇒ 唯一出路是**换一枚新的**：auth 侧 POST /service-accounts/:id/secret 轮换
+//	→ 拿新明文 → 用**当前**主密钥加密 → 落库。
+//
+// # 为什么可以自动做
+//
+//	轮换是破坏性操作（旧明文立即失效），所以必须由**带治理权限的真人**发起 ——
+//	Enable 本身就是那个入口（它带 userBearer，auth 侧按真人判权限）。
+//	⇒ 自愈发生在"有真人点了开启"这个上下文里，不是在后台偷偷轮换。
+func (c *Control) ensureUsableCredential(ctx context.Context, userBearer, clientID, branchID string, row *Credential) (bool, error) {
+	if row == nil {
+		return false, nil
+	}
+	if c.cipher == nil {
+		return false, fmt.Errorf("采集凭据未装配（本服务没有主密钥）")
+	}
+	if _, err := c.cipher.Open(row.SecretCipher, branchID); err == nil {
+		return false, nil
+	}
+	if c.accounts == nil {
+		return false, fmt.Errorf(
+			"采集凭据密文解不开（主密钥可能已被更换），且 auth 服务账号客户端未装配，无法自动重新授权")
+	}
+	secret, err := c.accounts.ResetSecret(ctx, userBearer, clientID)
+	if err != nil {
+		return false, fmt.Errorf(
+			"采集凭据密文解不开（主密钥可能已被更换），自动重新授权失败（轮换服务账号密钥出错）: %w", err)
+	}
+	cipherText, err := c.cipher.Seal(secret, branchID)
+	if err != nil {
+		return false, fmt.Errorf("重新加密服务账号密钥失败: %w", err)
+	}
+	now := c.now()
+	row.SecretCipher = cipherText
+	row.ClientID = clientID
+	row.Status = string(StatusEnabled)
+	row.EnabledAt = &now
+	if err := c.store.Put(ctx, row); err != nil {
+		// ⚠️ 这一刻服务账号密钥已经轮换（旧的永久失效），
+		//   而密文还没落库 ⇒ 再重试会撞 409 ⇒ 必须走"重建"那条路。
+		return false, fmt.Errorf(
+			"自动重新授权失败（服务账号密钥已轮换，但落库失败，请重试一次）: %w", err)
+	}
+	if c.jobs != nil {
+		if err := c.jobs.RegisterBranchJobs(ctx, branchID); err != nil {
+			return false, fmt.Errorf("凭据已修复，但定时任务注册失败: %w", err)
+		}
+	}
+	return true, nil
+}
+
+// BrokenCredentials 列出**已开启**但密文解不开的门店 id。
+//
+// # 为什么要有它
+//
+//	"主密钥被换过"这件事，若不主动报出来，只能让人从采集的 503 反推 ——
+//	而 503 的文案是"解密失败（密文被篡改，或主密钥/门店不匹配）"，
+//	指向的是**密码学**，不是"运维换过主密钥"这个真实原因。
+//
+//	⇒ 启动与每次对账时点名报出来，让真因出现在日志的第一行。
+//
+// ⚠️ 只报 **enabled** 的：未开启的行解不开不影响采集（没有 job），
+// 而且它在"重新开启"时会被 ensureUsableCredential 自愈掉。
+func (c *Control) BrokenCredentials(ctx context.Context) ([]string, error) {
+	if c.cipher == nil || c.store == nil {
+		return nil, nil
+	}
+	rows, err := c.store.ListAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var broken []string
+	for _, row := range rows {
+		if row == nil || CredentialStatus(row.Status) != StatusEnabled {
+			continue
+		}
+		if _, err := c.cipher.Open(row.SecretCipher, row.BranchID); err != nil {
+			broken = append(broken, row.BranchID)
+		}
+	}
+	return broken, nil
 }
 
 // createAccountWithRecovery 建号；遇到 409（上次建号成功但没落库）时转去轮换密钥。

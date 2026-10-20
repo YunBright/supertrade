@@ -131,6 +131,7 @@ func (c *DaprJobClient) Register(ctx context.Context, name, schedule, address st
 		return err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.sidecarBase+"/v1.0-alpha1/jobs/"+name, bytes.NewReader(raw))
+	setAPIToken(req)
 	if err != nil {
 		return err
 	}
@@ -152,6 +153,7 @@ func (c *DaprJobClient) Delete(ctx context.Context, name string) error {
 		return nil
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.sidecarBase+"/v1.0-alpha1/jobs/"+name, nil)
+	setAPIToken(req)
 	if err != nil {
 		return err
 	}

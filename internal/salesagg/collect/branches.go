@@ -120,6 +120,7 @@ func (l *AuthBranchLister) ListActiveBranches(ctx context.Context) ([]Branch, er
 		return nil, fmt.Errorf("collect: 门店列表未配置（没有 sidecar）")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, l.branchesURL(), nil)
+	setAPIToken(req)
 	if err != nil {
 		return nil, err
 	}

@@ -38,7 +38,16 @@ import (
 )
 
 // TokenAuthAppID 是签发 token 的 auth 引擎在 dapr 里的 app-id。
-const TokenAuthAppID = "login"
+//
+// ⚠️ 2026-10-20 改: "login" → "userd"。
+//
+// auth-login 与 auth-userd 已合并成**一个进程**、**一个 dapr app-id=userd**
+// (见 deployer/systemd/auth.service)。app-id=login 不再注册进 Consul,
+// 按它寻址必然 ERR_DIRECT_INVOKE。
+//
+// ⚠️ 私有 key 只在合并后的那个进程里(它同时负责签发与验签),
+//    所以 /auth/token 只能经 app-id=userd 寻址。
+const TokenAuthAppID = "userd"
 
 // TokenIssuer 用 client credentials 换 access token。
 type TokenIssuer interface {
@@ -109,6 +118,7 @@ func (i *DaprTokenIssuer) AccessToken(ctx context.Context, branchID, clientID, c
 		return "", err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, i.tokenURL(), bytes.NewReader(body))
+	setAPIToken(req)
 	if err != nil {
 		return "", err
 	}

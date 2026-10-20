@@ -133,7 +133,7 @@ func registerRoutes(r *gin.Engine) {
 	// 全局挂 X-Branch-ID 解析中间件(只读 header,不强求存在;handler 自选 source)。
 	r.Use(middleware.XBranchID())
 	// 把 caller 的 Authorization header 注入 ctx,后续 cubeclient / userinfo 内部
-	// 自动 forward 给下游(cube-gateway / userd)。userd 端 middleware.http.bearer
+	// 自动 forward 给下游(cube-gateway / userd)。userd 端的应用层验签
 	// 必需要 Authorization 头,无 token 会 401 Unauthenticated。
 	r.Use(forwardBearerToOutgoing())
 	h := handler.New(appSvc)
