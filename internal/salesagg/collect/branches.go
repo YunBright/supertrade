@@ -57,8 +57,9 @@ type BranchLister interface {
 //	auth-userd 的 unit **传了** `--config /opt/.dapr/config.yaml`（consul）
 //	            ⇒ Consul 服务目录里有 "userd"（✅ 实测 catalog 里有）
 //
-// 直连 `http://172.12.1.1:8081/auth/branches` 是通的（✅ 实测返回 7 个在营门店），
-// 但那绕过了 dapr 的寻址边界 —— 本仓其它跨服务调用一律走 dapr，
+// 直连 `http://172.12.1.1:8081/auth/branches` **当时**是通的（✅ 实测返回 7 个在营门店），
+// 但 8081 随 auth-login 一起下线了 ⇒ 现在那是**死地址**（真实端口是 8082）。
+// 即便它还活着，直连也绕过了 dapr 的寻址边界 —— 本仓其它跨服务调用一律走 dapr，
 // 这里保持一致，所以选 userd。
 //
 // ⚠️ 之前这里写的是 `login` 并附了一段"打 userd 会 404"的注释 ——
@@ -70,7 +71,7 @@ const AuthAppID = "userd"
 //
 // # 为什么经 dapr 而不是直连
 //
-//	直连 http://host:8081 也可行，但**不走 dapr** 就意味着
+//	直连 http://host:8082 也可行，但**不走 dapr** 就意味着
 //	绕过了服务寻址这条边界。本仓其它跨服务调用
 //	（如 wechat-bot 调 sales-agg）一律走 dapr，这里保持一致。
 type AuthBranchLister struct {
