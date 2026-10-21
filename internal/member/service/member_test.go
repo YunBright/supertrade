@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/shopspring/decimal"
@@ -101,6 +102,41 @@ func TestOpenCard_Idempotent(t *testing.T) {
 	var n int64
 	require.NoError(t, db.Model(&model.Member{}).Count(&n).Error)
 	assert.Equal(t, int64(1), n, "members 只应有 1 行")
+}
+
+// TestOpenCard_RejectsTooLongIDs 锁"超长 id / op_id ⇒ 400 而不是 500"。
+//
+// ⚠️ 2026-10-21 契约测试实测踩到：超长 op_id 写进 varchar(64) 会**数据库报错**
+// ⇒ handler 的 mapErr 落到 default 分支 ⇒ 返 **500 internal_error**
+// （"系统繁忙，请稍后重试"）—— 与"参数写错了"毫无关系，现场根本想不到是长度。
+//
+// ⇒ 落库前拦住，返 ErrInvalidInput（⇒ 400 bad_request）。
+func TestOpenCard_RejectsTooLongIDs(t *testing.T) {
+	svc, db := newService(t)
+	seedType(t, db, "T1", "10", "会员卡")
+	ctx := context.Background()
+
+	long := strings.Repeat("x", model.MaxIDLen+1)
+
+	_, err := svc.OpenCard(ctx, service.OpenCardInput{
+		OpID: long, BranchID: "10", ID: "M0001",
+		CardTypeID: "T1", Name: "张三", OperatorID: "u-1",
+	})
+	require.Error(t, err, "超长 op_id 必须被拒")
+	assert.ErrorIs(t, err, model.ErrInvalidInput,
+		"必须是入参非法(⇒ 400)，不能是内部错误(⇒ 500)")
+
+	_, err = svc.OpenCard(ctx, service.OpenCardInput{
+		OpID: "op-open-1", BranchID: "10", ID: long,
+		CardTypeID: "T1", Name: "张三", OperatorID: "u-1",
+	})
+	require.Error(t, err, "超长会员号必须被拒")
+	assert.ErrorIs(t, err, model.ErrInvalidInput,
+		"必须是入参非法(⇒ 400)，不能是内部错误(⇒ 500)")
+
+	var n int64
+	require.NoError(t, db.Model(&model.Member{}).Count(&n).Error)
+	assert.Equal(t, int64(0), n, "被拒的行不得落库")
 }
 
 // TestOpenCard_WritesEvent 锁"开卡事件与会员行同事务落库"。

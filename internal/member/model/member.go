@@ -28,6 +28,7 @@
 package model
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/shopspring/decimal"
@@ -136,6 +137,37 @@ type Member struct {
 
 // TableName 显式指定表名。
 func (Member) TableName() string { return "members" }
+
+// MaxIDLen 是 id / op_id 的**列宽上限**（members.id / members.op_id 都是
+// varchar(64)）。
+//
+// ⚠️ 为什么要显式校验（2026-10-21 契约测试实测踩到）：
+//
+//	超长 op_id 写进去 ⇒ **数据库报错** ⇒ handler 的 mapErr 落到 default 分支
+//	⇒ 返 **500 internal_error**（"系统繁忙,请稍后重试"）。
+//	症状与"参数写错了"毫无关系，现场根本想不到是长度问题。
+//
+//	⇒ 在落库前拦住并返 `model.ErrInvalidInput`（⇒ 400 bad_request）。
+//
+//	判据：**列宽是事实**，与"调用方应该传短的"这种假设无关 ——
+//	任何超出列宽的写入都是 500，而不是 400。
+const MaxIDLen = 64
+
+// BeforeSave 校验 id / op_id 的长度。
+//
+// ⚠️ 放在**模型 hook** 而不是某个 service 方法里：开卡 / 改状态 / 改密 /
+//
+//	人脸 / 改档案 / 导入都写这张表 —— 单点校验才盖得住全部写路径
+//	（每处 service 方法各判一次，漏一处就还是 500）。
+func (m *Member) BeforeSave(tx *gorm.DB) error {
+	if len(m.ID) > MaxIDLen {
+		return fmt.Errorf("%w: 会员号长度 %d 超过上限 %d", ErrInvalidInput, len(m.ID), MaxIDLen)
+	}
+	if len(m.OpID) > MaxIDLen {
+		return fmt.Errorf("%w: op_id 长度 %d 超过上限 %d", ErrInvalidInput, len(m.OpID), MaxIDLen)
+	}
+	return nil
+}
 
 // MemberType 是会员类别(门店各自维护)。
 type MemberType struct {
