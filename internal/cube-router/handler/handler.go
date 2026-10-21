@@ -91,6 +91,16 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		rbac.RequireScopeWithBranch("cube:read", branchFromHeaderFromMiddleware, resolver),
 		h.handleLoad,
 	)
+	// 档案导出(实现见 export.go)。
+	//
+	// ⚠️ 与 /v1/load **同一档 scope**(cube:read),不是 admin 角色 ——
+	// auth 建服务账号时"不分配任何角色(least privilege)",
+	// 服务账号过不了 RequireRole("admin")。
+	// 而这个端点就是给同步服务账号用的。
+	biz.GET("/v1/export",
+		rbac.RequireScopeWithBranch("cube:read", branchFromHeaderFromMiddleware, resolver),
+		h.handleExport,
+	)
 
 	// 管理端点(仅 admin 角色)
 	admin := r.Group("/admin")
@@ -219,6 +229,16 @@ func callerSub(c *gin.Context) string {
 
 // mapErr 把 service / model 错误映射为 HTTP 状态码 + JSON body。
 func (h *Handler) mapErr(c *gin.Context, err error) {
+	// 导出路径的错误自带 code/status(要区分 cube 的 404 到底是
+	// "没有这个 model" 还是"链路坏了")。
+	var ee *exportError
+	if errors.As(err, &ee) {
+		c.AbortWithStatusJSON(ee.status, gin.H{
+			"code":    ee.code,
+			"message": ee.message,
+		})
+		return
+	}
 	switch {
 	case errors.Is(err, model.ErrNotFound):
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{

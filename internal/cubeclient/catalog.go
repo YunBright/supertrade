@@ -46,13 +46,18 @@ const catalogDictLimit = 5000
 
 // productPageDimensions 是商品页 SELECT 的维度集合。
 //
-// 六个维度一起 GROUP BY,粒度 = 一个商品(product.id 是主键,唯一)。
+// 七个维度一起 GROUP BY,粒度 = 一个商品(product.id 是主键,唯一)。
 // ⚠️ 不要为了少查一列而删维度:少一个维度就会把不同的商品合并成一行,
 // 商品数(count / total)会跟着变小,而"侧栏 count == 列表 total"这条等式
 // 也就悄悄不成立了。
+//
+// 2026-10-20 加 `product.sub_code`(自编码/助记码,思迅 item_subno):
+// 业务要在列表里同时看到**货号**与**自编码** —— 自编码不唯一
+// (少数自编码对应 2 个货号:正常品 + 换购品),货号才是唯一键。
 func productPageDimensions() []string {
 	return []string{"product.id", "product.name", "product.category_id",
-		"product.supplier_id", "product.unit", "product.status"}
+		"product.supplier_id", "product.unit", "product.status",
+		"product.sub_code"}
 }
 
 // productPageQuery 构造商品页的 cube 查询。
@@ -281,7 +286,28 @@ func (c *DaprCubeClient) SearchProducts(ctx context.Context, q ProductQuery) (*P
 	}
 	hits = append(hits, hit{rows: productRows(rows), total: total})
 
-	// 按 id 去重合并(同一个商品可能同时命中编码与名称)。
+	// (3) 自编码命中(大小写无关)
+	//
+	// 2026-10-20 新增:思迅的搜索框是「输入编码、名称或助记码」,
+	// 而"编码"对它来说是**两个**东西:货号(item_no,唯一)与
+	// 自编码(item_subno,不唯一)。漏掉自编码 ⇒ 用户扫了自编码
+	// (或记起一个自编码)就搜不到那个商品。
+	//
+	// ⚠️ 自编码**会命中多个商品**(少数自编码对应 2 个货号:
+	// 正常品 + 换购品)⇒ 候选列表是正常结果,不能"只取第一条"。
+	cq = productPageQuery(q)
+	cq.Limit = fetch
+	cq.Offset = 0
+	cq.Filters = append(cq.Filters, CubeFilter{
+		Member: "product.sub_code", Operator: OperatorContainsCI, Values: []any{kw},
+	})
+	rows, total, err = c.LoadCubeQueryPage(ctx, "product", cq)
+	if err != nil {
+		return nil, err
+	}
+	hits = append(hits, hit{rows: productRows(rows), total: total})
+
+	// 按 id 去重合并(同一个商品可能同时命中编码、自编码与名称)。
 	seen := make(map[string]bool)
 	merged := make([]ProductDTO, 0, len(hits)*fetch)
 	sum := 0
@@ -516,6 +542,12 @@ func productRows(rows []map[string]any) []ProductDTO {
 			PriceYuan:  asDecimalPtr(row["product.avg_price_yuan"]),
 			// Barcode = id(领域事实:思迅 item_no 就是条码)。
 			Barcode: id,
+			// SubCode = 自编码/助记码(思迅 item_subno)。
+			//
+			// ⚠️ **不唯一**:少数自编码对应 2 个货号(正常品 + 换购品),
+			//    源库自己就只给它建了非唯一索引 ⇒ 按自编码查会命中多个候选。
+			//    唯一键是 ID(货号)。
+			SubCode: asStr(row["product.sub_code"]),
 		})
 	}
 	return out

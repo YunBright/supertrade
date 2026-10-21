@@ -240,7 +240,8 @@ func TestListProducts_SingleSupplierIDEmitsExactlyOneFilter(t *testing.T) {
 // 「属于该类别 且 属于该供应商」。
 //
 // ⚠️ 这跟分类那边**刻意相反**:分类的 CategoryIDs(子树)与 CategoryID(精确等于)
-//  必须二选一,否则子树语义被吃掉成"精确等于 X"。
+//
+//	必须二选一,否则子树语义被吃掉成"精确等于 X"。
 func TestListProducts_SupplierIDAndSupplierIDsAreIntersected(t *testing.T) {
 	inv := &recordingInvoker{}
 	c := newRecordingClient(inv)
@@ -339,12 +340,17 @@ func TestListProducts_EmptyCategorySetStillEmitsACategoryFilter(t *testing.T) {
 
 // ---- 搜索 ----
 
-// 搜索的编码/名称两个子查询都必须用 containsCI(大小写无关)。
+// 搜索的三个子查询(货号 / 自编码 / 名称)都必须用 containsCI(大小写无关)。
 //
 // 2026-10-20 之前这里发 3 次查询(原样 id / 大写 id / 名称),因为 cube 的
 // contains 大小写敏感、"再查一次大写"是唯一的绕法 —— 而那个绕法只覆盖
 // **全大写**这一种形态("z005-69" 仍然搜不到 "Z005-69")。
 // cube 有了 containsCI 之后,一次查询就够。
+//
+// 2026-10-20 又加了**自编码**那一路(思迅 item_subno):
+// 思迅的搜索框是「输入编码、名称或助记码」,而"编码"对它来说是**两个**东西
+// (货号 item_no 唯一 / 自编码 item_subno 不唯一)。
+// 漏掉这一路 ⇒ 用户搜自编码搜不到那个商品。
 func TestSearchProducts_UsesCaseInsensitiveOperator(t *testing.T) {
 	inv := &recordingInvoker{}
 	c := newRecordingClient(inv)
@@ -353,10 +359,11 @@ func TestSearchProducts_UsesCaseInsensitiveOperator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SearchProducts: %v", err)
 	}
-	if len(inv.bodies) != 2 {
-		t.Fatalf("应发 2 次查询(id / name),实际 %d 次", len(inv.bodies))
+	wantMembers := []string{"product.id", "product.name", "product.sub_code"}
+	if len(inv.bodies) != len(wantMembers) {
+		t.Fatalf("应发 %d 次查询(id / name / sub_code),实际 %d 次",
+			len(wantMembers), len(inv.bodies))
 	}
-	wantMembers := []string{"product.id", "product.name"}
 	for i, b := range inv.bodies {
 		f := filterOf(t, b, wantMembers[i])
 		if f == nil {
@@ -369,6 +376,55 @@ func TestSearchProducts_UsesCaseInsensitiveOperator(t *testing.T) {
 		if got := filterValue(t, b, wantMembers[i]); got != "z005-69" {
 			t.Errorf("第 %d 次查询过滤值 = %q, want z005-69(原样)", i+1, got)
 		}
+	}
+}
+
+// 商品页必须 SELECT `product.sub_code` —— 不然自编码既搜不到也显示不出来。
+//
+// ⚠️ 少一个维度不会让查询失败,只会让那一列**恒为空**:
+// 自编码搜索永远 0 命中、列表里"自编码"那栏永远空。
+// 所以这条断言盯的是"维度在 SELECT 里",不是"值对不对"。
+func TestListProducts_SelectsSubCodeDimension(t *testing.T) {
+	inv := &recordingInvoker{}
+	c := newRecordingClient(inv)
+
+	_, err := c.ListProducts(context.Background(), ProductQuery{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListProducts: %v", err)
+	}
+	dims := dimsOf(t, inv.bodies[0])
+	if !hasDim(dims, "product.sub_code") {
+		t.Errorf("商品页必须 SELECT product.sub_code,实际 %v", dims)
+	}
+}
+
+// 行里的 SubCode 必须来自 cube 的 product.sub_code(而不是拿 id 顶替)。
+//
+// ⚠️ 拿 id 顶替是个很隐蔽的错:货号与自编码**长得完全不一样**
+// (02000110 vs 6904406383122),用户会拿到一个"看起来像自编码"的货号,
+// 然后按它去仓库里找,找不到 —— 而界面上一丝异常都没有。
+func TestProductRows_SubCodeComesFromItsOwnColumn(t *testing.T) {
+	inv := &recordingInvoker{
+		responds: [][]map[string]any{{{
+			"product.id":       "02000110",
+			"product.name":     "远航九江双蒸酒精品500ml",
+			"product.sub_code": "6904406383122",
+		}}},
+	}
+	c := newRecordingClient(inv)
+
+	page, err := c.ListProducts(context.Background(), ProductQuery{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListProducts: %v", err)
+	}
+	if len(page.Rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(page.Rows))
+	}
+	if page.Rows[0].SubCode != "6904406383122" {
+		t.Errorf("SubCode = %q, want 6904406383122", page.Rows[0].SubCode)
+	}
+	if page.Rows[0].SubCode == page.Rows[0].ID {
+		t.Errorf("SubCode 不该被 id 顶替(货号 %q ≠ 自编码)", page.Rows[0].ID)
 	}
 }
 

@@ -43,7 +43,7 @@ type Client struct {
 	// 默认给**生产实测的那 6 行**(A 购销 / B 代销 / C 联营 / D 租赁 /
 	// E 自产 / F 扣率代销)—— 这不是编的,是两个生产库里的真实字典。
 	// 取值来源见 sixun-models/sale_way/schema.yaml。
-	saleWays map[string]cubeclient.SaleWayDTO
+	saleWays   map[string]cubeclient.SaleWayDTO
 	promotions []cubeclient.PromotionDTO
 	clock      func() time.Time
 }
@@ -113,15 +113,20 @@ func (c *Client) seed() {
 		SupplierID: "SUP-002", Unit: "瓶", Spec: "550ml",
 		Status: "active", Barcode: "6901234567892", PriceYuan: &p1003,
 	}
+	// P-2001 与 P-3001 **共用同一个自编码** —— 照思迅实测的
+	// 「正常品 + 换购品」配对(真实例子:6904406383122 → 02000110 /
+	// 02000111)。这样"按自编码搜会命中多个候选"这条路径在单测里也被走到。
 	c.products["P-2001"] = cubeclient.ProductDTO{
 		ID: "P-2001", Name: "五花肉", CategoryID: "CAT-02",
 		SupplierID: "SUP-101", Unit: "kg", Spec: "新鲜",
 		Status: "active", Barcode: "2001", PriceYuan: &p2001,
+		SubCode: "6904406383122",
 	}
 	c.products["P-3001"] = cubeclient.ProductDTO{
 		ID: "P-3001", Name: "大白菜", CategoryID: "CAT-03",
 		SupplierID: "SUP-201", Unit: "kg", Spec: "新鲜",
 		Status: "active", Barcode: "3001", PriceYuan: &p3001,
+		SubCode: "6904406383122",
 	}
 
 	c.stock["S001"] = map[string]cubeclient.StockSnapshotDTO{
@@ -437,8 +442,12 @@ func (c *Client) SearchProducts(_ context.Context, q cubeclient.ProductQuery) (*
 	seen := map[string]bool{}
 	var merged []cubeclient.ProductDTO
 	for _, p := range c.matchProducts(q) {
-		// 编码与名称都是**大小写无关**匹配(对齐 cube 的 containsCI)。
+		// 货号 / 自编码 / 名称都是**大小写无关**匹配(对齐 cube 的 containsCI)。
+		//
+		// ⚠️ 自编码那一路不能漏:思迅的搜索框是「输入编码、名称或助记码」,
+		// 而"编码"对它来说是**两个**东西(货号唯一 / 自编码不唯一)。
 		hit := strings.Contains(strings.ToLower(p.ID), lower) ||
+			strings.Contains(strings.ToLower(p.SubCode), lower) ||
 			strings.Contains(strings.ToLower(p.Name), lower)
 		if !hit || seen[p.ID] {
 			continue

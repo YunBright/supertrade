@@ -80,7 +80,7 @@ var ErrPromotionNotFound = errors.New("cubeclient: 该商品当前没有生效�
 // 字段含义与 cube `F:\go\src\github.com\YunBright\cube\sixun-models\product\schema.yaml` 一致;
 // 本系统不创建对应的 PG 表(REQUIREMENTS §7.5),但 Go struct 字段名 / 类型 / JSON tag 全部对齐。
 type ProductDTO struct {
-	ID         string `json:"id"`                // cube product.id = 思迅 item_no
+	ID         string `json:"id"`                // cube product.id = 思迅 item_no(货号,唯一)
 	Name       string `json:"name"`              // cube product.name
 	CategoryID string `json:"category_id"`       // cube product.category_id
 	SupplierID string `json:"supplier_id"`       // cube product.supplier_id
@@ -88,6 +88,16 @@ type ProductDTO struct {
 	Spec       string `json:"spec,omitempty"`    // 规格(扩展字段)
 	Status     string `json:"status"`            // cube product.status
 	Barcode    string `json:"barcode,omitempty"` // 主条码(扩展,给扫码用)
+	// SubCode 是**自编码 / 助记码**(思迅 `t_bd_item_info.item_subno`)。
+	//
+	// ⚠️ **不是唯一的**:实测 ysx 27565 个商品里 9 个自编码对应 2 个货号、
+	// hbposv7 44623 个里 72 个 —— 全部是「正常品 + 换购品」配对
+	// (例:`6904406383122` → `02000110` 远航九江双蒸酒精品500ml(16.50)
+	// / `02000111` (换购)远航九江双蒸酒精品500ml(5.00))。
+	// 源库自己也只给 `item_subno` 建了**非唯一**索引 ⇒ 1:N 是设计,不是脏数据。
+	//
+	// ⇒ 按自编码查商品会命中**多个候选**;唯一键是 [ID](货号)。
+	SubCode string `json:"sub_code,omitempty"`
 	// PriceYuan 商品当前售价(元),来自 cube 的 product.avg_price_yuan。
 	//
 	// 2026-10-08 新增。此前 GetProduct 不查价,wx-h5 的「商品当前售价」永远是 "-"。
