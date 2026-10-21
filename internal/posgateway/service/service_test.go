@@ -356,7 +356,7 @@ func TestService_LastOrder_DownstreamAuthError_Fails(t *testing.T) {
 
 func TestService_SearchProducts_ReturnsCandidates(t *testing.T) {
 	caller := newFakeCaller()
-	caller.stub(service.AppCatalog+" /products/local", `{"products":[
+	caller.stub(service.AppCatalog+" /products/search", `{"products":[
 		{"id":"02000110","name":"远航九江双蒸酒","barcode":"6904406383122","sub_code":"JZJ",
 		 "unit":"瓶","category_id":"01","category_name":"酒","supplier_id":"S1",
 		 "supplier_name":null,"status":"0"},
@@ -379,9 +379,9 @@ func TestService_SearchProducts_ReturnsCandidates(t *testing.T) {
 
 func TestService_Prices_AggregatesPriceAndPromotion(t *testing.T) {
 	caller := newFakeCaller()
-	caller.stub(service.AppPricing+" /prices/local", `{"branch_id":"B10","as_of":"2026-10-21",
+	caller.stub(service.AppPricing+" /prices", `{"branch_id":"B10","as_of":"2026-10-21",
 		"prices":[{"product_id":"P1","price_yuan":"3.5000","member_price_yuan":"3.0000"}],"count":1}`)
-	caller.stub(service.AppPricing+" /promotions/local", `{"branch_id":"B10","as_of":"2026-10-21",
+	caller.stub(service.AppPricing+" /promotions", `{"branch_id":"B10","as_of":"2026-10-21",
 		"promotions":[{"product_id":"P1","plan_no":"PL1","plan_name":"特价","price_yuan":"2.5000",
 		 "orig_price_yuan":"3.5000","begin_day":"2026-10-21","end_day":"2026-10-22"}],"count":1}`)
 	svc := service.New(caller, nil)
@@ -402,9 +402,9 @@ func TestService_Prices_AggregatesPriceAndPromotion(t *testing.T) {
 
 func TestService_Prices_PromotionsDown_Degrades(t *testing.T) {
 	caller := newFakeCaller()
-	caller.stub(service.AppPricing+" /prices/local", `{"branch_id":"B10","as_of":"2026-10-21",
+	caller.stub(service.AppPricing+" /prices", `{"branch_id":"B10","as_of":"2026-10-21",
 		"prices":[{"product_id":"P1","price_yuan":"3.5000"}],"count":1}`)
-	caller.stubErr(service.AppPricing+" /promotions/local", businessErr(service.AppPricing, "/promotions/local"))
+	caller.stubErr(service.AppPricing+" /promotions", businessErr(service.AppPricing, "/promotions"))
 	svc := service.New(caller, nil)
 
 	view, err := svc.Prices(context.Background(), service.PricesInput{

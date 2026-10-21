@@ -45,8 +45,8 @@ func localRouter(t *testing.T) *gin.Engine {
 	r := gin.New()
 	r.Use(middleware.XBranchID())
 	r.POST("/archive/import", h.importArchive)
-	r.GET("/prices/local", h.getLocalPrices)
-	r.GET("/promotions/local", h.getLocalPromotions)
+	r.GET("/prices", h.getPrices)
+	r.GET("/promotions", h.getPromotions)
 	return r
 }
 
@@ -122,7 +122,7 @@ func TestImportArchive_WritesPricesAndPromotions(t *testing.T) {
 	assert.Equal(t, 1, byScope["promotions"])
 
 	// 读回来:售价必须是**字符串**。
-	w = getJSON(t, r, "/prices/local?product_ids=6957583900828,6904406383122", "10")
+	w = getJSON(t, r, "/prices?product_ids=6957583900828,6904406383122", "10")
 	require.Equal(t, http.StatusOK, w.Code, "读本地价应 200: %s", w.Body.String())
 	var page struct {
 		Prices []struct {
@@ -144,7 +144,7 @@ func TestImportArchive_WritesPricesAndPromotions(t *testing.T) {
 		"没会员价时不能给 0 元(那是'没有会员价',不是'会员价 0 元')")
 
 	// 促销读回来。
-	w = getJSON(t, r, "/promotions/local?product_ids=6957583900828&on_date=2026-09-17", "10")
+	w = getJSON(t, r, "/promotions?product_ids=6957583900828&on_date=2026-09-17", "10")
 	require.Equal(t, http.StatusOK, w.Code)
 	var promoPage struct {
 		Promotions []struct {
@@ -218,7 +218,7 @@ func TestImportArchive_InvalidMoneyIsReportedNotSwallowed(t *testing.T) {
 	assert.Contains(t, res.Errors[0].Error, "售价解析失败")
 
 	// 那一行**不能**变成售价 0 元。
-	w = getJSON(t, r, "/prices/local?product_ids=P-BAD-01", "10")
+	w = getJSON(t, r, "/prices?product_ids=P-BAD-01", "10")
 	require.Equal(t, http.StatusOK, w.Code)
 	var page struct {
 		Prices []map[string]any `json:"prices"`
@@ -236,7 +236,7 @@ func TestImportArchive_UnpricedProductCreatesNoRow(t *testing.T) {
 		`{"mode":"overwrite","prices":[{"product_id":"P-NO-PRICE","price_yuan":""}]}`)
 	require.Equal(t, http.StatusOK, w.Code)
 
-	w = getJSON(t, r, "/prices/local?product_ids=P-NO-PRICE", "10")
+	w = getJSON(t, r, "/prices?product_ids=P-NO-PRICE", "10")
 	require.Equal(t, http.StatusOK, w.Code)
 	var page struct {
 		Prices []map[string]any `json:"prices"`
@@ -249,9 +249,9 @@ func TestImportArchive_UnpricedProductCreatesNoRow(t *testing.T) {
 func TestLocalRead_RequiresProductIDs(t *testing.T) {
 	r := localRouter(t)
 	for _, path := range []string{
-		"/prices/local",
-		"/prices/local?product_ids=",
-		"/promotions/local",
+		"/prices",
+		"/prices?product_ids=",
+		"/promotions",
 	} {
 		w := getJSON(t, r, path, "10")
 		assert.Equal(t, http.StatusBadRequest, w.Code, "%s 应 400", path)
@@ -264,7 +264,7 @@ func TestLocalRead_RequiresProductIDs(t *testing.T) {
 // TestLocalRead_RejectsBadOnDate 锁"非法基准日必须报错"。
 func TestLocalRead_RejectsBadOnDate(t *testing.T) {
 	r := localRouter(t)
-	w := getJSON(t, r, "/promotions/local?product_ids=P-0001&on_date=not-a-date", "10")
+	w := getJSON(t, r, "/promotions?product_ids=P-0001&on_date=not-a-date", "10")
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	var body map[string]any
 	_ = json.Unmarshal(w.Body.Bytes(), &body)

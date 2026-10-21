@@ -27,8 +27,8 @@ func localRouterWithDB(t *testing.T) (*gin.Engine, *gorm.DB) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.Use(middleware.XBranchID())
-	r.GET("/prices/local", h.getLocalPrices)
-	r.GET("/promotions/local", h.getLocalPromotions)
+	r.GET("/prices", h.getPrices)
+	r.GET("/promotions", h.getPromotions)
 	r.GET("/prices/export", h.exportLocalPrices)
 	return r, db
 }
@@ -68,7 +68,7 @@ func TestLocalPrices_IncludesPromoPrice(t *testing.T) {
 		}}, false)
 	require.NoError(t, err)
 
-	w := getJSON(t, r, "/prices/local?product_ids=6922303199721&on_date=2026-10-21", "10")
+	w := getJSON(t, r, "/prices?product_ids=6922303199721&on_date=2026-10-21", "10")
 	require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
 
 	var out struct {
@@ -100,7 +100,7 @@ func TestLocalPrices_NoPromoMeansNull(t *testing.T) {
 		[]service.PriceInput{{ProductID: "P-1", PriceYuan: "9.90"}})
 	require.NoError(t, err)
 
-	w := getJSON(t, r, "/prices/local?product_ids=P-1&on_date=2026-10-21", "10")
+	w := getJSON(t, r, "/prices?product_ids=P-1&on_date=2026-10-21", "10")
 	require.Equal(t, http.StatusOK, w.Code)
 
 	var out struct {

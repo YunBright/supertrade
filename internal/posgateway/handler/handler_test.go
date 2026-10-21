@@ -100,11 +100,11 @@ func happyCaller() *fakeCaller {
 	c.stub(service.AppMember+" /members/M1", `{"id":"M1","branch_id":"B10","name":"张三"}`)
 	c.stub(service.AppMember+" /members/M1/last-order",
 		`{"member_id":"M1","last_order":null,"sale_lines":[],"payments":[]}`)
-	c.stub(service.AppCatalog+" /products/local",
+	c.stub(service.AppCatalog+" /products/search",
 		`{"products":[{"id":"P1","name":"可乐","barcode":"690","sub_code":"KL"}],"count":1,"total":1}`)
-	c.stub(service.AppPricing+" /prices/local",
+	c.stub(service.AppPricing+" /prices",
 		`{"branch_id":"B10","as_of":"2026-10-21","prices":[{"product_id":"P1","price_yuan":"3.5000"}],"count":1}`)
-	c.stub(service.AppPricing+" /promotions/local",
+	c.stub(service.AppPricing+" /promotions",
 		`{"branch_id":"B10","as_of":"2026-10-21","promotions":[],"count":0}`)
 	c.stub(service.AppPOS+" /sales", `{"sale_id":"S1","replayed":false}`)
 	return c

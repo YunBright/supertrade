@@ -18,7 +18,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/YunBright/supertrade/internal/pricing/model"
 	"github.com/YunBright/supertrade/pkg/middleware"
 )
 
@@ -68,26 +67,24 @@ type localPromoDTO struct {
 	EndDay        string  `json:"end_day"`
 }
 
-// getLocalPrices GET /prices/local?product_ids=a,b,c
+// getPrices GET /prices?product_ids=a,b,c
 //
-// 返回该门店本地表里这些商品的**当前生效售价**。
+// 返回这些商品的**当前生效售价**。
 //
 // ⚠️ **没维护价的商品不在返回里**(它没有行)——
 //
 //	调用方据此区分"没维护售价"与"售价 0 元"。
 //
-// # ⚠️ 这两个端点**只读本地表**,不按数据源路由
+// # ⚠️ 判据是「门店配没配数据源」(与 /quotes、/prices/export 同一套)
 //
-//	端点名字里的 "local" 就是承诺:批量查**本域 PG**里的售价/促销。
-//	要"按门店有无数据源路由"的实时价,走 /quotes(单个)与 /prices/export(全店)。
-//
-// ⇒ 门店 00(配了数据源)在这两个端点上拿到的仍是本地**快照**,
-// 而 /quotes 拿的是 cube 实时价 —— 这是**已知的不一致**,记在这里备查:
-// 现场问"为什么批量查和单个查不一样"时,答案就在这两行。
-func (h *Handler) getLocalPrices(c *gin.Context) {
-	if h.priceLists == nil {
+//	配了数据源 ⇒ 走那个 cube 实例的**实时**价;
+//	没配数据源   ⇒ 走本域 PG。
+//	⇒ 旧的 /prices/local("只读本地表")已删除:名字承诺"本地"、
+//	  而门店 00 拿到的是**两天前的快照** ⇒ "批量查和单个查的价不一样"。
+func (h *Handler) getPrices(c *gin.Context) {
+	if h.prices == nil {
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
-			"code": "not_ready", "message": "本地价格表未装配",
+			"code": "not_ready", "message": "价格服务未装配",
 		})
 		return
 	}
@@ -101,43 +98,20 @@ func (h *Handler) getLocalPrices(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	at := h.localNow()
 
-	rows, err := h.priceLists.ActivePrices(c.Request.Context(), branchID, "", ids, at)
+	rows, err := h.prices.BatchPrices(c.Request.Context(), branchID, ids, at)
 	if err != nil {
 		h.mapErr(c, err)
 		return
 	}
-	// ⚠️ **促销要单独查**:售价表里没有促销价,
-	//   而促销是**时效数据**(按基准日生效)⇒ 必须按 at 取当前生效的那些。
-	//
-	//   症状(2026-10-21 现场):POS 显示 15.00 而实际促销价 9.90 ——
-	//   因为这个端点只查了 price_lists,促销价**根本没参与**。
-	promos := map[string]model.Promotion{}
-	if h.promos != nil {
-		promos, err = h.promos.ActivePromotions(c.Request.Context(), branchID, ids, at)
-		if err != nil {
-			h.mapErr(c, err)
-			return
-		}
-	}
 	out := make([]localPriceDTO, 0, len(rows))
 	for _, r := range rows {
-		dto := localPriceDTO{
-			ProductID: r.ProductID,
-			PriceYuan: r.PriceYuan.String(),
-		}
-		if p, ok := promos[r.ProductID]; ok && !p.PriceYuan.IsZero() {
-			s := p.PriceYuan.String()
-			dto.PromoPriceYuan = &s
-		}
-		if !r.MemberPriceYuan.IsZero() {
-			s := r.MemberPriceYuan.String()
-			dto.MemberPriceYuan = &s
-		}
-		if !r.CostYuan.IsZero() {
-			s := r.CostYuan.String()
-			dto.CostYuan = &s
-		}
-		out = append(out, dto)
+		out = append(out, localPriceDTO{
+			ProductID:       r.ProductID,
+			PriceYuan:       r.PriceYuan,
+			PromoPriceYuan:  r.PromoPriceYuan,
+			MemberPriceYuan: r.MemberPriceYuan,
+			CostYuan:        r.CostYuan,
+		})
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"branch_id": branchID,
@@ -147,16 +121,21 @@ func (h *Handler) getLocalPrices(c *gin.Context) {
 	})
 }
 
-// getLocalPromotions GET /promotions/local?product_ids=a,b,c&on_date=yyyy-mm-dd
+// getPromotions GET /promotions?product_ids=a,b,c&on_date=yyyy-mm-dd
 //
-// 返回该门店本地表里这些商品**当前生效**的促销。
+// 返回这些商品**当前生效**的促销。
 //
 // ⚠️ 同一商品多个生效促销 ⇒ **只返促销价最低的那条**
 // (与 cube promotion model 的 min_promo_price 语义一致)。
-func (h *Handler) getLocalPromotions(c *gin.Context) {
-	if h.promos == nil {
+//
+// # ⚠️ 判据是「门店配没配数据源」(与 /quotes、/prices/export 同一套)
+//
+// 旧的 /promotions/local("只读本地表")已删除 —— 名字承诺"本地",
+// 而有数据源的门店拿到的是**本地快照** ⇒ 与实时价不一致。
+func (h *Handler) getPromotions(c *gin.Context) {
+	if h.prices == nil {
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
-			"code": "not_ready", "message": "本地促销表未装配",
+			"code": "not_ready", "message": "价格服务未装配",
 		})
 		return
 	}
@@ -180,26 +159,22 @@ func (h *Handler) getLocalPromotions(c *gin.Context) {
 		at = parsed
 	}
 
-	rows, err := h.promos.ActivePromotions(c.Request.Context(), branchID, ids, at)
+	rows, err := h.prices.BatchPromotions(c.Request.Context(), branchID, ids, at)
 	if err != nil {
 		h.mapErr(c, err)
 		return
 	}
 	out := make([]localPromoDTO, 0, len(rows))
 	for _, r := range rows {
-		dto := localPromoDTO{
-			ProductID: r.ProductID,
-			PlanNo:    r.ID,
-			PlanName:  r.PlanName,
-			PriceYuan: r.PriceYuan.String(),
-			BeginDay:  r.BeginAt.Format("2006-01-02"),
-			EndDay:    r.EndAt.Format("2006-01-02"),
-		}
-		if !r.OrigPriceYuan.IsZero() {
-			s := r.OrigPriceYuan.String()
-			dto.OrigPriceYuan = &s
-		}
-		out = append(out, dto)
+		out = append(out, localPromoDTO{
+			ProductID:     r.ProductID,
+			PlanNo:        r.PlanNo,
+			PlanName:      r.PlanName,
+			PriceYuan:     r.PriceYuan,
+			OrigPriceYuan: r.OrigPriceYuan,
+			BeginDay:      r.BeginDay,
+			EndDay:        r.EndDay,
+		})
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"branch_id":  branchID,

@@ -255,7 +255,7 @@ type ProductSearchView struct {
 	Warnings []string `json:"warnings"`
 }
 
-// LocalPrice 是一行本地售价(来自 pricing 的 GET /prices/local)。
+// LocalPrice 是一行售价(来自 pricing 的 GET /prices)。
 type LocalPrice struct {
 	// ProductID 是商品 id。
 	ProductID string `json:"product_id"`
@@ -267,7 +267,7 @@ type LocalPrice struct {
 	CostYuan *AmountString `json:"cost_yuan"`
 }
 
-// LocalPromotion 是一行当前生效促销(来自 pricing 的 GET /promotions/local)。
+// LocalPromotion 是一行当前生效促销(来自 pricing 的 GET /promotions)。
 type LocalPromotion struct {
 	// ProductID 是商品 id。
 	ProductID string `json:"product_id"`
@@ -645,27 +645,25 @@ type ProductSearchInput struct {
 
 // SearchProducts 代理 catalog 的商品搜索。
 //
-// # ⚠️ 调的是 **`/products/local`（本地表）**，不是 `/products/search`（cube 实时）
+// # ⚠️ 调的是 catalog 的 **`/products/search`**(商品选择控件那条,已按数据源分流)
 //
-// catalog 有两个商品查询端点，**数据源不同**：
+// catalog 的读端点按「门店配没配数据源」分流(判据只有这一套):
 //
-//	GET /products/search  → **实时打 cube**（商品选择控件的老路径）
-//	GET /products/local   → **本地表** products（自营门店用）
+//	配了源 ⇒ 走那个 cube 实例(商品档案在外部系统里)
+//	没配源 ⇒ 走本域 PG(自营门店 10)
 //
-// ⇒ 门店 10（自营，`branch_cube_sources` 里**没有**它）根本没有 cube 源，
-//
-//	  打 `/products/search` 的症状是：
-//
-//		502 {"code":"cube_error","message":"调用者缺少该门店的 cube 读权限"}
-//
-//	  —— 看着像权限问题，实际是**打错了数据源**。
+// ⚠️ 2026-10-22:这里原本调的是 catalog 的 `/products/local`——
+// 那条端点**只读本域 PG**,名字承诺"本地"、数据却是另一套
+// ⇒ 同一个门店在 BFF 与后台管理页会看到**两个不同的商品列表**
+// (门店 00 的本地副本已被清空 ⇒ BFF 搜出来是空的,而后台管理页是全的)。
+// ⇒ 那条端点已删除,统一走 `/products/search`。
 //
 // ⚠️ catalog 的搜索本身命中 **货号 / 自编码 / 名称 / 条码** 四列
-// （思迅的搜索框是「输入编码、名称或助记码(Q)」，而"编码"是**两个**东西：
-// 货号唯一 / 自编码不唯一）⇒ 四者命中在下游已经成立，本服务只做代理 + 收敛字段名。
+// (思迅的搜索框是「输入编码、名称或助记码(Q)」,而"编码"是**两个**东西:
+// 货号唯一 / 自编码不唯一)⇒ 四者命中在下游已经成立,本服务只做代理 + 收敛字段名。
 //
-// ⚠️ **一个自编码可能命中多个商品**（思迅实测 9 组「正常品 + 换购品」共用自编码）
-// ⇒ 返回候选列表，前端要能选，不能只取第一条。
+// ⚠️ **一个自编码可能命中多个商品**(思迅实测 9 组「正常品 + 换购品」共用自编码)
+// ⇒ 返回候选列表,前端要能选,不能只取第一条。
 func (s *Service) SearchProducts(ctx context.Context, in ProductSearchInput) (*ProductSearchView, error) {
 	q := url.Values{}
 	q.Set("q", in.Keyword)
@@ -675,13 +673,13 @@ func (s *Service) SearchProducts(ctx context.Context, in ProductSearchInput) (*P
 	if in.PageSize > 0 {
 		q.Set("page_size", strconv.Itoa(in.PageSize))
 	}
-	raw, err := s.caller.Get(ctx, AppCatalog, "/products/local?"+q.Encode())
+	raw, err := s.caller.Get(ctx, AppCatalog, "/products/search?"+q.Encode())
 	if err != nil {
 		return nil, err
 	}
 	var page catalogProductPage
 	if err := json.Unmarshal(raw, &page); err != nil {
-		return nil, fmt.Errorf("posgateway: 解析 %s/products/local 失败: %w", AppCatalog, err)
+		return nil, fmt.Errorf("posgateway: 解析 %s/products/search 失败: %w", AppCatalog, err)
 	}
 	if page.Products == nil {
 		page.Products = []ProductCandidate{}
@@ -705,7 +703,9 @@ type PricesInput struct {
 	OnDate string
 }
 
-// Prices 代理 pricing 的本地售价 + 当前生效促销。
+// Prices 代理 pricing 的**当前生效售价 + 当前生效促销**。
+//
+// ⚠️ 判据在 pricing 侧（配了数据源走 cube、没配走本地）⇒ 本服务不关心数据源。
 //
 // # 降级语义
 //
@@ -725,13 +725,13 @@ func (s *Service) Prices(ctx context.Context, in PricesInput) (*PricesView, erro
 		Warnings:   []string{},
 	}
 
-	priceRaw, err := s.caller.Get(ctx, AppPricing, "/prices/local?product_ids="+url.QueryEscape(ids))
+	priceRaw, err := s.caller.Get(ctx, AppPricing, "/prices?product_ids="+url.QueryEscape(ids))
 	if err != nil {
 		return nil, err
 	}
 	var priceResp pricingPricesResp
 	if err := json.Unmarshal(priceRaw, &priceResp); err != nil {
-		return nil, fmt.Errorf("posgateway: 解析 %s/prices/local 失败: %w", AppPricing, err)
+		return nil, fmt.Errorf("posgateway: 解析 %s/prices 失败: %w", AppPricing, err)
 	}
 	view.Prices = priceResp.Prices
 	if view.Prices == nil {
@@ -744,7 +744,7 @@ func (s *Service) Prices(ctx context.Context, in PricesInput) (*PricesView, erro
 	if strings.TrimSpace(in.OnDate) != "" {
 		promoQ.Set("on_date", strings.TrimSpace(in.OnDate))
 	}
-	promoRaw, err := s.caller.Get(ctx, AppPricing, "/promotions/local?"+promoQ.Encode())
+	promoRaw, err := s.caller.Get(ctx, AppPricing, "/promotions?"+promoQ.Encode())
 	if err != nil {
 		if IsAuthError(err) {
 			return nil, err

@@ -15,14 +15,26 @@
 //	POST   /products                             新建商品(product:manage)—— 本地表
 //	PUT    /products/:id                         改商品(product:manage)—— 本地表
 //	DELETE /products/:id                         软删商品(product:manage)—— 本地表
-//	GET    /products/local                        本地表商品列表(product:view)—— 分页
 //	GET    /products/export                       离线商品库(product:view)—— 不分页,含换购/停用
 //	GET    /categories?with_counts=               分类字典(supplier:view,商品选择控件)
-//	GET    /categories/local                      本地表分类列表(product:view)
 //	GET    /categories/:id                        查单个分类(product:view)
 //	POST   /categories                            新建分类(product:manage)
 //	PUT    /categories/:id                        改分类(product:manage)
 //	DELETE /categories/:id                        软删分类(product:manage)
+//
+// # ⚠️ 旧的 /products/local、/categories/local 已删除(2026-10-22)
+//
+// 名字里的 "local" 承诺"只读本域 PG",而全域判据是**配没配数据源**
+// (internal/cubesource:配了 ⇒ 走 cube,没配 ⇒ 走本域 PG)
+// ⇒ 名字与语义两套话:门店 00(配了源)在这两个端点上拿到的是**本域旧数据**,
+// 而同一批数据的 picker 端点给的是外部系统的现值
+// ⇒ "同一个门店,两个端点两个答案",现场无从判断哪个对。
+//
+// ⇒ 承接方式(不留后门):
+//
+//	商品列表/搜索 → GET /products、/products/search(picker,已按数据源分流)
+//	分类字典      → GET /categories(picker,已按数据源分流)
+//	离线商品库    → GET /products/export(POS 在用,已按数据源分流)
 //
 // 中间件:
 //   - middleware.XBranchID() 全局挂(由 cmd/catalog/main.go::registerRoutes)
@@ -179,9 +191,6 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.DELETE("/products/:id",
 		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
 		h.deleteProduct)
-	r.GET("/products/local",
-		rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver),
-		h.listLocalProducts)
 	// 离线商品库(一次给全,不分页,含换购品/停用品)。
 	//
 	// ⚠️ 静态段 `/products/export` 与参数段 `/products/:id` **共存**:
@@ -234,10 +243,12 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	//
 	// ⚠️ 分类用 `product:view`/`product:manage` 而不是独立的 category:* ——
 	// 分类是"商品档案"域的一部分,少一组 scope 少一轮 auth 改动。
-	// `GET /categories`(cube)由 RegisterProductPickerRoutes 注册,不冲突。
-	r.GET("/categories/local",
-		rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver),
-		h.listLocalCategories)
+	// `GET /categories`(cube/本域,由数据源决定)由 RegisterProductPickerRoutes
+	// 注册,不冲突。
+	//
+	// ⚠️ 旧的 `GET /categories/local`(只读本地表)已删除(2026-10-22):
+	// 它对"配了数据源的门店"给的是本域旧分类,而 picker 给的是外部系统的现值
+	// ⇒ 同一个门店两个答案。分类字典统一走 `GET /categories`。
 	r.GET("/categories/:id",
 		rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver),
 		h.getCategory)

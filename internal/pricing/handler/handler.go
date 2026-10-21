@@ -5,8 +5,13 @@
 //	GET  /quotes?barcode=&on_date=   查条码当前价格结论(pricing:view,per branch)
 //	GET  /promotions/active?barcode=  同上,只返促销部分(给"只关心特价"的调用方)
 //	GET  /meta                        价格标签字段名等静态元数据(pricing:view)
-//	GET  /prices/local?product_ids=   批量查本地售价(pricing:view)
-//	GET  /promotions/local?...        批量查本地当前生效促销(pricing:view)
+//	GET  /prices?product_ids=   批量查售价(pricing:view)
+//	                              判据:配了数据源走 cube、没配走本地
+//	GET  /promotions?...        批量查当前生效促销(pricing:view)
+//	                              判据同上
+//	⚠️ 旧的 /prices/local、/promotions/local 已删除(2026-10-22):
+//	   名字承诺「只读本地表」,而有数据源的门店拿到的是本地快照
+//	   ⇒ 批量查与单个查(/quotes)的价不一样。
 //	GET  /prices/export?on_date=      离线价格包(pricing:view)—— 不分页,全店
 //	GET  /archive/export?scope=       归档导出(archivedto 契约)(pricing:view)
 //	POST /archive/import               导入售价/促销(pricing:manage,per branch)
@@ -92,12 +97,12 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 		rbac.RequireScopeWithBranch("pricing:view", branchFromHeader, resolver),
 		h.getMeta)
 	// 本地批量读(POS 一次扫一屏商品 ⇒ 一次请求拿一批价)。
-	r.GET("/prices/local",
+	r.GET("/prices",
 		rbac.RequireScopeWithBranch("pricing:view", branchFromHeader, resolver),
-		h.getLocalPrices)
-	r.GET("/promotions/local",
+		h.getPrices)
+	r.GET("/promotions",
 		rbac.RequireScopeWithBranch("pricing:view", branchFromHeader, resolver),
-		h.getLocalPromotions)
+		h.getPromotions)
 	// 离线价格包(一次给全:默认价目表的生效零售价 + 该基准日生效的促销)。
 	//
 	// ⚠️ **路径与响应形状不许变**(前端 / POS 离线包在用)——

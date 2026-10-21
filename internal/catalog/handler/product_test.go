@@ -56,13 +56,16 @@ func newLocalTestRouter(t *testing.T) *gin.Engine {
 		nil, nil, nil,
 	)
 
-	// 与生产同款的路径集合。注意 :id 先注册、/local 后注册,
+	// 与生产同款的路径集合。注意 :id 先注册、/export 后注册,
 	// **注册顺序反过来也要成立**(见下面的路由优先级测试)。
+	//
+	// ⚠️ 旧的 /products/local、/categories/local 已删除(2026-10-22):
+	// 名字承诺"只读本地表",而全域判据是"配没配数据源"
+	// ⇒ 见 TestDeletedLocalEndpoints_AreGone(锁住"别把它们加回来")。
 	r.GET("/products/:id", h.getProduct)
 	r.POST("/products", h.createProduct)
 	r.PUT("/products/:id", h.updateProduct)
 	r.DELETE("/products/:id", h.deleteProduct)
-	r.GET("/products/local", h.listLocalProducts)
 	r.GET("/products/export", h.exportLocalProducts)
 	r.GET("/products/by-barcode/:code", h.getProductByBarcode)
 	r.GET("/products/:id/barcodes", h.listProductBarcodes)
@@ -73,7 +76,6 @@ func newLocalTestRouter(t *testing.T) *gin.Engine {
 	r.POST("/categories", h.createCategory)
 	r.PUT("/categories/:id", h.updateCategory)
 	r.DELETE("/categories/:id", h.deleteCategory)
-	r.GET("/categories/local", h.listLocalCategories)
 
 	return r
 }
@@ -199,50 +201,54 @@ func TestUpdateCategory_Cycle_400(t *testing.T) {
 	require.Equal(t, "category_cycle", errorCode(t, w))
 }
 
-// ---- 路由优先级(与既有 picker 测试同款纪律) ----
+// ---- 旧端点已删除(2026-10-22) ----
 
-// /products/local 必须命中 local 端点,**不能**被 /products/:id 吃掉。
+// TestDeletedLocalEndpoints_AreGone 锁住「/products/local、/categories/local 已删除」。
 //
-// gin 的路由树里静态段优先于参数段 —— 但这条依赖 gin 版本,
-// 必须实测(既有 TestSuppliersSummaryRouteWinsOverParam 是同一条纪律)。
+// # 为什么要有这条测试
 //
-// ⚠️ 如果这条挂了,症状是"GET /products/local 返回 404 product_not_found",
-// 看起来像"数据没导入",实际是路由被吃掉了 —— 排查方向会完全跑偏。
-func TestProductsLocalRouteWinsOverParam(t *testing.T) {
+// 这两条端点的名字承诺"只读本地表",而全域判据是**配没配数据源**
+// (配了 ⇒ 走 cube,没配 ⇒ 走本域 PG)
+// ⇒ 名字与语义两套话:同一个门店在后台管理页与 POS 收银页会看到**两个答案**
+// (门店 00 的本地副本已被清空 ⇒ 一边是全的、一边是空的)。
+//
+// ⇒ 删除后**必须**404,不能"悄悄恢复"。
+// 恢复的诱惑很大:代码里已经有一份能跑的实现,加回一行路由即可。
+//
+// # 为什么会落到 503 / 404 而不是"路由不存在"
+//
+// `/products/local` 现在落到参数段 `/products/:id`(id="local")
+// ⇒ getProduct 按数据源分流:没配源的门店查本域 ⇒ 404 product_not_found;
+// 配了源的门店打 cube ⇒ 单测里 cube 未装配 ⇒ 503。
+// `/categories/local` 同理落到 `/categories/:id` ⇒ 404 category_not_found。
+//
+// ⇒ 断言**不看状态码**(它随门店/装配变),只断言两件事:
+//
+//	① 路由表里**没有**这两条路径(精确);
+//	② 请求这两个路径**拿不到本地表的商品**(行为)。
+func TestDeletedLocalEndpoints_AreGone(t *testing.T) {
 	r := newLocalTestRouter(t)
 
-	w := doJSON(t, r, http.MethodPost, "/products", "10", map[string]any{"id": "P1", "name": "X"})
+	// ① 路由表里没有这两条路径。
+	registered := map[string]bool{}
+	for _, route := range r.Routes() {
+		registered[route.Path] = true
+	}
+	for _, path := range []string{"/products/local", "/categories/local"} {
+		require.False(t, registered[path], "%s 必须从路由表里消失", path)
+	}
+
+	// ② 就算请求它,也拿不到本地表的商品。
+	w := doJSON(t, r, http.MethodPost, "/products", "10", map[string]any{"id": "P1", "name": "本地商品X"})
 	require.Equal(t, http.StatusCreated, w.Code)
 
-	w = do(t, r, "/products/local", "10")
-	require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
-
-	var body struct {
-		Products []map[string]any `json:"products"`
-		Count    int              `json:"count"`
-		Total    int              `json:"total"`
+	for _, path := range []string{"/products/local", "/categories/local"} {
+		w = do(t, r, path, "10")
+		require.NotEqual(t, http.StatusOK, w.Code,
+			"%s 必须已删除(不能返回本地表数据),body=%s", path, w.Body.String())
+		require.NotContains(t, w.Body.String(), "本地商品X",
+			"%s 不得返回本地表的商品", path)
 	}
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
-	require.Len(t, body.Products, 1, "命中了错误的 handler:%s", w.Body.String())
-	require.Equal(t, 1, body.Total)
-}
-
-// /categories/local 同理:不能被 /categories/:id 吃掉。
-func TestCategoriesLocalRouteWinsOverParam(t *testing.T) {
-	r := newLocalTestRouter(t)
-
-	w := doJSON(t, r, http.MethodPost, "/categories", "10", map[string]any{"id": "01", "name": "生鲜"})
-	require.Equal(t, http.StatusCreated, w.Code)
-
-	w = do(t, r, "/categories/local", "10")
-	require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
-
-	var body struct {
-		Categories []map[string]any `json:"categories"`
-		Count      int              `json:"count"`
-	}
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
-	require.Len(t, body.Categories, 1, "命中了错误的 handler:%s", w.Body.String())
 }
 
 // 真正带 :id 的路径仍然按 id 处理(找不到 → 404 category_not_found)。
@@ -260,44 +266,16 @@ func TestCategoriesByIDRouteStillWorks(t *testing.T) {
 	require.Equal(t, "category_not_found", errorCode(t, w))
 }
 
-// ---- 分页参数(离线商品库全量拉取的入口) ----
-
-// TestProductsLocal_PageSizeOutOfRange_400 锁"page_size 越界必须 400"。
+// ---- 分页参数 ----
 //
-// ⚠️ 之前是"**静默截断** + **回显请求值**"——
+// ⚠️ "page_size 越界必须 400(不是静默截断 + 回显请求值)"这条守卫
+// **没有随旧端点一起消失** —— 它现在挂在商品选择控件那两条端点上
+// (`GET /products` / `GET /products/search`,见 catalog.go 的 parsePageQuery):
 //
-//	客户端请求 page_size=500,服务端只给 200 条,响应里却写 page_size=500
-//	⇒ 客户端以为这一页有 500 条 ⇒ **漏数据,且零报错**。
+//	TestParsePageQuery_RejectsInvalidPagination  越界 → 400 bad_request
+//	TestListProducts_EchoesPagination            回显**生效值**(归一化之后)
 //
-//	(客户端是分页拉全量:27565 商品 = 138 页 ⇒ 每一页算错都丢商品。)
-func TestProductsLocal_PageSizeOutOfRange_400(t *testing.T) {
-	r := newLocalTestRouter(t)
-
-	// ⚠️ `page_size=0` **不在**这个列表里:0 与"不传"在 query 里无法区分
-	//   ⇒ 一律当"不传"⇒ 用默认值(见下面的回显测试)。
-	for _, ps := range []string{"501", "-1", "100000"} {
-		w := do(t, r, "/products/local?page_size="+ps, "10")
-		require.Equal(t, http.StatusBadRequest, w.Code,
-			"page_size=%s 必须被拒,body=%s", ps, w.Body.String())
-		require.Equal(t, "bad_request", errorCode(t, w))
-	}
-}
-
-// TestProductsLocal_EchoesEffectivePaging 锁"回显**生效值**(归一化之后)"。
-//
-// ⚠️ 不传 page/page_size 时回显 0 ⇒ 客户端以为"第 0 页、每页 0 条" ⇒ 翻页逻辑错乱。
-func TestProductsLocal_EchoesEffectivePaging(t *testing.T) {
-	r := newLocalTestRouter(t)
-
-	w := do(t, r, "/products/local", "10")
-	require.Equal(t, http.StatusOK, w.Code, "body=%s", w.Body.String())
-
-	var body struct {
-		Page     int `json:"page"`
-		PageSize int `json:"page_size"`
-	}
-	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
-	require.Equal(t, 1, body.Page, "不传 page 必须是第 1 页")
-	require.Equal(t, service.DefaultProductPageSize, body.PageSize,
-		"不传 page_size 必须回显默认值")
-}
+// ⚠️ 为什么这条守卫要紧:客户端是**分页拉全量**(27565 商品 = 138 页)
+// ⇒ 每一页算错都**漏商品**,而且**零报错**。
+// 之前就是"静默截断 + 回显请求值":客户端请求 page_size=500、服务端只给 200 条,
+// 响应里却写 page_size=500 ⇒ 客户端以为这页有 500 条。

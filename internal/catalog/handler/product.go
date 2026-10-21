@@ -171,72 +171,6 @@ func (h *Handler) deleteProduct(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// listLocalProducts GET /products/local —— 本地表商品列表(分页)。
-//
-// ⚠️ 与既有的 `GET /products`(cube,商品选择控件在用)是**两个端点**。
-// 之所以不合并到一条路径上分派,是因为两者响应形状不同
-// (本地是裸数组 + count,Picker 是 products[] + total + page + page_size),
-// 合并会让前端两套解析逻辑都得留着。
-//
-// 单独开一条路径,前端按"数据源"显式选:自营门店用这条,cube 门店用老的。
-func (h *Handler) listLocalProducts(c *gin.Context) {
-	branchID := middleware.SingleBranchFromCtx(c)
-	if branchID == "" {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-			"code":    "branch_required",
-			"message": "X-Branch-ID header 必填",
-		})
-		return
-	}
-	page, _ := strconv.Atoi(c.Query("page"))
-	pageSize, _ := strconv.Atoi(c.Query("page_size"))
-	// ⚠️ **不传 = 默认值**;越界 = 400(不是静默截断)。
-	//
-	//	原因:之前是"越界静默截断 + **回显请求值**"
-	//	⇒ 客户端请求 page_size=500,服务端只给 200 条,响应里却写 page_size=500
-	//	⇒ 客户端以为这一页有 500 条 ⇒ **漏数据,且零报错**。
-	//
-	//	⇒ 现在:越界直接 400;回显**生效值**(归一化之后)。
-	if page == 0 {
-		page = 1
-	}
-	if pageSize == 0 {
-		pageSize = service.DefaultProductPageSize
-	}
-	if page < 1 {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-			"code": "bad_request", "message": "page 必须 >= 1",
-		})
-		return
-	}
-	if pageSize < 1 || pageSize > service.MaxProductPageSize {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-			"code":    "bad_request",
-			"message": "page_size 必须在 1.." + strconv.Itoa(service.MaxProductPageSize) + " 之间",
-		})
-		return
-	}
-	rows, total, err := h.products.List(c.Request.Context(), branchID, service.LocalProductQuery{
-		Keyword:    c.Query("q"),
-		CategoryID: c.Query("category_id"),
-		SupplierID: c.Query("supplier_id"),
-		Status:     c.Query("status"),
-		Page:       page,
-		PageSize:   pageSize,
-	})
-	if err != nil {
-		h.mapErr(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"products":  rows,
-		"count":     len(rows),
-		"total":     total,
-		"page":      page,
-		"page_size": pageSize,
-	})
-}
-
 // exportProductDTO 是离线商品库里的一行。
 //
 // # ⚠️ barcode 与 barcodes 是**两回事**
@@ -280,13 +214,10 @@ type exportProductDTO struct {
 
 // exportLocalProducts GET /products/export —— 离线商品库(一次给全)。
 //
-// # 与 listLocalProducts 的关系
+// # 与商品选择控件那两个端点的关系
 //
-//	GET /products/local   分页,默认过滤换购品/停用品 —— 给"商品选择控件"用
-//	GET /products/export  **不分页**,含换购品/停用品 —— 给"离线数据包"用
-//
-// ⚠️ **不改动 listLocalProducts 的现有行为**:商品选择控件与 tradewind_app
-// 都在用那条路径,响应形状不能动。
+//	GET /products、/products/search  分页,商品选择控件在用(已按数据源分流)
+//	GET /products/export             **不分页**,含换购品/停用品 —— 给"离线数据包"用
 //
 // # ⚠️ 门店只从 X-Branch-ID header 取
 //

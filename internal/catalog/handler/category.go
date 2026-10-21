@@ -44,33 +44,6 @@ type updateCategoryReq struct {
 	Status    *string `json:"status"`
 }
 
-// listCategories GET /categories —— **本地表**的全部分类(平铺)。
-//
-// ⚠️ 与既有的 `GET /categories?with_counts=`(cube)是**两个端点**:
-// 前者带 with_counts 参数时走 cube(商品选择控件在用),
-// 不带时走本地表(自营门店 / 导入工具在用)。
-//
-// 分派逻辑放在 catalog.go 的 listCategories 里,两个文件合看才完整。
-func (h *Handler) listLocalCategories(c *gin.Context) {
-	branchID := middleware.SingleBranchFromCtx(c)
-	if branchID == "" {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-			"code":    "branch_required",
-			"message": "X-Branch-ID header 必填",
-		})
-		return
-	}
-	rows, err := h.categories.List(c.Request.Context(), branchID)
-	if err != nil {
-		h.mapErr(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"categories": rows,
-		"count":      len(rows),
-	})
-}
-
 // getCategory GET /categories/:id
 func (h *Handler) getCategory(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)

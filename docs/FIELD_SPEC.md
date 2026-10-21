@@ -37,8 +37,11 @@
 **本期定位(2026-10-20 更新)**:
 - **本地维护** `catalog.suppliers` 表(带 `branch_id`,复合主键 `(id, branch_id)`)—— 本系统数据
 - **本地维护** `catalog.products` 表(带 `branch_id`)—— **2026-10-20 实装 CRUD**
-  (写侧 `POST/PUT/DELETE /products` + 本地读侧 `GET /products/local`;
-   既有 picker 端点仍走 cube,**契约未动**)
+  (写侧 `POST/PUT/DELETE /products`;读侧一律按「配没配数据源」分流:
+   配了 ⇒ 走那个 cube 实例,没配 ⇒ 走本域 PG)
+  ⚠️ 旧的本地读侧 `GET /products/local` **已于 2026-10-22 删除**
+  (名字承诺"只读本地表",与分流判据两套话 ⇒ 同一个门店两个答案);
+  商品列表/搜索统一走 `GET /products` / `GET /products/search`,离线包走 `GET /products/export`
 - **本地维护** `catalog.categories` 表(带 `branch_id`)—— **2026-10-20 新增**
   (自营门店没有 cube 源,分类必须本系统持有)
 - **不再代理** cube `product` / `category` 转发;cube 转发**仅在 picker 端点**保留
@@ -518,9 +521,14 @@ PK = `(id, branch_id, product_id)`。一个促销单可覆盖多个商品,所以
 | `GET /quotes?barcode=&on_date=` | `pricing:view` | 单条码的价格结论。响应含 `source`(`local` / `cube`) |
 | `GET /promotions/active?barcode=` | `pricing:view` | 只返促销部分 |
 | `GET /meta` | `pricing:view` | 价签字段名枚举(`promo_date_labels`) |
-| `GET /prices/local?product_ids=` | `pricing:view` | **批量**查本地售价(POS 一次扫一屏) |
-| `GET /promotions/local?product_ids=&on_date=` | `pricing:view` | 批量查本地当前生效促销 |
+| `GET /prices?product_ids=` | `pricing:view` | **批量**查售价(POS 一次扫一屏)。判据:配了数据源 ⇒ cube 实时;没配 ⇒ 本域 PG |
+| `GET /promotions?product_ids=&on_date=` | `pricing:view` | 批量查当前生效促销(判据同上) |
 | `POST /archive/import` | `pricing:manage` | 导入售价/促销(幂等 upsert) |
+
+⚠️ 旧的 `GET /prices/local` / `GET /promotions/local` **已于 2026-10-22 删除**:
+名字里的 "local" 承诺"只读本域 PG",而门店 00 在那两条端点上拿到的仍是
+**两天前的快照价**,而 `/quotes` 拿的是思迅实时价
+⇒ "同一个门店,批量查和单个查的价不一样"。**响应形状逐字不变**(pos-gateway 不用改解析)。
 
 ⚠️ `pricing:manage` **已存在**（auth `migrations/003_add_employee_login` 加的 17 条 scope 之一），
 写侧端点对**有该 scope 的操作人**放行。
@@ -634,8 +642,8 @@ PK = `(id, branch_id, product_id)`。一个促销单可覆盖多个商品,所以
 | `GET /home` | `pos:sale` | master-data `/stores` `/shifts` `/employees` + member `/config` `/payment-ways` |
 | `GET /config` | `pos:sale` | 同上 + member `/types` |
 | `GET /members/{id}/last-order` | `member:view` | member `/members/{id}` + `/last-order` + pos `/sales/{id}` |
-| `GET /products/search?q=` | `product:view` | catalog **`/products/local`**（⚠️ **不是** `/products/search` —— 那个打 cube，自营门店没有 cube 源） |
-| `GET /prices?product_ids=` | `pricing:view` | pricing `/prices/local` `/promotions/local` |
+| `GET /products/search?q=` | `product:view` | catalog **`/products/search`**(商品选择控件那条,已按「配没配数据源」分流:配了 ⇒ cube,没配 ⇒ 本域 PG) |
+| `GET /prices?product_ids=` | `pricing:view` | pricing `/prices` `/promotions`(同样按数据源分流) |
 | `POST /sales` | `pos:sale` | pos `/sales`（**body 一字不改转发**，`op_id` 原样透传） |
 
 ⚠️ **降级语义**：某个下游取不到 ⇒ 该项 `null` + 响应里带 `warnings[]`，其余照常 200；

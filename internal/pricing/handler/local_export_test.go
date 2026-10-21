@@ -1,8 +1,8 @@
 // 本文件锁住**离线价格包**(GET /prices/export)的 HTTP 层行为。
 //
-// # 与 GET /prices/local 的差别
+// # 与 GET /prices 的差别
 //
-//	/prices/local   必须带 product_ids(上限 500,超限**静默截断**)
+//	/prices   必须带 product_ids(上限 500,超限**静默截断**)
 //	/prices/export  不带 product_ids,给**全店**默认价目表的生效价 + 生效促销
 //
 // # 守门链说明
