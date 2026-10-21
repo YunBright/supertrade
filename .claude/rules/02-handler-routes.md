@@ -76,7 +76,7 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 func registerRoutes(r *gin.Engine) {
     users := userinfo.New("userd")
     r.Use(middleware.XBranchID())  // 全局:把 X-Branch-ID header 注入 ctx
-    handler.New(appSup, appProd, appCube, users, nil).RegisterRoutes(r)
+    handler.New(appSup, appProd, appCat, appCube, users, nil).RegisterRoutes(r)
 }
 
 // internal/catalog/handler/handler.go

@@ -78,6 +78,10 @@
 | `wecom.approval.command` | settlement-auditor | wechat-bot(执行企微命令) | id, type(apply_event/notify_text/stocktake_taskcard), corp_id, payload | §2.17 |
 | `wecom.approval.command_result` | wechat-bot | settlement-auditor | command_id, type, ok, sp_no, error | §2.17 |
 | `wecom.approval.status_changed` | wechat-bot | settlement-auditor | corp_id, sp_no, sp_status, applyer_userid | §2.17 |
+| **`sale.paid`** | **pos** | **inventory / member** | op_id, sale_id, branch_id, member_id, lines[] | **§2.18** |
+| **`member.opened`** | **member** | notification-gateway / wechat-bot | op_id, member_id, branch_id, card_type_id, name | **§2.18** |
+| **`member.points.changed`** | **member** | notification-gateway | op_id, member_id, branch_id, direction, points, points_after | **§2.18** |
+| **`member.updated`** | **member** | notification-gateway | op_id, member_id, branch_id, changed_fields[] | **§2.18** |
 
 ---
 
@@ -554,7 +558,78 @@ subscriptions:
 
 ---
 
-## §4 修订记录
+## §2.18 商云 POS 交易/会员域（2026-10-21 上线）
+
+> 这四个 topic 是「商云 POS」链路的**核心契约**：
+> `pos` 开单 → `sale.paid` → `inventory` 扣库存 + `member` 加积分。
+>
+> ⚠️ **发布必须走 `pkg/outbox`（事务性发件箱）**：
+> 业务行与发件箱行在**同一个事务**里写入 ⇒ 进程在 commit 与 publish 之间被杀也不丢事件。
+> （仓里 `internal/stocktake/service/events.go` 那种"事务外直接 publish"是**反面教材**。）
+
+### 2.18.1 `sale.paid`（pos → inventory / member）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `op_id` | string | **幂等键**（= 发件箱行的业务键）。订阅方按它去重 |
+| `sale_id` | string | 销售单号 `SO<yyyymmdd><6位seq>` |
+| `branch_id` | string | 门店 |
+| `member_id` | string | 会员号（**空 ⇒ 不计积分**） |
+| `operator_id` | string | 操作人（收银员） |
+| `authorized_by` | string | 越权授权人（改价/冲减积分被授权时） |
+| `total_amount_yuan` | **string** | 合计（⚠️ 金额一律字符串） |
+| `paid_at` | string | 收款时间（RFC3339，+08:00） |
+| `order_status` | string | `S`=销售 / `R`=退货 |
+| `lines[]` | array | `line_id` / `product_id` / `qty`(string) / `unit_price_yuan`(string) / `amount_yuan`(string) |
+
+⚠️ **退货复用同一个 topic**，用 `order_status="R"` 区分，**不另开** `sale.refunded`
+⇒ 下游只订阅一条，少一处漏订阅的坑。
+⚠️ 退货时 `qty` 与 `amount_yuan` **取负**（`unit_price_yuan` 保持正数，保证 `amount = qty × unit`）。
+⇒ 下游统一按 `库存数量 -= qty` 处理：负数即入库。
+
+**幂等**：`inventory` 用 `stock_moves` 的唯一索引 `(branch_id, product_id, ref_type, ref_id)`
+（`ref_id` = `op_id`）；`member` 用 `member_point_ledger.op_id` 唯一索引。
+⇒ 同一 `op_id` 投递 **N** 次，库存只扣一次、积分只加一次。
+
+### 2.18.2 `member.opened`（member → notification-gateway / wechat-bot）
+
+`op_id` / `member_id` / `branch_id` / `card_type_id` / `name` / `opened_at`
+
+### 2.18.3 `member.points.changed`（member → notification-gateway）
+
+`op_id` / `member_id` / `branch_id` / `direction`(`earn`/`deduct`) / `points`(string) /
+`points_after`(string，**变动后累计获得值**) / `reason`(`sale`/`manual_deduct`/`manual_grant`) /
+`operator_id` / `authorized_by`
+
+⚠️ `points_after` 记的是**累计获得值**，不是"剩余积分"——
+剩余积分是 `points_accumulated − points_used` 的**派生量**，不落列（思迅口径）。
+
+### 2.18.4 `member.updated`（member → notification-gateway）
+
+`op_id` / `member_id` / `branch_id` / `changed_fields[]`
+
+### 2.18.5 ⚠️ 发件箱表的**服务命名空间**（2026-10-21 生产事故）
+
+`pos` 与 `member` **共用同一个 PG 库**，`outbox` 表是**同一张**。
+若两边的行 id 都直接用业务 `op_id`：
+
+```
+pos     写: id = "op-sale-123"  (topic=sale.paid)
+member 写: id = "op-sale-123"  (topic=member.points.changed)
+⇒ duplicate key value violates unique constraint "outbox_pkey"
+```
+
+症状**极其安静**：member 那一整个事务回滚 ⇒ 积分没加、流水没有，
+而日志里只有一行 SQL 错误（极易被当成"数据库抖动"忽略）。
+
+⇒ **每个服务用自己的命名空间**：行 id = `<ns>:<op_id>`（`outbox.NewRecorder("pos")`）。
+⚠️ 查"这个 op_id 处理过没有"必须用 `rec.RowID(opID)`，**不能**用原始 op_id ——
+否则会查到**别的服务**写的行 ⇒ 误判成"已处理过"⇒ 业务被静默跳过。
+
+⇒ **发布出去的事件体里的 `op_id` 仍是原始值** —— 订阅方的去重键是**载荷里的 op_id**，
+不是发件箱行的 id。命名空间只影响发件箱这张**内部表**。
+
+---
 
 | 日期 | 修订人 | 内容 |
 |---|---|---|
@@ -562,4 +637,5 @@ subscriptions:
 | 2026-09-19 | Mavis | 新增 §2.12 stocktake.line.{added,updated,deleted} + §2.13 stocktake.header.{submitted,approved} + stocktake.plan_item.added + §2.14 auth.user.permissions_changed;同步 stocktake/service.go 6 个 publish 调用点与 notification-gateway 订阅实现 |
 | 2026-09-23 | Mavis | Phase 3:§2.14 auth.user.permissions_changed → auth.user.access_changed;payload 增加 changed_branches / changed_default_branch;subscribe Topics 与 wsmsg.TypeUserAccessChanged 同步切换 |
 | 2026-09-24 | Tinkler | 修订 8:§1 topic 表新增 cube-router 自有 `cube.source.changed` 事件 + §2.15 payload schema;§2.14 `auth.user.access_changed` 订阅方加 stocktake(失效 scope cache);保留全部 12 占位 cmd(用户指令);保留 go.mod `replace ../authkit` |
+| 2026-10-21 | Mavis | **修订 10:商云 POS 交易/会员域上线** —— §1 新增 `sale.paid` / `member.opened` / `member.points.changed` / `member.updated`;§2.18 展开四个 payload schema + **发件箱服务命名空间**约定(同库多服务共用一张 outbox 表 ⇒ 行 id 必须带 `ns:` 前缀,否则撞主键且症状安静) |
 | 2026-10-10 | Tinkler | 修订 9:settlement-auditor(结算付款审批机器一审)上线:§1 新增 settlement.audit.{status,log} + wecom.approval.{command,command_result,status_changed};§2.16/§2.17 payload schema(§2.17 为 supertrade↔wechat-bot 跨仓 wire 契约,改动需双仓同步);notification-gateway Topics +2;§3.2 订阅表加 settlement-auditor |

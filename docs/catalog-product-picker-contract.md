@@ -58,7 +58,7 @@ X-Branch-ID → cube-router → branch_cube_sources → 该门店专属 cube 实
 
 | model | DuckDB 表 | 源表 | 可用维度 | 可用度量 |
 |---|---|---|---|---|
-| `product` | `product` | `t_bd_item_info` | `id` `name` `category_id` `supplier_id` `unit` `status` `created_at` | `count` `avg_price_yuan` `max_price_yuan` `min_price_yuan` `total_cost_yuan` |
+| `product` | `product` | `t_bd_item_info` | `id` `name` `category_id` `supplier_id` `unit` `status` `sub_code` `created_at` | `count` `avg_price_yuan` `max_price_yuan` `min_price_yuan` `total_cost_yuan` |
 | `category` | `category` | `t_bd_item_cls` | `id` `name` `parent_id` | `count` |
 | `supplier` | `supplier` | `t_bd_supcust_info` | `id` `name` `type` `cust_flag` `supply_way` `cust_clsno` `contact` `phone` `email` `address` `status` `modified_at` | `count` `total_credit_yuan` |
 | `sale_way` | `sale_way` | `t_bd_base_code`(`type_no='SW'` 子集) | `id` `name` | `count` |
@@ -166,6 +166,17 @@ LOWER(RTRIM(name)) LIKE '%face%'   -- 模式在编译期 lower,仍走参数绑�
 > ⚠️ 加算子的实测踩坑:2026-10-20 部署 cube 时,ysx 实例的 DuckDB **WAL 损坏**
 > 导致 app 崩溃循环(与本次改动无关,用改动前的二进制复现同样打不开)。
 > 详见 agent memory 的 `yunbright-prod` topic。
+>
+> ⚠️⚠️ **同日第二次事故(2026-10-20 22:24)**:部署 cube 后 cube 三个服务又崩溃循环,
+> 这次**不是** WAL,而是 cube 归档里的 `components/bearer-auth.yaml` ——
+> 一份 `middleware.http.bearer` 组件,jwksURL 指向 auth 合并后**已下线**的 `:8081`
+> (现在是 `:8082`)。components 目录里的 Component YAML 是 **daprd 自动加载**的
+> ⇒ 拉不到 JWKS ⇒ **daprd fatal 退出** ⇒ 整个 app 跟着死。
+> 而 goreleaser 的 gateway 归档**带着** `dapr/components`
+> ⇒ **每次部署 cube 都会把仓里那份覆盖回服务器** ⇒ 每次部署都会再炸一次。
+> ⇒ 已在 **cube 仓**加回归锁(`dapr/components_test.go`)。
+> ⚠️ deployer 仓那份锁**锁不住**:它扫的是 deployer 仓的 `dapr/`,
+> 而被打包的是 cube 仓的 `dapr/components/` —— 两个不同文件。
 
 ### 2.6 `avg_price_yuan` 与 null
 
@@ -338,17 +349,41 @@ primary_key 撞车 ⇒ 某些行被静默吞掉,id→name 对应关系是错的)
 
 | Query | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `q` | 否 | `""` | 子串,命中 `product.id` **或** `product.name` |
+| `q` | 否 | `""` | 子串,命中 `product.id`(货号)**或** `product.sub_code`(自编码)**或** `product.name` |
 | `category_id` | 否 | – | |
 | `supplier_id` | 否 | – | |
 | `page` | 否 | 1 | |
 | `page_size` | 否 | 20 | 上限 200 |
 
 - `q` 空 → 等价于 3.1(前端"空关键词 + 全量浏览"走的是 `list`)。
-- `q` 非空 → **3 次 cube 查询**:`id contains q`、`id contains UPPER(q)`
-  (仅当与 `q` 不同时)、`name contains q`;按 id 去重合并,`total` 取三者之和
+- `q` 非空 → **3 次 cube 查询**:`id containsCI q`、`sub_code containsCI q`、
+  `name containsCI q`;按 id 去重合并,`total` 取三者之和
   (重叠时是上界,前端只用它判断"还有没有下一页",可接受)。
 - 大小写:见 §2.5。
+
+#### ⚠️ 搜**自编码**会命中**多个**商品(这是设计,不是 bug)
+
+思迅的搜索框是「输入编码、名称或助记码」,而"编码"对它来说是**两个**东西:
+
+| 字段 | cube 维度 | 唯一性 | 生产实测 |
+|---|---|---|---|
+| 货号 `item_no` | `product.id` | **唯一** | ysx 27565 行 / distinct(item_no) == 27565 |
+| 自编码 `item_subno` | `product.sub_code` | **不唯一** | ysx 9 个 / hbposv7 72 个自编码对应 2 个货号 |
+
+那 9 / 72 个**全部是「正常品 + 换购品」配对**(源库自己也只给 `item_subno`
+建了**非唯一**索引 ⇒ 1:N 是设计,不是脏数据):
+
+```
+6904406383122 → 02000110 远航九江双蒸酒精品500ml       (16.50)
+              → 02000111 (换购)远航九江双蒸酒精品500ml   ( 5.00)
+```
+
+⇒ 按自编码搜返回**候选列表**是正常结果,前端**不能只取第一条**;
+要唯一请用货号。响应里 `id`(货号)与 `sub_code`(自编码)**都要带**。
+
+> ⚠️ 字段名为什么是 `sub_code` 而不是 `barcode`:本仓的 `barcode` 指**另一件事**
+> (商品条码 `t_bd_item_barcode`,一品多码补充表,只在本系统维护,实测只覆盖
+> 0.4% 的商品)。两件事的来源表、唯一性、维护方全都不同 ⇒ 不能共用一个名字。
 
 ### 3.3 `GET /categories`
 
@@ -539,7 +574,8 @@ type CubeQuery struct {
 | "`status`:cube 现状为 `active` / `inactive`" | **错**。是思迅状态码 `"0"`~`"6"`,且两个 family 语义不同(§2.4) |
 | "本期 cube 是否有 `category` model 待 catalog 仓确认" | **已有**。`category` model,186 条 |
 | "本地表 `SELECT ... FROM products WHERE status='active'`" | 本期**没有本地表**,数据全在 cube(§一) |
-| "`q` 大小写无关子串" | cube `contains` **大小写敏感**;编码侧由后端补大写查询(§2.5) |
+| "`q` 大小写无关子串" | ✅ **已实现**(2026-10-20)。cube 新增 `containsCI` 算子,`face`/`Face`/`fAcE` 命中**同一批**商品(见 §2.5) |
+| "商品只有一套编码" | **两套**:货号 `item_no`(cube `product.id`,唯一)+ 自编码 `item_subno`(cube `product.sub_code`,**不唯一**)。搜索与列表都要覆盖两者(见 §3.2) |
 | "`price_yuan`:未维护返 `null`" | 对。但要显式写 `null`(cube 是**缺 key**,§2.6) |
 | "`category_name`:实时查 cube `category.name`" | 对,但**不能**在一次 cube 查询里 join 出来(§2.3) |
 

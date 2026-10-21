@@ -32,12 +32,19 @@
 > 来源:`F:\go\src\github.com\YunBright\supertrade` 各 dapr app 内 GORM 模型。
 > 下列清单是**目标 schema**(target);它们跟 cube source 的对应关系见 §3。
 
-### 1.1 catalog(商品 / 供应商,dapr app `catalog`)
+### 1.1 catalog(商品 / 分类 / 供应商,dapr app `catalog`)
 
-**本期定位(2026-09 重构后)**:
+**本期定位(2026-10-20 更新)**:
 - **本地维护** `catalog.suppliers` 表(带 `branch_id`,复合主键 `(id, branch_id)`)—— 本系统数据
-- **本地维护** `catalog.products` 表(带 `branch_id`)—— schema 占位,业务 CRUD 暂未实装,search 接口过渡期走 cube 兜底
-- **不再代理** cube `product` / `category` 转发;cube 转发**仅在 `products/search` 本地表无数据时作为兜底**(经 supertrade-cube-router)
+- **本地维护** `catalog.products` 表(带 `branch_id`)—— **2026-10-20 实装 CRUD**
+  (写侧 `POST/PUT/DELETE /products` + 本地读侧 `GET /products/local`;
+   既有 picker 端点仍走 cube,**契约未动**)
+- **本地维护** `catalog.categories` 表(带 `branch_id`)—— **2026-10-20 新增**
+  (自营门店没有 cube 源,分类必须本系统持有)
+- **不再代理** cube `product` / `category` 转发;cube 转发**仅在 picker 端点**保留
+
+> ⚠️ **价格不在 `catalog.products`**:售价/促销归 **pricing** 服务
+> (`price_lists` / `promotions`,带生效期与历史版本)。两处都存价 = 两个真相源。
 
 `catalog.suppliers`(本地表):
 
@@ -54,21 +61,105 @@
 | `status` | string | - | `active` / `inactive`(索引 `(branch_id, status)`) |
 | `created_by` / `updated_by` | string | - | JWT `sub` |
 | `created_at` / `updated_at` | datetime | - | |
-| `deleted_at` | datetime | - | 软删(GORM `gorm.DeletedAt`) |
+| `deleted_at` | datetime | - | 软删(**`gorm.DeletedAt`**) |
 
-`catalog.products`(本地表,业务 CRUD 占位):
+`catalog.products`(本地表,2026-10-20 实装 CRUD):
 
 | 字段 | 类型 | 单位 | 说明 |
 |---|---|---|---|
-| `id` | string | - | 复合主键 `(id, branch_id)`,= cube `product.id` = 思迅 `item_no` |
+| `id` | string | - | 复合主键 `(id, branch_id)`,= 思迅 `item_no`(**唯一**) |
 | `branch_id` | string | - | 门店 |
 | `name` | string | - | 商品名(索引 `(branch_id, name)`) |
 | `category_id` | string | - | 分类(索引 `(branch_id, category_id)`) |
 | `supplier_id` | string | - | 主供应商 |
-| `barcode` | string | - | 条码(索引 `(branch_id, barcode)`,本期 = item_no) |
-| `unit` / `spec` | string | - | 基本单位 / 规格 |
+| `sub_code` | string | - | **自编码 / 助记码**(思迅 `item_subno`,索引 `(branch_id, sub_code)`)—— ⚠️ **不唯一** |
+| `is_exchange` | boolean | - | **换购品**标记(思迅用品名前缀「(换购)」承载) |
+| `is_void` | boolean | - | **停用品**标记(思迅用品名前缀「（停用）」承载) |
+| `barcode` | string | - | **主条码**(索引 `(branch_id, barcode)`)—— 全集在 `catalog.product_barcodes` |
+| `unit` | string | - | 基本单位(思迅 `unit_no`,值即单位名本身如"提") |
+| `spec` | string | - | 规格(思迅 `item_size`;实测有 "1*10" 这类脏值,**原样存**) |
 | `status` | string | - | `active` / `inactive` |
-| `created_by` / `updated_by` / `created_at` / `updated_at` / `deleted_at` | - | - | 同 supplier |
+| `created_by` / `updated_by` | string | - | JWT `sub`;**批量导入时填 `import`** |
+| `created_at` / `updated_at` | datetime | - | |
+| `deleted_at` | datetime | - | 软删(**`gorm.DeletedAt`**) |
+
+> ⚠️ **不存价格**:见上面的说明。POS 扫码要价走 pricing。
+>
+> ⚠️ **没有 `origin_branch_id`**:基础档案的**来源**不记录在业务字段上。
+> 数据可以从任何地方进来(cube 导出、Excel 导入、手工建档)——
+> 归属哪个门店由 `branch_id` 决定,**谁建的**由 `created_by` 决定
+> (`import` / `admin` / 某个收银员工号)。多一个"来源门店"字段只会
+> 让人误以为"数据只能从某个地方来"。
+
+> ⭐ **三种编码,三种语义,三种基数**(思迅实测 2026-10-21,别再混了):
+>
+> | 概念 | 源列 | 基数 | 唯一? |
+> |---|---|---|---|
+> | **货号** | `t_bd_item_info.item_no` | 27,565 个商品 | ✅ 唯一(PK) |
+> | **自编码 / 助记码** | `t_bd_item_info.item_subno` | 27,547 个对应 1 个货号,**9 个对应 2 个货号** | ❌ **不唯一** |
+> | **商品条码** | `t_bd_item_barcode.item_barcode` | 153 个条码**各自只对应 1 个货号**;而**一个货号有 1~7 个条码** | ❌ 1 商品 : N 条码 |
+>
+> - `item_subno` 与 `t_bd_item_barcode.item_barcode` **零交集**(实测 JOIN = 0 行)⇒ **两张表是完全不同的东西**。
+> - 源库自己只给 `item_subno` 建了**非唯一**索引(`i_bd_item_info_1`)⇒ 1:N 是设计,不是脏数据。
+> - `item_subno` **覆盖率 100%**(27,565 个商品全有)。
+>
+> ⭐ **那 9 组"一个自编码两个货号"全是「正常品 + 换购品」配对**(实测):
+> `6904406383122` → `02000110` 远航九江双蒸酒精品500ml(16.50 元)
+> / `02000111` **(换购)**远航九江双蒸酒精品500ml(5.00 元)。
+> 另 8 组全是槟榔/酒类(口味王、湘潭铺子、和成天下…)。
+>
+> ⇒ ⭐ **扫一个编码可能命中多个商品** ⇒ 查商品的端点**必须返回候选列表**,
+> 收银员要能选。`GET /products/by-barcode/:code` 返回 `{products:[…], count:N}`。
+>
+> ⭐ **换购/停用靠品名前缀承载,必须解析成字段**:实测品名含「换购」19 个、
+> 以「（停用）」开头 17 个、带括号前缀共 62 个;而换购品的 `status` 也是 `1`(=在售),
+> 售价多为 `.0000` 或象征价(1 元 / 15 元)⇒ **不单独售卖**,是"搭售 / 积分换购"的载体。
+> ⇒ 不解析成字段的话,POS 界面上会出现「(换购)远航九江…」这种脏品名,
+> 而且**没法按"是否换购 / 是否停用"过滤**(图1 商品选择器就有「是否积分」列)。
+> ⇒ `catalog.products` 默认**不返回**换购品 / 停用品,需要时显式传 `include_special=true`。
+
+`catalog.product_barcodes`(本地表,2026-10-21 新增):
+
+| 字段 | 类型 | 单位 | 说明 |
+|---|---|---|---|
+| `product_id` | string | - | 复合主键 `(product_id, branch_id, barcode)` |
+| `branch_id` | string | - | 门店 |
+| `barcode` | string | - | 条码(索引 `(branch_id, barcode)`——**扫码查商品的主路径**) |
+| `is_primary` | boolean | - | 是否主条码(= `products.barcode` 冗余的那条);一个商品**至多一条** |
+| `label` | string | - | 条码说明(思迅 `other1`,实测"草莓味"/"桔子味") |
+| `created_by` | string | - | JWT `sub` |
+| `created_at` / `updated_at` | datetime | - | |
+| `deleted_at` | datetime | - | 软删(**`gorm.DeletedAt`**) |
+
+> ⭐ **为什么必须 1:N**:思迅的**商品条码**在独立表 `t_bd_item_barcode`,
+> 实测**每个 `item_barcode` 只对应 1 个 `item_no`**,而**一个 `item_no` 可有 1~7 个条码**
+> (分布:1 个 87 个、2 个 11 个、3 个 7 个、5 个 2 个、6 个 1 个、7 个 1 个)
+> ⇒ 1 商品 : N 条码。
+>
+> ⚠️ **别与"自编码"混**:自编码是 `t_bd_item_info.item_subno`(见上一节的表),
+> 它与 `t_bd_item_barcode.item_barcode` **零交集**(实测 JOIN = 0 行)——
+> **两张表是完全不同的东西**。
+>
+> ⚠️ **替换语义**:导入一个商品时,它的条码集合是**权威的**——
+> 源库删掉的条码要跟着消失(增量式"只加不减"会留下**幽灵条码**,扫出来是错商品)。
+
+`catalog.categories`(本地表,2026-10-20 新增):
+
+| 字段 | 类型 | 单位 | 说明 |
+|---|---|---|---|
+| `id` | string | - | 复合主键 `(id, branch_id)`,= 思迅 `t_bd_item_cls.item_clsno` |
+| `branch_id` | string | - | 门店 |
+| `name` | string | - | 分类名(索引 `(branch_id, name)`) |
+| `parent_id` | string | - | 父分类(索引 `(branch_id, parent_id)`)—— **导入必须带** |
+| `sort_order` | integer | - | 同级展示顺序 |
+| `status` | string | - | `active` / `inactive` |
+| `created_by` / `updated_by` | string | - | JWT `sub`;**批量导入时填 `import`** |
+| `created_at` / `updated_at` | datetime | - | |
+| `deleted_at` | datetime | - | 软删(**`gorm.DeletedAt`**) |
+
+> ⚠️ **父子关系成环会在写入时被拒**(`category_cycle` → 400):分类是树,
+> 成环 ⇒ 建树时无限递归且**不报错**。父节点在库里查不到时该节点当**顶级**处理
+> (与 cube 侧 `buildCategoryTree` 同一套口径)。
 
 ### 1.1.1 `GET /products/search` 响应字段(catalog 本期实装)
 
@@ -92,22 +183,49 @@
 `stock_qty` / `avg_cost_yuan` 字段额外需要 `inventory:view` scope;
 `supplier_id` / `supplier_name` 字段额外需要 `supplier:view` scope。
 
-### 1.2 inventory(实时库存代理,dapr app `inventory`)
+### 1.2 inventory(库存域,dapr app `inventory`)
 
-**本期定位**:不维护本地库存表,**只代理 cube-gateway `/v1/load` 返回 stock 维度数据**(经 cube-router 多源路由)。
+**2026-10-21 起定位变了**：不只代理 cube,**还拥有两张表**并**订阅 `sale.paid`**。
 
-`GET /stock/:product_id` 请求/响应字段来自 cube `stock` model(branch 从 `X-Branch-ID` header 取):
+⚠️ 变化的原因：自营门店（门店 10）**没有 cube 源**（`branch_cube_sources` 只有 00 / 01）
+⇒ 门店 10 的库存只能落在自己的库里；且卖货扣库存由**事件**驱动，不是同步调用。
+
+`inventory.stock_levels`（**当前库存快照**，按 `(branch_id, product_id)` 唯一）：
 
 | 字段 | 类型 | 单位 | 来源 |
 |---|---|---|---|
-| `product_id` | string | - | cube `stock.product_id` |
-| `branch_id` | string | - | cube `stock.branch_id` |
-| `quantity` | decimal | - | cube `stock.total_quantity` |
-| `avg_cost_yuan` | decimal | yuan | cube `stock.avg_cost` |
-| `updated_at` | datetime | - | cube `stock.updated_at` |
+| `branch_id` | string | - | `X-Branch-ID` |
+| `product_id` | string | - | catalog `products.id`（货号） |
+| `qty` | decimal | - | 出入库累计（**可负**：无库存快照时卖货会扣成负数） |
+| `avg_cost_yuan` | decimal | yuan | 成本档案（**当前恒为 0**，见下） |
+| `server_version` | bigint | - | 同步水位 |
 
-> 注:思迅源已含完整批次 / 保质期 / 出入库流水信息,本系统只取汇总的
-> `(product, branch) → quantity` 维度,本系统**不建 `inventory.batches` 表**。
+`inventory.stock_moves`（**流水，append-only**）：
+
+| 字段 | 类型 | 单位 | 说明 |
+|---|---|---|---|
+| `id` | string | - | 流水号 |
+| `branch_id` / `product_id` | string | - | 门店 / 商品 |
+| `move_type` | string | - | `sale` / `refund` / `stocktake` / `adjust` / `in` / `out` |
+| `qty` | decimal | - | **负 = 出库**（销售），正 = 入库（退货） |
+| `qty_after` | decimal | - | 变动后库存 |
+| `unit_cost_yuan` / `amount_yuan` | decimal | yuan | 金额（**字符串**） |
+| `ref_type` / `ref_id` | string | - | **`ref_id` = `sale.paid` 的 `op_id`** |
+| `occurred_at` | datetime | - | 发生时刻 |
+| `operator_id` / `authorized_by` | string | - | 操作人 / 越权授权人 |
+
+⚠️ **唯一索引 `(branch_id, product_id, ref_type, ref_id)`** —— 这就是"同一笔销售重复投递只落一行"的保证。
+⚠️ `avg_cost_yuan` **当前恒为 0**（没有成本档案来源）⇒ 接入 `purchase.completed` 后应改用加权成本。
+
+端点：
+
+| 端点 | scope | 说明 |
+|---|---|---|
+| `GET /stock-levels?branch_id=&product_id=&keyword=&page=&page_size=` | `inventory:view` | 库存快照 |
+| `GET /stock-levels/:product_id` | `inventory:view` | 单个商品库存 |
+| `GET /stock-moves?branch_id=&product_id=&move_type=&occurred_from=&occurred_to=` | `inventory:view` | 流水 |
+| `GET /dapr/subscribe` | 免鉴权窗口 | 订阅 `sale.paid` |
+| `POST /events/sale.paid` | 免鉴权窗口 | 扣库存 / 退货加回 |
 
 ### 1.2.1 cube-router(cube 多源路由,dapr app `cube-router`)
 
@@ -134,7 +252,43 @@
 
 ### 1.3 pos(销售单据,dapr app `pos`)
 
-`pos.sales_order` / `pos.sale_lines` / `pos.payments`,字段从原 §5 销售明细 + §1 采购入库头部结构移植,字段名沿用 §0 命名约定。
+**2026-10-21 起实装**：`sales_orders` / `sale_lines` / `payments` + **发件箱**（`pkg/outbox`）。
+
+`pos.sales_orders`：
+
+| 字段 | 类型 | 单位 | 说明 |
+|---|---|---|---|
+| `id` | string | - | 单号 `SO<yyyymmdd><6位seq>`（**当天单调递增、不撞**） |
+| `branch_id` | string | - | 门店（**只从 header 取**，body 里带一份就能跨店写） |
+| `member_id` | string | - | 会员号（空 = 非会员单） |
+| `shift_id` | string | - | 班次 |
+| `operator_id` | string | - | 操作人（收银员） |
+| `authorized_by` | string | - | ★ 越权授权人（图4/图5 的审计） |
+| `total_amount_yuan` / `discount_amount_yuan` / `paid_amount_yuan` / `change_amount_yuan` | decimal | yuan | **字符串**（JSON 金额一律字符串） |
+| `status` | string | - | `draft` / `paid` / `returned` / `void` |
+| `sold_at` | datetime | - | 销售时间 |
+| `op_id` | string | - | ★ **幂等键**（uuid，唯一索引） |
+| `server_version` | bigint | - | 同步水位 |
+
+`pos.sale_lines`：`id` / `sale_id` / `branch_id` / `product_id` / `product_name` / `product_no` /
+`barcode` / `unit` / `qty` / `original_price_yuan` / `unit_price_yuan` / `discount_amount_yuan` /
+`amount_yuan` / `is_exchange` / `is_void`
+
+`pos.payments`：`id` / `sale_id` / `branch_id` / `pay_way`（`RMB`/`SWX`/`SZF`/`SAV`/`JFP`/`EKT`）/
+`amount_yuan` / `exchange_rate` / `converted_amount_yuan` / `ref_flow_no`
+
+⚠️ **金额自洽强约束**：`total_amount_yuan` 必须 == Σ 明细 `amount_yuan`，
+`change_amount_yuan` 必须 == `paid − total` 且 ≥ 0，否则 `409 amount_mismatch`。
+
+端点：
+
+| 端点 | scope | 说明 |
+|---|---|---|
+| `POST /sales` | `pos:sale` | 开单/收款（**`op_id` 幂等**：重放返回首次那张单，`replayed:true`） |
+| `GET /sales` | `pos:sale` | 列表（分页） |
+| `GET /sales/:id` | `pos:sale` | 查单（头 + 行 + 收付） |
+| `POST /sales/:id/refund` | `pos:refund` | 退货（事件 `order_status="R"`，金额取负） |
+| `POST /sales/:id/lines/:line_id/price-override` | `pos:price-override` | 改价（无权限 ⇒ `403 pos_permission_required` + `required_scope`） |
 
 ### 1.4 procurement(采购,dapr app `procurement`)
 
@@ -279,9 +433,190 @@
 | 服务 | 本期关键表 / 字段 |
 |---|---|
 | `master-data` | `stores` / `employees`(本地维护);供应商/客户已搬到 **catalog 本地表**(`catalog.suppliers`),master-data 不再转发 |
-| `pricing` | `price_lists` / `promotions`(本地维护,本系统自营 POS 用) |
+| `pricing` | `price_lists` / `promotions`(本地维护,本系统自营 POS 用)—— 详见 **§1.12** |
 | `sales-agg` | `sales_view_minute` / `sales_view_daily`(本地宽表,聚合 POS + erp-connector) |
 | `erp-connector` | `erp_sales_raw` / `sync_logs`(拉 cube 数据落库,供 sales-agg) |
+
+### 1.12 pricing(售价 / 促销,dapr app `pricing`)
+
+**2026-10-21 实装。** pricing 从"只读 cube 代理"变成"价格的拥有者",
+原因是**自营门店(门店 10)没有 cube 源**(`branch_cube_sources` 实测只有 `00` / `01`)
+⇒ 门店 10 的售价/促销没有别的地方可取。
+
+⚠️ **售价/促销不归 catalog** —— `catalog.products` **不存价**(两个真相源)。
+`catalog.products` 的"当前值"语义与价格的历史/生效期语义不同。
+
+#### 1.12.1 表 `price_lists`(售价)
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | varchar(64) | **价目表编码**(默认 `default`)。预留"会员价目表""团购价目表";当前只有一套 |
+| `branch_id` | varchar(64) | 门店 |
+| `product_id` | varchar(64) | 商品货号(思迅 `item_no`,与 `catalog.products.id` 同一套编码) |
+| `price_yuan` | numeric(18,4) | **零售价**。0 与"没维护价"是两件事,见下 |
+| `member_price_yuan` | numeric(18,4) | 会员价。0 = 没有会员价(不是"会员价 0 元") |
+| `cost_yuan` | numeric(18,4) | 成本价。0 = 不知道成本。**只用于毛利估算**,不参与收银计价 |
+| `effective_at` | datetime | **开始生效的那天**(日粒度,存当天零点) |
+| `expired_at` | datetime | **失效的那天**(日粒度);nil = 长期有效。失效**不删行** |
+| `status` | varchar(16) | `active` / `inactive` |
+| `created_by` / `updated_by` | varchar(64) | 导入写入为 `import` |
+| `created_at` / `updated_at` | datetime | |
+| `deleted_at` | datetime | 软删(`gorm.DeletedAt`) |
+
+PK = `(id, branch_id, product_id)`。**一行 = 一个商品在一个价目表里的当前价**。
+
+⚠️ **"没维护价" = 该商品在表里没有行**,而不是"有一行、价是 0"。
+POS 据此印「未维护售价」;印 ¥0.00 会被顾客当真价。
+
+⚠️ **日粒度**:价签按天印,查价的基准时刻是"基准日的 00:00:00"。
+`effective_at` / `expired_at` 都按天判(失效当天仍算有效)。
+
+#### 1.12.2 表 `promotions`(促销)
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | varchar(64) | **促销单号**(思迅 `plan_no`) |
+| `branch_id` | varchar(64) | 门店 |
+| `product_id` | varchar(64) | 商品货号 |
+| `plan_name` | varchar(255) | 促销单名称(印在价签上用于人工追溯) |
+| `price_yuan` | numeric(18,4) | **促销价** |
+| `orig_price_yuan` | numeric(18,4) | **原价**;0 = 源库没给 |
+| `begin_at` / `end_at` | datetime | 活动起止**日**(日粒度,存当天零点) |
+| `status` | varchar(16) | `active` / `inactive` |
+| `created_by` / `updated_by` / `created_at` / `updated_at` / `deleted_at` | | 同上 |
+
+PK = `(id, branch_id, product_id)`。一个促销单可覆盖多个商品,所以不能只拿 `plan_no` 当主键。
+
+⚠️ **源列语义相反**:思迅 `t_pub_plan_flow.sale_price` = **原价**、`price` = **促销价**。
+拿反了价签会印出「原价 ¥3.50 / 促销价 ¥9.90」,**全程不报错**。
+
+⚠️ **同一商品多个生效促销 ⇒ 取促销价最低的那条**
+(与 cube `promotion.min_promo_price` 语义一致:用户实际能买到的最低价)。
+
+#### 1.12.3 金额的传输约定(全服务)
+
+- **DB**:`numeric(18,4)`(不是 float/double —— PG 的 double 有二进制误差)。
+- **Go**:`shopspring/decimal`。
+- **JSON**:**字符串**。JSON number 到了 Dart 侧会被 `jsonDecode` 变成 double,精度当场丢掉
+  (9.90 → 9.899999999999999)。
+- **导入契约**:见 `internal/archivedto` 的 `ImportPriceRow` / `ImportPromotionRow`。
+
+#### 1.12.4 读路径:本地优先、cube 回落
+
+| 门店 | 判据 | 读哪里 |
+|---|---|---|
+| `10`(自营) | 本地**有**价格数据 | 本地表。某个商品查不到 = **数据缺口**,显性暴露(不回落) |
+| `00` / `01`(过渡期) | 本地**没有**价格数据 | 回落到 cube(`product.avg_price_yuan` / `promotion`) |
+
+⚠️ 回落判据是**按门店**而不是按商品:若按商品判,门店 10 某个没导到价的商品会回落 cube
+—— 而门店 10 的 cube 路径必然 503 ⇒ "数据缺口"被翻译成「库存服务暂不可用」,排查方向完全跑偏。
+
+#### 1.12.5 端点
+
+| 端点 | scope | 说明 |
+|---|---|---|
+| `GET /quotes?barcode=&on_date=` | `pricing:view` | 单条码的价格结论。响应含 `source`(`local` / `cube`) |
+| `GET /promotions/active?barcode=` | `pricing:view` | 只返促销部分 |
+| `GET /meta` | `pricing:view` | 价签字段名枚举(`promo_date_labels`) |
+| `GET /prices/local?product_ids=` | `pricing:view` | **批量**查本地售价(POS 一次扫一屏) |
+| `GET /promotions/local?product_ids=&on_date=` | `pricing:view` | 批量查本地当前生效促销 |
+| `POST /archive/import` | `pricing:manage` | 导入售价/促销(幂等 upsert) |
+
+⚠️ `pricing:manage` **已存在**（auth `migrations/003_add_employee_login` 加的 17 条 scope 之一），
+写侧端点对**有该 scope 的操作人**放行。
+
+### 1.13 member(会员域,dapr app `member`，2026-10-21 上线)
+
+**六张表**：`members` / `member_types` / `member_point_ledger` / `member_account_ledger` /
+`member_settings` / `payment_ways`。
+
+`member.members`（复合主键 **`(id, branch_id)`** —— 思迅卡号**非全局唯一**）：
+
+| 字段 | 类型 | 单位 | 说明 |
+|---|---|---|---|
+| `id` | string | - | 会员号（思迅 `card_id`，导入时去反引号与前导零） |
+| `branch_id` | string | - | 归属门店 |
+| `card_type_id` | string | - | → `member_types.id` |
+| `card_face_no` | string | - | 卡面卡号（两库列名不同，且 hbposv7 全空 ⇒ 多为空属正常） |
+| `name` / `phone` / `mobile` / `gender` | string | - | 基本信息 |
+| `birthday` | datetime | - | 生日 |
+| `calendar_type` | string | - | `公历` / `农历` |
+| `status` | string | - | `normal` / `frozen` / `lost` / `cancelled`（**我们自己的枚举**，不照搬思迅的 0/1/2/3/5） |
+| `valid_from` / `valid_until` | datetime | - | 有效期 |
+| `favorite` / `id_card_no` / `remark` | string | - | 爱好 / 身份证 / 备注 |
+| `fee_amount_yuan` | decimal | yuan | 会员费（**思迅的 `acc_amt` 恒为 0 ⇒ 由我们自己的会员类别配置**） |
+| `limited_use_count` | int | - | 限用次数（0 = 不限次；思迅的 `999998` 哨兵导入时转 0） |
+| `used_count` | int | - | 已用次数 |
+| `points_accumulated` | decimal | - | **累计获得**（思迅 `acc_num` 口径） |
+| `points_used` | decimal | - | **累计扣减**（思迅 `dec_num` 口径） |
+| `balance_yuan` | decimal | yuan | 零钱包余额（⚠️ 思迅的 `residual_amt` 是**密文** ⇒ 只从明文 numeric 源取，取不到留 0） |
+| `consumed_amount_yuan` / `consumed_count` | decimal / int | yuan | 消费汇总 |
+| `password_hash` | string | - | bcrypt（**不存明文**） |
+| `face_id` / `open_id` | string | - | 人脸 / 微信 |
+| `authorized_by` | string | - | ★ 越权授权人 |
+| `op_id` | string | - | ★ **幂等键**（开卡幂等） |
+| `server_version` | bigint | - | 同步水位 |
+
+⚠️ **不另立 `points_balance` 列**：剩余积分 = `points_accumulated − points_used`（**派生**）。
+多一个列就多一处会漂移的真相源（思迅的口径就是"累计/已用"两列）。
+
+⚠️ **积分规则**：`points_rate = 1.0`（消费 1 元得 1 积分）、`points_rounding = half_up`（**四舍五入**）。
+⚠️ 契约原文写的是 `ceiling`，但**数学上 `ceil(22.20)=23` 与思迅那一行的 22 对不上** ⇒ 已按实测改正为四舍五入
+（8 行真实流水：四舍五入 8/8、数学 ceil 7/8）。
+
+`member.member_point_ledger`（append-only，`op_id` **唯一索引**）：
+`id` / `branch_id` / `member_id` / `op_id` / `direction`(`earn`/`deduct`) / `points` / `points_after` /
+`reason`(`sale`/`manual_deduct`/`manual_grant`) / `ref_flow_no` / `operator_id` / `authorized_by` / `operated_at`
+
+⚠️ `points_after` 记**变动后累计获得值**（扣减时累计获得不变，剩余积分现算）。
+
+`member.member_account_ledger`（append-only，`op_id` 唯一索引）：
+`id` / `branch_id` / `member_id` / `op_id` / `direction`(`recharge`/`refund`) / `amount_yuan` /
+`balance_after_yuan` / `reason` / `ref_flow_no` / `operator_id` / `authorized_by` / `operated_at`
+
+`member.member_types`：`id` / `branch_id` / `name` / `discount_rate` / `fee_amount_yuan` /
+`limited_use_count` / `allow_stored_value` / `allow_points_pay` / `priority` / `status` / 审计列
+
+`member.member_settings`（**按门店**一行）：`branch_id` / `membership_enabled` / `points_rate` /
+`points_deduct_rate` / `password_required` / `face_required` / `max_face_per_member` / `updated_by` / `updated_at`
+
+`member.payment_ways`：`code` / `name` / `is_integral` / `exchange_rate`（`JFP`=积分支付，`is_integral=1`）
+
+端点（scope 见方案 §6.2）：
+
+| 端点 | scope |
+|---|---|
+| `GET /config` `/types` `/payment-ways` `/members` `/members/{id}` `/members/{id}/points` `/members/{id}/account` `/members/{id}/consume` `/members/{id}/last-order` `/members/{id}/recharge-card` `/members/{id}/stored-value-card` | `member:view` |
+| `POST /members` | `member:card-open` |
+| `POST /members/{id}/points/deduct` | `member:point-deduct` |
+| `POST /members/{id}/points/grant` | `member:point-manage` |
+| `POST /members/{id}/account/recharge` `/refund` | `member:account-recharge` |
+| `POST /members/{id}/status` | `member:status-manage` |
+| `POST /members/{id}/password` | `member:password-manage` |
+| `POST /members/{id}/face` | `member:face-manage` |
+| `GET /dapr/subscribe` / `POST /events/sale.paid` | 免鉴权窗口（订阅 `sale.paid` 累计积分） |
+
+⚠️ **写端点故意不挂 `rbac.RequireScopeWithBranch`** —— 它只会返 `forbidden`，
+会员域要区分**图4**（`member_permission_required` + `required_scope`，弹授权框）与
+**图5**（`member_permission_denied`「你没有冲减积分的权限！」）。
+
+### 1.14 pos-gateway(POS BFF，dapr app `pos-gateway`，2026-10-21 上线)
+
+**不拥有任何表**（纯聚合层）⇒ unit 里没有 `POSTGRES_DSN`。
+
+| 端点 | scope | 聚合的下游 |
+|---|---|---|
+| `GET /home` | `pos:sale` | master-data `/stores` `/shifts` `/employees` + member `/config` `/payment-ways` |
+| `GET /config` | `pos:sale` | 同上 + member `/types` |
+| `GET /members/{id}/last-order` | `member:view` | member `/members/{id}` + `/last-order` + pos `/sales/{id}` |
+| `GET /products/search?q=` | `product:view` | catalog **`/products/local`**（⚠️ **不是** `/products/search` —— 那个打 cube，自营门店没有 cube 源） |
+| `GET /prices?product_ids=` | `pricing:view` | pricing `/prices/local` `/promotions/local` |
+| `POST /sales` | `pos:sale` | pos `/sales`（**body 一字不改转发**，`op_id` 原样透传） |
+
+⚠️ **降级语义**：某个下游取不到 ⇒ 该项 `null` + 响应里带 `warnings[]`，其余照常 200；
+但**鉴权失败（401/403）必须整体失败**（不能把 401 吞成"部分成功"）。
+
+⚠️ **内部路径不带 `/v1/`** —— nginx 只剥一层前缀 ⇒ 前端调 `/api/v1/pos-gateway/home`。
 
 ---
 
