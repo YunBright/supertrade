@@ -237,12 +237,22 @@ func (s *PriceService) batchPricesFromCube(
 			continue
 		}
 		row := BatchPrice{ProductID: id, PriceYuan: price}
+		// ⚠️ 成本价与促销价：**零值一律当"没有"**(与本地路径同一口径)。
+		//
+		// 本地路径用 `!CostYuan.IsZero()` 判断"没维护成本";
+		// 而 cube 的 `SUM(cost_yuan)` 在源列为空时是 0 而不是 NULL
+		// ⇒ 直接给会把"不知道成本"显示成"成本 0 元"。
+		// ⇒ 两条路径必须给**同一个答案**,否则同一个商品在两个门店看到的成本不一样。
 		if v, ok := exportAmountValue(raw["product.total_cost_yuan"]).(string); ok && v != "" {
-			row.CostYuan = &v
+			if !cubeclient.ParseDecimal(v).IsZero() {
+				row.CostYuan = &v
+			}
 		}
 		if p, ok := lowest[id]; ok {
 			v := p.PriceYuan
-			row.PromoPriceYuan = &v
+			if !cubeclient.ParseDecimal(v).IsZero() {
+				row.PromoPriceYuan = &v
+			}
 		}
 		out = append(out, row)
 	}

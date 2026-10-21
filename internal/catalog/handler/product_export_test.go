@@ -2,9 +2,13 @@
 //
 // # 为什么单独立一个文件
 //
-// `GET /products/local`(分页)与 `GET /products/export`(全量)是**两个端点**:
+// `GET /products/export`(全量,离线包)与商品选择控件的 `GET /products`
+// `GET /products/search`(分页)是**不同形状**的端点:
 // 响应形状不同(有无分页字段)、过滤口径不同(含不含换购品/停用品)。
-// 混在一个文件里,后人会以为"export 只是 local 的一个变体"。
+// 混在一个文件里,后人会以为"export 只是列表的一个变体"。
+//
+// (旧的 `GET /products/local` 已于 2026-10-22 删除 —— 它只读本域 PG,
+// 与「配没配数据源」的判据两套话。)
 //
 // # 守门链说明
 //
@@ -50,7 +54,8 @@ type exportBody struct {
 
 // TestExportProducts_ReturnsEveryProductIncludingSpecial 锁"**换购品 / 停用品也要给**"。
 //
-// ⚠️ `/products/local` 默认**过滤掉**换购品与停用品(见 service/product.go 的 List)。
+// ⚠️ 商品选择控件那两条端点(以及已删的 `/products/local`)默认**过滤掉**
+// 换购品与停用品(见 service/product.go 的 List)。
 //
 //	离线商品库缺这两类是**已知缺口**:收银员扫到换购品时
 //	POS 查不到商品 ⇒ 只能干瞪眼。
