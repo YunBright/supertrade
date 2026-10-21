@@ -341,6 +341,67 @@ func TestCatalogService_SearchProducts_EmptyKeywordEqualsList(t *testing.T) {
 	}
 }
 
+// 按**自编码**搜索必须能命中 —— 而且可能命中**多个**。
+//
+// ⚠️ 自编码(item_subno)**不唯一**:思迅实测 ysx 27565 个商品里 9 个自编码
+// 对应 2 个货号、hbposv7 44623 个里 72 个,全部是「正常品 + 换购品」配对。
+// ⇒ 搜自编码返回**候选列表**是正常结果,不能"只取第一条"。
+//
+// 这条用例照抄思迅实测的一对:6904406383122 → 02000110 / 02000111。
+func TestCatalogService_SearchProducts_MatchesSubCode(t *testing.T) {
+	svc, _ := newSvc(t)
+
+	page, err := svc.SearchProducts(context.Background(), service.ProductListQuery{
+		Keyword: "6904406383122", Page: 1, PageSize: 50,
+	})
+	if err != nil {
+		t.Fatalf("SearchProducts: %v", err)
+	}
+	if len(page.Products) == 0 {
+		t.Fatalf("按自编码搜不到任何商品 —— 用户扫了自编码却搜不到")
+	}
+	// 自编码不唯一 ⇒ 至少要能列出 2 个候选。
+	if len(page.Products) < 2 {
+		t.Errorf("按自编码只搜到 %d 条,应 >= 2(自编码不唯一):%+v",
+			len(page.Products), page.Products)
+	}
+	for _, p := range page.Products {
+		if p.SubCode != "6904406383122" {
+			t.Errorf("商品 %s 的 sub_code = %q,不该出现在自编码搜索结果里",
+				p.ID, p.SubCode)
+		}
+	}
+}
+
+// 商品响应必须带 **sub_code**(自编码)—— 不带的话前端那栏永远空着。
+//
+// ⚠️ 别用 id 顶替:货号(02000110)与自编码(6904406383122)**长得完全不一样**,
+// 顶替了用户会拿到一个"看起来像自编码"的货号,
+// 然后拿着它去仓库里找,找不到 —— 而界面上一丝异常都没有。
+func TestCatalogService_ProductItemCarriesSubCode(t *testing.T) {
+	svc, _ := newSvc(t)
+
+	page, err := svc.ListProducts(context.Background(), service.ProductListQuery{
+		Page: 1, PageSize: 50,
+	})
+	if err != nil {
+		t.Fatalf("ListProducts: %v", err)
+	}
+	checked := 0
+	for _, p := range page.Products {
+		if p.SubCode == "" {
+			continue
+		}
+		checked++
+		if p.SubCode == p.ID {
+			t.Errorf("商品 %s 的 sub_code 被 id 顶替了(货号 ≠ 自编码)", p.ID)
+		}
+	}
+	if checked == 0 {
+		t.Fatalf("没有任何商品带 sub_code —— 响应里这一列根本没出来")
+	}
+}
+
 // ---- 老路径兼容 ----
 
 // 老路径(?barcode=)必须保留老字段(product_id / product_name / category),
@@ -386,6 +447,7 @@ func TestCatalogService_SearchProductsByBarcode_KeepsLegacyFields(t *testing.T) 
 		t.Errorf("meta.barcode_query = %q", page.Meta.BarcodeQuery)
 	}
 }
+
 // ---- 分类树(2026-10-20) ----
 
 // 分类必须按 parent_id 组成**树**,子节点挂在父节点下。
@@ -612,8 +674,8 @@ func TestCatalogService_FilterByEmptySupplierCategoryReturnsNoRows(t *testing.T)
 
 	page, err := svc.ListProducts(context.Background(), service.ProductListQuery{
 		SupplierCategoryID: "Z-NO-SUCH-CATEGORY",
-		Page:                1,
-		PageSize:            50,
+		Page:               1,
+		PageSize:           50,
 	})
 	if err != nil {
 		t.Fatalf("ListProducts: %v", err)

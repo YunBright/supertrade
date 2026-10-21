@@ -126,9 +126,19 @@ func (q ProductListQuery) normalized() ProductListQuery {
 // 错误,不是显示问题。所以这里用 *float64 且**不加 omitempty**:
 // 缺失时也要显式写 "price_yuan": null。
 type ProductItem struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Barcode    string `json:"barcode"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Barcode string `json:"barcode"`
+	// SubCode 是**自编码 / 助记码**(思迅 item_subno)。
+	//
+	// ⚠️ **不唯一**:少数自编码对应 2 个货号(正常品 + 换购品)⇒
+	// 按自编码搜会命中**多个候选**,前端要能列出候选而不是只取第一个。
+	// 唯一键是 [ID](货号)。
+	//
+	// ⚠️ 叫 `sub_code` 而不是 `barcode`:本仓的 `barcode` 指**另一件事**
+	// (商品条码 `t_bd_item_barcode`,一品多码补充表,只在本系统维护,
+	// 实测只覆盖 0.4% 的商品)。两件事来源表、唯一性、维护方都不同。
+	SubCode    string `json:"sub_code"`
 	CategoryID string `json:"category_id"`
 	// CategoryName 查不到时为 null —— **不编造**"分类-<id>"这种占位名。
 	//
@@ -409,9 +419,9 @@ func (s *CatalogService) ListSuppliers(ctx context.Context) (*SupplierList, erro
 		flat = append(flat, item)
 	}
 	return &SupplierList{
-		Suppliers:           flat,
+		Suppliers:          flat,
 		SupplierCategories: buildSupplierCategories(flat, ways.Rows),
-		Total:               sups.Total,
+		Total:              sups.Total,
 	}, nil
 }
 
@@ -780,6 +790,7 @@ func joinProduct(r cubeclient.ProductDTO, catNames, supNames map[string]string) 
 		// 比"信任上游字段恰好相等"稳 —— 上游哪天多映射了一列真正的
 		// EAN 条码,前端就会同时看到两个不同的条码。
 		Barcode:    r.ID,
+		SubCode:    r.SubCode,
 		CategoryID: r.CategoryID,
 		SupplierID: r.SupplierID,
 		Unit:       strPtr(r.Unit),

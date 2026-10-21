@@ -21,7 +21,7 @@ func newTestDB(t *testing.T) *gorm.DB {
 	dialector := sqlite.Dialector{DriverName: "sqlite", DSN: ":memory:?_pragma=foreign_keys(1)"}
 	db, err := gorm.Open(dialector, &gorm.Config{})
 	require.NoError(t, err, "open sqlite")
-	require.NoError(t, db.AutoMigrate(&model.Supplier{}, &model.Product{}), "auto migrate")
+	require.NoError(t, db.AutoMigrate(&model.Supplier{}, &model.Product{}, &model.Category{}, &model.ProductBarcode{}), "auto migrate")
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)

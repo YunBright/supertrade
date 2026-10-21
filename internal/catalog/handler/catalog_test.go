@@ -80,7 +80,7 @@ func newTestRouter(t *testing.T, cube cubeclient.Client) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.Use(middleware.XBranchID())
-	h := New(nil, nil, cube, nil, nil)
+	h := New(nil, nil, nil, nil, nil, cube, nil, nil)
 	h.RegisterProductPickerRoutes(r, func(scope string) []gin.HandlerFunc {
 		return []gin.HandlerFunc{h.requireSingleBranch()}
 	})
@@ -269,7 +269,7 @@ func TestSuppliersSummaryRouteWinsOverParam(t *testing.T) {
 	r.Use(middleware.XBranchID())
 	cube := &recordingCube{Client: cubeclientfake.New()}
 	db := newTestDB(t)
-	h := New(service.NewSupplierService(db), nil, cube, nil, nil)
+	h := New(service.NewSupplierService(db), nil, nil, nil, nil, cube, nil, nil)
 	// 与生产同款的路径集合(:id 先注册,summary 后注册,顺序反过来也要成立)。
 	r.GET("/suppliers/:id", h.getSupplier)
 	h.RegisterProductPickerRoutes(r, func(scope string) []gin.HandlerFunc {
@@ -305,7 +305,7 @@ func TestSuppliersSummaryRouteWinsOverParam(t *testing.T) {
 func TestRegisterRoutes_RegistersPickerRoutes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	h := New(nil, nil, cubeclientfake.New(), nil, nil)
+	h := New(nil, nil, nil, nil, nil, cubeclientfake.New(), nil, nil)
 	h.RegisterRoutes(r)
 
 	got := map[string]bool{}

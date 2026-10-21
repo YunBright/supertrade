@@ -12,7 +12,16 @@
 //	GET    /products/search?barcode=             按条码查商品(product:view,老路径)
 //	GET    /products/search?q=&page=             关键字搜商品(product:view,商品选择控件)
 //	GET    /products/:id                         查单个商品(product:view)
-//	GET    /categories?with_counts=              分类字典(supplier:view,商品选择控件)
+//	POST   /products                             新建商品(product:manage)—— 本地表
+//	PUT    /products/:id                         改商品(product:manage)—— 本地表
+//	DELETE /products/:id                         软删商品(product:manage)—— 本地表
+//	GET    /products/local                        本地表商品列表(product:view)—— 分页
+//	GET    /categories?with_counts=               分类字典(supplier:view,商品选择控件)
+//	GET    /categories/local                      本地表分类列表(product:view)
+//	GET    /categories/:id                        查单个分类(product:view)
+//	POST   /categories                            新建分类(product:manage)
+//	PUT    /categories/:id                        改分类(product:manage)
+//	DELETE /categories/:id                        软删分类(product:manage)
 //
 // 中间件:
 //   - middleware.XBranchID() 全局挂(由 cmd/catalog/main.go::registerRoutes)
@@ -22,6 +31,11 @@
 // 错误映射:
 //   - model.ErrSupplierNotFound        → 404
 //   - model.ErrSupplierAlreadyExists   → 409
+//   - model.ErrProductNotFound         → 404
+//   - model.ErrProductAlreadyExists    → 409
+//   - model.ErrCategoryNotFound        → 404
+//   - model.ErrCategoryAlreadyExists   → 409
+//   - model.ErrCategoryCycle           → 400
 //   - model.ErrInvalidInput            → 400
 //   - 其它                              → 500
 package handler
@@ -44,12 +58,15 @@ import (
 
 // Handler 是 catalog 服务的 HTTP handler 聚合。
 type Handler struct {
-	suppliers *service.SupplierService
-	products  *service.ProductService
-	catalog   *service.CatalogService
-	cube      cubeclient.Client // 兜底,本地表无数据时转发 cube
-	users     *userinfo.Client  // per-branch scope 守门用
-	logger    *slog.Logger
+	suppliers  *service.SupplierService
+	products   *service.ProductService
+	categories *service.CategoryService
+	barcodes   *service.ProductBarcodeService
+	archive    *service.ArchiveService
+	catalog    *service.CatalogService
+	cube       cubeclient.Client // 兜底,本地表无数据时转发 cube
+	users      *userinfo.Client  // per-branch scope 守门用
+	logger     *slog.Logger
 }
 
 // New 构造 Handler。
@@ -57,17 +74,23 @@ type Handler struct {
 // cubeClient 可以为 nil(本地表已有完整数据时),searchProducts 在 cubeClient
 // == nil 时返 503 cube_unavailable。
 // users 用于业务端点 per-branch 守门;传 nil 时所有业务端点 503 userd_unavailable。
-func New(suppliers *service.SupplierService, products *service.ProductService, cube cubeclient.Client, users *userinfo.Client, logger *slog.Logger) *Handler {
+func New(suppliers *service.SupplierService, products *service.ProductService,
+	categories *service.CategoryService, barcodes *service.ProductBarcodeService,
+	archive *service.ArchiveService,
+	cube cubeclient.Client, users *userinfo.Client, logger *slog.Logger) *Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Handler{
-		suppliers: suppliers,
-		products:  products,
-		catalog:   service.NewCatalogService(cube, logger),
-		cube:      cube,
-		users:     users,
-		logger:    logger,
+		suppliers:  suppliers,
+		products:   products,
+		categories: categories,
+		barcodes:   barcodes,
+		archive:    archive,
+		catalog:    service.NewCatalogService(cube, logger),
+		cube:       cube,
+		users:      users,
+		logger:     logger,
 	}
 }
 
@@ -117,6 +140,78 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/products/:id",
 		rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver),
 		h.getProduct)
+
+	// 本地商品档案的写侧 + 本地列表。
+	//
+	// ⚠️ `product:manage` 这个 scope **在 auth 的 seed 里还不存在**
+	// (现有的是 product:view / supplier:manage / inventory:* 等)。
+	// ⇒ 这些端点在 auth 补上 seed 之前会对所有人返 403(fail-closed)。
+	// 这是**已知状态**:auth 的 scope seed 属于 Phase 0(见
+	// docs/ARCHITECTURE.md §7)。
+	r.POST("/products",
+		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
+		h.createProduct)
+	r.PUT("/products/:id",
+		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
+		h.updateProduct)
+	r.DELETE("/products/:id",
+		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
+		h.deleteProduct)
+	r.GET("/products/local",
+		rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver),
+		h.listLocalProducts)
+
+	// 商品条码(1 商品 : N 条码)。
+	//
+	// ⚠️ `/products/by-barcode/:barcode` 与 `/products/:id` 的**静态段优先级**:
+	// gin 的路由树里静态段优先于参数段(与注册顺序无关)——
+	// 这条依赖 gin 版本,必须有测试锁住
+	// (见 handler/product_test.go 的 TestProductsByBarcodeRouteWinsOverParam)。
+	r.GET("/products/by-barcode/:code",
+		rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver),
+		h.getProductByBarcode)
+	r.GET("/products/:id/barcodes",
+		rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver),
+		h.listProductBarcodes)
+	r.POST("/products/:id/barcodes",
+		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
+		h.createProductBarcode)
+	r.DELETE("/products/:id/barcodes/:barcode",
+		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
+		h.deleteProductBarcode)
+
+	// 档案导入(实现见 archive.go)。
+	//
+	// ⚠️ 守门是 `product:manage` scope,**不是** admin 角色 ——
+	// auth 建服务账号时"不分配任何角色(least privilege)",
+	// 服务账号过不了 RequireRole("admin")。而这个端点就是给同步服务账号用的。
+	//
+	// ⚠️ 门店只从 X-Branch-ID header 取,body 里**不认**门店 ——
+	// body 里带一份门店,A 店的登录态就能把数据写进 B 店。
+	r.POST("/archive/import",
+		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
+		h.importArchive)
+
+	// 分类(本地表)。
+	//
+	// ⚠️ 分类用 `product:view`/`product:manage` 而不是独立的 category:* ——
+	// 分类是"商品档案"域的一部分,少一组 scope 少一轮 auth 改动。
+	// `GET /categories`(cube)由 RegisterProductPickerRoutes 注册,不冲突。
+	r.GET("/categories/local",
+		rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver),
+		h.listLocalCategories)
+	r.GET("/categories/:id",
+		rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver),
+		h.getCategory)
+	r.POST("/categories",
+		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
+		h.createCategory)
+	r.PUT("/categories/:id",
+		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
+		h.updateCategory)
+	r.DELETE("/categories/:id",
+		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
+		h.deleteCategory)
 
 	// 商品选择控件(ProductPicker)的 4 条端点。
 	//
@@ -173,6 +268,12 @@ func callerSub(c *gin.Context) string {
 }
 
 // mapErr 把 service / model 错误映射为 HTTP 状态码 + JSON body。
+//
+// ⚠️ **code 是按资源分的,不是按 HTTP 状态统一**。
+// 已有的 `supplier_not_found` / `supplier_already_exists` 是**线上契约**
+// (Flutter 端与契约测试都按这两个字符串判定),**不能**改成通用的
+// `not_found` / `already_exists` —— 那是静默的契约破坏。
+// ⇒ 新增资源(product / category)也各用各的 code,保持同一套风格。
 func (h *Handler) mapErr(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, model.ErrSupplierNotFound):
@@ -183,6 +284,38 @@ func (h *Handler) mapErr(c *gin.Context, err error) {
 	case errors.Is(err, model.ErrSupplierAlreadyExists):
 		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
 			"code":    "supplier_already_exists",
+			"message": err.Error(),
+		})
+	case errors.Is(err, model.ErrProductNotFound):
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
+			"code":    "product_not_found",
+			"message": err.Error(),
+		})
+	case errors.Is(err, model.ErrProductAlreadyExists):
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"code":    "product_already_exists",
+			"message": err.Error(),
+		})
+	case errors.Is(err, model.ErrCategoryNotFound):
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
+			"code":    "category_not_found",
+			"message": err.Error(),
+		})
+	case errors.Is(err, model.ErrBarcodeNotFound):
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
+			"code":    "barcode_not_found",
+			"message": err.Error(),
+		})
+	case errors.Is(err, model.ErrCategoryAlreadyExists):
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"code":    "category_already_exists",
+			"message": err.Error(),
+		})
+	case errors.Is(err, model.ErrCategoryCycle):
+		// 成环是**数据问题**(不是权限、不是参数格式)⇒ 400 而不是 500。
+		// 挂错父节点会挡住分类树建树(无限递归),必须当场拒掉。
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"code":    "category_cycle",
 			"message": err.Error(),
 		})
 	case errors.Is(err, model.ErrInvalidInput):

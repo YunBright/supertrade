@@ -54,6 +54,9 @@ var (
 	appDB   *gorm.DB
 	appSup  *service.SupplierService
 	appProd *service.ProductService
+	appCat  *service.CategoryService
+	appBar  *service.ProductBarcodeService
+	appArc  *service.ArchiveService
 	appCube cubeclient.Client
 	appUser *userinfo.Client
 )
@@ -69,12 +72,20 @@ func initApp() error {
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
 	}
-	if err := appDB.AutoMigrate(&model.Supplier{}, &model.Product{}); err != nil {
+	if err := appDB.AutoMigrate(
+		&model.Supplier{},
+		&model.Product{},
+		&model.ProductBarcode{},
+		&model.Category{},
+	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
 	}
 
 	appSup = service.NewSupplierService(appDB)
 	appProd = service.NewProductService(appDB)
+	appCat = service.NewCategoryService(appDB)
+	appBar = service.NewProductBarcodeService(appDB)
+	appArc = service.NewArchiveService(appDB)
 
 	// cube client 用作 products/search 兜底(本期未实装本地 product CRUD)
 	if appCube, err = cubehttp.NewClient(); err != nil {
@@ -109,7 +120,7 @@ func registerRoutes(r *gin.Engine) {
 	// 自动 forward 给下游(cube-gateway / userd)。userd 端 middleware.http.bearer
 	// 必需要 Authorization 头,无 token 会 401 Unauthenticated。
 	r.Use(forwardBearerToOutgoing())
-	handler.New(appSup, appProd, appCube, appUser, nil).RegisterRoutes(r)
+	handler.New(appSup, appProd, appCat, appBar, appArc, appCube, appUser, nil).RegisterRoutes(r)
 }
 
 // forwardBearerToOutgoing 把 gin request 的 Authorization / X-Branch-ID header 注入 ctx。
