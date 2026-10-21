@@ -222,6 +222,14 @@ type ListMembersInput struct {
 	//   而 Limit 上限是 200 ⇒ 不给 offset 就**只能看到前 200 条**,
 	//   而且响应里没有"总数"⇒ 前端会以为"这个店就这么点会员"(静默截断)。
 	Offset int
+	// Sort 是排序字段(白名单,见 model.MemberSortColumn)。
+	//
+	// ⚠️ 空 = 默认 updated_at DESC。
+	// ⛔ 不在白名单 ⇒ 400(不是"忽略这个参数")——
+	//   忽略的话前端会以为"按积分排了",实际没排,排序看着"时灵时不灵"。
+	Sort string
+	// Order 是排序方向:asc / desc(空 = desc)。
+	Order string
 }
 
 // ListMembers 查会员列表(图3 的"查询条件"下拉 + 输入框)。
@@ -287,15 +295,60 @@ func (s *Service) ListMembersPage(ctx context.Context, in ListMembersInput) ([]m
 		return nil, 0, err
 	}
 	var rows []model.Member
-	// ⚠️ 排序键必须是**全序**:updated_at 会并列,id 在本门店内唯一 ⇒
-	//   (updated_at DESC, id ASC) 是全序 ⇒ 翻页不会重复/漏行。
-	if err := rowsQ.Order("updated_at DESC, id ASC").Limit(limit).Offset(offset).Find(&rows).Error; err != nil {
+	// ⚠️ 排序键必须是**全序**:排序列会并列,id 在本门店内唯一 ⇒
+	//   (排序列, id ASC) 是全序 ⇒ 翻页不会重复/漏行。
+	//
+	// ⚠️ 排序列**必须来自白名单**(model.MemberSortColumn)——
+	//   把 query 拼进 ORDER BY 是注入面,而这里根本不需要灵活性。
+	orderExpr, err := memberOrderExpr(in.Sort, in.Order)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := rowsQ.Order(orderExpr).Limit(limit).Offset(offset).Find(&rows).Error; err != nil {
 		return nil, 0, err
 	}
 	for i := range rows {
 		fillDerived(&rows[i])
 	}
 	return rows, total, nil
+}
+
+// memberOrderExpr 造 ORDER BY 片段(排序列 + id 兜底)。
+//
+// ⚠️ 排序列**只认白名单**(model.MemberSortColumn)——
+//
+//	把 query 拼进 ORDER BY 是注入面。
+//
+// ⚠️ 方向也只认 asc / desc —— 其它一律当 desc(而不是原样拼)。
+// ⚠️ 末尾永远追加 `id ASC`：排序列会并列 ⇒ 没有兜底键就不是全序
+//
+//	⇒ 翻页会重复/漏行（症状是"第 2 页又看到第 1 页的某条"）。
+func memberOrderExpr(sortField, order string) (string, error) {
+	field := strings.TrimSpace(sortField)
+	expr := ""
+	if field != "" {
+		col, ok := model.MemberSortColumn(field)
+		if !ok {
+			return "", fmt.Errorf("%w: 排序字段 %q 不允许(可用:%s)",
+				model.ErrInvalidInput, field,
+				strings.Join(model.MemberSortFields(), ","))
+		}
+		expr = col
+	} else {
+		// 默认:最后修改时刻倒序(与历史行为一致)。
+		expr = "updated_at"
+	}
+	dir := "DESC"
+	switch strings.ToLower(strings.TrimSpace(order)) {
+	case "asc":
+		dir = "ASC"
+	case "", "desc":
+		dir = "DESC"
+	default:
+		return "", fmt.Errorf("%w: 排序方向 %q 不允许(只能 asc / desc)",
+			model.ErrInvalidInput, order)
+	}
+	return fmt.Sprintf("%s %s, id ASC", expr, dir), nil
 }
 
 // ExportMembers 导出该门店的**全部**会员(离线会员包用)。

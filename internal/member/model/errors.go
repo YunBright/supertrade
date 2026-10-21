@@ -1,6 +1,9 @@
 package model
 
-import "errors"
+import (
+	"errors"
+	"sort"
+)
 
 // ---- 业务错误 sentinel(handler 层映 4xx / 5xx) ----
 
@@ -114,6 +117,84 @@ const (
 	// ⚠️ 与 auth 的 permissions seed **逐字相同** —— 差一个字符就是"所有人 403"。
 	ScopeConfig = "member:config"
 )
+
+// ---- 排序字段(会员档案列表的"按列排序") ----
+
+// 允许的会员排序字段。
+//
+// ⚠️ 这些是**契约名**(前端传的),不是列名 —— 列名映射见 memberSortExpr。
+const (
+	// MemberSortID 是按会员号排。
+	MemberSortID = "id"
+	// MemberSortName 是按姓名排。
+	MemberSortName = "name"
+	// MemberSortMobile 是按手机排。
+	MemberSortMobile = "mobile"
+	// MemberSortCardType 是按会员类别排。
+	MemberSortCardType = "card_type_id"
+	// MemberSortStatus 是按状态排。
+	MemberSortStatus = "status"
+	// MemberSortPointsAccumulated 是按累计积分排。
+	MemberSortPointsAccumulated = "points_accumulated"
+	// MemberSortPointsUsed 是按已用积分排。
+	MemberSortPointsUsed = "points_used"
+	// MemberSortRemainingPoints 是按**剩余积分**排(派生列)。
+	MemberSortRemainingPoints = "remaining_points"
+	// MemberSortBalance 是按储值余额排。
+	MemberSortBalance = "balance_yuan"
+	// MemberSortConsumedAmount 是按累计消费排。
+	MemberSortConsumedAmount = "consumed_amount_yuan"
+	// MemberSortConsumedCount 是按消费次数排。
+	MemberSortConsumedCount = "consumed_count"
+	// MemberSortValidFrom 是按有效期起排。
+	MemberSortValidFrom = "valid_from"
+	// MemberSortValidUntil 是按有效期止排。
+	MemberSortValidUntil = "valid_until"
+	// MemberSortUpdatedAt 是按最后修改时刻排(**默认**)。
+	MemberSortUpdatedAt = "updated_at"
+)
+
+// memberSortExpr 把排序字段映射到 ORDER BY 表达式。
+//
+// ⛔ 不接受任意列名/表达式(那是 SQL 注入面)⇒ 只认白名单。
+//
+// ⚠️ 映射到的是**表达式**而不是裸列名:剩余积分是派生列
+// (points_accumulated − points_used,本域不落列),
+// 想按它排就必须在 SQL 里现算。
+var memberSortExpr = map[string]string{
+	MemberSortID:                "id",
+	MemberSortName:              "name",
+	MemberSortMobile:            "mobile",
+	MemberSortCardType:          "card_type_id",
+	MemberSortStatus:            "status",
+	MemberSortPointsAccumulated: "points_accumulated",
+	MemberSortPointsUsed:        "points_used",
+	MemberSortRemainingPoints:   "(points_accumulated - points_used)",
+	MemberSortBalance:           "balance_yuan",
+	MemberSortConsumedAmount:    "consumed_amount_yuan",
+	MemberSortConsumedCount:     "consumed_count",
+	MemberSortValidFrom:         "valid_from",
+	MemberSortValidUntil:        "valid_until",
+	MemberSortUpdatedAt:         "updated_at",
+}
+
+// MemberSortColumn 把排序字段映射到 ORDER BY 表达式。
+//
+// ⛔ 不接受任意列名(那是 SQL 注入面)⇒ 只认白名单。
+func MemberSortColumn(field string) (string, bool) {
+	expr, ok := memberSortExpr[field]
+	return expr, ok
+}
+
+// MemberSortFields 是全部可排序字段(供上层做白名单校验与文档化)。
+func MemberSortFields() []string {
+	out := make([]string, 0, len(memberSortExpr))
+	for k := range memberSortExpr {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // ---- 查询字段(图3 的"查询条件"下拉) ----
 

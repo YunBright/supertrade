@@ -276,7 +276,7 @@ func (h *Handler) listPaymentWays(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"payment_ways": rows, "count": len(rows)})
 }
 
-// listMembers GET /members?field=&q=&limit=&offset=
+// listMembers GET /members?field=&q=&limit=&offset=&sort=&order=
 //
 // ⚠️ 响应里**同时**给 count 与 total:
 //
@@ -285,6 +285,11 @@ func (h *Handler) listPaymentWays(c *gin.Context) {
 //
 // ⇒ 门店10 导入后有 4128 个会员,而 limit 上限是 200
 // ⇒ 只给 count 的话前端会以为"这个店就这么点会员"(静默截断)。
+//
+// ⚠️ sort / order 是**服务端排序**(不是前端排):
+//
+//	前端排只能排当前这一页 ⇒ "按积分排序"翻到第 2 页就乱序了。
+//	排序列只认白名单(model.MemberSortColumn)，非法值 ⇒ 400。
 func (h *Handler) listMembers(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	offset, _ := strconv.Atoi(c.Query("offset"))
@@ -297,6 +302,8 @@ func (h *Handler) listMembers(c *gin.Context) {
 		Q:        c.Query("q"),
 		Limit:    limit,
 		Offset:   offset,
+		Sort:     c.Query("sort"),
+		Order:    c.Query("order"),
 	})
 	if err != nil {
 		mapErr(c, err)

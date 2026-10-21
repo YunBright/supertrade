@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
@@ -421,4 +422,152 @@ func TestPasswordHash_Verify(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, service.ErrInvalidOldPassword))
+}
+
+// TestListMembers_Sort 锁"服务端排序"（会员档案页的"按列排序"）。
+//
+// ⚠️ 排序**必须在服务端**：前端只能排当前这一页 ⇒
+// "按积分排序"翻到第 2 页就乱序了。
+func TestListMembers_Sort(t *testing.T) {
+	svc, db := newService(t)
+	seedType(t, db, "T1", "10", "会员卡")
+	ctx := context.Background()
+	now := time.Now()
+	seed := func(id, name string, points string) {
+		require.NoError(t, db.Create(&model.Member{
+			ID: id, BranchID: "10", CardTypeID: "T1", Name: name,
+			// ⚠️ op_id 有唯一索引 ⇒ 每行必须不同（留空会撞唯一约束）。
+			OpID:              "op-" + id,
+			PointsAccumulated: decimal.RequireFromString(points),
+			PointsUsed:        decimal.Zero,
+			Status:            model.MemberStatusNormal,
+			CreatedBy:         "u-1", UpdatedBy: "u-1",
+			CreatedAt: now, UpdatedAt: now,
+		}).Error)
+	}
+	seed("M1", "Ccc", "10")
+	seed("M2", "Aaa", "300")
+	seed("M3", "Bbb", "200")
+
+	// 按累计积分倒序 ⇒ 甲(300) → 乙(200) → 丙(10)。
+	rows, total, err := svc.ListMembersPage(ctx, service.ListMembersInput{
+		BranchID: "10", Limit: 10,
+		Sort: model.MemberSortPointsAccumulated, Order: "desc",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), total)
+	require.Len(t, rows, 3)
+	assert.Equal(t, "M2", rows[0].ID)
+	assert.Equal(t, "M3", rows[1].ID)
+	assert.Equal(t, "M1", rows[2].ID)
+
+	// 按姓名升序 ⇒ Aaa → Bbb → Ccc。
+	//
+	// ⚠️ 这里用 **ASCII** 名字断言顺序：中文名的排序**依赖数据库排序规则** ——
+	//   PostgreSQL 生产库（zh_CN.UTF-8）按**拼音**排，
+	//   而测试用的 SQLite 默认是 **BINARY**（按 UTF-8 字节）排
+	//   ⇒ 用中文断言顺序会"测试库红、生产绿"或反之（跟库走）。
+	rows, _, err = svc.ListMembersPage(ctx, service.ListMembersInput{
+		BranchID: "10", Limit: 10,
+		Sort: model.MemberSortName, Order: "asc",
+	})
+	require.NoError(t, err)
+	require.Len(t, rows, 3)
+	assert.Equal(t, "Aaa", rows[0].Name)
+	assert.Equal(t, "Bbb", rows[1].Name)
+	assert.Equal(t, "Ccc", rows[2].Name)
+
+	// 剩余积分是**派生列**（本域不落列）⇒ 排序要在 SQL 里现算。
+	rows, _, err = svc.ListMembersPage(ctx, service.ListMembersInput{
+		BranchID: "10", Limit: 10,
+		Sort: model.MemberSortRemainingPoints, Order: "desc",
+	})
+	require.NoError(t, err)
+	require.Len(t, rows, 3)
+	assert.Equal(t, "M2", rows[0].ID)
+}
+
+// TestListMembers_SortStableAcrossPages 锁"排序 + 翻页不重复/不漏行"。
+//
+// ⚠️ 排序列会并列 ⇒ 没有兜底键就不是全序 ⇒ 翻页会漏行或重复。
+func TestListMembers_SortStableAcrossPages(t *testing.T) {
+	svc, db := newService(t)
+	seedType(t, db, "T1", "10", "会员卡")
+	ctx := context.Background()
+	now := time.Now()
+	// 积分**全相同** ⇒ 只能靠 id 兜底排序才稳定。
+	for _, id := range []string{"M3", "M1", "M2", "M5", "M4"} {
+		require.NoError(t, db.Create(&model.Member{
+			ID: id, BranchID: "10", CardTypeID: "T1", Name: "同名",
+			// ⚠️ op_id 有唯一索引 ⇒ 每行必须不同。
+			OpID:              "op-" + id,
+			PointsAccumulated: decimal.NewFromInt(100), PointsUsed: decimal.Zero,
+			Status:    model.MemberStatusNormal,
+			CreatedBy: "u-1", UpdatedBy: "u-1",
+			CreatedAt: now, UpdatedAt: now,
+		}).Error)
+	}
+	seen := map[string]bool{}
+	for offset := 0; offset < 5; offset += 2 {
+		rows, total, err := svc.ListMembersPage(ctx, service.ListMembersInput{
+			BranchID: "10", Limit: 2, Offset: offset,
+			Sort: model.MemberSortPointsAccumulated, Order: "desc",
+		})
+		require.NoError(t, err)
+		assert.Equal(t, int64(5), total)
+		for _, r := range rows {
+			assert.False(t, seen[r.ID], "第 %d 页出现了重复行 %s", offset, r.ID)
+			seen[r.ID] = true
+		}
+	}
+	assert.Len(t, seen, 5, "翻完 3 页应看到全部 5 行(不漏行)")
+}
+
+// TestListMembers_InvalidSortRejected 锁"非法排序字段 / 方向 ⇒ 400（不是忽略）"。
+//
+// ⚠️ 忽略的话前端会以为"按积分排了"，实际没排 ⇒ 排序看着"时灵时不灵"。
+func TestListMembers_InvalidSortRejected(t *testing.T) {
+	svc, db := newService(t)
+	seedType(t, db, "T1", "10", "会员卡")
+	ctx := context.Background()
+
+	_, _, err := svc.ListMembersPage(ctx, service.ListMembersInput{
+		BranchID: "10", Limit: 10, Sort: "id; DROP TABLE members--",
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, model.ErrInvalidInput, "非法排序字段必须是入参错误(⇒ 400)")
+
+	_, _, err = svc.ListMembersPage(ctx, service.ListMembersInput{
+		BranchID: "10", Limit: 10, Sort: model.MemberSortName, Order: "sideways",
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, model.ErrInvalidInput, "非法排序方向必须是入参错误(⇒ 400)")
+}
+
+// TestListMembers_DefaultSortUnchanged 锁"不传 sort ⇒ 仍是 updated_at DESC"。
+func TestListMembers_DefaultSortUnchanged(t *testing.T) {
+	svc, db := newService(t)
+	seedType(t, db, "T1", "10", "会员卡")
+	ctx := context.Background()
+	now := time.Now()
+	old := now.Add(-time.Hour)
+	require.NoError(t, db.Create(&model.Member{
+		ID: "OLD", BranchID: "10", CardTypeID: "T1", Name: "旧",
+		OpID: "op-OLD", Status: model.MemberStatusNormal,
+		CreatedBy: "u-1", UpdatedBy: "u-1",
+		CreatedAt: old, UpdatedAt: old,
+	}).Error)
+	require.NoError(t, db.Create(&model.Member{
+		ID: "NEW", BranchID: "10", CardTypeID: "T1", Name: "新",
+		OpID: "op-NEW", Status: model.MemberStatusNormal,
+		CreatedBy: "u-1", UpdatedBy: "u-1",
+		CreatedAt: now, UpdatedAt: now,
+	}).Error)
+
+	rows, _, err := svc.ListMembersPage(ctx, service.ListMembersInput{
+		BranchID: "10", Limit: 10,
+	})
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+	assert.Equal(t, "NEW", rows[0].ID, "默认按最后修改时刻倒序")
 }
