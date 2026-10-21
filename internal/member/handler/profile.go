@@ -47,7 +47,8 @@ var forbiddenProfileFields = map[string]string{
 // ⚠️ **指针 = 未传就保持原值**(局部更新语义,同 UpsertSettings / UpsertType)。
 //
 // ⚠️ **禁改的列不在这个结构体里** —— 类型上就不给改它们的机会;
-//   handler 另外扫一遍原始 body,出现即 400(见 forbiddenProfileFields)。
+//
+//	handler 另外扫一遍原始 body,出现即 400(见 forbiddenProfileFields)。
 type updateProfileReq struct {
 	// OpID 是幂等键(必填)。
 	OpID string `json:"op_id"`
@@ -84,8 +85,9 @@ type updateProfileReq struct {
 // 守门:走本域的越权授权链路(service.Authorize),scope = member:config。
 //
 // ⚠️ 为什么用 member:config:改档案是**后台维护动作**(同会员类别/门店会员参数),
-//   而 auth 的 seed 里 member:config 已存在且 admin 在门店10 已有
-//   ⇒ 不用改 auth 仓、不用加迁移。
+//
+//	而 auth 的 seed 里 member:config 已存在且 admin 在门店10 已有
+//	⇒ 不用改 auth 仓、不用加迁移。
 func (h *Handler) updateMember(c *gin.Context) {
 	// ⚠️ 先读原始 body:要同时做两件事 ——
 	//   ① 反序列化进结构体;② 扫一遍"禁改列"是否出现。
@@ -151,7 +153,8 @@ func (h *Handler) updateMember(c *gin.Context) {
 // deleteMember DELETE /members/:id
 //
 // ⚠️ **软删**(gorm.DeletedAt):行还在表里,但之后查不到
-//   (历史单据仍能对上这张卡)。
+//
+//	(历史单据仍能对上这张卡)。
 //
 // 守门:`member:config` scope(per-branch)—— 与 DELETE /types/:id 同档:
 // 这是**管理员后台动作**,不是"收银员在终端上越权"⇒ 不必让 POS 弹授权框。

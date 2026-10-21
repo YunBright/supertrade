@@ -19,13 +19,28 @@
 //	    财务列与状态列**一个都不碰**。
 //	  - `overwrite`:连财务列与状态列一起覆盖 —— **必须由运维显式选择**。
 //
-// # ⚠️ 为什么余额解析失败要**跳过该行**
+// # ⚠️ 余额解析失败**不跳整行**（2026-10-21 真库实测后修正）
 //
-//	思迅的 `residual_amt` 是**密文/脏值**(实测样例:"@><:6642675" / "86220.." / ","),
-//	还有 764 行是空的。
-//	⇒ 解析不出来时**不能静默当 0**:那会让一个**有储值余额**的会员变成"余额 0",
-//	  而"余额 0"没有任何人会去查(静默截断比报错危险)。
-//	⇒ 本实现:余额解析失败 ⇒ 该行**不落库** + 计入 skipped + 给一条 warning。
+//	思迅的 `residual_amt` 是 **varchar 且装的是不可读的密文/脏值**
+//	（真库实测：4128 行里 3364 行非空，但只有 **43 个不同取值**，
+//	样例 "@><:6642675" / "86220.." / "20,," / ","；
+//	另外 `t_rm_vip_consume.balance_amount` 3220 行**全是 0**，不是更好的来源）。
+//
+//	⇒ **储值余额在源库里就不可恢复**（疑似加密），不是"个别脏行"。
+//
+//	所以语义是：
+//	  - **空** ⇒ 余额 0，**不告警**（实测 764 行空余额**全部是会员卡**
+//	    card_type=0 —— 会员卡本来就没有储值，属正常）；
+//	  - **非空但解析不了** ⇒ 余额 0 + 一条 warning（余额未知），
+//	    **会员照常落库**。
+//
+//	⚠️ 为什么不能"解析不了就跳整行"：
+//	那样会**丢掉 3364 个会员**（实测那样导完只剩 3364 条）。
+//	会员的**身份**（姓名/手机/卡号/有效期/积分）都是好的，
+//	只有"余额"这一个字段不可读 ⇒ 为一个字段丢掉整条客户档案，
+//	代价远大于把余额当 0（余额本来就是本域 POS 从 0 开始累积的事实源）。
+//
+//	⇒ 余额以 **warning 形式显式暴露**（不静默），由业务决定是否另行补余额。
 //
 // # ⚠️ 会员类别**不自动建**
 //
@@ -57,7 +72,8 @@ const importActor = "import"
 // maxImportWarnings 是导入报告里**最多**带多少条 warning。
 //
 // ⚠️ 不是"随便截断":一次全量导入有 4128 行,脏值可能成百上千条。
-//   全量带回来会把响应体撑大、把真正的"第一条"淹没 ⇒ 截断 + 一条汇总说明。
+//
+//	全量带回来会把响应体撑大、把真正的"第一条"淹没 ⇒ 截断 + 一条汇总说明。
 const maxImportWarnings = 100
 
 // maxImportErrors 是导入报告里**最多**带多少条逐行失败明细。
@@ -66,7 +82,8 @@ const maxImportErrors = 200
 // 思迅 V10 的会员类别码 → **类别名**。
 //
 // ⚠️ 依据:源库 card_type 的实测取值(0/1/2)+ 仓内 model 的注释
-//   ("思迅 ysx 2=VIP储值卡")。本仓**没有**权威文档,见报告的"不确定"说明。
+//
+//	("思迅 ysx 2=VIP储值卡")。本仓**没有**权威文档,见报告的"不确定"说明。
 var sixunCardTypeNames = map[string]string{
 	"0": "会员卡",
 	"1": "储值卡",
@@ -93,7 +110,8 @@ var sixunCardStatusMap = map[string]string{
 // 思迅 `use_num` 的"不限次"哨兵 ⇒ 本域的 0(0 = 不限次)。
 //
 // ⚠️ 999998 / 999999 **不是**次数,是"不限"⇒ 直接当次数会把 POS 的
-//   "还能用 999998 次"显示给收银员。
+//
+//	"还能用 999998 次"显示给收银员。
 var sixunUnlimitedUseSentinels = map[string]bool{
 	"999998": true,
 	"999999": true,
@@ -282,13 +300,17 @@ func (s *Service) importMembers(ctx context.Context, branchID, mode string,
 				warns.add(fmt.Sprintf("members:会员 %s 的 card_status=%q 认不出,按 %s 处理", id, row.Status, status))
 			}
 
-			// ③ 余额:**解析失败 ⇒ 该行不落库**(见文件头)。
+			// ③ 余额:**解析不了 ⇒ 记 0 + warning,但会员照常落库**（见文件头）。
+			//
+			// ⚠️ 空余额**不告警**：实测 764 行空余额全是会员卡（本来就没储值）。
 			balance, okBal := parseDecimalLoose(row.BalanceYuan)
 			if !okBal {
-				res.Skipped++
-				warns.add(fmt.Sprintf("members:会员 %s 的余额 %q 解析不了,该行未落库(不静默当 0)", id, row.BalanceYuan))
-				errs.add(archivedto.ScopeMembers, id, "余额解析失败: "+row.BalanceYuan)
-				continue
+				balance = decimal.Zero
+				if strings.TrimSpace(row.BalanceYuan) != "" {
+					warns.add(fmt.Sprintf(
+						"members:会员 %s 的源库余额 %q 不可解析(源库该列疑似加密),余额按 0 导入,会员已落库",
+						id, row.BalanceYuan))
+				}
 			}
 
 			// ④ 其余数值列:解析不了按 0 + warning(不跳整行 ——
@@ -438,7 +460,8 @@ var memberOverwriteColumns = []string{
 // memberState 判断该会员在本域的状态。
 //
 // ⚠️ 用 Unscoped 查:软删的行**仍在表里**(只是查不到)⇒
-//   不看 deleted_at 就分不出"这张卡被门店删了" ⇒ 导入会把它复活。
+//
+//	不看 deleted_at 就分不出"这张卡被门店删了" ⇒ 导入会把它复活。
 func memberState(tx *gorm.DB, branchID, memberID string) (exists bool, softDeleted bool) {
 	var row model.Member
 	err := tx.Unscoped().
@@ -454,8 +477,9 @@ func memberState(tx *gorm.DB, branchID, memberID string) (exists bool, softDelet
 // importOpID 造一个导入用的 op_id(会员表的 op_id 有唯一索引)。
 //
 // ⚠️ 必须**每次导入都不同**:同一张卡重复导入时,老行还在表里,
-//   用固定 op_id 会撞唯一索引(而且撞的是"另一个"唯一约束 ⇒
-//   ON CONFLICT (id, branch_id) 救不了,直接报错)。
+//
+//	用固定 op_id 会撞唯一索引(而且撞的是"另一个"唯一约束 ⇒
+//	ON CONFLICT (id, branch_id) 救不了,直接报错)。
 func importOpID(branchID, memberID string, now time.Time) string {
 	return fmt.Sprintf("import:%s:%s:%d", branchID, memberID, now.UnixNano())
 }
@@ -463,8 +487,9 @@ func importOpID(branchID, memberID string, now time.Time) string {
 // normalizeMemberID 规整会员号。
 //
 // ⚠️ 思迅的 card_id 带反引号与前导零("`00123")⇒ 本域统一去掉,
-//   否则同一个会员在两端是两个字面量不同的 id ⇒ 查不到、还会重复建卡。
-//   (口径见 docs/FIELD_SPEC.md 的 members.id 说明。)
+//
+//	否则同一个会员在两端是两个字面量不同的 id ⇒ 查不到、还会重复建卡。
+//	(口径见 docs/FIELD_SPEC.md 的 members.id 说明。)
 func normalizeMemberID(raw string) string {
 	v := strings.TrimSpace(raw)
 	v = strings.Trim(v, "`'\"")
@@ -480,7 +505,8 @@ func normalizeMemberID(raw string) string {
 // memberTypeNameOf 把思迅的 card_type 解析成**类别名**。
 //
 // ⚠️ 认不出来时返回 ""(调用方跳过该行 + warning)——
-//   绝不"猜一个类别"、更不能"自动建一个"。
+//
+//	绝不"猜一个类别"、更不能"自动建一个"。
 func memberTypeNameOf(raw string, knownNames map[string]bool) string {
 	v := strings.TrimSpace(raw)
 	if v == "" {
@@ -518,7 +544,8 @@ func memberStatusOf(raw string) (string, bool) {
 // parseDecimalLoose 解析十进制字符串。
 //
 // ⚠️ 空串**不算** 0:返回 ok=false ⇒ 调用方能区分"没有值"与"值是 0"。
-//   (这是余额那条铁律的基础。)
+//
+//	(这是余额那条铁律的基础。)
 func parseDecimalLoose(raw string) (decimal.Decimal, bool) {
 	v := strings.TrimSpace(raw)
 	if v == "" {
@@ -556,8 +583,9 @@ func parseBoolLoose(raw string) bool {
 // parseTimeLoose 尽力把源值解析成时间。
 //
 // ⚠️ 源库的日期列有多种写法(带/不带时分秒、带/不带时间戳)⇒ 多试几种布局。
-//   解析不出来返回 nil(那一列就不写),**不报错** —— 一个生日解析不了
-//   不该让整张卡导不进来。
+//
+//	解析不出来返回 nil(那一列就不写),**不报错** —— 一个生日解析不了
+//	不该让整张卡导不进来。
 func parseTimeLoose(raw string) *time.Time {
 	v := strings.TrimSpace(raw)
 	if v == "" {
@@ -582,7 +610,8 @@ func parseTimeLoose(raw string) *time.Time {
 // warnCollector 收集 warning(带上限)。
 //
 // ⚠️ 上限的意义:一次全量导入可能产生上千条同类 warning,
-//   全量返回会把响应体撑大,并把"第一条真正的异常"淹没 ⇒ 截断 + 汇总说明。
+//
+//	全量返回会把响应体撑大,并把"第一条真正的异常"淹没 ⇒ 截断 + 汇总说明。
 type warnCollector struct {
 	items []string
 	extra int

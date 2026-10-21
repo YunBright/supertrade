@@ -141,9 +141,10 @@ func (f fakeToken) AccessToken(context.Context) (string, error) {
 // newTestSyncer 造一个 Syncer(fake 依赖)。
 //
 // ⚠️ 路由表:**catalog 拥有四个档案 scope**,prices/promotions 归 pricing,
-//   stock 归 inventory,member_types/members 归 member。
 //
-//	这里几个归属方都指向同一个 fake(测试不关心下游是谁)。
+//	  stock 归 inventory,member_types/members 归 member。
+//
+//		这里几个归属方都指向同一个 fake(测试不关心下游是谁)。
 func newTestSyncer(cfg Config, ex Exporter, im Importer) *Syncer {
 	s := NewSyncer(cfg, fakeToken{token: "T"}, ex, []Owner{
 		{Importer: im, Scopes: DefaultCatalogScopes()},

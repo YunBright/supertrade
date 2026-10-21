@@ -24,8 +24,9 @@ func profileStrPtr(s string) *string { return &s }
 // seedMemberWithOp 造一个会员(带**唯一** op_id)。
 //
 // ⚠️ 为什么不用共享的 seedMember:它不写 op_id ⇒ 空串撞上 members.op_id 的唯一索引
-//   ⇒ 同一个测试里插第二个会员就报 UNIQUE constraint failed。
-//   (op_id 在生产里总是有值 —— 开卡时写进去的。)
+//
+//	⇒ 同一个测试里插第二个会员就报 UNIQUE constraint failed。
+//	(op_id 在生产里总是有值 —— 开卡时写进去的。)
 func seedMemberWithOp(t *testing.T, db *gorm.DB, id, branchID string) {
 	t.Helper()
 	require.NoError(t, db.Create(&model.Member{
@@ -33,7 +34,7 @@ func seedMemberWithOp(t *testing.T, db *gorm.DB, id, branchID string) {
 		OpID:              "seed-" + branchID + "-" + id,
 		Status:            model.MemberStatusNormal,
 		PointsAccumulated: decimal.Zero, PointsUsed: decimal.Zero,
-		BalanceYuan:        decimal.Zero, ConsumedAmountYuan: decimal.Zero,
+		BalanceYuan: decimal.Zero, ConsumedAmountYuan: decimal.Zero,
 		CreatedBy: "test", CreatedAt: time.Now(), UpdatedAt: time.Now(),
 	}).Error)
 }
@@ -59,7 +60,8 @@ func TestUpdateProfile_ChangesName(t *testing.T) {
 // TestUpdateProfile_UnsetFieldsUnchanged 锁"未传的字段保持原值"。
 //
 // ⚠️ 这是局部更新语义的核心:管理端只改一个字段时,
-//   全量替换会把没改的清掉(电话/性别/爱好…全没了)。
+//
+//	全量替换会把没改的清掉(电话/性别/爱好…全没了)。
 func TestUpdateProfile_UnsetFieldsUnchanged(t *testing.T) {
 	svc, db := newService(t)
 	seedType(t, db, "T1", "10", "会员卡")

@@ -73,7 +73,7 @@ func (h *Handler) updateConfig(c *gin.Context) {
 		UpdatedBy:         callerSub(c),
 	}
 	// ⚠️ 比率解析失败 ⇒ 400(不能静默当 0 ——
-//	//	"把积分率设成 0" 与 "没传 points_rate" 完全是两件事)。
+	//	//	"把积分率设成 0" 与 "没传 points_rate" 完全是两件事)。
 	if req.PointsRate != nil {
 		d, err := decimal.NewFromString(strings.TrimSpace(*req.PointsRate))
 		if err != nil {

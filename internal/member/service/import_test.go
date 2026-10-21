@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -35,7 +36,8 @@ func scopeRow(t *testing.T, rep *archivedto.ImportResult, scope string) archived
 // TestImportMembers_NewMember_Bootstrap 锁"新会员 ⇒ 用思迅值初始化"。
 //
 // ⚠️ 这是"bootstrap 基线":积分/储值/消费/状态**从源库取**,
-//   因为本域还没有这张卡、没有本域发生过的业务。
+//
+//	因为本域还没有这张卡、没有本域发生过的业务。
 func TestImportMembers_NewMember_Bootstrap(t *testing.T) {
 	svc, db := newService(t)
 	seedType(t, db, "T1", "10", "会员卡")
@@ -43,24 +45,24 @@ func TestImportMembers_NewMember_Bootstrap(t *testing.T) {
 	rep, err := svc.ImportMembers(importCtx(), service.MemberImportInput{
 		SourceBranchID: "00", TargetBranchID: "10", Mode: "incremental",
 		Data: archivedto.ImportData{Members: []archivedto.ImportMemberRow{{
-			ID:                "M0001",
-			CardType:          "0", // 会员卡
-			Name:              "张三",
-			Phone:             "13800000000",
-			Gender:            "男",
-			Status:            "0", // normal
-			FeeAmountYuan:     "10.00",
-			LimitedUseCount:   "999998", // 不限次哨兵
-			PointsAccumulated: "10",
-			PointsUsed:        "2",
-			BalanceYuan:       "100.50",
+			ID:                 "M0001",
+			CardType:           "0", // 会员卡
+			Name:               "张三",
+			Phone:              "13800000000",
+			Gender:             "男",
+			Status:             "0", // normal
+			FeeAmountYuan:      "10.00",
+			LimitedUseCount:    "999998", // 不限次哨兵
+			PointsAccumulated:  "10",
+			PointsUsed:         "2",
+			BalanceYuan:        "100.50",
 			ConsumedAmountYuan: "88.80",
-			ConsumedCount:     "3",
-			BranchNo:          "00",
-			OperatorID:        "1003",
-			OperatedAt:        "2024-05-01 10:00:00",
-			ValidFrom:         "2024-05-01",
-			ValidUntil:        "2030-05-01",
+			ConsumedCount:      "3",
+			BranchNo:           "00",
+			OperatorID:         "1003",
+			OperatedAt:         "2024-05-01 10:00:00",
+			ValidFrom:          "2024-05-01",
+			ValidUntil:         "2030-05-01",
 		}}},
 	})
 	require.NoError(t, err)
@@ -89,7 +91,8 @@ func TestImportMembers_NewMember_Bootstrap(t *testing.T) {
 // TestImportMembers_ExistingMember_KeepsFinancialColumns 是本任务**最关键**的一条。
 //
 // ⚠️ 积分/储值/消费/状态是本域 POS 业务的事实源(sale.paid 订阅会给会员加积分)
-//   ⇒ 导入**绝不能**覆盖它们。
+//
+//	⇒ 导入**绝不能**覆盖它们。
 //
 // ⇒ 已存在的会员 ⇒ 只更新身份字段(姓名/电话/…)。
 func TestImportMembers_ExistingMember_KeepsFinancialColumns(t *testing.T) {
@@ -100,27 +103,27 @@ func TestImportMembers_ExistingMember_KeepsFinancialColumns(t *testing.T) {
 	require.NoError(t, db.Model(&model.Member{}).
 		Where("id = ? AND branch_id = ?", "M0001", "10").
 		Updates(map[string]any{
-			"points_accumulated":  decimal.NewFromInt(500),
-			"points_used":         decimal.NewFromInt(100),
-			"balance_yuan":        decimal.NewFromInt(50),
+			"points_accumulated":   decimal.NewFromInt(500),
+			"points_used":          decimal.NewFromInt(100),
+			"balance_yuan":         decimal.NewFromInt(50),
 			"consumed_amount_yuan": decimal.NewFromInt(999),
-			"consumed_count":      9,
-			"status":              model.MemberStatusFrozen,
+			"consumed_count":       9,
+			"status":               model.MemberStatusFrozen,
 		}).Error)
 
 	rep, err := svc.ImportMembers(importCtx(), service.MemberImportInput{
 		TargetBranchID: "10", Mode: "incremental",
 		Data: archivedto.ImportData{Members: []archivedto.ImportMemberRow{{
-			ID:                "M0001",
-			CardType:          "0",
-			Name:              "李四", // 身份字段:应当被更新
-			Phone:             "13900000000",
-			Status:            "0",                    // 源库说正常
-			PointsAccumulated: "10",                   // 源库的旧值
-			PointsUsed:        "0",
-			BalanceYuan:       "0",
+			ID:                 "M0001",
+			CardType:           "0",
+			Name:               "李四", // 身份字段:应当被更新
+			Phone:              "13900000000",
+			Status:             "0",  // 源库说正常
+			PointsAccumulated:  "10", // 源库的旧值
+			PointsUsed:         "0",
+			BalanceYuan:        "0",
 			ConsumedAmountYuan: "0",
-			ConsumedCount:     "0",
+			ConsumedCount:      "0",
 		}}},
 	})
 	require.NoError(t, err)
@@ -176,36 +179,52 @@ func TestImportMembers_OverwriteMode_OverwritesFinancial(t *testing.T) {
 	assert.Equal(t, model.MemberStatusNormal, m.Status)
 }
 
-// TestImportMembers_DirtyBalance_SkipsRow 锁"余额解析失败 ⇒ 该行不落库 + warning"。
+// TestImportMembers_DirtyBalance_ImportsWithZeroBalance 锁"余额不可解析 ⇒ 会员照常落库 + 余额记 0 + warning"。
 //
-// ⚠️ 思迅的 residual_amt 是密文/脏值("@><:6642675" / "86220.." / ",")。
-//   静默当 0 = 把"有余额的会员"变成"余额 0",而余额 0 没人会去查。
-func TestImportMembers_DirtyBalance_SkipsRow(t *testing.T) {
+// ⚠️ 2026-10-21 真库实测后改的语义（原来是"跳过该行"）：
+//
+//	思迅的 residual_amt 整列不可读（4128 行里 3364 行非空，但只有 43 个不同取值，
+//	样例 "@><:6642675" / "86220.." / ","；t_rm_vip_consume.balance_amount 全是 0）。
+//	⇒ 跳整行会**丢掉 3364 个会员**，而会员的姓名/手机/卡号/积分都是好的。
+//	⇒ 改为：会员落库 + 余额记 0 + 一条 warning（不静默）。
+func TestImportMembers_DirtyBalance_ImportsWithZeroBalance(t *testing.T) {
 	svc, db := newService(t)
 	seedType(t, db, "T1", "10", "会员卡")
 
-	for _, dirty := range []string{"@><:6642675", "86220..", ","} {
+	for i, dirty := range []string{"@><:6642675", "86220..", ","} {
+		// ⚠️ 每个脏值用**不同的会员号** —— 否则第二轮起就是 update，
+		//   断言"inserted==1"会误判（那是测试写错，不是实现错）。
+		id := fmt.Sprintf("M%04d", i+1)
 		rep, err := svc.ImportMembers(importCtx(), service.MemberImportInput{
 			TargetBranchID: "10", Mode: "incremental",
 			Data: archivedto.ImportData{Members: []archivedto.ImportMemberRow{{
-				ID: "M0001", CardType: "0", Name: "张三", Status: "0", BalanceYuan: dirty,
+				ID: id, CardType: "0", Name: "张三", Status: "0", BalanceYuan: dirty,
 			}}},
 		})
 		require.NoError(t, err)
 		row := scopeRow(t, rep, archivedto.ScopeMembers)
-		assert.Equal(t, 1, row.Skipped, "脏值 %q ⇒ 跳过", dirty)
-		assert.Equal(t, 0, row.Inserted)
+		assert.Equal(t, 1, row.Inserted, "脏余额 %q ⇒ 会员仍要落库", dirty)
+		assert.Equal(t, 0, row.Skipped, "不能因为一个字段读不了就丢掉客户")
 		assert.NotEmpty(t, rep.Warnings, "必须有 warning(不能静默)")
 		assert.True(t, strings.Contains(strings.Join(rep.Warnings, "|"), "余额"),
 			"warning 必须说清是余额的问题: %v", rep.Warnings)
 	}
 	var n int64
 	require.NoError(t, db.Model(&model.Member{}).Count(&n).Error)
-	assert.Equal(t, int64(0), n, "脏余额的行不得落库")
+	assert.Equal(t, int64(3), n, "三个会员都必须落库")
+
+	var m model.Member
+	require.NoError(t, db.Where("id = ? AND branch_id = ?", "M0001", "10").First(&m).Error)
+	assert.Equal(t, "0", m.BalanceYuan.String(), "余额未知 ⇒ 记 0")
+	assert.Equal(t, "张三", m.Name, "身份字段必须完好")
 }
 
-// TestImportMembers_EmptyBalance_SkipsRow 锁"余额为空 ⇒ 同样跳过 + warning"。
-func TestImportMembers_EmptyBalance_SkipsRow(t *testing.T) {
+// TestImportMembers_EmptyBalance_ImportsWithoutWarning 锁"余额为空 ⇒ 落库、余额 0、**不告警**"。
+//
+// ⚠️ 实测 764 行空余额**全部是会员卡**（card_type=0）——
+//
+//	会员卡本来就没有储值 ⇒ 空是常态，不是异常 ⇒ 不该刷 warning。
+func TestImportMembers_EmptyBalance_ImportsWithoutWarning(t *testing.T) {
 	svc, db := newService(t)
 	seedType(t, db, "T1", "10", "会员卡")
 
@@ -216,18 +235,23 @@ func TestImportMembers_EmptyBalance_SkipsRow(t *testing.T) {
 		}}},
 	})
 	require.NoError(t, err)
-	assert.Equal(t, 1, scopeRow(t, rep, archivedto.ScopeMembers).Skipped)
-	assert.NotEmpty(t, rep.Warnings)
+	assert.Equal(t, 1, scopeRow(t, rep, archivedto.ScopeMembers).Inserted)
+	// ⚠️ 断言的是"**没有余额相关的 warning**"，不是"一条 warning 都没有"——
+	//   本用例的行没填积分/限用次数，那些字段会各自产生一条 warning（那是对的）。
+	assert.NotContains(t, strings.Join(rep.Warnings, "|"), "余额",
+		"空余额是常态，不该刷余额 warning: %v", rep.Warnings)
+
 	var n int64
 	require.NoError(t, db.Model(&model.Member{}).Count(&n).Error)
-	assert.Equal(t, int64(0), n)
+	assert.Equal(t, int64(1), n)
 }
 
 // TestImportMembers_CardTypeWithoutCategory_SkipsRow 锁"类别不存在 ⇒ 跳过 + warning(不自动建类别)"。
 //
 // ⚠️ 门店10 只有 MT-STD-10(会员卡) / MT-SAV-10(储值卡);
-//   源库里 card_type=2(VIP储值卡)的那 1 行**没有对应类别**
-//   ⇒ 跳过 + warning,**不自动建类别**(类别是门店自己维护的字典)。
+//
+//	源库里 card_type=2(VIP储值卡)的那 1 行**没有对应类别**
+//	⇒ 跳过 + warning,**不自动建类别**(类别是门店自己维护的字典)。
 func TestImportMembers_CardTypeWithoutCategory_SkipsRow(t *testing.T) {
 	svc, db := newService(t)
 	seedType(t, db, "MT-STD-10", "10", "会员卡")
@@ -252,7 +276,8 @@ func TestImportMembers_CardTypeWithoutCategory_SkipsRow(t *testing.T) {
 // TestImportMembers_UnknownStatus_IsFrozen 锁"card_status=3 ⇒ frozen(保守处理)"。
 //
 // ⚠️ 思迅 V10 的 3 **没有权威文档** ⇒ 保守按"冻结"处理,
-//   绝不写 normal(猜错的代价是一张本该停用的卡在 POS 上能正常消费)。
+//
+//	绝不写 normal(猜错的代价是一张本该停用的卡在 POS 上能正常消费)。
 func TestImportMembers_UnknownStatus_IsFrozen(t *testing.T) {
 	svc, db := newService(t)
 	seedType(t, db, "T1", "10", "会员卡")
@@ -371,7 +396,8 @@ func TestImportMembers_Idempotent(t *testing.T) {
 // TestImportMembers_NormalizesMemberID 锁"会员号去反引号与前导零"。
 //
 // ⚠️ 口径见 docs/FIELD_SPEC.md(members.id):思迅 card_id 带反引号与前导零,
-//   不规整 ⇒ 同一个会员在两端是两个 id ⇒ 查不到 + 重复建卡。
+//
+//	不规整 ⇒ 同一个会员在两端是两个 id ⇒ 查不到 + 重复建卡。
 func TestImportMembers_NormalizesMemberID(t *testing.T) {
 	svc, db := newService(t)
 	seedType(t, db, "T1", "10", "会员卡")

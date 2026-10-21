@@ -24,7 +24,8 @@ import (
 // TestDefaultMemberScopes_Order 锁"member_types 在 members 之前"。
 //
 // ⚠️ 会员引用类别(members.card_type_id → member_types.id)⇒
-//   反过来就是"引用了还不存在的对象"。
+//
+//	反过来就是"引用了还不存在的对象"。
 func TestDefaultMemberScopes_Order(t *testing.T) {
 	scopes := DefaultMemberScopes()
 	require.Len(t, scopes, 2)
@@ -88,7 +89,8 @@ func TestSync_MemberScopes_GoToMemberImporter(t *testing.T) {
 // TestBuildImportData_Members_KeepsRawValues 锁"会员行的**原值**原样带出"。
 //
 // ⚠️ 语义归一化(状态映射 / 999998 哨兵 / 脏余额)在**导入端**做 ——
-//   在编排层"顺手翻译"会把"读不懂"变成"余额 0",而余额 0 没人会去查。
+//
+//	在编排层"顺手翻译"会把"读不懂"变成"余额 0",而余额 0 没人会去查。
 func TestBuildImportData_Members_KeepsRawValues(t *testing.T) {
 	row := map[string]any{
 		"id": "M1", "card_type": "0", "name": "张三", "status": "3",
@@ -108,8 +110,9 @@ func TestBuildImportData_Members_KeepsRawValues(t *testing.T) {
 // TestSidecarImporter_MemberImportPath 锁"member 的导入端点是 /import"。
 //
 // ⚠️ catalog / pricing / inventory 都是 /archive/import,
-//   而 member 是 /import(前端路径 /api/v1/member/import)⇒
-//   写死一个路径的话 member 那边 404,而症状是"会员一个都没导"。
+//
+//	而 member 是 /import(前端路径 /api/v1/member/import)⇒
+//	写死一个路径的话 member 那边 404,而症状是"会员一个都没导"。
 func TestSidecarImporter_MemberImportPath(t *testing.T) {
 	var gotPath string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

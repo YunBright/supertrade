@@ -210,7 +210,8 @@ func TestPermissions_ScopesAreDedupedAndSorted(t *testing.T) {
 // TestPermissions_OtherBranchNotLeaked 锁"别的门店的权限不串台"。
 //
 // ⚠️ 矩阵里有 "10" 与 "20" 两行,查 "10" ⇒ 只返 "10" 行的 scope。
-//   (若过滤写坏,"20" 行的 scope 会混进来 ⇒ 客户端会以为自己有别家店的权限。)
+//
+//	(若过滤写坏,"20" 行的 scope 会混进来 ⇒ 客户端会以为自己有别家店的权限。)
 func TestPermissions_OtherBranchNotLeaked(t *testing.T) {
 	stub := &permUserdStub{rows: []userinfo.BranchPermissionsRow{
 		{BranchID: "10", Scopes: []string{"member:view", "member:point-deduct"}},
@@ -231,9 +232,10 @@ func TestPermissions_OtherBranchNotLeaked(t *testing.T) {
 // TestPermissions_NoScopeInBranch_403 锁"该店一个 scope 都没有 ⇒ 403 forbidden"。
 //
 // ⚠️ **这是"没有权限"的真实表现形态** —— 不是 200 + 空数组:
-//   守门(rbac.RequireScopeWithBranch)要求该店有 member:view,
-//   没有就直接 403,根本进不到 handler。
-//   ⇒ 客户端拿到 403 要按"没有权限"处理(fail-closed)。
+//
+//	守门(rbac.RequireScopeWithBranch)要求该店有 member:view,
+//	没有就直接 403,根本进不到 handler。
+//	⇒ 客户端拿到 403 要按"没有权限"处理(fail-closed)。
 func TestPermissions_NoScopeInBranch_403(t *testing.T) {
 	stub := &permUserdStub{rows: []userinfo.BranchPermissionsRow{
 		{BranchID: "10", Scopes: []string{"member:view", "member:point-deduct"}},
@@ -281,7 +283,8 @@ func TestPermissions_NoScope_403(t *testing.T) {
 // TestPermissions_ScopesUnavailable_EmptyWithWarning 锁"查不到 ⇒ 空数组 + warnings(**不 500**)"。
 //
 // ⚠️ 守门那一次调用成功(第 1 次)、handler 那一次失败(第 2 次)
-//   ⇒ 才会走到"查不到"的分支。
+//
+//	⇒ 才会走到"查不到"的分支。
 func TestPermissions_ScopesUnavailable_EmptyWithWarning(t *testing.T) {
 	stub := &permUserdStub{
 		rows: []userinfo.BranchPermissionsRow{
@@ -303,7 +306,8 @@ func TestPermissions_ScopesUnavailable_EmptyWithWarning(t *testing.T) {
 // TestPermissions_UserdDown_503 锁"userd 挂 ⇒ 503(不是 200 空数组)"。
 //
 // ⚠️ 守门那一次调用就失败 ⇒ rbac 中间件返 503 userd_unavailable。
-//   ⇒ 客户端要把 503 当"**查不到**"(不是"没有权限")。
+//
+//	⇒ 客户端要把 503 当"**查不到**"(不是"没有权限")。
 func TestPermissions_UserdDown_503(t *testing.T) {
 	stub := &permUserdStub{failFromCall: 1}
 	r := newPermEngine(t, stub, true)

@@ -368,31 +368,31 @@ var memberDimensions = []string{
 // ⚠️ 与 memberDimensions 一一对应(cube 的 order 要求 order 成员在 SELECT 里,
 // 且维度元组是 GROUP BY 的键 ⇒ 按它排序必是全序,翻页不会重复/漏行)。
 var memberFields = map[string]string{
-	"member.id":                     "id",
-	"member.card_face_no":           "card_face_no",
-	"member.card_type":              "card_type",
-	"member.name":                   "name",
-	"member.gender":                 "gender",
-	"member.phone":                  "phone",
-	"member.mobile":                 "mobile",
-	"member.birthday":               "birthday",
-	"member.id_card_no":             "id_card_no",
-	"member.status":                 "status",
-	"member.fee_amount_yuan":        "fee_amount_yuan",
-	"member.limited_use_count":      "limited_use_count",
-	"member.points_accumulated":     "points_accumulated",
-	"member.points_used":            "points_used",
-	"member.balance_yuan":           "balance_yuan",
-	"member.consumed_amount_yuan":   "consumed_amount_yuan",
-	"member.consumed_count":         "consumed_count",
-	"member.favorite":               "favorite",
-	"member.remark":                 "remark",
-	"member.branch_no":              "branch_no",
-	"member.operator_id":            "operator_id",
-	"member.operated_at":            "operated_at",
-	"member.valid_from":             "valid_from",
-	"member.valid_until":            "valid_until",
-	"member.open_id":                "open_id",
+	"member.id":                   "id",
+	"member.card_face_no":         "card_face_no",
+	"member.card_type":            "card_type",
+	"member.name":                 "name",
+	"member.gender":               "gender",
+	"member.phone":                "phone",
+	"member.mobile":               "mobile",
+	"member.birthday":             "birthday",
+	"member.id_card_no":           "id_card_no",
+	"member.status":               "status",
+	"member.fee_amount_yuan":      "fee_amount_yuan",
+	"member.limited_use_count":    "limited_use_count",
+	"member.points_accumulated":   "points_accumulated",
+	"member.points_used":          "points_used",
+	"member.balance_yuan":         "balance_yuan",
+	"member.consumed_amount_yuan": "consumed_amount_yuan",
+	"member.consumed_count":       "consumed_count",
+	"member.favorite":             "favorite",
+	"member.remark":               "remark",
+	"member.branch_no":            "branch_no",
+	"member.operator_id":          "operator_id",
+	"member.operated_at":          "operated_at",
+	"member.valid_from":           "valid_from",
+	"member.valid_until":          "valid_until",
+	"member.open_id":              "open_id",
 }
 
 // exportQuery 是发给 cube 的查询体。
@@ -646,14 +646,15 @@ func isNumericField(name string) bool {
 // numericContractFields 是"导出值应该是**数字字符串**"的列名集合(除 `_yuan` / `qty` 之外)。
 //
 // ⚠️ 为什么会员的积分 / 次数列也要走数字通道:
-//   1. **精度**:JSON number 到 Dart 侧会变成 double(9.90 → 9.899999999999999)。
-//   2. **契约**:导入端的字段是 string ⇒ number 会让整批反序列化**直接失败**。
-//   3. **兼容**:思迅 live 源的 decimal 列经 MSSQL 驱动出来是 `[]byte`
-//      ⇒ `encoding/json` 序列化成 **base64** ⇒ 必须走 decodeNumeric 的兼容分支。
+//  1. **精度**:JSON number 到 Dart 侧会变成 double(9.90 → 9.899999999999999)。
+//  2. **契约**:导入端的字段是 string ⇒ number 会让整批反序列化**直接失败**。
+//  3. **兼容**:思迅 live 源的 decimal 列经 MSSQL 驱动出来是 `[]byte`
+//     ⇒ `encoding/json` 序列化成 **base64** ⇒ 必须走 decodeNumeric 的兼容分支。
 //
 // ⚠️ 脏值(如 residual_amt 的 "@><:6642675")**原样带出**:
-//   decodeNumeric 解析不了就返回 false ⇒ exportValue 落到字符串分支 ⇒ 保留原文
-//   ⇒ 导入端能识别"这个值我读不懂"并报告它(而不是静默当 0)。
+//
+//	decodeNumeric 解析不了就返回 false ⇒ exportValue 落到字符串分支 ⇒ 保留原文
+//	⇒ 导入端能识别"这个值我读不懂"并报告它(而不是静默当 0)。
 var numericContractFields = map[string]bool{
 	"points_accumulated": true,
 	"points_used":        true,

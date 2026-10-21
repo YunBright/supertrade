@@ -301,8 +301,9 @@ type ImportData struct {
 // ⚠️ 折扣率一律**字符串**:JSON number 到 Dart 侧会变成 double,精度当场丢。
 //
 // ⚠️ allow_stored_value / allow_points_pay 也用**字符串**("1"/"0"/"true"/"false")
-//   —— 源库那两个列是 0/1 的 char,不是布尔;用 bool 接收时
-//   源值是字符串就会反序列化失败(整批导入报错)。
+//
+//	—— 源库那两个列是 0/1 的 char,不是布尔;用 bool 接收时
+//	源值是字符串就会反序列化失败(整批导入报错)。
 type ImportMemberTypeRow struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`

@@ -276,13 +276,15 @@ func TestAuthorize_HasScope_Allowed(t *testing.T) {
 // TestAuthorize_OnlyAuthorizedBy_Denied 锁"**只带** authorized_by ⇒ 必须被拒"。
 //
 // ⚠️ 2026-10-21 安全修复:旧实现里这一支直接放行 ⇒
-//   任何调用方只要在 body 里填一个工号,就能在**没有任何权限**的情况下
-//   完成写操作(开卡 / 赠分 / 充值 / 改状态 …)——
-//   而 POST /members 这些端点是**登录用户就能调到的**。
+//
+//	任何调用方只要在 body 里填一个工号,就能在**没有任何权限**的情况下
+//	完成写操作(开卡 / 赠分 / 充值 / 改状态 …)——
+//	而 POST /members 这些端点是**登录用户就能调到的**。
 //
 // ⇒ 现在:调用方自己没有该 scope 时,必须走 authorization(工号 + 口令)让 member 验。
 // ⇒ 返的是 member_permission_required(带 required_scope):
-//   POS 收到它会弹授权框(图4)⇒ 调用方补凭据即可继续。
+//
+//	POS 收到它会弹授权框(图4)⇒ 调用方补凭据即可继续。
 func TestAuthorize_OnlyAuthorizedBy_Denied(t *testing.T) {
 	svc, _ := newService(t)
 	svc.SetScopeChecker(fakeChecker{scopes: map[string]bool{}})
@@ -303,7 +305,8 @@ func TestAuthorize_OnlyAuthorizedBy_Denied(t *testing.T) {
 // TestAuthorize_HasScope_AuthorizedByPassedThrough 锁"自己**有** scope ⇒ authorized_by 仍可透传(审计)。
 //
 // ⚠️ 修复只堵"没有权限却自称已授权"这条路;
-//   有权限的调用方带 authorized_by(例如"店长在场")仍然放行并写审计。
+//
+//	有权限的调用方带 authorized_by(例如"店长在场")仍然放行并写审计。
 func TestAuthorize_HasScope_AuthorizedByPassedThrough(t *testing.T) {
 	svc, _ := newService(t)
 	svc.SetScopeChecker(fakeChecker{scopes: map[string]bool{

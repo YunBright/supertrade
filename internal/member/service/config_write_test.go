@@ -12,9 +12,9 @@ import (
 	"github.com/YunBright/supertrade/internal/member/service"
 )
 
-func boolPtr(b bool) *bool          { return &b }
-func intPtr(i int) *int             { return &i }
-func strPtr(s string) *string       { return &s }
+func boolPtr(b bool) *bool                      { return &b }
+func intPtr(i int) *int                         { return &i }
+func strPtr(s string) *string                   { return &s }
 func decPtr(d decimal.Decimal) *decimal.Decimal { return &d }
 
 // TestUpsertSettings_Create_ThenReadBack 锁"写完能读回来"。

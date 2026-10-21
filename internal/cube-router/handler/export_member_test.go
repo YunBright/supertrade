@@ -20,7 +20,8 @@ import (
 // TestExportScopeMembers_NoWindow 锁"会员 scope **没有**时效窗口"。
 //
 // ⚠️ 会员主档是"当前状态"而不是流水 ⇒ 导出的天然是源库此刻的会员。
-//   误加 inDateRange ⇒ 恒不匹配 ⇒ **永远导不出行而且不报错**。
+//
+//	误加 inDateRange ⇒ 恒不匹配 ⇒ **永远导不出行而且不报错**。
 func TestExportScopeMembers_NoWindow(t *testing.T) {
 	for _, scope := range []string{"members", "member_types"} {
 		sc, ok := exportScopes[scope]
@@ -97,8 +98,9 @@ func TestExportValue_MemberNumericFields(t *testing.T) {
 // TestExportValue_DirtyBalanceKeptAsIs 锁"脏余额**原样带出**"。
 //
 // ⚠️ 思迅的 residual_amt 是密文/脏值("@><:6642675" / "86220.." / ",")⇒
-//   导出端"顺手"把它变成 0 = 把"读不懂"说成"余额 0"
-//   ⇒ 导入端就永远不会报"这个值我读不懂"。
+//
+//	导出端"顺手"把它变成 0 = 把"读不懂"说成"余额 0"
+//	⇒ 导入端就永远不会报"这个值我读不懂"。
 func TestExportValue_DirtyBalanceKeptAsIs(t *testing.T) {
 	for _, dirty := range []string{"@><:6642675", "86220..", ","} {
 		got := exportValue(json.RawMessage(`"`+dirty+`"`), "balance_yuan")

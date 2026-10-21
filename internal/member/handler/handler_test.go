@@ -170,8 +170,9 @@ func TestHandler_Deduct_NoScope_PermissionRequired(t *testing.T) {
 // TestHandler_Deduct_OnlyAuthorizedBy_Denied 锁"**只带** authorized_by ⇒ 403"。
 //
 // ⚠️ 2026-10-21 安全修复:旧实现里"只带 authorized_by"直接放行 ⇒
-//   任何调用方只要在 body 里填一个工号,就能在**没有任何权限**的情况下
-//   完成写操作(这里是冲减积分)。
+//
+//	任何调用方只要在 body 里填一个工号,就能在**没有任何权限**的情况下
+//	完成写操作(这里是冲减积分)。
 //
 // ⇒ 现在必须带 authorization(工号 + 口令)让 member 侧验。
 func TestHandler_Deduct_OnlyAuthorizedBy_Denied(t *testing.T) {
