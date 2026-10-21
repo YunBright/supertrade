@@ -2,7 +2,7 @@
 #
 # 生产部署由 F:\go\src\github.com\YunBright\deployer\deploy-supertrade.ps1 驱动。
 # 该脚本的契约(必须严格满足):
-#   - 必须在 <SupertradeDir>/dist/ 下产出 16 个 .tar.gz 归档(每个二进制一个)
+#   - 必须在 <SupertradeDir>/dist/ 下产出 18 个 .tar.gz 归档(每个二进制一个)
 #   - 归档文件名 = <project>_<version>_<OS>_<arch>.tar.gz(被脚本当 leaf 传到 ssh tar -xzf)
 #   - 解压必须能在 <RemoteDir>/apps/<name>/ 下完成,extract 步骤是
 #     `cd <归档所在父目录> && tar -xzf <leaf>`,所以归档内部结构 = 生产 cwd 的内容
@@ -80,7 +80,7 @@ before:
     - go mod tidy
 
 builds:
-  # 16 个 binary,每个 build 的 id == binary 名。这样 `goreleaser --id stocktake`
+  # 18 个 binary,每个 build 的 id == binary 名。这样 `goreleaser --id stocktake`
   # 会只构建 stocktake 一个并产出 dist/apps/stocktake/stocktake_<ver>_Linux_x86_64.tar.gz,
   # 是 deploy-supertrade.ps1 -Service <name> 单服务部署的根基。
   - main: ./cmd/catalog
@@ -304,8 +304,47 @@ builds:
       - goos: linux
         goarch: 386
 
+  # 2026-10-21 新增:cube-sync(cube → catalog 档案同步编排器)。
+  #
+  # ⚠️ 它**不连任何数据库** —— 只做编排:
+  #   导出 ← cube-router GET /v1/export
+  #   导入 → catalog     POST /archive/import
+  # ⇒ 不需要 POSTGRES_DSN,也不带 dapr components(不订阅任何 topic)。
+  #
+  # ⚠️ 端口 8116:8110~8115 已占(见 deployer/tests/contract 的端口占用断言)。
+  - main: ./cmd/cube-sync
+    id: "cube-sync"
+    binary: "cube-sync"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  # 2026-10-21 新增:member(会员域)。
+  #
+  # ⚠️ 端口 8113:8110~8112 已占(sales-agg 8110 / pricing 8111 / sales-insight 8112),
+  #    8113~8115 分给 member / pos / pos-gateway。
+  #    (deployer/tests/contract 的端口占用断言会挡住冲突。)
+  - main: ./cmd/member
+    id: "member"
+    binary: "member"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
 archives:
-  # 16 个 archive,每个 binary 一份,name_template 用 apps/<name>/ 前缀,这样
+  # 18 个 archive,每个 binary 一份,name_template 用 apps/<name>/ 前缀,这样
   # deploy-supertrade.ps1 自动在远端 <RemoteDir>/apps/<name>/ 下建子目录 + scp + 解压,
   # 镜像 cube 的 semantic-layers/<family>/ 模式 —— 不同 binary 不互相覆盖同名二进制。
   # wrap_in_directory: false —— 避免 tarball 内多套一层同名目录,确保解压后
@@ -326,6 +365,14 @@ archives:
       - inventory
     wrap_in_directory: false
     name_template: 'apps/inventory/inventory_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+    # 2026-10-21:inventory 额外打包 pubsub 组件。
+    # 缺它 ⇒ sidecar 加载不到 tradewind-pubsub ⇒ /dapr/subscribe 不被调用
+    # ⇒ **sale.paid 永远送不到库存** ⇒ 卖货不扣库存,而且零报错。
+    # 解压后顶层 = inventory + components/pubsub.yaml,与 systemd unit 的
+    # `--resources-path /opt/YunBright/supertrade/apps/inventory/components` 对齐。
+    files:
+      - src: dapr/components/inventory/*
+        dst: components
 
   - id: "cube-router"
     format: tar.gz
@@ -371,6 +418,25 @@ archives:
       - pos
     wrap_in_directory: false
     name_template: 'apps/pos/pos_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+    # 2026-10-21:pos 额外打包 pubsub 组件。
+    # 缺它 ⇒ sidecar 加载不到 tradewind-pubsub ⇒ outbox 发布器找不到 component
+    # ⇒ **sale.paid 发不出去** ⇒ 库存不扣、积分不加,而且零报错。
+    files:
+      - src: dapr/components/pos/*
+        dst: components
+
+  - id: "member"
+    format: tar.gz
+    builds:
+      - member
+    wrap_in_directory: false
+    name_template: 'apps/member/member_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+    # 2026-10-21:member 额外打包 pubsub 组件。
+    # 它既是**发布侧**(member.opened / member.points.changed / member.updated),
+    # 也是**订阅侧**(sale.paid ⇒ 累计积分)⇒ 两侧都要这条 bus。
+    files:
+      - src: dapr/components/member/*
+        dst: components
 
   - id: "pos-gateway"
     format: tar.gz
@@ -500,6 +566,15 @@ archives:
     files:
       - src: dapr/components/settlement-auditor/*
         dst: components
+
+  # 2026-10-21 新增:cube-sync。
+  # 没有 files 块 —— 它不订阅任何 topic,不需要 dapr Component。
+  - id: "cube-sync"
+    format: tar.gz
+    builds:
+      - cube-sync
+    wrap_in_directory: false
+    name_template: 'apps/cube-sync/cube-sync_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
 
 checksum:
   name_template: 'checksums.txt'
