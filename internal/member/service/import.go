@@ -53,6 +53,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -157,13 +158,27 @@ func (s *Service) ImportMembers(ctx context.Context, in MemberImportInput) (*arc
 	// ① 类别先导 —— 会员引用类别,反了就成"引用了不存在的对象"。
 	typeRow, typeWarn, typeErr := s.importMemberTypes(ctx, target, mode, in.Data.MemberTypes)
 	// ② 会员主档。
-	memRow, memWarn, memErr := s.importMembers(ctx, target, mode, in.Data.Members)
+	memRow, memWarn, memErr, memFatal := s.importMembers(ctx, target, mode, in.Data.Members)
 
 	rep.ByScope = []archivedto.ImportScopeRow{typeRow, memRow}
 	rep.Warnings = append(rep.Warnings, typeWarn...)
 	rep.Warnings = append(rep.Warnings, memWarn...)
 	rep.Errors = append(rep.Errors, typeErr...)
 	rep.Errors = append(rep.Errors, memErr...)
+
+	// ⚠️ **事务级失败必须冒泡**（2026-10-21 契约测试实测）：
+	//
+	//	之前 importMembers 把事务错误丢掉了 ⇒ 接口返 **200 + inserted=0**，
+	//	报告里 received=1 / inserted=0 / skipped=0 / errors 空
+	//	⇒ 看上去"导了但一条没进"，**零报错**。
+	//
+	//	而真正的病因（超长 op_id 撞列宽）**只存在于被丢掉的那个 error 里**。
+	//	⇒ 静默失败 + 病因被吞，是最难查的一类。
+	//
+	//	⇒ 这里原样返回错误 ⇒ handler 的 mapErr 映成 500（带真实原因）。
+	if memFatal != nil {
+		return rep, memFatal
+	}
 	return rep, nil
 }
 
@@ -246,11 +261,11 @@ func (s *Service) importMemberTypes(ctx context.Context, branchID, mode string,
 // ⚠️ **已存在的会员只更新身份字段**(incremental)——
 // 积分 / 储值 / 消费 / 状态是本域 POS 业务的事实源,导入无权覆盖。
 func (s *Service) importMembers(ctx context.Context, branchID, mode string,
-	rows []archivedto.ImportMemberRow) (archivedto.ImportScopeRow, []string, []archivedto.ImportErrorItem) {
+	rows []archivedto.ImportMemberRow) (archivedto.ImportScopeRow, []string, []archivedto.ImportErrorItem, error) {
 
 	res := archivedto.ImportScopeRow{Scope: archivedto.ScopeMembers, Received: len(rows)}
 	if len(rows) == 0 {
-		return res, nil, nil
+		return res, nil, nil, nil
 	}
 	warns := &warnCollector{}
 	errs := &errCollector{}
@@ -258,7 +273,7 @@ func (s *Service) importMembers(ctx context.Context, branchID, mode string,
 	// 本门店的类别(按名字索引)—— 会员引用类别。
 	types, err := s.ListTypes(ctx, branchID)
 	if err != nil {
-		return res, nil, nil
+		return res, nil, nil, err
 	}
 	byName := make(map[string]model.MemberType, len(types))
 	knownNames := make(map[string]bool, len(types))
@@ -427,9 +442,12 @@ func (s *Service) importMembers(ctx context.Context, branchID, mode string,
 		return nil
 	})
 	if err != nil {
-		return res, warns.list(), errs.list()
+		// ⚠️ **原样返回事务错误**（不吞）：吞掉的话接口会返 200 +
+		// inserted=0，看起来"导了但一条没进"，零报错 —— 而病因只存在于
+		// 这个被丢掉的 error 里（见 ImportMembers 的注释）。
+		return res, warns.list(), errs.list(), err
 	}
-	return res, warns.list(), errs.list()
+	return res, warns.list(), errs.list(), nil
 }
 
 // memberIdentityColumns 是 incremental 模式下**允许更新**的列。
@@ -480,8 +498,20 @@ func memberState(tx *gorm.DB, branchID, memberID string) (exists bool, softDelet
 //
 //	用固定 op_id 会撞唯一索引(而且撞的是"另一个"唯一约束 ⇒
 //	ON CONFLICT (id, branch_id) 救不了,直接报错)。
+//
+// ⚠️ **长度必须 ≤ members.op_id 的列宽(64)**：
+//
+//	朴素写法 "import:<branch>:<memberID>:<unixNano>" 在会员号较长时
+//	(思迅卡号 + 门店号 + 时间戳)会超过 64 ⇒ 数据库报错 ⇒ 整个导入事务回滚。
+//	⚠️ 而回滚的错误**曾经被吞掉** ⇒ 接口返 200 + inserted=0，
+//	看上去"导了但一条没进"，**零报错**——最坏的一类静默失败。
+//
+//	⇒ 会员号部分改用 **8 位哈希**（fnv32a），保留可读前缀 + 时间戳；
+//	哈希 + 时间戳已足够保证"同一次导入内不同会员、不同次导入都不同"。
 func importOpID(branchID, memberID string, now time.Time) string {
-	return fmt.Sprintf("import:%s:%s:%d", branchID, memberID, now.UnixNano())
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(memberID))
+	return fmt.Sprintf("import:%s:%08x:%d", branchID, h.Sum32(), now.UnixNano())
 }
 
 // normalizeMemberID 规整会员号。

@@ -219,6 +219,59 @@ func TestImportMembers_DirtyBalance_ImportsWithZeroBalance(t *testing.T) {
 	assert.Equal(t, "张三", m.Name, "身份字段必须完好")
 }
 
+// TestImportMembers_LongMemberID_OpIDStillFitsColumn 锁"会员号很长时也能导入"。
+//
+// ⚠️ 2026-10-21 契约测试实测踩到：导入端自己生成的 op_id 朴素写法是
+//
+//	"import:<branch>:<memberID>:<unixNano>" ⇒ 会员号 50 字符时长度 80 > 64
+//	⇒ 数据库报错 ⇒ 整个导入事务回滚。
+//
+//	⇒ op_id 里的会员号必须用**哈希**，保证列宽内。
+func TestImportMembers_LongMemberID_OpIDStillFitsColumn(t *testing.T) {
+	svc, db := newService(t)
+	seedType(t, db, "T1", "10", "会员卡")
+
+	longID := strings.Repeat("M", 50)
+	rep, err := svc.ImportMembers(importCtx(), service.MemberImportInput{
+		TargetBranchID: "10", Mode: "incremental",
+		Data: archivedto.ImportData{Members: []archivedto.ImportMemberRow{{
+			ID: longID, CardType: "0", Name: "长号会员", Status: "0",
+		}}},
+	})
+	require.NoError(t, err, "长会员号必须能导入: %v", rep.Warnings)
+	row := scopeRow(t, rep, archivedto.ScopeMembers)
+	assert.Equal(t, 1, row.Inserted, "长会员号也要真的落库: %v", rep.Warnings)
+
+	// op_id 必须落在列宽内。
+	var m model.Member
+	require.NoError(t, db.Where("id = ? AND branch_id = ?", longID, "10").First(&m).Error)
+	assert.LessOrEqual(t, len(m.OpID), model.MaxIDLen,
+		"op_id 超过列宽 ⇒ 下一轮导入就会撞库报错")
+}
+
+// TestImportMembers_ErrorIsNotSwallowed 锁"落库失败必须冒泡，不能静默"。
+//
+// ⚠️ 之前 importMembers 把事务错误丢掉了 ⇒ 接口返 **200 + inserted=0**，
+//
+//	报告里 received=1 / inserted=0 / skipped=0 / errors 空
+//	⇒ 看上去"导了但一条没进"，**零报错** —— 静默失败。
+func TestImportMembers_ErrorIsNotSwallowed(t *testing.T) {
+	svc, db := newService(t)
+	seedType(t, db, "T1", "10", "会员卡")
+
+	// 会员号超列宽 ⇒ 落库前被 BeforeSave 拦下 ⇒ 必须把错误抛出来。
+	tooLong := strings.Repeat("X", model.MaxIDLen+1)
+	_, err := svc.ImportMembers(importCtx(), service.MemberImportInput{
+		TargetBranchID: "10", Mode: "incremental",
+		Data: archivedto.ImportData{Members: []archivedto.ImportMemberRow{{
+			ID: tooLong, CardType: "0", Name: "超长号", Status: "0",
+		}}},
+	})
+	require.Error(t, err, "落库失败必须冒泡(不能返 200 + inserted=0 的静默失败)")
+	assert.ErrorIs(t, err, model.ErrInvalidInput,
+		"超长会员号是入参问题 ⇒ 应映成 400,不是 500")
+}
+
 // TestImportMembers_EmptyBalance_ImportsWithoutWarning 锁"余额为空 ⇒ 落库、余额 0、**不告警**"。
 //
 // ⚠️ 实测 764 行空余额**全部是会员卡**（card_type=0）——
