@@ -28,6 +28,16 @@ var (
 	ErrMemberTypeAlreadyExists = errors.New("member: 会员类别已存在")
 	// ErrMemberTypeInUse:该类别下还有会员,不能删(409)。
 	ErrMemberTypeInUse = errors.New("member: 会员类别下仍有会员,不能删除")
+	// ErrCubeSourceUnavailable:问不到"这个门店配了哪个数据源"(503)。
+	//
+	// ⚠️ 与"没配数据源"严格区分:没配是**正常状态**(自营店),
+	// 问不到是**链路故障** ⇒ 后者必须让用户看到"暂不可用",
+	// 而不是让它悄悄回落成"空列表"(那正是本次要修的那个症状)。
+	ErrCubeSourceUnavailable = errors.New("member: 数据源路由暂不可用")
+	// ErrCubeSourceDisabled:该门店的数据源被管理员停用(503)。
+	ErrCubeSourceDisabled = errors.New("member: 该门店的数据源已停用")
+	// ErrExternalSourceReadOnly:该门店的会员档案来自外部系统,本域只读(409)。
+	ErrExternalSourceReadOnly = errors.New("member: 该门店的会员档案来自外部系统,本域只读")
 )
 
 // ---- 会员状态 ----

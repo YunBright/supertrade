@@ -370,7 +370,7 @@ type PointsSummary struct {
 
 // PointsSummaryOf 汇总某会员的积分。
 func (s *Service) PointsSummaryOf(ctx context.Context, branchID, memberID string) (*PointsSummary, error) {
-	member, err := s.getMember(ctx, branchID, memberID)
+	member, err := s.getMemberAny(ctx, branchID, memberID)
 	if err != nil {
 		return nil, err
 	}

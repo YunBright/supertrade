@@ -44,6 +44,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -120,6 +121,15 @@ func (s *Service) OnSalePaid(ctx context.Context, p SalePaidPayload) (*SalePaidR
 	// 退货(R)⇒ 不累计积分(思迅的退货单也不给积分)。
 	if strings.EqualFold(strings.TrimSpace(p.OrderStatus), "R") {
 		return &SalePaidResult{Skipped: true}, nil
+	}
+
+	// ⚠️ 该门店的会员档案来自**外部系统**(富百家 / 佳乐)⇒ 本域不记积分。
+	// 硬写会写进本域 PG 的一行"没人看的会员",而那个门店的账在外部 ERP 里。
+	if err := s.EnsureLocalSource(ctx, branchID); err != nil {
+		if errors.Is(err, model.ErrExternalSourceReadOnly) {
+			return &SalePaidResult{Skipped: true}, nil
+		}
+		return nil, err
 	}
 
 	member, err := s.getMember(ctx, branchID, memberID)

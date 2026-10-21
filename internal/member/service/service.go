@@ -47,6 +47,10 @@ type Service struct {
 	checker ScopeChecker
 	// verifier 校验工号+口令(图4 越权授权链路)。
 	verifier EmployeeVerifier
+	// sources 解析"这个门店配了哪个数据源"(nil = 未装配 ⇒ 一律走本地 PG)。
+	sources SourceResolver
+	// cube 读 cube 里的会员档案(nil = 未装配 ⇒ 一律走本地 PG)。
+	cube MemberReader
 	// now 是可注入时钟(测试用)。
 	now func() time.Time
 }
@@ -86,6 +90,9 @@ func (s *Service) DB() *gorm.DB { return s.db }
 // getMember 取会员(按复合主键 id + branch_id)。
 //
 // ⚠️ 软删行**查不到**:`gorm.DeletedAt` 让 GORM 自动加 `deleted_at IS NULL`。
+//
+// ⚠️ **只查本地 PG**。写端点也用它 —— 写必须落在本域的事实源上,
+// 外部数据源的门店(富百家 / 佳乐)由 EnsureLocalSource 在**进 handler 之前**拒掉。
 func (s *Service) getMember(ctx context.Context, branchID, memberID string) (*model.Member, error) {
 	var row model.Member
 	err := s.db.WithContext(ctx).
@@ -99,6 +106,19 @@ func (s *Service) getMember(ctx context.Context, branchID, memberID string) (*mo
 	}
 	fillDerived(&row)
 	return &row, nil
+}
+
+// getMemberAny 取会员(读端点用):该门店配了数据源 ⇒ 走 cube;否则走本地 PG。
+//
+// ⚠️ 读端点(详情 / 积分 / 储值 / 消费 / 卡信息)统一走它,
+// 写端点**不走**(写要落在本域事实源上)。
+func (s *Service) getMemberAny(ctx context.Context, branchID, memberID string) (*model.Member, error) {
+	if _, useCube, err := s.resolveCubeSource(ctx, branchID); err != nil {
+		return nil, err
+	} else if useCube {
+		return s.getMemberFromCube(ctx, branchID, memberID)
+	}
+	return s.getMember(ctx, branchID, memberID)
 }
 
 // fillDerived 填充派生字段(剩余积分)。

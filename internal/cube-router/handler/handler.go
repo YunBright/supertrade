@@ -3,6 +3,8 @@
 // 路由(/v1/load 由 cmdbootstrap 之外的子路由组注册;admin 由 RequireRole 守门):
 //
 //	POST /v1/load                         业务端点 —— cube:read scope(走 userd per-branch)
+//	POST /v1/branch-source                业务端点 —— 该门店配了哪个数据源(cube:read)
+//	GET  /v1/export                       档案导出(cube:read)
 //	GET  /admin/branch-cube-sources       管理员:列出全部映射
 //	POST /admin/branch-cube-sources       管理员:新增映射
 //	PUT  /admin/branch-cube-sources/:id   管理员:修改映射
@@ -100,6 +102,14 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	biz.GET("/v1/export",
 		rbac.RequireScopeWithBranch("cube:read", branchFromHeaderFromMiddleware, resolver),
 		h.handleExport,
+	)
+	// 「这个门店配了哪个数据源」(见 branch_source.go 的包注释)。
+	//
+	// ⚠️ 与 /v1/load 同一档 scope(cube:read)——
+	// 业务服务在读数据前要靠它决定"走 cube 还是走本地 PG"。
+	biz.POST(BranchSourcePath,
+		rbac.RequireScopeWithBranch("cube:read", branchFromHeaderFromMiddleware, resolver),
+		h.getBranchSource,
 	)
 
 	// 管理端点(仅 admin 角色)

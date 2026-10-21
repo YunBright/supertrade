@@ -203,7 +203,7 @@ func (s *Service) memberByOpID(tx *gorm.DB, branchID, opID string) (*model.Membe
 
 // Get 取会员详情(图3)。
 func (s *Service) Get(ctx context.Context, branchID, memberID string) (*model.Member, error) {
-	return s.getMember(ctx, branchID, memberID)
+	return s.getMemberAny(ctx, branchID, memberID)
 }
 
 // ListMembersInput 是会员查询入参。
@@ -277,6 +277,18 @@ func (s *Service) ListMembersPage(ctx context.Context, in ListMembersInput) ([]m
 		offset = 0
 	}
 
+	// ① 该门店配了数据源(富百家 00 / 佳乐 01)?⇒ 走 cube。
+	//
+	// ⚠️ **必须先判这一条**:这类门店的会员档案在外部系统里,
+	// 本域 PG 一行都没有 ⇒ 不走 cube 的话列表恒为空
+	// (症状:前端显示「该门店还没有会员档案」,而真相是"会员在外部系统里")。
+	if _, useCube, err := s.resolveCubeSource(ctx, branchID); err != nil {
+		return nil, 0, err
+	} else if useCube {
+		return s.listMembersFromCube(ctx, branchID, in)
+	}
+
+	// ② 自营店(没配数据源)⇒ 本域 PG。
 	// ⚠️ **两条独立的查询链** —— 复用同一条链时,Count 留下的 SELECT
 	//   会污染后面的 Find(症状:列表恒为空,且不报错)。
 	countQ, err := applyMemberFilter(s.db.WithContext(ctx).Model(&model.Member{}),

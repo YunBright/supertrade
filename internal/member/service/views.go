@@ -44,7 +44,7 @@ type ConsumeSummary struct {
 
 // ConsumeSummaryOf 汇总某会员的消费。
 func (s *Service) ConsumeSummaryOf(ctx context.Context, branchID, memberID string) (*ConsumeSummary, error) {
-	member, err := s.getMember(ctx, branchID, memberID)
+	member, err := s.getMemberAny(ctx, branchID, memberID)
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +96,7 @@ type RechargeCardView struct {
 
 // RechargeCardOf 取某会员的充值卡信息(图2 F3)。
 func (s *Service) RechargeCardOf(ctx context.Context, branchID, memberID string) (*RechargeCardView, error) {
-	member, err := s.getMember(ctx, branchID, memberID)
+	member, err := s.getMemberAny(ctx, branchID, memberID)
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +158,7 @@ type StoredValueCardView struct {
 
 // StoredValueCardOf 取某会员的一卡通信息(图2 F7)。
 func (s *Service) StoredValueCardOf(ctx context.Context, branchID, memberID string) (*StoredValueCardView, error) {
-	member, err := s.getMember(ctx, branchID, memberID)
+	member, err := s.getMemberAny(ctx, branchID, memberID)
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +224,7 @@ func (s *Service) LastOrderOf(ctx context.Context, branchID, memberID string) (*
 		return nil, fmt.Errorf("%w: branch_id / member_id 必填", model.ErrInvalidInput)
 	}
 	// 会员必须存在(否则前端拿到的是"查无此人",而不是"没消费过")。
-	if _, err := s.getMember(ctx, branchID, memberID); err != nil {
+	if _, err := s.getMemberAny(ctx, branchID, memberID); err != nil {
 		return nil, err
 	}
 	out := &LastOrderView{

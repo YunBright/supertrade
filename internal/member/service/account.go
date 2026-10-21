@@ -210,7 +210,7 @@ type AccountSummary struct {
 
 // AccountSummaryOf 汇总某会员的储值。
 func (s *Service) AccountSummaryOf(ctx context.Context, branchID, memberID string) (*AccountSummary, error) {
-	member, err := s.getMember(ctx, branchID, memberID)
+	member, err := s.getMemberAny(ctx, branchID, memberID)
 	if err != nil {
 		return nil, err
 	}

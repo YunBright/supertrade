@@ -156,12 +156,15 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 		h.updateConfig)
 	r.POST("/types",
 		rbac.RequireScopeWithBranch(model.ScopeConfig, branchFromHeader, resolver),
+		h.requireLocalSource,
 		h.createType)
 	r.PUT("/types/:id",
 		rbac.RequireScopeWithBranch(model.ScopeConfig, branchFromHeader, resolver),
+		h.requireLocalSource,
 		h.updateType)
 	r.DELETE("/types/:id",
 		rbac.RequireScopeWithBranch(model.ScopeConfig, branchFromHeader, resolver),
+		h.requireLocalSource,
 		h.deleteType)
 
 	// ---- 归档导入端点:标准 scope 守门 ----
@@ -170,6 +173,7 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	//   ⇒ 用 member:config(与会员类别/门店会员参数同档),不弹授权框。
 	r.POST("/import",
 		rbac.RequireScopeWithBranch(model.ScopeConfig, branchFromHeader, resolver),
+		h.requireLocalSource,
 		h.importMembers)
 
 	// ---- 会员档案的编辑 / 删除 ----
@@ -177,10 +181,11 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	// ⚠️ PUT /members/:id 是**写端点** ⇒ 走本域的越权授权链路(见下),
 	//   不是 rbac.RequireScopeWithBranch(它只会返 403 forbidden,
 	//   POS 分不出"要弹授权框"与"授权不通过")。
-	r.PUT("/members/:id", h.updateMember)
+	r.PUT("/members/:id", h.requireLocalSource, h.updateMember)
 	// ⚠️ DELETE 是**管理员后台动作**(同 DELETE /types/:id)⇒ 标准 scope 守门。
 	r.DELETE("/members/:id",
 		rbac.RequireScopeWithBranch(model.ScopeConfig, branchFromHeader, resolver),
+		h.requireLocalSource,
 		h.deleteMember)
 
 	// ---- 写端点:会员域自己的授权链路(图4 / 图5) ----
@@ -188,14 +193,38 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	// ⚠️ **不挂 rbac.RequireScopeWithBranch**:它只会返 403 forbidden,
 	//   而 POS 需要区分"要弹授权框"(member_permission_required)
 	//   与"授权不通过"(member_permission_denied)。
-	r.POST("/members", h.openMember)
-	r.POST("/members/:id/points/deduct", h.deductPoints)
-	r.POST("/members/:id/points/grant", h.grantPoints)
-	r.POST("/members/:id/account/recharge", h.rechargeAccount)
-	r.POST("/members/:id/account/refund", h.refundAccount)
-	r.POST("/members/:id/status", h.updateStatus)
-	r.POST("/members/:id/password", h.updatePassword)
-	r.POST("/members/:id/face", h.updateFace)
+	//
+	// ⚠️ requireLocalSource:该门店的会员档案来自**外部系统**(富百家 / 佳乐)
+	//   ⇒ 本域只读,写操作一律拒(409)。
+	//   不拒的话:写进本域 PG 的一行,前台显示"写成功了",
+	//   而那个门店的事实源是外部 ERP ⇒ 这行数据永远没人看。
+	r.POST("/members", h.requireLocalSource, h.openMember)
+	r.POST("/members/:id/points/deduct", h.requireLocalSource, h.deductPoints)
+	r.POST("/members/:id/points/grant", h.requireLocalSource, h.grantPoints)
+	r.POST("/members/:id/account/recharge", h.requireLocalSource, h.rechargeAccount)
+	r.POST("/members/:id/account/refund", h.requireLocalSource, h.refundAccount)
+	r.POST("/members/:id/status", h.requireLocalSource, h.updateStatus)
+	r.POST("/members/:id/password", h.requireLocalSource, h.updatePassword)
+	r.POST("/members/:id/face", h.requireLocalSource, h.updateFace)
+}
+
+// requireLocalSource 拦住"该门店的会员档案来自外部系统"的写操作。
+//
+// ⚠️ 放在**写端点的第一层**:不然后面那些写方法会在本域 PG 里
+// 写一行"没人看的会员",而前台还显示成功。
+func (h *Handler) requireLocalSource(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if branchID == "" {
+		// 门店头缺失由 rbac 中间件判 400,这里不重复处理。
+		c.Next()
+		return
+	}
+	if err := h.svc.EnsureLocalSource(c.Request.Context(), branchID); err != nil {
+		mapErr(c, err)
+		c.Abort()
+		return
+	}
+	c.Next()
 }
 
 // branchFromHeader 取 X-Branch-ID(单店)。

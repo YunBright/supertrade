@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/shopspring/decimal"
 
+	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/internal/member/model"
 	"github.com/YunBright/supertrade/internal/member/service"
 )
@@ -72,6 +73,23 @@ func mapErr(c *gin.Context, err error) {
 		writeError(c, http.StatusBadRequest, "bad_request", err.Error())
 	case errors.Is(err, model.ErrInvalidInput):
 		writeError(c, http.StatusBadRequest, "bad_request", err.Error())
+	case errors.Is(err, model.ErrCubeSourceUnavailable):
+		// ⚠️ 503 而不是回落成空列表:这是链路故障(问不到路由),
+		// 回落会让用户看到"该门店还没有会员档案"——与故障无关的结论。
+		writeError(c, http.StatusServiceUnavailable, "cube_unavailable", "数据源路由暂不可用，请稍后重试")
+	case errors.Is(err, model.ErrCubeSourceDisabled):
+		writeError(c, http.StatusServiceUnavailable, "cube_source_disabled", "该门店的数据源已停用")
+	case errors.Is(err, model.ErrExternalSourceReadOnly):
+		// 409:状态冲突(这个门店的账在外部系统里,不是权限问题)。
+		writeError(c, http.StatusConflict, "member_source_is_external", err.Error())
+	case errors.Is(err, cubeclient.ErrCubeForbidden):
+		writeError(c, http.StatusForbidden, "forbidden", "没有该门店的数据读权限")
+	case errors.Is(err, cubeclient.ErrCubeAuthRejected):
+		writeError(c, http.StatusUnauthorized, "unauthorized", "登录已失效，请重新登录")
+	case errors.Is(err, cubeclient.ErrCubeBadRequest):
+		writeError(c, http.StatusBadRequest, "bad_request", err.Error())
+	case errors.Is(err, cubeclient.ErrCubeUnavailable):
+		writeError(c, http.StatusServiceUnavailable, "cube_unavailable", "数据源暂不可用，请稍后重试")
 	case errors.Is(err, service.ErrInvalidOldPassword):
 		writeError(c, http.StatusForbidden, "member_password_invalid", "原口令不正确")
 	case errors.Is(err, service.ErrCredentialsInvalid):

@@ -220,6 +220,36 @@ const (
 	OperatorContainsCI = "containsCI"
 )
 
+// invoke 发一次 POST 调用(带 JSON body),返回原始响应体。
+//
+// ⚠️ 与 loadCubeQuery 的差别:那个方法把 body 固定成 cube 查询的形状
+// (measures / dimensions / filters),而这里要发的是**别的端点**
+// (如 cube-router 的 /v1/branch-source)⇒ 不能复用它的 body 构造。
+//
+// JWT / X-Branch-ID 的透传与 loadCubeQuery **完全一致**
+// (否则被调方拿不到调用者身份 ⇒ scope 守门会 403)。
+func (c *DaprCubeClient) invoke(ctx context.Context, method string, body any) ([]byte, error) {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("cubeclient: 序列化请求体失败: %w", err)
+	}
+	if bearer := bearerFromCtx(ctx); bearer != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", bearer)
+	}
+	if bid := branchFromCtx(ctx); bid != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, "x-branch-id", bid)
+	}
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	resp, err := c.dapr.InvokeMethodWithContent(ctx, c.appID, method, "POST",
+		&dapr.DataContent{ContentType: "application/json", Data: b})
+	if err != nil {
+		return nil, classifyCubeError(err)
+	}
+	return resp, nil
+}
+
 // LoadCubeQuery 调 cube /v1/load,返回 data[] 数组。
 //
 // 每行 key 形如 "<model>.<field>",例如 "product.id"、"stock.total_quantity"。
@@ -640,6 +670,65 @@ func asDecimalPtr(v any) *decimal.Decimal {
 	}
 	d := ParseDecimal(v)
 	return &d
+}
+
+// asInt64 把 cube 返回的整数字段转成 int64。
+//
+// ⚠️ 与 asInt 同款理由(驱动返回的类型不统一),但**计数类**字段要 int64:
+// 会员的消费次数 / 限用次数在思迅是 int,超过 int32 的库(实测 999999 哨兵)
+// 用 int32 会溢出成负数 —— 那是一个"看起来正常"的错数。
+func asInt64(v any) int64 {
+	switch x := v.(type) {
+	case nil:
+		return 0
+	case int:
+		return int64(x)
+	case int32:
+		return int64(x)
+	case int64:
+		return x
+	case float64:
+		return int64(x)
+	case json.Number:
+		i, err := x.Int64()
+		if err != nil {
+			return ParseDecimal(v).IntPart()
+		}
+		return i
+	case string:
+		i, err := strconv.ParseInt(strings.TrimSpace(x), 10, 64)
+		if err != nil {
+			return ParseDecimal(v).IntPart()
+		}
+		return i
+	}
+	return ParseDecimal(v).IntPart()
+}
+
+// asTimePtr 把 cube 返回的时间字段转成 *time.Time(nil = 没维护)。
+//
+// ⚠️ 源库的时间列有三种形态:时间戳字符串 / RFC3339 / 空串 ⇒ 全收。
+func asTimePtr(v any) *time.Time {
+	if v == nil {
+		return nil
+	}
+	s := strings.TrimSpace(asStr(v))
+	if s == "" {
+		return nil
+	}
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02T15:04:05.999999999",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return &t
+		}
+	}
+	return nil
 }
 
 // ParseDecimal 把 cube 返回的任意数值字段转为 decimal.Decimal(导出,测试可见)。

@@ -28,9 +28,11 @@ import (
 	"os"
 	"time"
 
+	"github.com/YunBright/authkit/daprclient"
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/gin-gonic/gin"
 
+	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/internal/member/db"
 	"github.com/YunBright/supertrade/internal/member/handler"
 	"github.com/YunBright/supertrade/internal/member/model"
@@ -126,6 +128,30 @@ func initApp() error {
 		slog.Info("userinfo warmup ok")
 	}
 
+	// 会员档案的 **cube 读路径**:
+	//   该门店在 cube-router 里配了数据源(富百家 00 / 佳乐 01)⇒
+	//   它的会员档案在外部系统里,本域 PG 没有行 ⇒ 读必须走 cube。
+	//   没配数据源的自营店(10)⇒ 仍读本域 PG。
+	//
+	// ⚠️ 用 daprclient.New() 而不是 dapr.NewClient():
+	//   go-sdk 的 api-token 拦截器会**整块替换** outgoing metadata,
+	//   把本客户端转发给 cube 的 Authorization 头抹掉
+	//   (2026-10-20 全网加 DAPR_API_TOKEN 之后暴露的)。
+	//   详见 authkit/daprclient 的包注释。
+	daprCli, err := daprclient.New()
+	if err != nil {
+		return fmt.Errorf("创建 dapr 客户端失败: %w (确认 dapr run 已起)", err)
+	}
+	cube := cubeclient.NewDaprCubeClient(
+		daprCli,
+		cubeclient.DefaultCubeAppID(),
+		cubeclient.DefaultCubeQueryPath(),
+	)
+	// ⚠️ **两个一起注入**(解析器 + 读端):只注入一个 ⇒ 仍走本地 PG
+	//   ⇒ 有数据源的门店又变成"没有会员档案"(本次要修的那个症状)。
+	appSvc.SetCubeSource(cube, cube)
+	slog.Info("member: cube 读路径已启用", "app_id", cubeclient.DefaultCubeAppID())
+
 	slog.Info("member app initialized",
 		"db_driver", "postgres",
 		"schema", "member (6 tables) + outbox",
@@ -161,11 +187,21 @@ func registerDaprRoutes(r *gin.Engine) {
 // 让 userinfo 内部调用自动 forward 给 auth(userd)。
 //
 // ⚠️ 与 catalog / inventory / master-data 同构。
+//
+// ⚠️ **同时**写进 cubeclient 的 ctx key:
+// 该门店配了数据源(富百家 / 佳乐)时,会员档案走 cube,
+// 而 cube-router 与 cube 都有 bearer 中间件 ⇒ JWT 必须被透传过去,
+// 否则 401(而症状是"列表空了",排查方向会被带偏)。
 func forwardBearerToOutgoing() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ctx := c.Request.Context()
 		if bearer := c.Request.Header.Get("Authorization"); bearer != "" {
 			ctx = userinfo.WithBearer(ctx, bearer)
+			ctx = cubeclient.WithBearer(ctx, bearer)
+		}
+		// X-Branch-ID 也要透传:cube-router 按它做 per-branch 路由。
+		if b := middleware.SingleBranchFromCtx(c); b != "" {
+			ctx = cubeclient.WithBranchID(ctx, b)
 		}
 		c.Request = c.Request.WithContext(ctx)
 		c.Next()
