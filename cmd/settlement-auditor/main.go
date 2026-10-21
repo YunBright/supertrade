@@ -36,11 +36,13 @@ import (
 	"time"
 
 	"github.com/YunBright/authkit/daprclient"
+	"github.com/YunBright/authkit/rbac"
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/cubesource"
 	settlementauditor "github.com/YunBright/supertrade/internal/settlement-auditor"
 	"github.com/YunBright/supertrade/internal/settlement-auditor/handler"
 	"github.com/YunBright/supertrade/internal/settlement-auditor/model"
@@ -62,8 +64,9 @@ func main() {
 }
 
 var (
-	appDB  *gorm.DB
-	appSvc *service.Service
+	appDB      *gorm.DB
+	appSvc     *service.Service
+	appArchive *service.ArchiveService
 )
 
 func initApp() error {
@@ -130,9 +133,21 @@ func initApp() error {
 	slog.Info("dapr publisher enabled")
 
 	// cube 查询客户端(cube-router live 查询)。
-	appSvc.SetCube(service.NewDaprCubeQuerier(cubeclient.NewDaprCubeClient(
-		daprCli, cubeclient.DefaultCubeAppID(), cubeclient.DefaultCubeQueryPath())))
+	cubeCli := cubeclient.NewDaprCubeClient(
+		daprCli, cubeclient.DefaultCubeAppID(), cubeclient.DefaultCubeQueryPath())
+	appSvc.SetCube(service.NewDaprCubeQuerier(cubeCli))
 	slog.Info("cube client enabled")
+
+	// ---- 归档导出/导入的「这个门店配了哪个数据源」解析器 ----
+	//
+	// ⚠️ **只用它解析数据源,不拿它查业务数据**:
+	//   审批实例 / 核对信号 / 推理日志是**本域自己产生的**,cube 里没有这些 model。
+	//
+	// ⚠️ 解析器带 60s 缓存 + stale-on-error:每次导出都打一次 dapr 往返不划算,
+	//   而一次网络抖动不该让整个门店的导出挂掉。
+	appArchive = service.NewArchiveService(appDB)
+	appArchive.SetSourceResolver(cubesource.NewCachedResolver(cubeCli, cubesource.DefaultTTL, slog.Default()))
+	slog.Info("settlement-auditor: 归档导出/导入已启用", "app_id", cubeclient.DefaultCubeAppID())
 
 	// LLM 研判(同步调 Dapr Conversation API,仿 fresh-meat)。
 	convName := os.Getenv("SETTLEMENT_AUDITOR_CONVERSATION")
@@ -223,6 +238,14 @@ func registerRoutes(r *gin.Engine) {
 	r.Use(forwardBearerToOutgoing())
 	h := handler.New(appSvc)
 	h.RegisterRoutes(r)
+	// 归档导出/导入(独立的契约 + 独立的守卫 scope)。
+	//
+	// ⚠️ 守门复用 service 层的 effective scopes(带 60s 缓存),
+	//   与本域既有的 settlement:view / settlement:audit 同一套口径。
+	handler.NewArchiveHandler(appArchive, rbac.ScopeResolver(
+		func(c *gin.Context, userID, branchID, scope string) (bool, error) {
+			return appSvc.HasEffectiveScope(c.Request.Context(), userID, branchID, scope)
+		})).RegisterRoutes(r)
 }
 
 // registerDaprRoutes 在 auth 中间件**之前**注册 dapr 订阅端点
@@ -238,15 +261,23 @@ func registerDaprRoutes(r *gin.Engine) {
 
 // forwardBearerToOutgoing 把 caller 的 Authorization 注入 ctx,供下游
 // dapr 调用(cubeclient → cube-router,userinfo → userd)转发。
+//
+// ⚠️ X-Branch-ID 也要写进 **cubeclient 的 ctx key**:
+//
+//	归档端点要问 cube-router「这个门店配了哪个数据源」,
+//	而 cube-router 的 /v1/branch-source 挂着 cube:read 守门
+//	⇒ JWT 与门店都要被透传过去,否则 401 / 路由到错的门店。
 func forwardBearerToOutgoing() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		bearer := c.Request.Header.Get("Authorization")
-		if bearer != "" {
-			ctx := c.Request.Context()
+		ctx := c.Request.Context()
+		if bearer := c.Request.Header.Get("Authorization"); bearer != "" {
 			ctx = cubeclient.WithBearer(ctx, bearer)
 			ctx = userinfo.WithBearer(ctx, bearer)
-			c.Request = c.Request.WithContext(ctx)
 		}
+		if branchID := strings.TrimSpace(c.Request.Header.Get("X-Branch-ID")); branchID != "" {
+			ctx = cubeclient.WithBranchID(ctx, branchID)
+		}
+		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	}
 }
