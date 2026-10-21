@@ -1,4 +1,4 @@
-﻿package handler
+package handler
 
 import (
 	"context"
@@ -55,7 +55,7 @@ func (s *stubCube) GetActivePromotion(_ context.Context, itemNo, onDate string) 
 func bareRouter(svc *service.PriceService) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	h := New(svc, nil, nil)
+	h := New(svc, nil, nil, nil, nil)
 	r.GET("/quotes", h.getQuote)
 	r.GET("/promotions/active", h.getActivePromo)
 	r.GET("/meta", h.getMeta)
@@ -231,7 +231,7 @@ func TestRoutes_RequireBranchHeader(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	// 故意不挂 middleware.XBranchID():模拟前端没带 X-Branch-ID 的请求。
-	New(svcWith(&stubCube{}), nil, nil).RegisterRoutes(r)
+	New(svcWith(&stubCube{}), nil, nil, nil, nil).RegisterRoutes(r)
 
 	for _, path := range []string{
 		"/quotes?barcode=6957583900828",

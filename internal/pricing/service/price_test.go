@@ -12,7 +12,10 @@ import (
 	"github.com/YunBright/supertrade/internal/cubeclient/cubeclientfake"
 )
 
-// fakePrice 固定基准日的 PriceService。
+// testBranch 是测试用的门店。
+const testBranch = "00"
+
+// fakePrice 固定基准日的 PriceService(纯 cube 回落,没有本地表)。
 func fakePrice(t *testing.T) (*PriceService, *cubeclientfake.Client) {
 	t.Helper()
 	f := cubeclientfake.New()
@@ -24,15 +27,16 @@ func fakePrice(t *testing.T) (*PriceService, *cubeclientfake.Client) {
 // 有生效促销 → promo 非空,且取**最低价**那条。
 func TestQuote_PicksLowestActivePromo(t *testing.T) {
 	s, _ := fakePrice(t)
-	q, err := s.Quote(context.Background(), "P-1001", "2026-09-17")
+	q, err := s.Quote(context.Background(), testBranch, "P-1001", "2026-09-17")
 	if err != nil {
 		t.Fatalf("Quote: %v", err)
 	}
 	if q.Promo == nil {
 		t.Fatal("P-1001 在 2026-09-17 有两条生效促销,promo 不该为 nil")
 	}
-	if got := q.Promo.Price; got != 9.90 {
-		t.Errorf("应取最低促销价 9.90,实际 %v", got)
+	// ⚠️ 金额是**字符串**(JSON number 到了 Dart 侧会变 double,精度当场丢)。
+	if got := q.Promo.Price; got != "9.9" {
+		t.Errorf("应取最低促销价 9.9,实际 %q", got)
 	}
 	if q.Promo.PlanNo != "PS-002" {
 		t.Errorf("最低价那条是 PS-002,实际 %q", q.Promo.PlanNo)
@@ -46,7 +50,7 @@ func TestQuote_PicksLowestActivePromo(t *testing.T) {
 func TestQuote_ExpiredPromoIsNotActive(t *testing.T) {
 	s, _ := fakePrice(t)
 	// P-1002 的促销 2026-08-01~2026-08-31,9 月已过期。
-	q, err := s.Quote(context.Background(), "P-1002", "2026-09-17")
+	q, err := s.Quote(context.Background(), testBranch, "P-1002", "2026-09-17")
 	if err != nil {
 		t.Fatalf("过期促销不应是错误,实际 %v", err)
 	}
@@ -65,22 +69,22 @@ func TestQuote_DistinguishesUnsetFromZeroPrice(t *testing.T) {
 	zero := decimal.NewFromInt(0)
 	f.UpsertProductPrice("P-3001", &zero)
 
-	q, err := s.Quote(context.Background(), "P-3001", "2026-09-17")
+	q, err := s.Quote(context.Background(), testBranch, "P-3001", "2026-09-17")
 	if err != nil {
 		t.Fatalf("Quote: %v", err)
 	}
 	if q.RetailPrice == nil {
 		t.Fatal("售价为 0 时不能是 nil(那是'未维护')")
 	}
-	if *q.RetailPrice != 0 {
-		t.Errorf("应为 0,实际 %v", *q.RetailPrice)
+	if *q.RetailPrice != "0" {
+		t.Errorf("应为 0,实际 %q", *q.RetailPrice)
 	}
 
 	nilPrice := (*decimal.Decimal)(nil)
 	f.UpsertProductPrice("P-3001", nilPrice)
-	q2, _ := s.Quote(context.Background(), "P-3001", "2026-09-17")
+	q2, _ := s.Quote(context.Background(), testBranch, "P-3001", "2026-09-17")
 	if q2.RetailPrice != nil {
-		t.Errorf("未维护售价必须是 nil,实际 %v", *q2.RetailPrice)
+		t.Errorf("未维护售价必须是 nil,实际 %q", *q2.RetailPrice)
 	}
 }
 
@@ -92,7 +96,7 @@ func TestQuote_ProductMissingStillQueriesPromo(t *testing.T) {
 		PlanNo: "PS-900", Price: decimal.NewFromFloat(5.0),
 		OrigPrice: &orig, BeginDay: "2026-09-01", EndDay: "2026-09-30",
 	})
-	q, err := s.Quote(context.Background(), "P-NOT-IN-CATALOG", "2026-09-17")
+	q, err := s.Quote(context.Background(), testBranch, "P-NOT-IN-CATALOG", "2026-09-17")
 	if err != nil {
 		t.Fatalf("档案缺失不应报错,实际 %v", err)
 	}
@@ -100,7 +104,7 @@ func TestQuote_ProductMissingStillQueriesPromo(t *testing.T) {
 		t.Fatal("档案缺失时促销仍应查得到")
 	}
 	if q.RetailPrice != nil {
-		t.Errorf("档案缺失时 retail_price 应缺省,实际 %v", *q.RetailPrice)
+		t.Errorf("档案缺失时 retail_price 应缺省,实际 %q", *q.RetailPrice)
 	}
 }
 
@@ -120,7 +124,7 @@ func TestQuote_SkipsNonPositivePromoPrice(t *testing.T) {
 			BeginDay: "2026-09-01", EndDay: "2026-09-30",
 		},
 	)
-	q, err := s.Quote(context.Background(), "P-2001", "2026-09-17")
+	q, err := s.Quote(context.Background(), testBranch, "P-2001", "2026-09-17")
 	if err != nil {
 		t.Fatalf("Quote: %v", err)
 	}
@@ -131,7 +135,7 @@ func TestQuote_SkipsNonPositivePromoPrice(t *testing.T) {
 
 func TestQuote_RejectsShortBarcode(t *testing.T) {
 	s, _ := fakePrice(t)
-	if _, err := s.Quote(context.Background(), "1234", ""); !errors.Is(err, ErrInvalidBarcode) {
+	if _, err := s.Quote(context.Background(), testBranch, "1234", ""); !errors.Is(err, ErrInvalidBarcode) {
 		t.Fatalf("4 位条码应 ErrInvalidBarcode,实际 %v", err)
 	}
 }
@@ -139,7 +143,7 @@ func TestQuote_RejectsShortBarcode(t *testing.T) {
 func TestQuote_TrimSpaceAndBadDateFallback(t *testing.T) {
 	s, _ := fakePrice(t)
 	// 前后空格不应导致"条码长度不足"。
-	q, err := s.Quote(context.Background(), "  P-1001  ", "not-a-date")
+	q, err := s.Quote(context.Background(), testBranch, "  P-1001  ", "not-a-date")
 	if err != nil {
 		t.Fatalf("Quote: %v", err)
 	}
@@ -155,9 +159,22 @@ func TestQuote_TrimSpaceAndBadDateFallback(t *testing.T) {
 	}
 }
 
+// 回落到 cube 时,来源必须标成 "cube" ——
+// 现场问"这个价哪来的"时不必去翻日志。
+func TestQuote_SourceIsCubeWhenFallingBack(t *testing.T) {
+	s, _ := fakePrice(t)
+	q, err := s.Quote(context.Background(), testBranch, "P-1001", "2026-09-17")
+	if err != nil {
+		t.Fatalf("Quote: %v", err)
+	}
+	if q.Source != SourceCube {
+		t.Errorf("无本地表时应标 source=cube,实际 %q", q.Source)
+	}
+}
+
 func TestQuote_NoCubeClient(t *testing.T) {
 	s := NewPriceService(nil)
-	if _, err := s.Quote(context.Background(), "P-1001", ""); !errors.Is(err, ErrNoCube) {
+	if _, err := s.Quote(context.Background(), testBranch, "P-1001", ""); !errors.Is(err, ErrNoCube) {
 		t.Fatalf("cube=nil 应 ErrNoCube,实际 %v", err)
 	}
 }

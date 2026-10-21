@@ -8,12 +8,23 @@
 // 没有 nginx 路由、从未部署过**。本次为 POP 价签打印落地促销查询,
 // 把它变成一个真正在跑的 dapr app。
 //
-// # 无本地数据库
+// # 2026-10-21:开始**拥有表**(price_lists / promotions)
 //
-// 与 catalog / stocktake 不同,pricing **不需要 POSTGRES_DSN**:
-// 它不拥有任何表,全部数据实时来自 cube(product 档案 + promotion 促销)。
-// 促销时效性极强(门店随时在思迅里录促销单),落本地快照必然过期,
-// 所以刻意不建表 —— 这也是这里没有 AutoMigrate 的原因。
+// 此前 pricing **不需要 POSTGRES_DSN**:它不拥有任何表,全部数据实时来自
+// cube(product 档案 + promotion 促销)。
+//
+// 现在拥有表,原因是**自营门店(门店 10)没有 cube 源**
+// (`branch_cube_sources` 实测只有 `00` / `01`)
+// ⇒ 门店 10 的售价/促销**没有别的地方可取**。
+//
+// ⇒ 读路径变成"**本地优先、cube 回落**":
+//   - 门店 10(自营):本地表
+//   - 门店 00 / 01(过渡期):本地无数据 ⇒ 回落 cube
+//
+// ⚠️ **POSTGRES_DSN 缺失即拒绝启动** ——
+// 缺数据库却照常起来,症状是"服务正常、查价永远走 cube",
+// 而门店 10 的 cube 路径必然 503 ⇒ 现场看到的是「库存服务暂不可用」,
+// 真因(DSN 没配)不出现在任何日志里。
 //
 // 端口分配(8101~8110 已被占用,8111 起):
 //
@@ -27,12 +38,15 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/internal/cubehttp"
+	"github.com/YunBright/supertrade/internal/pricing/db"
 	"github.com/YunBright/supertrade/internal/pricing/handler"
+	"github.com/YunBright/supertrade/internal/pricing/model"
 	"github.com/YunBright/supertrade/internal/pricing/service"
 	"github.com/YunBright/supertrade/pkg/cmdbootstrap"
 	"github.com/YunBright/supertrade/pkg/middleware"
@@ -41,9 +55,11 @@ import (
 
 // appDeps 持有运行时单例(在 initApp 里建立,registerRoutes 里消费)。
 var (
-	appCube  cubeclient.Client
-	appPrice *service.PriceService
-	appUser  *userinfo.Client
+	appCube       cubeclient.Client
+	appPrice      *service.PriceService
+	appPriceLists *service.PriceListService
+	appPromos     *service.PromotionService
+	appUser       *userinfo.Client
 )
 
 func main() {
@@ -60,7 +76,27 @@ func initApp() error {
 	if appCube, err = cubehttp.NewClient(); err != nil {
 		return fmt.Errorf("cube client: %w", err)
 	}
-	appPrice = service.NewPriceService(appCube)
+
+	// ---- 本地价格表(pricing 从 2026-10-21 起拥有表)----
+	dsn := os.Getenv("POSTGRES_DSN")
+	if dsn == "" {
+		return fmt.Errorf("pricing: POSTGRES_DSN 必填(pricing 拥有 price_lists / promotions 表;无 fallback)")
+	}
+	appDB, err := db.OpenPostgres(dsn)
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+	if err := appDB.AutoMigrate(
+		&model.PriceList{},
+		&model.Promotion{},
+	); err != nil {
+		return fmt.Errorf("auto migrate: %w", err)
+	}
+	appPriceLists = service.NewPriceListService(appDB)
+	appPromos = service.NewPromotionService(appDB)
+
+	// 本地优先、cube 回落。
+	appPrice = service.NewPriceService(appCube).WithStore(appPriceLists, appPromos)
 
 	if appUser, err = userinfo.New("userd"); err != nil {
 		return fmt.Errorf("userinfo client: %w", err)
@@ -84,7 +120,7 @@ func registerRoutes(r *gin.Engine) {
 	}
 	r.Use(middleware.XBranchID())
 	r.Use(forwardBearerToOutgoing())
-	handler.New(appPrice, appUser, nil).RegisterRoutes(r)
+	handler.New(appPrice, appPriceLists, appPromos, appUser, nil).RegisterRoutes(r)
 }
 
 // forwardBearerToOutgoing 把 caller's Authorization / X-Branch-ID 注入 ctx,

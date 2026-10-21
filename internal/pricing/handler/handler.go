@@ -2,9 +2,12 @@
 //
 // 路由(nginx 已剥过 /api/v1/pricing/):
 //
-//	GET /quotes?barcode=&on_date=   查条码当前价格结论(pricing:view,per branch)
-//	GET /promotions/active?barcode= 同上,只返促销部分(给"只关心特价"的调用方)
-//	GET /meta                       价格标签字段名等静态元数据(pricing:view)
+//	GET  /quotes?barcode=&on_date=   查条码当前价格结论(pricing:view,per branch)
+//	GET  /promotions/active?barcode=  同上,只返促销部分(给"只关心特价"的调用方)
+//	GET  /meta                        价格标签字段名等静态元数据(pricing:view)
+//	GET  /prices/local?product_ids=   批量查本地售价(pricing:view)
+//	GET  /promotions/local?...        批量查本地当前生效促销(pricing:view)
+//	POST /archive/import               导入售价/促销(pricing:manage,per branch)
 //
 // 中间件:
 //   - middleware.XBranchID() 全局挂(由 cmd/pricing/main.go 注册)
@@ -12,12 +15,20 @@
 //
 // 错误映射(与 catalog 保持同一套 code,前端 error_mapper 不用分服务处理):
 //   - service.ErrInvalidBarcode → 400 invalid_barcode
+//   - model.ErrInvalidInput     → 400 bad_request
 //   - cubeclient.ErrCubeUnavailable / ErrCubeAuthRejected → 503 / 401
 //   - cubeclient.ErrCubeForbidden → 403
 //   - 其余 → 500
 //
 // ⚠️ **无生效促销不是错误**:返 200 + {"promo": null}。
-//    绝大多数商品本来就没有促销,返 404 会让前端把"正常"显示成"查失败"。
+//
+//	绝大多数商品本来就没有促销,返 404 会让前端把"正常"显示成"查失败"。
+//
+// # ⚠️ `pricing:manage` 目前在 auth 的 seed 里**不存在**
+//
+// ⇒ 写侧端点目前对所有人 403(fail-closed),这是**有意的**:
+// 权限点没 seed 就放行 = 任何有 pricing:view 的人都能改价。
+// scope seed 属 Phase 0(与 catalog 的 product:manage 一起加)。
 package handler
 
 import (
@@ -30,6 +41,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/pricing/model"
 	"github.com/YunBright/supertrade/internal/pricing/service"
 	"github.com/YunBright/supertrade/pkg/middleware"
 )
@@ -37,16 +49,27 @@ import (
 // Handler 是 pricing 服务的 HTTP handler 聚合。
 type Handler struct {
 	prices *service.PriceService
-	users  *userinfo.Client
-	logger *slog.Logger
+	// priceLists / promos 是本地表服务(写侧 + 批量读侧用)。
+	priceLists *service.PriceListService
+	promos     *service.PromotionService
+	users      *userinfo.Client
+	logger     *slog.Logger
 }
 
 // New 构造 Handler。users 传 nil 时业务端点一律 503 userd_unavailable。
-func New(prices *service.PriceService, users *userinfo.Client, logger *slog.Logger) *Handler {
+//
+// priceLists / promos 传 nil 时:读侧走 cube 回落,写侧端点返 503 not_ready。
+func New(prices *service.PriceService, priceLists *service.PriceListService, promos *service.PromotionService, users *userinfo.Client, logger *slog.Logger) *Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Handler{prices: prices, users: users, logger: logger}
+	return &Handler{
+		prices:     prices,
+		priceLists: priceLists,
+		promos:     promos,
+		users:      users,
+		logger:     logger,
+	}
 }
 
 // RegisterRoutes 挂载全部路由(nginx 已剥过 /api/v1/pricing/)。
@@ -62,6 +85,17 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/meta",
 		rbac.RequireScopeWithBranch("pricing:view", branchFromHeader, resolver),
 		h.getMeta)
+	// 本地批量读(POS 一次扫一屏商品 ⇒ 一次请求拿一批价)。
+	r.GET("/prices/local",
+		rbac.RequireScopeWithBranch("pricing:view", branchFromHeader, resolver),
+		h.getLocalPrices)
+	r.GET("/promotions/local",
+		rbac.RequireScopeWithBranch("pricing:view", branchFromHeader, resolver),
+		h.getLocalPromotions)
+	// 写侧(导入)。scope 是 pricing:manage(见包注释:目前未 seed ⇒ 403)。
+	r.POST("/archive/import",
+		rbac.RequireScopeWithBranch("pricing:manage", branchFromHeader, resolver),
+		h.importArchive)
 }
 
 // branchFromHeader 取 X-Branch-ID(单店)。
@@ -85,7 +119,8 @@ func (h *Handler) getQuote(c *gin.Context) {
 		})
 		return
 	}
-	q, err := h.prices.Quote(c.Request.Context(), barcode, c.Query("on_date"))
+	branchID := middleware.SingleBranchFromCtx(c)
+	q, err := h.prices.Quote(c.Request.Context(), branchID, barcode, c.Query("on_date"))
 	if err != nil {
 		h.mapErr(c, err)
 		return
@@ -104,12 +139,13 @@ func (h *Handler) getActivePromo(c *gin.Context) {
 		})
 		return
 	}
-	q, err := h.prices.Quote(c.Request.Context(), barcode, c.Query("on_date"))
+	branchID := middleware.SingleBranchFromCtx(c)
+	q, err := h.prices.Quote(c.Request.Context(), branchID, barcode, c.Query("on_date"))
 	if err != nil {
 		h.mapErr(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"barcode": q.Barcode, "promo": q.Promo, "as_of": q.AsOf})
+	c.JSON(http.StatusOK, gin.H{"barcode": q.Barcode, "promo": q.Promo, "as_of": q.AsOf, "source": q.Source})
 }
 
 // getMeta GET /meta
@@ -119,7 +155,7 @@ func (h *Handler) getActivePromo(c *gin.Context) {
 // 两份枚举必然漂移,而漂移的表现是"某个选项打出来是空白标签",极难发现。
 func (h *Handler) getMeta(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"app":              "pricing",
+		"app":               "pricing",
 		"promo_date_labels": service.DefaultPromoDateLabels,
 	})
 }
@@ -127,13 +163,19 @@ func (h *Handler) getMeta(c *gin.Context) {
 // mapErr 把 service / cubeclient 错误映射为 HTTP 状态码 + JSON body。
 //
 // ⚠️ ErrCubeAuthRejected 与 ErrCubeUnavailable **必须**分开:
-//   前者是"你的登录态没了"(401,重新登录能好),后者是"cube 挂了"(503,重试没用)。
+//
+//	前者是"你的登录态没了"(401,重新登录能好),后者是"cube 挂了"(503,重试没用)。
+//
 // 合并的后果是一次登录态问题被显示成「系统繁忙」,排查全部跑去查 cube 健康度。
 func (h *Handler) mapErr(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, service.ErrInvalidBarcode):
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 			"code": "invalid_barcode", "message": err.Error(),
+		})
+	case errors.Is(err, model.ErrInvalidInput):
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"code": "bad_request", "message": err.Error(),
 		})
 	case errors.Is(err, service.ErrNoCube):
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
