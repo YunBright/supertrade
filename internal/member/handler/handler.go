@@ -2,6 +2,7 @@
 //
 // 路由(nginx 已剥过 /api/v1/member/):
 //
+//	GET  /permissions                     当前工号在本门店的 scope 集合(member:view)
 //	GET  /config                          门店会员配置(member:view)
 //	PUT  /config                          写门店会员配置(member:config)
 //	GET  /types                           会员类别(member:view)
@@ -87,6 +88,13 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	}
 
 	// ---- 读端点:标准 scope 守门 ----
+	//
+	// ⚠️ /permissions 是"我的权限"查询:用 member:view 守门即可
+	//   (登录用户都能查"我在这个店有什么权限")。
+	//   ⚠️ 它**只读**:不改任何状态,也不需要 body。
+	r.GET("/permissions",
+		rbac.RequireScopeWithBranch(model.ScopeView, branchFromHeader, resolver),
+		h.getPermissions)
 	r.GET("/config",
 		rbac.RequireScopeWithBranch(model.ScopeView, branchFromHeader, resolver),
 		h.getConfig)
