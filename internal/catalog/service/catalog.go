@@ -37,6 +37,7 @@ import (
 	"log/slog"
 
 	"github.com/shopspring/decimal"
+	"gorm.io/gorm"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
 )
@@ -56,8 +57,12 @@ const (
 
 // CatalogService 是商品选择控件的数据服务。
 type CatalogService struct {
-	cube   cubeclient.Client
-	logger *slog.Logger
+	cube cubeclient.Client
+	// db 是本域 PG(没配数据源的门店走本地时用)。
+	db *gorm.DB
+	// sources 解析"这个门店配了哪个数据源"(见 source.go)。
+	sources SourceResolver
+	logger  *slog.Logger
 }
 
 // NewCatalogService 构造 CatalogService。
@@ -265,8 +270,28 @@ func (s *CatalogService) SearchProducts(ctx context.Context, q ProductListQuery)
 
 // productPage 是列表 / 搜索的共同实现。
 //
+// # 数据来源按「门店配没配数据源」分流
+//
+//	配了源 ⇒ 走 cube(cube-router → 该门店的 cube 实例)
+//	没配源 ⇒ 走本域 PG(自营店 10)
+//
+// ⚠️ 问不到路由 ⇒ 503,**不**回落本地:
+// 回落 = 把一次链路故障显示成"该门店没有商品"(2026-10-21 生产故障的形状)。
+//
+// ⚠️ 门店从 **ctx** 取(cubeclient.BranchFromContext):
+// picker 的 4 条端点由 requireSingleBranch 写入**已校验过的**单店,
+// 与 cube 收到的是同一个值 ⇒ 两条路径永远看同一个门店。
+//
 // cube 查询数固定:商品页(1 或 3 次)+ 分类字典 + 供应商字典。
 func (s *CatalogService) productPage(ctx context.Context, q ProductListQuery, search bool) (*ProductPage, error) {
+	branchID := cubeclient.BranchFromContext(ctx)
+	useCube, err := s.useCubeForRead(ctx, branchID)
+	if err != nil {
+		return nil, err
+	}
+	if !useCube {
+		return s.localProductPage(ctx, branchID, q)
+	}
 	if s.cube == nil {
 		return nil, ErrCubeUnavailable
 	}
@@ -363,7 +388,17 @@ func (s *CatalogService) productPage(ctx context.Context, q ProductListQuery, se
 //
 // ⚠️ 节点 count 与 `/products?category_id=<该节点>` 的 total **必然相等**
 // (同一套"子树"口径),所以"侧栏写 87、点进去只有 12"这种自相矛盾不会出现。
+//
+// ⚠️ 数据来源按门店分流(配了源 ⇒ cube;没配源 ⇒ 本域 PG),见 source.go。
 func (s *CatalogService) ListCategories(ctx context.Context, withCounts bool) (*CategoryList, error) {
+	branchID := cubeclient.BranchFromContext(ctx)
+	useCube, err := s.useCubeForRead(ctx, branchID)
+	if err != nil {
+		return nil, err
+	}
+	if !useCube {
+		return s.localCategoryList(ctx, branchID, withCounts)
+	}
 	if s.cube == nil {
 		return nil, ErrCubeUnavailable
 	}
@@ -386,7 +421,17 @@ func (s *CatalogService) ListCategories(ctx context.Context, withCounts bool) (*
 // ListSuppliers 供应商**两级**摘要(类别 → 供应商)。
 //
 // count 与 `/products?supplier_id=X` 的 total 必然相等(口径同上)。
+//
+// ⚠️ 数据来源按门店分流(配了源 ⇒ cube;没配源 ⇒ 本域 PG),见 source.go。
 func (s *CatalogService) ListSuppliers(ctx context.Context) (*SupplierList, error) {
+	branchID := cubeclient.BranchFromContext(ctx)
+	useCube, err := s.useCubeForRead(ctx, branchID)
+	if err != nil {
+		return nil, err
+	}
+	if !useCube {
+		return s.localSupplierList(ctx, branchID)
+	}
 	if s.cube == nil {
 		return nil, ErrCubeUnavailable
 	}
@@ -686,7 +731,18 @@ type LegacyProductPage struct {
 //
 // 字典查询失败时**不**让整个请求失败:老路径的核心数据是"商品 + 库存",
 // 名字查不到就留 null(前端会显示空分类名,但价签该印的品名/单位照样印)。
+//
+// ⚠️ 数据来源按门店分流(配了源 ⇒ cube;没配源 ⇒ 本域 PG),见 source.go。
+//
+//	本域路径不返库存字段(库存归 inventory 服务,本域没有库存表)。
 func (s *CatalogService) SearchProductsByBarcode(ctx context.Context, barcode, branchID string, limit int) (*LegacyProductPage, error) {
+	useCube, err := s.useCubeForRead(ctx, branchID)
+	if err != nil {
+		return nil, err
+	}
+	if !useCube {
+		return s.localSearchProductsByBarcode(ctx, barcode, branchID, limit)
+	}
 	if s.cube == nil {
 		return nil, ErrCubeUnavailable
 	}
@@ -727,6 +783,29 @@ func (s *CatalogService) SearchProductsByBarcode(ctx context.Context, barcode, b
 		Total:    len(products),
 		Meta:     LegacyMeta{BarcodeQuery: barcode, BranchID: branchID},
 	}, nil
+}
+
+// GetProduct 取单个商品(按数据源分流)。
+//
+// ⚠️ 两条路径返回**同一个 DTO**(cubeclient.ProductDTO)⇒ 响应形状逐字一致:
+// 这个端点的响应体一直是这个 DTO,前端按它解析。
+//
+//	配了源 ⇒ cube(GetProduct;查不到 ⇒ ErrProductNotFound)
+//	没配源 ⇒ 本域 PG(查不到 ⇒ model.ErrProductNotFound)
+//
+// 两条路径的"查不到"都被上层翻成 404 product_not_found ⇒ 前端不用区分数据源。
+func (s *CatalogService) GetProduct(ctx context.Context, branchID, id string) (*cubeclient.ProductDTO, error) {
+	useCube, err := s.useCubeForRead(ctx, branchID)
+	if err != nil {
+		return nil, err
+	}
+	if !useCube {
+		return s.localGetProduct(ctx, branchID, id)
+	}
+	if s.cube == nil {
+		return nil, ErrCubeUnavailable
+	}
+	return s.cube.GetProduct(ctx, id)
 }
 
 // dictionariesBestEffort 取分类 / 供应商字典;失败时返空字典 + 记日志。

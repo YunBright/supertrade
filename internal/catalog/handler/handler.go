@@ -50,6 +50,7 @@ import (
 	"github.com/YunBright/authkit/rbac"
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 
 	"github.com/YunBright/supertrade/internal/catalog/model"
 	"github.com/YunBright/supertrade/internal/catalog/service"
@@ -65,8 +66,7 @@ type Handler struct {
 	barcodes   *service.ProductBarcodeService
 	archive    *service.ArchiveService
 	catalog    *service.CatalogService
-	cube       cubeclient.Client // 兜底,本地表无数据时转发 cube
-	users      *userinfo.Client  // per-branch scope 守门用
+	users      *userinfo.Client // per-branch scope 守门用
 	logger     *slog.Logger
 }
 
@@ -89,10 +89,31 @@ func New(suppliers *service.SupplierService, products *service.ProductService,
 		barcodes:   barcodes,
 		archive:    archive,
 		catalog:    service.NewCatalogService(cube, logger),
-		cube:       cube,
 		users:      users,
 		logger:     logger,
 	}
+}
+
+// SetSourceResolver 装配数据源解析器(「这个门店配了哪个数据源」)。
+//
+// ⚠️ 生产**必须**装配(cmd/catalog/main.go 里装 cubesource.CachedResolver):
+// 没装 ⇒ picker 的读端点一律走 cube ⇒ 自营店(门店 10)又变回
+// 2026-10-21 那个症状(cube 404,而本地明明有 27565 个商品)。
+func (h *Handler) SetSourceResolver(r service.SourceResolver) {
+	h.catalog.SetSourceResolver(r)
+	h.archive.SetSourceResolver(r)
+}
+
+// SetLocalDB 装配本域 PG(没配数据源的门店走本地时用)。
+func (h *Handler) SetLocalDB(db *gorm.DB) {
+	h.catalog.SetLocalDB(db)
+}
+
+// SetArchiveExporter 装配上游导出端点客户端(cube-router 的 GET /v1/export)。
+//
+// ⚠️ 没装 ⇒ 配了数据源的门店导出返 503(**不**回落本地)。
+func (h *Handler) SetArchiveExporter(e service.ArchiveExporter) {
+	h.archive.SetExporter(e)
 }
 
 // branchFromHeader 拿当前请求的 X-Branch-ID header(单店场景)。
@@ -201,6 +222,13 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.POST("/archive/import",
 		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
 		h.importArchive)
+	// 档案导出(archivedto 契约;实现见 archive.go)。
+	//
+	// ⚠️ 守门是 `product:view` scope —— 导出是**读**操作,
+	// 与既有的 `/products/export` 同一档。
+	r.GET("/archive/export",
+		rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver),
+		h.exportArchive)
 
 	// 分类(本地表)。
 	//
@@ -285,6 +313,11 @@ func callerSub(c *gin.Context) string {
 // `not_found` / `already_exists` —— 那是静默的契约破坏。
 // ⇒ 新增资源(product / category)也各用各的 code,保持同一套风格。
 func (h *Handler) mapErr(c *gin.Context, err error) {
+	// ⚠️ 「数据源」相关的错误**先**判:它们的 code 与会员域同名同义
+	// (见 writeSourceErr 的注释)。
+	if h.writeSourceErr(c, err) {
+		return
+	}
 	switch {
 	case errors.Is(err, model.ErrSupplierNotFound):
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{

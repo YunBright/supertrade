@@ -27,13 +27,14 @@ import (
 	"os"
 	"time"
 
+	"github.com/YunBright/authkit/daprclient"
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/YunBright/supertrade/internal/catalog/db"
 	"github.com/YunBright/supertrade/internal/catalog/handler"
 	"github.com/YunBright/supertrade/internal/catalog/model"
 	"github.com/YunBright/supertrade/internal/catalog/service"
 	"github.com/YunBright/supertrade/internal/cubeclient"
-	"github.com/YunBright/supertrade/internal/cubehttp"
+	"github.com/YunBright/supertrade/internal/cubesource"
 	"github.com/YunBright/supertrade/pkg/cmdbootstrap"
 	"github.com/YunBright/supertrade/pkg/middleware"
 	"github.com/gin-gonic/gin"
@@ -57,7 +58,13 @@ var (
 	appCat  *service.CategoryService
 	appBar  *service.ProductBarcodeService
 	appArc  *service.ArchiveService
-	appCube cubeclient.Client
+	// appCube 是**具体类型**(不是接口):数据源解析器要用它的
+	// ResolveBranchSource(接口 cubeclient.Client 里没有这个方法)。
+	appCube *cubeclient.DaprCubeClient
+	// appSrc 解析"这个门店配了哪个数据源"。
+	appSrc service.SourceResolver
+	// appExp 是上游导出端点客户端(cube-router 的 GET /v1/export)。
+	appExp  service.ArchiveExporter
 	appUser *userinfo.Client
 )
 
@@ -87,10 +94,39 @@ func initApp() error {
 	appBar = service.NewProductBarcodeService(appDB)
 	appArc = service.NewArchiveService(appDB)
 
-	// cube client 用作 products/search 兜底(本期未实装本地 product CRUD)
-	if appCube, err = cubehttp.NewClient(); err != nil {
-		return fmt.Errorf("cube client: %w", err)
+	// cube client 用作 picker 查询 + 数据源解析 + 上游导出转发。
+	//
+	// ⚠️ **一个 dapr 客户端,三个用途** —— 别建第二个:
+	// 第二个 sidecar 连接 = 多一份连接池 + 多一份超时行为。
+	//
+	// ⚠️ 用 daprclient.New() 而不是 dapr.NewClient():
+	//   go-sdk 的 api-token 拦截器会**整块替换** outgoing metadata,
+	//   把本客户端转发给 cube 的 Authorization 头抹掉
+	//   (2026-10-20 全网加 DAPR_API_TOKEN 之后暴露的)。
+	//   详见 authkit/daprclient 的包注释。
+	daprCli, err := daprclient.New()
+	if err != nil {
+		return fmt.Errorf("创建 dapr 客户端失败: %w (确认 dapr run 已起)", err)
 	}
+	appCube = cubeclient.NewDaprCubeClient(
+		daprCli,
+		cubeclient.DefaultCubeAppID(),
+		cubeclient.DefaultCubeQueryPath(),
+	)
+	// ⚠️ **数据源解析器必须装配**:没装 ⇒ picker 的读端点一律走 cube
+	//   ⇒ 自营店(门店 10,`branch_cube_sources` 里没有它)又变回 2026-10-21
+	//   那个症状(cube 404,而本地明明有 27565 个商品)。
+	//
+	// ⚠️ 解析器带 60s 缓存 + stale-on-error:每次读都打一次 dapr 往返不划算,
+	//   而一次网络抖动不该让整个门店的服务挂掉。
+	appSrc = cubesource.NewCachedResolver(appCube, cubesource.DefaultTTL, slog.Default())
+	// 上游导出端点(同一个 dapr 客户端、同一个 app-id —— /v1/export 与 /v1/load
+	// 都在 cube-router 上)。
+	appExp = service.NewDaprArchiveExporter(daprCli, cubeclient.DefaultCubeAppID())
+	slog.Info("catalog: cube 读路径已启用",
+		"app_id", cubeclient.DefaultCubeAppID(),
+		"query_path", cubeclient.DefaultCubeQueryPath())
+
 	appUser, err = userinfo.New("userd")
 	if err != nil {
 		return fmt.Errorf("userinfo client: %w", err)
@@ -120,7 +156,16 @@ func registerRoutes(r *gin.Engine) {
 	// 自动 forward 给下游(cube-gateway / userd)。userd 端 middleware.http.bearer
 	// 必需要 Authorization 头,无 token 会 401 Unauthenticated。
 	r.Use(forwardBearerToOutgoing())
-	handler.New(appSup, appProd, appCat, appBar, appArc, appCube, appUser, nil).RegisterRoutes(r)
+	h := handler.New(appSup, appProd, appCat, appBar, appArc, appCube, appUser, nil)
+	// ⚠️ **三件必须装配的东西**(少一件的症状与 2026-10-21 一模一样):
+	//
+	//	数据源解析器 ⇒ 决定"这个门店走 cube 还是走本域 PG"
+	//	本地库       ⇒ 没配数据源的门店(自营店 10)读它
+	//	上游导出客户端 ⇒ 配了数据源的门店导出走它(而不是回落本地)
+	h.SetSourceResolver(appSrc)
+	h.SetLocalDB(appDB)
+	h.SetArchiveExporter(appExp)
+	h.RegisterRoutes(r)
 }
 
 // forwardBearerToOutgoing 把 gin request 的 Authorization / X-Branch-ID header 注入 ctx。

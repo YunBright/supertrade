@@ -54,7 +54,11 @@ type ArchiveService struct {
 	db *gorm.DB
 	// barcodeSvc 复用商品条码服务(条码是"某商品的集合",要用它的替换语义)。
 	barcodeSvc *ProductBarcodeService
-	now        func() time.Time
+	// sources 解析"这个门店配了哪个数据源"(写端点只读闸门 + 导出分流)。
+	sources SourceResolver
+	// exporter 是上游导出端点客户端(cube-router 的 GET /v1/export)。
+	exporter ArchiveExporter
+	now      func() time.Time
 }
 
 // NewArchiveService 构造 ArchiveService。
@@ -122,6 +126,18 @@ type (
 func (s *ArchiveService) Import(ctx context.Context, branchID string, req ImportRequest) (*ImportResult, error) {
 	if branchID == "" {
 		return nil, model.ErrInvalidInput
+	}
+	// ⚠️ **只读闸门**:该门店的商品档案来自外部系统(富百家 / 佳乐)⇒ 本域不写。
+	//
+	// 不拦的话:写进本域 PG 的一行"没人看的商品",而前台还显示"写成功了"。
+	//
+	// ⚠️ 闸门在**领域授权之后**(handler 的 rbac 中间件先跑)⇒
+	// 没权限的人拿到的仍然是 403,而不是 409。
+	//
+	// ⚠️ 解析失败(问不到路由)时**放行**:写路径自己会兜底,
+	// 而路由抖动不该挡住自营店(门店 10)的正常导入(见 EnsureLocalSource)。
+	if err := s.EnsureLocalSource(ctx, branchID); err != nil {
+		return nil, err
 	}
 	mode := req.Mode
 	if mode == "" {

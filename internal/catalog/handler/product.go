@@ -30,6 +30,9 @@
 package handler
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -37,6 +40,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/YunBright/supertrade/internal/archivedto"
 	"github.com/YunBright/supertrade/internal/catalog/model"
 	"github.com/YunBright/supertrade/internal/catalog/service"
 	"github.com/YunBright/supertrade/internal/cubeclient"
@@ -287,6 +291,13 @@ type exportProductDTO struct {
 // # ⚠️ 门店只从 X-Branch-ID header 取
 //
 // body / query 里**不认**门店 —— 否则 A 店的登录态能把 B 店的商品导走。
+//
+// # 数据来源按「门店配没配数据源」切
+//
+//	配了源 ⇒ 上游导出端点(cube-router)的商品(该门店的档案在外部系统里)
+//	没配源 ⇒ 本域 PG
+//
+// ⚠️ **路径与响应形状都不变**(前端 / POS 离线包在用)⇒ 前端不动。
 func (h *Handler) exportLocalProducts(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if branchID == "" {
@@ -297,6 +308,15 @@ func (h *Handler) exportLocalProducts(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
+	useCube, err := h.archive.UseCubeForRead(ctx, branchID)
+	if err != nil {
+		h.mapErr(c, err)
+		return
+	}
+	if useCube {
+		h.exportProductsFromCube(c, branchID)
+		return
+	}
 	rows, err := h.products.ExportAll(ctx, branchID)
 	if err != nil {
 		h.mapErr(c, err)
@@ -322,6 +342,116 @@ func (h *Handler) exportLocalProducts(c *gin.Context) {
 		"count":     len(out),
 		"total":     len(out),
 	})
+}
+
+// exportProductsFromCube 从上游导出端点取该门店的**全部**商品(离线商品库)。
+//
+// ⚠️ **响应形状与本地路径逐字一致**(同一批字段名),只有数据来源不同。
+//
+// ⚠️ 条码子表(item_barcodes)是**尽力而为**:取不到就只用"barcode 回落 id"
+// (绝大多数商品的扫码键就是 id),而不是让整个导出失败。
+func (h *Handler) exportProductsFromCube(c *gin.Context, branchID string) {
+	ctx := c.Request.Context()
+	bearer := c.Request.Header.Get("Authorization")
+
+	rows, err := h.archive.ExportScopeAll(ctx, bearer, branchID, archivedto.ScopeProducts)
+	if err != nil {
+		h.mapErr(c, err)
+		return
+	}
+	barRows, err := h.archive.ExportScopeAll(ctx, bearer, branchID, archivedto.ScopeItemBarcodes)
+	if err != nil {
+		// 条码是补充信息(主扫码键 = id)⇒ 取不到不阻断导出,但要留下痕迹。
+		h.logger.Warn("catalog: 取商品条码失败,离线包只带 id 兜底条码",
+			"branch_id", branchID, "err", err)
+		barRows = nil
+	}
+	byProduct := map[string][]string{}
+	for _, r := range barRows {
+		pid := rowString(r, "product_id")
+		code := rowString(r, "barcode")
+		if pid == "" || code == "" {
+			continue
+		}
+		byProduct[pid] = append(byProduct[pid], code)
+	}
+
+	out := make([]exportProductDTO, 0, len(rows))
+	for _, r := range rows {
+		id := rowString(r, "id")
+		out = append(out, buildExportProductFromRow(r, byProduct[id]))
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"branch_id": branchID,
+		"products":  out,
+		"count":     len(out),
+		"total":     len(out),
+	})
+}
+
+// buildExportProductFromRow 从上游的契约行组装离线商品。
+//
+// ⚠️ 与本地路径(buildExportProduct)**同一批字段名** —— 响应形状不许变。
+func buildExportProductFromRow(row map[string]any, subBarcodes []string) exportProductDTO {
+	id := rowString(row, "id")
+	// ⚠️ 上游的 product 模型**没有 barcode 列** ⇒ 空 ⇒ 回落成 id
+	// (领域事实:思迅 item_no 就是条码)。
+	code := rowString(row, "barcode")
+	if code == "" {
+		code = id
+	}
+	codes := make([]string, 0, len(subBarcodes)+1)
+	seen := make(map[string]bool, len(subBarcodes)+1)
+	for _, b := range subBarcodes {
+		if b == "" || seen[b] {
+			continue
+		}
+		seen[b] = true
+		codes = append(codes, b)
+	}
+	if code != "" && !seen[code] {
+		seen[code] = true
+		codes = append(codes, code)
+	}
+	return exportProductDTO{
+		ID:         id,
+		Name:       rowString(row, "name"),
+		SubCode:    rowString(row, "sub_code"),
+		Barcode:    code,
+		Barcodes:   codes,
+		Unit:       rowString(row, "unit"),
+		Spec:       rowString(row, "spec"),
+		CategoryID: rowString(row, "category_id"),
+		SupplierID: rowString(row, "supplier_id"),
+		Status:     rowString(row, "status"),
+		// ⚠️ updated_at 恒为零值:上游的 product 模型只有 created_at,
+		// 没有 updated_at ⇒ 不拿 created_at 冒充(那会让客户端以为
+		// "这件商品从建档起就没变过")。
+		UpdatedAt: time.Time{},
+	}
+}
+
+// rowString 从契约行里取一个字符串值。
+//
+// ⚠️ 契约行的值是 any(上游是 JSON)⇒ 可能是 string,也可能是数字。
+// 统一转成字符串,免得下游拿到 float64(9.9 → 9.899999999999999)。
+func rowString(row map[string]any, key string) string {
+	v, ok := row[key]
+	if !ok || v == nil {
+		return ""
+	}
+	switch t := v.(type) {
+	case string:
+		return t
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case json.Number:
+		return t.String()
+	case bool:
+		return strconv.FormatBool(t)
+	default:
+		return fmt.Sprintf("%v", t)
+	}
 }
 
 // buildExportProduct 组装一行离线商品。
@@ -366,40 +496,60 @@ func buildExportProduct(p model.Product, subBarcodes []string) exportProductDTO 
 	}
 }
 
-// getProduct GET /products/:id —— 本期返 501,留待未来实装本地 CRUD。
+// getProduct GET /products/:id —— 查单个商品(按数据源分流)。
+//
+// ⚠️ 数据来源按「门店配没配数据源」切(见 service/source.go):
+//
+//	配了源 ⇒ cube(cube-router → 该门店的 cube 实例)
+//	没配源 ⇒ 本域 PG(自营店 10)
+//
+// ⚠️ 两条路径返回**同一个 DTO**(cubeclient.ProductDTO)⇒ 响应形状不变,
+// 前端不用改。
 func (h *Handler) getProduct(c *gin.Context) {
-	// 兜底走 cube(原 cubehttp.getProduct 的行为),保留现有 stocktake
-	// SearchProducts / 后续 product CRUD 的访问入口。
 	id := c.Param("id")
-	if h.cube == nil {
-		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
-			"code":    "cube_unavailable",
-			"message": "cube client 未配置",
-		})
-		return
-	}
-	p, err := h.cube.GetProduct(c.Request.Context(), id)
+	branchID := middleware.SingleBranchFromCtx(c)
+	// ⚠️ 把**已解析的**门店写回 ctx:本域路径按它查表,
+	// cube 路径按它路由 —— 两条路径看同一个门店。
+	ctx := cubeclient.WithBranchID(c.Request.Context(), branchID)
+	p, err := h.catalog.GetProduct(ctx, branchID, id)
 	if err != nil {
-		h.mapCubeErr(c, err)
+		h.mapProductErr(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, p)
 }
 
-// mapCubeErr 把 cubeclient 错误映到 HTTP。
-func (h *Handler) mapCubeErr(c *gin.Context, err error) {
+// mapProductErr 把单个商品查询的错误映到 HTTP。
+//
+// ⚠️ "查不到"在两条路径上是**同一个结论**(404 product_not_found):
+// 前端不需要知道这个商品是从 cube 还是本域 PG 找到的。
+func (h *Handler) mapProductErr(c *gin.Context, err error) {
+	if h.writeSourceErr(c, err) {
+		return
+	}
 	switch {
-	case err == cubeclient.ErrProductNotFound:
+	case errors.Is(err, model.ErrProductNotFound), errors.Is(err, cubeclient.ErrProductNotFound):
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
 			"code":    "product_not_found",
 			"message": err.Error(),
 		})
-	case err == cubeclient.ErrStockNotFound:
+	case errors.Is(err, cubeclient.ErrStockNotFound):
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
 			"code":    "stock_not_found",
 			"message": err.Error(),
 		})
+	case errors.Is(err, service.ErrCubeUnavailable):
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+			"code":    "cube_unavailable",
+			"message": err.Error(),
+		})
+	case errors.Is(err, model.ErrInvalidInput):
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"code":    "bad_request",
+			"message": err.Error(),
+		})
 	default:
+		h.logger.Error("catalog 查商品失败", "err", err, "path", c.Request.URL.Path)
 		c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
 			"code":    "cube_error",
 			"message": err.Error(),

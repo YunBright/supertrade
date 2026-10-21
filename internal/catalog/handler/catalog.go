@@ -35,6 +35,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/YunBright/supertrade/internal/catalog/model"
 	"github.com/YunBright/supertrade/internal/catalog/service"
 	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/pkg/middleware"
@@ -294,13 +295,23 @@ func badRequest(c *gin.Context, message string) {
 
 // mapCatalogErr 把 catalog 查询错误映到 HTTP。
 //
-//	cube client 未配置 → 503 cube_unavailable
-//	其余(cube 故障 / 查询非法)→ 502 cube_error
+//	cube client 未配置 / 问不到数据源路由 → 503 cube_unavailable
+//	数据源被停用                        → 503 cube_source_disabled
+//	调用者缺该门店读权限                → 403 forbidden
+//	登录态失效                          → 401 unauthorized
+//	其余(cube 故障 / 查询非法)          → 502 cube_error
 //
 // ⚠️ 一律**不**把 cube 的 404 说成"没有数据":404 在这条链路上更常见的原因是
 // "该门店没配 cube 源"(cube-router 返 cube_source_not_configured),
 // 说成"空列表"会把部署缺口伪装成业务结论。
+//
+// ⚠️ 现在这条链路**先**问"门店配了数据源吗"(见 service/source.go):
+// 没配 ⇒ 走本域 PG(自营店 10 的商品在这里),
+// 问不到 ⇒ 503(**不**回落本地:回落 = 把一次链路故障显示成"该门店没有商品")。
 func (h *Handler) mapCatalogErr(c *gin.Context, err error) {
+	if h.writeSourceErr(c, err) {
+		return
+	}
 	if errors.Is(err, service.ErrCubeUnavailable) {
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
 			"code":    "cube_unavailable",
@@ -308,7 +319,14 @@ func (h *Handler) mapCatalogErr(c *gin.Context, err error) {
 		})
 		return
 	}
-	h.logger.Error("catalog 查询 cube 失败", "err", err, "path", c.Request.URL.Path)
+	if errors.Is(err, model.ErrInvalidInput) {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"code":    "bad_request",
+			"message": err.Error(),
+		})
+		return
+	}
+	h.logger.Error("catalog 查询失败", "err", err, "path", c.Request.URL.Path)
 	c.AbortWithStatusJSON(http.StatusBadGateway, gin.H{
 		"code":    "cube_error",
 		"message": err.Error(),
