@@ -1,0 +1,42 @@
+# ── 生产位置 ───────────────────────────────────────────────
+# 服务器：gyy (172.12.1.5)
+# 路径  ：/opt/YunBright/supertrade/apps/pos/components/pubsub.yaml
+# 装载方：supertrade-pos.service 的 --resources-path /opt/YunBright/supertrade/apps/pos/components
+#         （该 unit 还有第二条 --resources-path /opt/YunBright/.dapr/shared-components）
+# ──────────────────────────────────────────────────────────
+# local-secret-store 是在服务器上独立的component,所有差异化配置都放在服务器的 secret-store 里,不放在代码仓库里。
+# ⚠️ metadata.name 必须是 **tradewind-pubsub** —— 与 auth / wechat-bot / stocktake / fresh-meat 一致。
+#
+# dapr 的 component name 是路由键,发布方与订阅方必须逐字相同。
+# 名字不同 ⇒ 两条 bus 互不相通 ⇒ **事件永远到不了,而且完全不报错**
+# (本仓真踩过。见 pkg/eventbus/eventbus.go 的完整说明。)
+#
+# pos 是 sale.paid 的**发布侧**:事件先写进 outbox 表(与销售单同事务),
+# 再由后台发布器投递 ⇒ 进程在 commit 与 publish 之间被杀也不会丢事件。
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: tradewind-pubsub
+  namespace: default
+spec:
+  type: pubsub.redis
+  version: v1
+  metadata:
+    - name: redisHost
+      value: "172.12.1.1:6379"
+    - name: redisPassword
+      secretKeyRef:
+        name: redis.password
+        key: redis.password
+    - name: consumerID
+      value: "{appID}"
+    - name: enableDeadLetter
+      value: "true"
+    - name: deadLetterTTL
+      value: "86400"
+    - name: processingTimeout
+      value: "30s"
+    - name: redeliverInterval
+      value: "30s"
+auth:
+  secretStore: local-secret-store
