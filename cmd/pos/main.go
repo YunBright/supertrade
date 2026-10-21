@@ -30,11 +30,14 @@ import (
 	"os"
 	"time"
 
+	"github.com/YunBright/authkit/daprclient"
+	"github.com/YunBright/authkit/rbac"
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/cubesource"
 	"github.com/YunBright/supertrade/internal/pos/db"
 	"github.com/YunBright/supertrade/internal/pos/handler"
 	"github.com/YunBright/supertrade/internal/pos/model"
@@ -57,12 +60,13 @@ func main() {
 
 // appDeps 持有运行时单例。
 var (
-	appDB    *gorm.DB
-	appSales *service.SalesService
-	appUser  *userinfo.Client
-	appRun   *outbox.Runner
-	runCtx   context.Context
-	runStop  context.CancelFunc
+	appDB      *gorm.DB
+	appSales   *service.SalesService
+	appArchive *service.ArchiveService
+	appUser    *userinfo.Client
+	appRun     *outbox.Runner
+	runCtx     context.Context
+	runStop    context.CancelFunc
 )
 
 // initApp 建 DB / service / 权限客户端,并起**发件箱投递器**。
@@ -114,6 +118,28 @@ func initApp() error {
 	appRun = outbox.NewRunner(appDB, pub, slog.Default())
 	runCtx, runStop = context.WithCancel(context.Background())
 	go appRun.Start(runCtx)
+
+	// ---- 归档导出/导入的「这个门店配了哪个数据源」解析器 ----
+	//
+	// ⚠️ **只用它解析数据源,不拿它查业务数据**:
+	//   销售单头 / 明细 / 收付是**本域自己产生的**,cube 里没有这些 model。
+	//
+	// ⚠️ 用 daprclient.New() 而不是 dapr.NewClient():
+	//   go-sdk 的 api-token 拦截器会**整块替换** outgoing metadata,
+	//   把本客户端转发给 cube 的 Authorization 头抹掉
+	//   (2026-10-20 全网加 DAPR_API_TOKEN 之后暴露的)。
+	//   详见 authkit/daprclient 的包注释。
+	daprCli, err := daprclient.New()
+	if err != nil {
+		return fmt.Errorf("创建 dapr 客户端失败: %w (确认 dapr run 已起)", err)
+	}
+	cubeCli := cubeclient.NewDaprCubeClient(
+		daprCli, cubeclient.DefaultCubeAppID(), cubeclient.DefaultCubeQueryPath())
+	appArchive = service.NewArchiveService(appDB)
+	// ⚠️ 解析器带 60s 缓存 + stale-on-error:每次导出都打一次 dapr 往返不划算,
+	//   而一次网络抖动不该让整个门店的导出挂掉。
+	appArchive.SetSourceResolver(cubesource.NewCachedResolver(cubeCli, cubesource.DefaultTTL, slog.Default()))
+	slog.Info("pos: 归档导出/导入已启用", "app_id", cubeclient.DefaultCubeAppID())
 	return nil
 }
 
@@ -133,6 +159,8 @@ func registerRoutes(r *gin.Engine) {
 	r.Use(middleware.XBranchID())
 	r.Use(forwardBearerToOutgoing())
 	handler.New(appSales, appUser, slog.Default()).RegisterRoutes(r)
+	// 归档导出/导入(独立的契约 + 独立的守卫 scope)。
+	handler.NewArchiveHandler(appArchive, rbac.HasAnyScopeWithBranch(appUser)).RegisterRoutes(r)
 }
 
 // forwardBearerToOutgoing 把 caller's Authorization / X-Branch-ID 注入 ctx,
@@ -144,6 +172,12 @@ func forwardBearerToOutgoing() gin.HandlerFunc {
 		ctx := c.Request.Context()
 		if bearer := c.Request.Header.Get("Authorization"); bearer != "" {
 			ctx = userinfo.WithBearer(ctx, bearer)
+			// ⚠️ **同时写进 cubeclient 的 ctx key**(不只是 userinfo 的):
+			//   归档端点要问 cube-router「这个门店配了哪个数据源」,
+			//   而 cube-router 的 /v1/branch-source 挂着 cube:read 守门
+			//   ⇒ JWT 必须被透传过去,否则 401
+			//   (而症状是"导出报暂不可用",排查方向会被带偏)。
+			ctx = cubeclient.WithBearer(ctx, bearer)
 		}
 		if branchID := c.Request.Header.Get("X-Branch-ID"); branchID != "" {
 			ctx = cubeclient.WithBranchID(ctx, branchID)
