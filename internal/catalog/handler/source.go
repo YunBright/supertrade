@@ -31,6 +31,7 @@ import (
 
 	"github.com/YunBright/supertrade/internal/catalog/model"
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/pkg/middleware"
 )
 
 // writeSourceErr 把「数据源」相关的错误映到 HTTP;处理了才返 true。
@@ -77,4 +78,49 @@ func (h *Handler) writeSourceErr(c *gin.Context, err error) bool {
 		return false
 	}
 	return true
+}
+
+// requireLocalSource 拦住「该门店的商品档案来自外部系统」的写操作。
+//
+// # 为什么写侧也要有这道闸门
+//
+// 读侧已经按数据源分流(配了源 ⇒ 走那个 cube 实例),所以本域 PG 里
+// **对有源门店的行永远没人读**。
+//
+// ⇒ 写侧若不拦:写进本域 PG 的一行"没人看的商品",而前台还显示"写成功了"
+// ⇒ 现场看到的是"商品改了但查出来还是老的",排查方向完全跑偏。
+//
+// ⚠️ 与会员域(internal/member/handler.go 的同名中间件)**同一套判据**
+// (internal/cubesource):同一个门店,会员档案与商品档案必须给同一种解释。
+//
+// # 为什么复用 ArchiveService.EnsureLocalSource
+//
+// 它与归档导入路径**用的是同一个方法** ⇒ 同一个门店的"手动建档"与
+// "批量导入"给**同一个答案**。
+//
+// ⚠️ 判据要放在**写端点的第一层**(在 rbac 之后、handler 之前):
+// 不然写方法会在本域 PG 里落一行"没人看的商品"。
+//
+// ⚠️ **问不到路由时放行**(与导入路径同一处理):
+// cube-router 抖一下不该挡住自营店(门店 10)的正常建档;
+// 而真写了也没关系 —— 没配源的门店本来就读本域。
+func (h *Handler) requireLocalSource(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if branchID == "" {
+		// 门店头缺失由 rbac 中间件判 400,这里不重复处理。
+		c.Next()
+		return
+	}
+	if h.archive == nil {
+		// 装配漏了 archive(只在单测/极简装配里出现)⇒ 判据问不到
+		// ⇒ 与"问不到路由"同一处理:放行。
+		c.Next()
+		return
+	}
+	if err := h.archive.EnsureLocalSource(c.Request.Context(), branchID); err != nil {
+		h.mapErr(c, err)
+		c.Abort()
+		return
+	}
+	c.Next()
 }

@@ -49,6 +49,15 @@
 > ⚠️ **价格不在 `catalog.products`**:售价/促销归 **pricing** 服务
 > (`price_lists` / `promotions`,带生效期与历史版本)。两处都存价 = 两个真相源。
 
+> ⚠️ **写侧只读闸门(2026-10-22)**:`POST/PUT/DELETE /products`、`/categories`、
+> `/suppliers`、`/products/:id/barcodes` 在**配了数据源的门店**一律返
+> **409 `member_source_is_external`**(与会员域同名同码)。
+> 原因:读侧已按数据源分流 ⇒ 本域 PG 里对有源门店的行**永远没人读**
+> ⇒ 不拦就是"写进一行没人看的商品,而前台显示写成功了"。
+> 闸门与归档导入路径**复用同一个判据**(`internal/cubesource`),
+> 与会员域的 `requireLocalSource` 中间件同款。
+> ⚠️ 问不到数据源路由时**放行**(cube-router 抖一下不该挡住自营店建档)。
+
 `catalog.suppliers`(本地表):
 
 | 字段 | 类型 | 单位 | 说明 |

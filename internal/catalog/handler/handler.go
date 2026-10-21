@@ -150,6 +150,10 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	resolver := rbac.HasAnyScopeWithBranch(h.users)
 
 	// 供应商
+	//
+	// ⚠️ 写侧挂 **requireLocalSource**:该门店的供应商档案来自外部系统
+	// (富百家 / 佳乐)⇒ 本域只读,不写(见 source.go 的注释)。
+	// 不拦的话:写进本域 PG 的一行"没人看的供应商",而前台显示"写成功了"。
 	r.GET("/suppliers",
 		rbac.RequireScopeWithBranch("supplier:view", branchFromHeader, resolver),
 		h.listSuppliers)
@@ -158,12 +162,15 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 		h.getSupplier)
 	r.POST("/suppliers",
 		rbac.RequireScopeWithBranch("supplier:manage", branchFromHeader, resolver),
+		h.requireLocalSource,
 		h.createSupplier)
 	r.PUT("/suppliers/:id",
 		rbac.RequireScopeWithBranch("supplier:manage", branchFromHeader, resolver),
+		h.requireLocalSource,
 		h.updateSupplier)
 	r.DELETE("/suppliers/:id",
 		rbac.RequireScopeWithBranch("supplier:manage", branchFromHeader, resolver),
+		h.requireLocalSource,
 		h.deleteSupplier)
 
 	// 商品
@@ -182,14 +189,20 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	// ⇒ 这些端点在 auth 补上 seed 之前会对所有人返 403(fail-closed)。
 	// 这是**已知状态**:auth 的 scope seed 属于 Phase 0(见
 	// docs/ARCHITECTURE.md §7)。
+	//
+	// ⚠️ 写侧挂 **requireLocalSource**:该门店的商品档案来自外部系统
+	// (富百家 / 佳乐)⇒ 本域只读,不写(见 source.go 的注释)。
 	r.POST("/products",
 		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
+		h.requireLocalSource,
 		h.createProduct)
 	r.PUT("/products/:id",
 		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
+		h.requireLocalSource,
 		h.updateProduct)
 	r.DELETE("/products/:id",
 		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
+		h.requireLocalSource,
 		h.deleteProduct)
 	// 离线商品库(一次给全,不分页,含换购品/停用品)。
 	//
@@ -215,9 +228,11 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 		h.listProductBarcodes)
 	r.POST("/products/:id/barcodes",
 		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
+		h.requireLocalSource,
 		h.createProductBarcode)
 	r.DELETE("/products/:id/barcodes/:barcode",
 		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
+		h.requireLocalSource,
 		h.deleteProductBarcode)
 
 	// 档案导入(实现见 archive.go)。
@@ -249,17 +264,22 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	// ⚠️ 旧的 `GET /categories/local`(只读本地表)已删除(2026-10-22):
 	// 它对"配了数据源的门店"给的是本域旧分类,而 picker 给的是外部系统的现值
 	// ⇒ 同一个门店两个答案。分类字典统一走 `GET /categories`。
+	//
+	// ⚠️ 写侧挂 **requireLocalSource**:分类同属商品档案域 ⇒ 同一条只读闸门。
 	r.GET("/categories/:id",
 		rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver),
 		h.getCategory)
 	r.POST("/categories",
 		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
+		h.requireLocalSource,
 		h.createCategory)
 	r.PUT("/categories/:id",
 		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
+		h.requireLocalSource,
 		h.updateCategory)
 	r.DELETE("/categories/:id",
 		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
+		h.requireLocalSource,
 		h.deleteCategory)
 
 	// 商品选择控件(ProductPicker)的 4 条端点。
