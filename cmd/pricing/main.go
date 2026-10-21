@@ -17,9 +17,15 @@
 // (`branch_cube_sources` 实测只有 `00` / `01`)
 // ⇒ 门店 10 的售价/促销**没有别的地方可取**。
 //
-// ⇒ 读路径变成"**本地优先、cube 回落**":
-//   - 门店 10(自营):本地表
-//   - 门店 00 / 01(过渡期):本地无数据 ⇒ 回落 cube
+// ⇒ 读路径变成"**配了数据源 ⇒ cube;没配 ⇒ 本地 PG**":
+//   - 门店 00 / 01(富百家 / 佳乐,配了数据源):cube(实时价与促销)
+//   - 门店 10(自营,没配数据源):本域 PG
+//
+// ⚠️ 判据**不是**"本地有没有数据"(旧判据):
+// 门店 00 的价格已被主同步实例(00→00)灌进本地 PG(27565 行,快照 2026-10-20 19:24)
+// ⇒ 旧判据让查价命中本地 ⇒ 返回**两天前的快照价**。
+// ⇒ 判据统一到"配没配数据源"(与 member / catalog / inventory 同一套,
+// 见 internal/cubesource)。
 //
 // ⚠️ **POSTGRES_DSN 缺失即拒绝启动** ——
 // 缺数据库却照常起来,症状是"服务正常、查价永远走 cube",
@@ -44,6 +50,7 @@ import (
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/internal/cubehttp"
+	"github.com/YunBright/supertrade/internal/cubesource"
 	"github.com/YunBright/supertrade/internal/pricing/db"
 	"github.com/YunBright/supertrade/internal/pricing/handler"
 	"github.com/YunBright/supertrade/internal/pricing/model"
@@ -95,8 +102,27 @@ func initApp() error {
 	appPriceLists = service.NewPriceListService(appDB)
 	appPromos = service.NewPromotionService(appDB)
 
-	// 本地优先、cube 回落。
+	// 读路径:**配了数据源 ⇒ cube;没配 ⇒ 本地 PG**(判据唯一,见 internal/cubesource)。
+	//
+	// ⚠️ **解析器与 cube 读端必须一起注入**,且**复用同一个 client**:
+	// 只注入解析器 ⇒ 走 cube 但没有读端;只注入读端 ⇒ 有数据源的门店仍走本地
+	// ⇒ 症状与"没接数据源"完全一样(查价返回旧快照),而且**没有任何报错**。
+	//
+	// ⚠️ cubeclient.Client 接口**不含** ResolveBranchSource / LoadCubeQueryPage
+	// (那是被"查一个商品"用的窄接口)⇒ 这里要拿到**具体类型**。
+	// 断言失败就**拒绝启动**:带着半套装配跑起来 = 静默走错路。
+	daprCube, ok := appCube.(*cubeclient.DaprCubeClient)
+	if !ok {
+		return fmt.Errorf("pricing: cube client 类型不是 *cubeclient.DaprCubeClient,装配有误")
+	}
 	appPrice = service.NewPriceService(appCube).WithStore(appPriceLists, appPromos)
+	// 解析器带 60s 缓存 + stale-on-error:每次读都打一次 dapr 往返不划算,
+	// 而一次网络抖动不该让整个门店的服务挂掉。
+	appPrice.SetCubeSource(
+		cubesource.NewCachedResolver(daprCube, cubesource.DefaultTTL, slog.Default()),
+		daprCube,
+	)
+	slog.Info("pricing: 门店数据源路由已启用", "app_id", cubeclient.DefaultCubeAppID())
 
 	if appUser, err = userinfo.New("userd"); err != nil {
 		return fmt.Errorf("userinfo client: %w", err)

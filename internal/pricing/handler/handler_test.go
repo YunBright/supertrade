@@ -237,6 +237,8 @@ func TestRoutes_RequireBranchHeader(t *testing.T) {
 		"/quotes?barcode=6957583900828",
 		"/promotions/active?barcode=6957583900828",
 		"/meta",
+		// ⚠️ 归档导出也是 per-branch 守门:导出的是**某个门店**的价格。
+		"/archive/export?scope=prices",
 	} {
 		w := do(t, r, path)
 		if w.Code != http.StatusBadRequest {

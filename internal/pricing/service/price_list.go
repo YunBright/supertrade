@@ -362,25 +362,6 @@ func (s *PriceListService) ActivePricesAll(ctx context.Context, branchID, listID
 	return rows, nil
 }
 
-// HasAnyPrices 该门店本地是否有价格数据。
-//
-// # 这是"回落 cube"的判据
-//
-// 门店 00 / 01(有 cube 源)本地没有价格 ⇒ 回落 cube(过渡期)。
-// 门店 10(自营,没有 cube 源)本地**有**价格 ⇒ **不回落** ——
-// 此时某个商品查不到价是**数据缺口**,必须显性暴露,
-// 而不是回落 cube 拿一个必然 503 的错误盖过去。
-func (s *PriceListService) HasAnyPrices(ctx context.Context, branchID string) (bool, error) {
-	var n int64
-	err := s.db.WithContext(ctx).Model(&model.PriceList{}).
-		Where("branch_id = ?", branchID).
-		Count(&n).Error
-	if err != nil {
-		return false, err
-	}
-	return n > 0, nil
-}
-
 // existingKeys 读出该门店已存在的 (list_id, branch_id, product_id) 集合。
 //
 // ⚠️ **必须 Unscoped** ——

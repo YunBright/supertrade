@@ -369,6 +369,35 @@ func (s *PromotionService) ActivePromotionsAll(ctx context.Context, branchID str
 	return out, nil
 }
 
+// ActivePromotionRows 取该门店在基准日**全部生效**的促销行(一行一促销单)。
+//
+// # ⚠️ 与 ActivePromotionsAll 的区别:那边是 map[商品]最低价那条,
+// 这里给的是**原始行**(一个促销单一行)——
+// 归档导出契约的 promotions scope 就是"一行一促销单"
+// (字段:product_id / plan_no / plan_name / price_yuan / orig_price_yuan /
+// begin_day / end_day),与 cube-router 的 /v1/export 同构。
+//
+// # ⚠️ WHERE 条件与 ActivePromotions **逐字相同**
+//
+//	口径不能各发明一套 —— 否则"查价说有促销、导出说没有"的分裂。
+//
+// ⚠️ 排序按 (product_id, id):同一商品多个促销单时顺序稳定
+// ⇒ 导出结果可复现(客户端拿两次导出做 diff 才靠谱)。
+func (s *PromotionService) ActivePromotionRows(ctx context.Context, branchID string, at time.Time) ([]model.Promotion, error) {
+	var rows []model.Promotion
+	err := s.db.WithContext(ctx).
+		Where("branch_id = ?", branchID).
+		Where("status = ?", "active").
+		Where("begin_at <= ?", at).
+		Where("end_at >= ?", at).
+		Order("product_id, id").
+		Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
 // ActivePromotion 取一个商品在某门店、某基准日当前生效的促销。
 //
 // 返回 (nil, nil) = 该商品此刻没有生效促销(绝大多数商品的常态)。

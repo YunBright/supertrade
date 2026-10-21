@@ -45,6 +45,14 @@ import (
 )
 
 // importArchive POST /archive/import
+//
+// ⚠️ **有源门店只读**:该门店的价格来自外部系统(富百家 / 佳乐)⇒
+// 写进本域 PG 的一行"没人看的价",而前台还显示"写成功了"。
+// ⇒ 有源时一律 409(与 member 域同一套闸门)。
+//
+// ⚠️ **解析失败(问不到路由)⇒ 放行**:导入路径自己会兜底
+// (本域 PG 里没有这个门店的行 ⇒ 导入 0 条),那是**诚实**的失败。
+// ⇒ 顺带:cube-router 挂掉时不会挡住自营店(门店 10)的正常导入。
 func (h *Handler) importArchive(c *gin.Context) {
 	if h.priceLists == nil || h.promos == nil {
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
@@ -57,6 +65,11 @@ func (h *Handler) importArchive(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 			"code": "branch_required", "message": "X-Branch-ID header 必填",
 		})
+		return
+	}
+	// ⚠️ 闸门在**写库之前**:有源门店的导入一律拒(409)。
+	if err := h.prices.EnsureLocalSource(c.Request.Context(), branchID); err != nil {
+		h.mapErr(c, err)
 		return
 	}
 	var req archivedto.ImportRequest

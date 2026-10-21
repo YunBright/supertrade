@@ -8,6 +8,7 @@
 //	GET  /prices/local?product_ids=   批量查本地售价(pricing:view)
 //	GET  /promotions/local?...        批量查本地当前生效促销(pricing:view)
 //	GET  /prices/export?on_date=      离线价格包(pricing:view)—— 不分页,全店
+//	GET  /archive/export?scope=       归档导出(archivedto 契约)(pricing:view)
 //	POST /archive/import               导入售价/促销(pricing:manage,per branch)
 //
 // 中间件:
@@ -17,6 +18,10 @@
 // 错误映射(与 catalog 保持同一套 code,前端 error_mapper 不用分服务处理):
 //   - service.ErrInvalidBarcode → 400 invalid_barcode
 //   - model.ErrInvalidInput     → 400 bad_request
+//   - model.ErrUnsupportedExportScope → 400 unsupported_export_scope
+//   - model.ErrCubeSourceUnavailable → 503 cube_unavailable
+//   - model.ErrCubeSourceDisabled    → 503 cube_source_disabled
+//   - model.ErrExternalSourceReadOnly → 409 member_source_is_external
 //   - cubeclient.ErrCubeUnavailable / ErrCubeAuthRejected → 503 / 401
 //   - cubeclient.ErrCubeForbidden → 403
 //   - 其余 → 500
@@ -94,9 +99,18 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 		rbac.RequireScopeWithBranch("pricing:view", branchFromHeader, resolver),
 		h.getLocalPromotions)
 	// 离线价格包(一次给全:默认价目表的生效零售价 + 该基准日生效的促销)。
+	//
+	// ⚠️ **路径与响应形状不许变**(前端 / POS 离线包在用)——
+	// 只有**数据来源**按"配没配数据源"切(有源 ⇒ cube 实时,没源 ⇒ 本地 PG)。
 	r.GET("/prices/export",
 		rbac.RequireScopeWithBranch("pricing:view", branchFromHeader, resolver),
 		h.exportLocalPrices)
+	// 归档导出(archivedto 契约):与 cube-router 的 /v1/export **同一份字段名**。
+	//
+	// ⚠️ 守门是 `pricing:view` —— 导出是**读**操作。
+	r.GET("/archive/export",
+		rbac.RequireScopeWithBranch("pricing:view", branchFromHeader, resolver),
+		h.getArchiveExport)
 	// 写侧(导入)。scope 是 pricing:manage(见包注释:目前未 seed ⇒ 403)。
 	r.POST("/archive/import",
 		rbac.RequireScopeWithBranch("pricing:manage", branchFromHeader, resolver),
@@ -181,6 +195,30 @@ func (h *Handler) mapErr(c *gin.Context, err error) {
 	case errors.Is(err, model.ErrInvalidInput):
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 			"code": "bad_request", "message": err.Error(),
+		})
+	case errors.Is(err, model.ErrUnsupportedExportScope):
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"code": "unsupported_export_scope", "message": err.Error(),
+		})
+	case errors.Is(err, model.ErrLocalStoreNotReady):
+		// 503:部署错误(本地表没装配),不是业务结论。
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+			"code": "not_ready", "message": err.Error(),
+		})
+	case errors.Is(err, model.ErrCubeSourceUnavailable):
+		// ⚠️ 503 而不是回落成一份空结果:这是链路故障(问不到路由),
+		// 回落会让用户看到「该门店还没有价格」——与故障无关的结论。
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+			"code": "cube_unavailable", "message": "数据源路由暂不可用，请稍后重试",
+		})
+	case errors.Is(err, model.ErrCubeSourceDisabled):
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+			"code": "cube_source_disabled", "message": "该门店的数据源已停用",
+		})
+	case errors.Is(err, model.ErrExternalSourceReadOnly):
+		// 409:状态冲突(这个门店的价在外部系统里,不是权限问题)。
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"code": "member_source_is_external", "message": err.Error(),
 		})
 	case errors.Is(err, service.ErrNoCube):
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{

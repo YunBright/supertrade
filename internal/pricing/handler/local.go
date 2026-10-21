@@ -13,14 +13,12 @@ package handler
 
 import (
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/YunBright/supertrade/internal/pricing/model"
-	"github.com/YunBright/supertrade/internal/pricing/service"
 	"github.com/YunBright/supertrade/pkg/middleware"
 )
 
@@ -77,6 +75,15 @@ type localPromoDTO struct {
 // ⚠️ **没维护价的商品不在返回里**(它没有行)——
 //
 //	调用方据此区分"没维护售价"与"售价 0 元"。
+//
+// # ⚠️ 这两个端点**只读本地表**,不按数据源路由
+//
+//	端点名字里的 "local" 就是承诺:批量查**本域 PG**里的售价/促销。
+//	要"按门店有无数据源路由"的实时价,走 /quotes(单个)与 /prices/export(全店)。
+//
+// ⇒ 门店 00(配了数据源)在这两个端点上拿到的仍是本地**快照**,
+// 而 /quotes 拿的是 cube 实时价 —— 这是**已知的不一致**,记在这里备查:
+// 现场问"为什么批量查和单个查不一样"时,答案就在这两行。
 func (h *Handler) getLocalPrices(c *gin.Context) {
 	if h.priceLists == nil {
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
@@ -202,38 +209,6 @@ func (h *Handler) getLocalPromotions(c *gin.Context) {
 	})
 }
 
-// exportPriceDTO 是离线价格包里的一行。
-//
-// # ⚠️ 零售价与促销价**分开给**
-//
-//	成交价 = min(price_yuan, promo_price_yuan) —— 由消费方决定
-//	(POS 收银用 min;价签打印用零售价划线 + 促销价)。
-//
-// ⚠️ 只给一个"价"的话,消费方要么按原价收钱(多收),
-// 要么自己再查一次 promotions(多一次往返)。
-type exportPriceDTO struct {
-	// ProductID 是商品货号(与 catalog.products.id 同一套编码)。
-	ProductID string `json:"product_id"`
-	// PriceYuan 是零售价(字符串)。
-	//
-	// ⚠️ 空串 = **没维护零售价**(该商品在 price_lists 里没有行),
-	// 与"零售价 0 元"是两件事。
-	PriceYuan string `json:"price_yuan"`
-	// PromoPriceYuan 是**该基准日生效的促销价**;null = 没有生效促销。
-	//
-	// ⚠️ **不用 omitempty**:键必须**始终在场**(没促销时值为 null)——
-	// 客户端才能区分"没有促销"与"响应里没这个字段"。
-	// ⚠️ null 与 "0" 也必须能区分:促销价 0 元的商品 ≠ 没有促销。
-	PromoPriceYuan *string `json:"promo_price_yuan"`
-	// PromoPlanNo 是促销单号(思迅 plan_no)。
-	PromoPlanNo *string `json:"promo_plan_no,omitempty"`
-	// PromoPlanName 是促销单名称(印在价签上,用于人工追溯"这个价哪来的")。
-	PromoPlanName *string `json:"promo_plan_name,omitempty"`
-	// PromoBeginDay / PromoEndDay 是活动起止日(yyyy-mm-dd)。
-	PromoBeginDay *string `json:"promo_begin_day,omitempty"`
-	PromoEndDay   *string `json:"promo_end_day,omitempty"`
-}
-
 // exportLocalPrices GET /prices/export?on_date=yyyy-mm-dd
 //
 // # 是什么
@@ -249,6 +224,13 @@ type exportPriceDTO struct {
 // ⚠️ 500 的上限是 `product_id IN (...)` 拼一条 SQL 的代价;
 // 导出走的是"整表扫",不受那个上限约束。
 //
+// # ⚠️ 路径与响应形状**不许变**(前端 / POS 离线包在用)
+//
+//	{"branch_id","as_of","prices":[…],"count","total"}
+//
+// 只有**数据来源**按"配没配数据源"切(有源 ⇒ cube 实时;没源 ⇒ 本地 PG),
+// 判据与查价同一套(见 service.ExportPriceRows)。
+//
 // # on_date
 //
 //   - 不传 = 今天(基准日的 00:00:00,与 localNow 同一口径)
@@ -258,7 +240,7 @@ type exportPriceDTO struct {
 // ⚠️ 非法 on_date ⇒ 400 bad_on_date(绝不"尽力解析"成一个大概的日期 ——
 // 那会让促销在错误的日期生效,印出低于真价的价签)。
 func (h *Handler) exportLocalPrices(c *gin.Context) {
-	if h.priceLists == nil || h.promos == nil {
+	if h.prices == nil {
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
 			"code": "not_ready", "message": "本地价格表未装配",
 		})
@@ -282,78 +264,20 @@ func (h *Handler) exportLocalPrices(c *gin.Context) {
 		}
 		at = parsed
 	}
-	ctx := c.Request.Context()
-	prices, err := h.priceLists.ActivePricesAll(ctx, branchID, service.DefaultPriceListID, at)
+	// ⚠️ 数据来源由 service 决定(有源 ⇒ cube 实时;没源 ⇒ 本地 PG)。
+	rows, err := h.prices.ExportPriceRows(c.Request.Context(), branchID, at)
 	if err != nil {
 		h.mapErr(c, err)
 		return
 	}
-	promos, err := h.promos.ActivePromotionsAll(ctx, branchID, at)
-	if err != nil {
-		h.mapErr(c, err)
-		return
-	}
-
-	out := make([]exportPriceDTO, 0, len(prices)+len(promos))
-	seen := make(map[string]bool, len(prices))
-	for _, p := range prices {
-		dto := exportPriceDTO{
-			ProductID: p.ProductID,
-			PriceYuan: p.PriceYuan.String(),
-		}
-		if promo, ok := promos[p.ProductID]; ok {
-			applyExportPromo(&dto, promo)
-		}
-		seen[p.ProductID] = true
-		out = append(out, dto)
-	}
-	// ⚠️ 促销可能落在**没维护零售价**的商品上(源库就是这种脏数据)。
-	//   只给"有零售价的行" ⇒ 客户端永远看不到这条促销 ⇒
-	//   该商品被当成"无促销"处理(按零售价/按未维护售价收钱)。
-	//   ⇒ 这类行也要给(price_yuan 为空串 = 没维护零售价)。
-	//
-	// ⚠️ map 迭代顺序随机 ⇒ 先把 id 排好序,保证导出结果**可复现**
-	//   (客户端拿两次导出做 diff,顺序必须一样)。
-	onlyPromo := make([]string, 0, len(promos))
-	for pid := range promos {
-		if !seen[pid] {
-			onlyPromo = append(onlyPromo, pid)
-		}
-	}
-	sort.Strings(onlyPromo)
-	for _, pid := range onlyPromo {
-		dto := exportPriceDTO{ProductID: pid}
-		applyExportPromo(&dto, promos[pid])
-		out = append(out, dto)
-	}
-
 	c.JSON(http.StatusOK, gin.H{
 		"branch_id": branchID,
 		// as_of 回给调用方:让"这批价格是按哪一天判的"从响应里就能看出来。
 		"as_of":  at.Format("2006-01-02"),
-		"prices": out,
-		"count":  len(out),
-		"total":  len(out),
+		"prices": rows,
+		"count":  len(rows),
+		"total":  len(rows),
 	})
-}
-
-// applyExportPromo 把促销信息挂到一行价格上。
-//
-// ⚠️ 促销价 **0 元也要给**(不是"没有促销")——
-// null 与 "0" 必须能区分,否则客户端会把"打折到 0 元"当成"没促销"。
-func applyExportPromo(dto *exportPriceDTO, promo model.Promotion) {
-	price := promo.PriceYuan.String()
-	dto.PromoPriceYuan = &price
-	planNo := promo.ID
-	dto.PromoPlanNo = &planNo
-	if promo.PlanName != "" {
-		name := promo.PlanName
-		dto.PromoPlanName = &name
-	}
-	begin := promo.BeginAt.Format("2006-01-02")
-	dto.PromoBeginDay = &begin
-	end := promo.EndAt.Format("2006-01-02")
-	dto.PromoEndDay = &end
 }
 
 // localNow 返回当前时刻(基准日的 00:00:00)。
