@@ -18,11 +18,15 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/YunBright/authkit/daprclient"
+	"github.com/YunBright/authkit/rbac"
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/internal/cubehttp"
+	"github.com/YunBright/supertrade/internal/cubesource"
 	"github.com/YunBright/supertrade/internal/stocktake"
 	"github.com/YunBright/supertrade/internal/stocktake/handler"
 	"github.com/YunBright/supertrade/internal/stocktake/model"
@@ -50,9 +54,10 @@ func main() {
 // 用 package var 是因为 cmdbootstrap.Options.OnStart / Register 回调签名不返回外部状态;
 // 后续可改成显式 dependency injection。
 var (
-	appDB   *gorm.DB
-	appSvc  *service.Service
-	appCube cubeclient.Client
+	appDB      *gorm.DB
+	appSvc     *service.Service
+	appCube    cubeclient.Client
+	appArchive *service.ArchiveService
 )
 
 func initApp() error {
@@ -115,6 +120,28 @@ func initApp() error {
 	appSvc.SetPublisher(pub)
 	slog.Info("dapr publisher enabled")
 
+	// ---- 归档导出/导入的「这个门店配了哪个数据源」解析器 ----
+	//
+	// ⚠️ **只用它解析数据源,不拿它查业务数据**:
+	//   盘点单 / 盘点明细 / 操作历史是**本域自己产生的**,cube 里没有这些 model。
+	//
+	// ⚠️ 用 daprclient.New() 而不是 dapr.NewClient():
+	//   go-sdk 的 api-token 拦截器会**整块替换** outgoing metadata,
+	//   把本客户端转发给 cube 的 Authorization 头抹掉
+	//   (2026-10-20 全网加 DAPR_API_TOKEN 之后暴露的)。
+	//   详见 authkit/daprclient 的包注释。
+	daprCli, err := daprclient.New()
+	if err != nil {
+		return fmt.Errorf("创建 dapr 客户端失败: %w (确认 dapr run 已起)", err)
+	}
+	cubeCli := cubeclient.NewDaprCubeClient(
+		daprCli, cubeclient.DefaultCubeAppID(), cubeclient.DefaultCubeQueryPath())
+	appArchive = service.NewArchiveService(appDB)
+	// ⚠️ 解析器带 60s 缓存 + stale-on-error:每次导出都打一次 dapr 往返不划算,
+	//   而一次网络抖动不该让整个门店的导出挂掉。
+	appArchive.SetSourceResolver(cubesource.NewCachedResolver(cubeCli, cubesource.DefaultTTL, slog.Default()))
+	slog.Info("stocktake: 归档导出/导入已启用", "app_id", cubeclient.DefaultCubeAppID())
+
 	slog.Info("stocktake app initialized",
 		"db_driver", "postgres",
 	)
@@ -138,6 +165,14 @@ func registerRoutes(r *gin.Engine) {
 	r.Use(forwardBearerToOutgoing())
 	h := handler.New(appSvc)
 	h.RegisterRoutes(r)
+	// 归档导出/导入(独立的契约 + 独立的守卫 scope)。
+	//
+	// ⚠️ 守门复用 service 层的 effective scopes(带 60s 缓存),
+	//   与本域既有的 inventory:view / inventory:manage 同一套口径。
+	handler.NewArchiveHandler(appArchive, rbac.ScopeResolver(
+		func(c *gin.Context, userID, branchID, scope string) (bool, error) {
+			return appSvc.HasEffectiveScope(c.Request.Context(), userID, branchID, scope)
+		})).RegisterRoutes(r)
 }
 
 // registerDaprRoutes 在 auth 中间件**之前**注册 Dapr 订阅端点。
@@ -172,6 +207,15 @@ func forwardBearerToOutgoing() gin.HandlerFunc {
 			ctx := c.Request.Context()
 			ctx = cubeclient.WithBearer(ctx, bearer)
 			ctx = userinfo.WithBearer(ctx, bearer)
+			c.Request = c.Request.WithContext(ctx)
+		}
+		// ⚠️ X-Branch-ID 也要写进 **cubeclient 的 ctx key**:
+		//   归档端点要问 cube-router「这个门店配了哪个数据源」,
+		//   而 cube-router 的 /v1/branch-source 挂着 cube:read 守门
+		//   ⇒ JWT 与门店都要被透传过去,否则 401 / 路由到错的门店。
+		if branchID := strings.TrimSpace(c.Request.Header.Get("X-Branch-ID")); branchID != "" {
+			ctx := c.Request.Context()
+			ctx = cubeclient.WithBranchID(ctx, branchID)
 			c.Request = c.Request.WithContext(ctx)
 		}
 		c.Next()
