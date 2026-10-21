@@ -142,6 +142,12 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/members/:id/stored-value-card",
 		rbac.RequireScopeWithBranch(model.ScopeView, branchFromHeader, resolver),
 		h.getStoredValueCard)
+	// 归档导出(cube-async 搬数据时读它)。
+	//
+	// ⚠️ 守卫 member:view(读操作,与 /members/export 同档)。
+	r.GET("/archive/export",
+		rbac.RequireScopeWithBranch(model.ScopeView, branchFromHeader, resolver),
+		h.getArchiveExport)
 
 	// ---- 配置类写端点:标准 scope 守门(不走图4/图5 的授权链路) ----
 	//

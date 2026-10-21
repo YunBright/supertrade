@@ -51,6 +51,8 @@ type Service struct {
 	sources SourceResolver
 	// cube 读 cube 里的会员档案(nil = 未装配 ⇒ 一律走本地 PG)。
 	cube MemberReader
+	// archiveExporter 调上游的导出端点(配了数据源的门店导出会员档案时用)。
+	archiveExporter ArchiveExporter
 	// now 是可注入时钟(测试用)。
 	now func() time.Time
 }

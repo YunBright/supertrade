@@ -154,6 +154,9 @@ func initApp() error {
 	// ⚠️ 解析器带 60s 缓存 + stale-on-error:每次读都打一次 dapr 往返不划算,
 	//   而一次网络抖动不该让整个门店的会员服务挂掉。
 	appSvc.SetCubeSource(cubesource.NewCachedResolver(cube, cubesource.DefaultTTL, slog.Default()), cube)
+	// 归档导出器:配了数据源的门店导出会员档案时**原样转发**上游
+	// (cube-router 的 /v1/export，字段名与导入契约逐字一致)。
+	appSvc.SetArchiveExporter(service.NewDaprArchiveExporter(daprCli, cubeclient.DefaultCubeAppID()))
 	slog.Info("member: cube 读路径已启用", "app_id", cubeclient.DefaultCubeAppID())
 
 	slog.Info("member app initialized",
