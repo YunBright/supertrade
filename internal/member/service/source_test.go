@@ -11,24 +11,25 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/cubesource"
 	"github.com/YunBright/supertrade/internal/member/model"
 	"github.com/YunBright/supertrade/internal/member/service"
 )
 
 // ---- 测试替身 ----
 
-// fakeSource 替身 SourceResolver。
+// fakeSource 替身 SourceResolver(cubesource.Resolver)。
 type fakeSource struct {
-	src cubeclient.BranchSource
+	src cubesource.Source
 	err error
 	// calls 记录解析次数(用来断言"每次读都问一次"或"没问")。
 	calls int
 }
 
-func (f *fakeSource) ResolveBranchSource(_ context.Context, _ string) (cubeclient.BranchSource, error) {
+func (f *fakeSource) Resolve(_ context.Context, _ string) (cubesource.Source, error) {
 	f.calls++
 	if f.err != nil {
-		return cubeclient.BranchSource{}, f.err
+		return cubesource.Source{}, f.err
 	}
 	return f.src, nil
 }
@@ -61,12 +62,12 @@ func (f *fakeCubeReader) GetMember(_ context.Context, memberID string) (*cubecli
 	return nil, cubeclient.ErrCubeNotFound
 }
 
-func localSource() cubeclient.BranchSource {
-	return cubeclient.BranchSource{BranchID: "10"}
+func localSource() cubesource.Source {
+	return cubesource.Source{BranchID: "10"}
 }
 
-func externalSource() cubeclient.BranchSource {
-	return cubeclient.BranchSource{
+func externalSource() cubesource.Source {
+	return cubesource.Source{
 		BranchID:       "00",
 		Configured:     true,
 		Enabled:        true,

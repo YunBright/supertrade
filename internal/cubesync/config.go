@@ -60,6 +60,12 @@ type Config struct {
 	MemberAppID string
 	// Scopes 是本次同步的资料域(**按依赖顺序**)。
 	Scopes []string
+	// JobPrefix 是 dapr job 名的前缀(SYNC_JOB_PREFIX)。
+	//
+	// ⚠️ **必须与其它编排器不同名**:dapr scheduler 的 job 按名字 upsert,
+	// 同名 ⇒ 两个编排器互相覆盖 ⇒ "只有一个在跑"且没有任何日志会说这件事。
+	// 空 = 用 DefaultJobPrefix("cube-sync")。
+	JobPrefix string
 	// Mode 是 incremental / overwrite。
 	Mode string
 	// Cron 是 dapr job 的调度表达式(**6 字段,UTC**)。
@@ -110,6 +116,8 @@ const (
 	DefaultInventoryApp   = "supertrade-inventory"
 	DefaultMemberApp      = "supertrade-member"
 	DefaultMode           = "overwrite"
+	// DefaultJobPrefix 是 dapr job 名的默认前缀。
+	DefaultJobPrefix = "cube-sync"
 	// DefaultCron 是**本地时刻**写法,由 normalizeCron 换算成 UTC 6 字段。
 	DefaultCron      = "03:30"
 	DefaultPageSize  = 5000
@@ -201,6 +209,7 @@ func LoadConfig() Config {
 		InventoryAppID:       envStr("INVENTORY_APP_ID", DefaultInventoryApp),
 		MemberAppID:          envStr("MEMBER_APP_ID", DefaultMemberApp),
 		Scopes:               envList("SYNC_SCOPES", DefaultScopes),
+		JobPrefix:            envStr("SYNC_JOB_PREFIX", DefaultJobPrefix),
 		Mode:                 envStr("SYNC_MODE", DefaultMode),
 		CronSpec:             envStr("SYNC_CRON", DefaultCron),
 		PageSize:             envInt("SYNC_PAGE_SIZE", DefaultPageSize),
@@ -258,8 +267,17 @@ func (c Config) CallbackAddress(path string) string {
 // 所以必须做**文件名安全性**处理 —— 只挡 "/" 不够,
 // "\"、"?"、"#" 在 URL 与文件系统里同样能改变解析结果。
 // (与 salesagg/collect.JobName 同款处理,理由同款。)
+//
+// ⚠️ 前缀可配(SYNC_JOB_PREFIX):cube-sync 与 cube-async 是两个编排器,
+// 它们的 job 必须**不同名** —— 同名会互相覆盖调度(实测 dapr scheduler
+// 的 job 是按名字 upsert 的)⇒ 结果是"两个编排器只有一个在跑",
+// 而且没有任何一行日志会说这件事。
 func (c Config) JobName() string {
-	return "cube-sync-" + sanitizeID(c.SourceBranchID) + "-" + sanitizeID(c.TargetBranchID)
+	prefix := strings.TrimSpace(c.JobPrefix)
+	if prefix == "" {
+		prefix = DefaultJobPrefix
+	}
+	return prefix + "-" + sanitizeID(c.SourceBranchID) + "-" + sanitizeID(c.TargetBranchID)
 }
 
 // sanitizeID 把 id 压成可以安全出现在 URL 路径与文件名里的形态。

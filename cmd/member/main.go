@@ -33,6 +33,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/cubesource"
 	"github.com/YunBright/supertrade/internal/member/db"
 	"github.com/YunBright/supertrade/internal/member/handler"
 	"github.com/YunBright/supertrade/internal/member/model"
@@ -149,7 +150,10 @@ func initApp() error {
 	)
 	// ⚠️ **两个一起注入**(解析器 + 读端):只注入一个 ⇒ 仍走本地 PG
 	//   ⇒ 有数据源的门店又变成"没有会员档案"(本次要修的那个症状)。
-	appSvc.SetCubeSource(cube, cube)
+	//
+	// ⚠️ 解析器带 60s 缓存 + stale-on-error:每次读都打一次 dapr 往返不划算,
+	//   而一次网络抖动不该让整个门店的会员服务挂掉。
+	appSvc.SetCubeSource(cubesource.NewCachedResolver(cube, cubesource.DefaultTTL, slog.Default()), cube)
 	slog.Info("member: cube 读路径已启用", "app_id", cubeclient.DefaultCubeAppID())
 
 	slog.Info("member app initialized",

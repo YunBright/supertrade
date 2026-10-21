@@ -325,6 +325,29 @@ builds:
       - goos: linux
         goarch: 386
 
+  # 2026-10-22 新增:cube-async(服务层数据搬运编排器)。
+  #
+  # ⚠️ 它与 cube-sync 的区别只有一处,但很关键:
+  #   cube-sync  : 导出直接问 cube-router(GET /v1/export)⇒ 只认 cube 里的数据;
+  #   cube-async : 导出问**各服务自己的**归档导出端口(GET /archive/export)
+  #                 ⇒ 源门店配了数据源就导 cube 的、没配就导本地的;
+  #                 ⇒ 搬运方不需要知道 cube 的存在。
+  #
+  # ⚠️ 它同样**不连任何数据库** —— 只做编排。
+  # ⚠️ 端口 8118:8110~8117 已占(cube-sync 8116 / cube-sync-member 8117)。
+  - main: ./cmd/cube-async
+    id: "cube-async"
+    binary: "cube-async"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
   # 2026-10-21 新增:member(会员域)。
   #
   # ⚠️ 端口 8113:8110~8112 已占(sales-agg 8110 / pricing 8111 / sales-insight 8112),
@@ -575,6 +598,15 @@ archives:
       - cube-sync
     wrap_in_directory: false
     name_template: 'apps/cube-sync/cube-sync_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  # 2026-10-22 新增:cube-async(服务层搬运编排器)。
+  # 同样没有 files 块 —— 它不订阅任何 topic。
+  - id: "cube-async"
+    format: tar.gz
+    builds:
+      - cube-async
+    wrap_in_directory: false
+    name_template: 'apps/cube-async/cube-async_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
 
 checksum:
   name_template: 'checksums.txt'

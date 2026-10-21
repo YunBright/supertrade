@@ -11,6 +11,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/cubesource"
 	"github.com/YunBright/supertrade/internal/member/model"
 )
 
@@ -35,10 +36,11 @@ import (
 
 // SourceResolver 解析"这个门店配了哪个数据源"。
 //
-// 实现:internal/cubeclient 的 DaprCubeClient(问 cube-router 的 /v1/branch-source)。
-type SourceResolver interface {
-	ResolveBranchSource(ctx context.Context, branchID string) (cubeclient.BranchSource, error)
-}
+// 实现:internal/cubesource.CachedResolver(问 cube-router 的 /v1/branch-source)。
+//
+// ⚠️ 各服务**共用同一个实现**——判据必须只有一个,
+// 否则同一个门店在不同服务里表现不一致(2026-10-21 审计的真实教训)。
+type SourceResolver = cubesource.Resolver
 
 // MemberReader 读 cube 里的会员档案。
 //
@@ -95,20 +97,20 @@ func (s *Service) EnsureLocalSource(ctx context.Context, branchID string) error 
 //   - useCube=true  ⇒ 走 cube
 //   - useCube=false ⇒ 走本域 PG
 //   - err != nil    ⇒ 问不到 / 数据源被关停 ⇒ 上抛(503)
-func (s *Service) resolveCubeSource(ctx context.Context, branchID string) (cubeclient.BranchSource, bool, error) {
+func (s *Service) resolveCubeSource(ctx context.Context, branchID string) (cubesource.Source, bool, error) {
 	if s.sources == nil || s.cube == nil {
 		// 未装配 ⇒ 本地(自营店场景)。
-		return cubeclient.BranchSource{}, false, nil
+		return cubesource.Source{}, false, nil
 	}
-	src, err := s.sources.ResolveBranchSource(ctx, branchID)
+	src, err := s.sources.Resolve(ctx, branchID)
 	if err != nil {
 		// ⚠️ **权限类错误要原样上抛**:调用者没有该门店的 cube:read ⇒ 403,
 		//   而"问不到路由"⇒ 503。两者混在一起会让"没权限"显示成"暂不可用",
 		//   用户会去查数据源健康度(而真正的原因是权限)。
 		if errors.Is(err, cubeclient.ErrCubeForbidden) || errors.Is(err, cubeclient.ErrCubeAuthRejected) {
-			return cubeclient.BranchSource{}, false, err
+			return cubesource.Source{}, false, err
 		}
-		return cubeclient.BranchSource{}, false, fmt.Errorf("%w: %v", model.ErrCubeSourceUnavailable, err)
+		return cubesource.Source{}, false, fmt.Errorf("%w: %v", model.ErrCubeSourceUnavailable, err)
 	}
 	if !src.Configured {
 		// 自营店(没配数据源)⇒ 本域 PG。
