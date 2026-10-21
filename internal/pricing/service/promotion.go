@@ -329,6 +329,46 @@ func (s *PromotionService) ActivePromotions(ctx context.Context, branchID string
 	return out, nil
 }
 
+// ActivePromotionsAll 取该门店在基准日**全部**生效的促销(按商品取最低价)。
+//
+// # ⚠️ WHERE 条件与 ActivePromotions **逐字相同**(只少了 product_id IN 过滤)
+//
+//	口径不能各发明一套 —— 促销是时效数据,两处判定不同一天,
+//	就会出现"查价说有促销、导出说没有"的分裂。
+//
+// # ⚠️ 同商品多促销 ⇒ 取**促销价最低**的那条
+//
+// 与 ActivePromotions 同一口径(cube promotion model 的 min_promo_price 语义:
+// 「用户实际能买到的最低价」)。
+//
+// ⚠️ 排序按 (product_id, id) —— **不按 price_yuan**:
+//
+//	单价比较由 Go 侧的 decimal 比大小做(不是 SQL),SQL 只管行序。
+//	若按 price_yuan 排,SQLite(存 TEXT)与 PG(存 numeric)的排序不同
+//	⇒ 同价促销在两个库上会选中不同的那条 ⇒ 导出与查价可能给出不同的促销单号。
+//	⇒ 只按 id 定序 ⇒ 同价时**先到的**(id 小的)那条胜出,两个库一致。
+func (s *PromotionService) ActivePromotionsAll(ctx context.Context, branchID string, at time.Time) (map[string]model.Promotion, error) {
+	out := map[string]model.Promotion{}
+	var rows []model.Promotion
+	err := s.db.WithContext(ctx).
+		Where("branch_id = ?", branchID).
+		Where("status = ?", "active").
+		Where("begin_at <= ?", at).
+		Where("end_at >= ?", at).
+		Order("product_id, id").
+		Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		cur, ok := out[r.ProductID]
+		if !ok || r.PriceYuan.LessThan(cur.PriceYuan) {
+			out[r.ProductID] = r
+		}
+	}
+	return out, nil
+}
+
 // ActivePromotion 取一个商品在某门店、某基准日当前生效的促销。
 //
 // 返回 (nil, nil) = 该商品此刻没有生效促销(绝大多数商品的常态)。

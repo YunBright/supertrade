@@ -29,6 +29,7 @@ func localRouterWithDB(t *testing.T) (*gin.Engine, *gorm.DB) {
 	r.Use(middleware.XBranchID())
 	r.GET("/prices/local", h.getLocalPrices)
 	r.GET("/promotions/local", h.getLocalPromotions)
+	r.GET("/prices/export", h.exportLocalPrices)
 	return r, db
 }
 

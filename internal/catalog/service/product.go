@@ -240,6 +240,38 @@ func (s *ProductService) List(ctx context.Context, branchID string, q LocalProdu
 	return rows, total, nil
 }
 
+// ExportAll 导出该门店的**全部**商品(离线商品库用)。
+//
+// # ⚠️ 与 List 的三处差别(都是"离线数据包"逼出来的)
+//
+//  1. **不分页**:门店 10 有 27470 个商品,`page_size` 上限 200
+//     ⇒ 分页拉全量是 **138 次 HTTP 往返**,每趟还要过一次 RBAC。
+//     ⇒ 一次给全,是"离线商品库"这件事的前提。
+//  2. **含换购品 / 停用品**:List 默认过滤掉它们(见 List 里的注释),
+//     而离线商品库缺这两类是**已知缺口** —— 收银员扫到换购品时
+//     POS 查不到商品,只能干瞪眼。
+//  3. 排序仍是 (name, id) 全序 ⇒ 同一份数据任何时候导出结果一致
+//     (客户端可以拿导出的结果做本地全量索引,不需要再排序)。
+//
+// # ⚠️ 返回的行**不含条码全集**
+//
+// 条码在 `product_barcodes` 子表(1 商品 : 1~7 条),
+// 归组由 ProductBarcodeService.ListByBranch 做 —— 两张表分两个 service,
+// 各自守自己的表。
+func (s *ProductService) ExportAll(ctx context.Context, branchID string) ([]model.Product, error) {
+	if branchID == "" {
+		return nil, model.ErrInvalidInput
+	}
+	var rows []model.Product
+	if err := s.db.WithContext(ctx).
+		Where("branch_id = ?", branchID).
+		Order("name").Order("id").
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
 // FindCandidatesByCode 按一个编码找出**候选商品列表**。
 //
 // # 为什么返回列表而不是单个商品

@@ -16,6 +16,7 @@
 //	PUT    /products/:id                         改商品(product:manage)—— 本地表
 //	DELETE /products/:id                         软删商品(product:manage)—— 本地表
 //	GET    /products/local                        本地表商品列表(product:view)—— 分页
+//	GET    /products/export                       离线商品库(product:view)—— 不分页,含换购/停用
 //	GET    /categories?with_counts=               分类字典(supplier:view,商品选择控件)
 //	GET    /categories/local                      本地表分类列表(product:view)
 //	GET    /categories/:id                        查单个分类(product:view)
@@ -160,6 +161,15 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/products/local",
 		rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver),
 		h.listLocalProducts)
+	// 离线商品库(一次给全,不分页,含换购品/停用品)。
+	//
+	// ⚠️ 静态段 `/products/export` 与参数段 `/products/:id` **共存**:
+	// gin 的路由树里静态段优先于参数段(与注册顺序无关)——
+	// 这条依赖 gin 版本,必须有测试锁住
+	// (见 handler/product_export_test.go 的 TestProductsExportRouteWinsOverParam)。
+	r.GET("/products/export",
+		rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver),
+		h.exportLocalProducts)
 
 	// 商品条码(1 商品 : N 条码)。
 	//

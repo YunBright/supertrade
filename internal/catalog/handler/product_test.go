@@ -63,6 +63,7 @@ func newLocalTestRouter(t *testing.T) *gin.Engine {
 	r.PUT("/products/:id", h.updateProduct)
 	r.DELETE("/products/:id", h.deleteProduct)
 	r.GET("/products/local", h.listLocalProducts)
+	r.GET("/products/export", h.exportLocalProducts)
 	r.GET("/products/by-barcode/:code", h.getProductByBarcode)
 	r.GET("/products/:id/barcodes", h.listProductBarcodes)
 	r.POST("/products/:id/barcodes", h.createProductBarcode)

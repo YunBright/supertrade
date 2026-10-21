@@ -7,6 +7,7 @@
 //	GET  /meta                        价格标签字段名等静态元数据(pricing:view)
 //	GET  /prices/local?product_ids=   批量查本地售价(pricing:view)
 //	GET  /promotions/local?...        批量查本地当前生效促销(pricing:view)
+//	GET  /prices/export?on_date=      离线价格包(pricing:view)—— 不分页,全店
 //	POST /archive/import               导入售价/促销(pricing:manage,per branch)
 //
 // 中间件:
@@ -92,6 +93,10 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/promotions/local",
 		rbac.RequireScopeWithBranch("pricing:view", branchFromHeader, resolver),
 		h.getLocalPromotions)
+	// 离线价格包(一次给全:默认价目表的生效零售价 + 该基准日生效的促销)。
+	r.GET("/prices/export",
+		rbac.RequireScopeWithBranch("pricing:view", branchFromHeader, resolver),
+		h.exportLocalPrices)
 	// 写侧(导入)。scope 是 pricing:manage(见包注释:目前未 seed ⇒ 403)。
 	r.POST("/archive/import",
 		rbac.RequireScopeWithBranch("pricing:manage", branchFromHeader, resolver),

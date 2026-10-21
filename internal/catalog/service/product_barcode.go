@@ -157,6 +157,43 @@ func (s *ProductBarcodeService) ListByProduct(ctx context.Context, branchID, pro
 	return rows, nil
 }
 
+// ListByBranch 列出该门店**全部**条码,按 product_id 归组。
+//
+// # 为什么要"一次全量"
+//
+// 离线商品库需要每个商品的**全部**条码(1 商品 : 1~7 条),
+// 逐个商品调 ListByProduct 是 N 次往返(27470 个商品 = 27470 次)。
+//
+// # 返回值语义
+//
+// 返回 map[product_id][]barcode:
+//
+//   - **没有条码的商品不在 map 里**(调用方据此回落到 `products.id`)
+//   - 同一商品的条码按 (is_primary desc, barcode) 排 —— 主条码在前
+//
+// ⚠️ 软删行由 GORM 自动过滤(`gorm.DeletedAt`)⇒ 删掉的条码不会回来。
+func (s *ProductBarcodeService) ListByBranch(ctx context.Context, branchID string) (map[string][]string, error) {
+	out := map[string][]string{}
+	if branchID == "" {
+		return nil, model.ErrInvalidInput
+	}
+	var rows []model.ProductBarcode
+	if err := s.db.WithContext(ctx).
+		Where("branch_id = ?", branchID).
+		Order("is_primary desc, barcode").
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		code := strings.TrimSpace(r.Barcode)
+		if code == "" {
+			continue
+		}
+		out[r.ProductID] = append(out[r.ProductID], code)
+	}
+	return out, nil
+}
+
 // FindByBarcode 按条码找商品 id。
 //
 // 只查条码表(全集)。查不到时调用方可以再退到 `products.barcode`。

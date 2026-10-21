@@ -32,9 +32,12 @@ package handler
 import (
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/YunBright/supertrade/internal/catalog/model"
 	"github.com/YunBright/supertrade/internal/catalog/service"
 	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/pkg/middleware"
@@ -228,6 +231,139 @@ func (h *Handler) listLocalProducts(c *gin.Context) {
 		"page":      page,
 		"page_size": pageSize,
 	})
+}
+
+// exportProductDTO 是离线商品库里的一行。
+//
+// # ⚠️ barcode 与 barcodes 是**两回事**
+//
+//	barcode  = **单个**扫码键(客户端按它建索引)
+//	barcodes = 该商品的**全部**扫码键(1~7 条,扫码枪可能扫到任一条)
+//
+// # ⚠️ barcode 为什么要**回落到 id**
+//
+// `products.barcode` 在生产**根本没赋值**(导入时不写这一列,
+// 见 service/archive.go 建 model.Product 的地方)⇒ 全是空串。
+// 而绝大多数商品的扫码键就是 `products.id`(思迅 item_no,形如 6922303199721)
+// ⇒ 空条码时用 id 兜底,否则离线 POS 扫什么都扫不出来。
+//
+// 兜底后的 id 也会进 barcodes 数组 ⇒ 客户端一张表就能建"码 → 商品"索引。
+type exportProductDTO struct {
+	// ID 是货号(思迅 item_no),也是**扫码键**之一。
+	ID string `json:"id"`
+	// Name 是品名(已去掉思迅的「(换购)」「（停用）」前缀)。
+	Name string `json:"name"`
+	// SubCode 是自编码/助记码(**不唯一**,见 model.Product.SubCode)。
+	SubCode string `json:"sub_code"`
+	// Barcode 是主扫码键(products.barcode 为空时回落成 id)。
+	Barcode string `json:"barcode"`
+	// Barcodes 是该商品的**全部**扫码键(子表条码 + 回落后的 id,去重)。
+	//
+	// ⚠️ 永远是**数组**(不返回 null)—— 客户端遍历时不用判空。
+	Barcodes []string `json:"barcodes"`
+	// Unit 是基本单位(实测值直接就是单位名本身如"提")。
+	Unit string `json:"unit"`
+	// Spec 是规格(思迅 item_size,实测有 "1*10" 这类脏值 —— 原样存)。
+	Spec string `json:"spec"`
+	// CategoryID / SupplierID 是分类与供应商(外键)。
+	CategoryID string `json:"category_id"`
+	SupplierID string `json:"supplier_id"`
+	// Status 是商品状态(导入时从思迅状态码映射而来,**不翻译**成 active/inactive)。
+	Status string `json:"status"`
+	// UpdatedAt 是最后修改时刻(RFC3339,与 model.Product 的 JSON 编码一致)。
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// exportLocalProducts GET /products/export —— 离线商品库(一次给全)。
+//
+// # 与 listLocalProducts 的关系
+//
+//	GET /products/local   分页,默认过滤换购品/停用品 —— 给"商品选择控件"用
+//	GET /products/export  **不分页**,含换购品/停用品 —— 给"离线数据包"用
+//
+// ⚠️ **不改动 listLocalProducts 的现有行为**:商品选择控件与 tradewind_app
+// 都在用那条路径,响应形状不能动。
+//
+// # ⚠️ 门店只从 X-Branch-ID header 取
+//
+// body / query 里**不认**门店 —— 否则 A 店的登录态能把 B 店的商品导走。
+func (h *Handler) exportLocalProducts(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if branchID == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"code":    "branch_required",
+			"message": "X-Branch-ID header 必填",
+		})
+		return
+	}
+	ctx := c.Request.Context()
+	rows, err := h.products.ExportAll(ctx, branchID)
+	if err != nil {
+		h.mapErr(c, err)
+		return
+	}
+	// 条码一次取全(1 商品 : 1~7 条 ⇒ 逐个商品查是 N 次往返)。
+	byProduct := map[string][]string{}
+	if h.barcodes != nil {
+		byProduct, err = h.barcodes.ListByBranch(ctx, branchID)
+		if err != nil {
+			h.mapErr(c, err)
+			return
+		}
+	}
+
+	out := make([]exportProductDTO, 0, len(rows))
+	for _, p := range rows {
+		out = append(out, buildExportProduct(p, byProduct[p.ID]))
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"branch_id": branchID,
+		"products":  out,
+		"count":     len(out),
+		"total":     len(out),
+	})
+}
+
+// buildExportProduct 组装一行离线商品。
+//
+// ⚠️ 扫码键的组装顺序:
+//  1. 子表条码(主条码在前)
+//  2. 回落后的主扫码键(products.barcode 非空用它,否则用 id)
+//
+// 去重 ⇒ 同一商品的多个条码不重复出现。
+func buildExportProduct(p model.Product, subBarcodes []string) exportProductDTO {
+	// ⚠️ barcode 回落:products.barcode 在生产是空串(导入不赋值),
+	//   而绝大多数商品的扫码键就是 id ⇒ 空则用 id 兜底。
+	code := strings.TrimSpace(p.Barcode)
+	if code == "" {
+		code = p.ID
+	}
+	codes := make([]string, 0, len(subBarcodes)+1)
+	seen := make(map[string]bool, len(subBarcodes)+1)
+	for _, b := range subBarcodes {
+		if b == "" || seen[b] {
+			continue
+		}
+		seen[b] = true
+		codes = append(codes, b)
+	}
+	if code != "" && !seen[code] {
+		seen[code] = true
+		codes = append(codes, code)
+	}
+	return exportProductDTO{
+		ID:         p.ID,
+		Name:       p.Name,
+		SubCode:    p.SubCode,
+		Barcode:    code,
+		Barcodes:   codes,
+		Unit:       p.Unit,
+		Spec:       p.Spec,
+		CategoryID: p.CategoryID,
+		SupplierID: p.SupplierID,
+		Status:     p.Status,
+		UpdatedAt:  p.UpdatedAt,
+	}
 }
 
 // getProduct GET /products/:id —— 本期返 501,留待未来实装本地 CRUD。

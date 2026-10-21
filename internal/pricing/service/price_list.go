@@ -330,6 +330,38 @@ func (s *PriceListService) ActivePrices(ctx context.Context, branchID, listID st
 	return out, nil
 }
 
+// ActivePricesAll 取该门店某价目表在基准时刻**全部**生效的售价。
+//
+// # ⚠️ WHERE 条件与 ActivePrices **逐字相同**(只少了 product_id IN 过滤)
+//
+//	口径不能各发明一套 —— 否则"批量查价"与"导出价"对同一时刻
+//	会给出不同结论(查价说没价、导出说有价 ⇒ 客户端取哪个都不对)。
+//
+// # 返回值是**切片**而不是 map
+//
+// ActivePrices 返回 map 是因为它按 product_id 查;这里要的是"全量",
+// 切片保留 DB 的行序,交给调用方自己归组。
+//
+// ⚠️ 排序按 product_id —— 一个商品在一个价目表里**只有一行**(PK 保证)
+// ⇒ 这是**全序** ⇒ 两次导出结果顺序一致(客户端拿两次导出做 diff 才靠谱)。
+func (s *PriceListService) ActivePricesAll(ctx context.Context, branchID, listID string, at time.Time) ([]model.PriceList, error) {
+	if listID == "" {
+		listID = DefaultPriceListID
+	}
+	var rows []model.PriceList
+	err := s.db.WithContext(ctx).
+		Where("branch_id = ? AND id = ?", branchID, listID).
+		Where("status = ?", "active").
+		Where("effective_at <= ?", at).
+		Where("expired_at IS NULL OR expired_at >= ?", at).
+		Order("product_id").
+		Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
 // HasAnyPrices 该门店本地是否有价格数据。
 //
 // # 这是"回落 cube"的判据
