@@ -526,6 +526,54 @@ func buildImportData(scope string, rows []map[string]any) archivedto.ImportData 
 			})
 		}
 		return archivedto.ImportData{Stocks: out}
+	case archivedto.ScopeMemberTypes:
+		// ⚠️ 会员类别:只带字典,导入端按**名字**对齐(两边 id 体系不同)。
+		out := make([]archivedto.ImportMemberTypeRow, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, archivedto.ImportMemberTypeRow{
+				ID:               strOf(r, "id"),
+				Name:             strOf(r, "name"),
+				DiscountRate:     strOf(r, "discount_rate"),
+				AllowStoredValue: strOf(r, "allow_stored_value"),
+				AllowPointsPay:   strOf(r, "allow_points_pay"),
+			})
+		}
+		return archivedto.ImportData{MemberTypes: out}
+	case archivedto.ScopeMembers:
+		// ⚠️ 会员档案:**原样带出**(不归一化)——
+		// 语义归一化(状态映射 / 哨兵 / 脏值)在**导入端**做,
+		// 在这里"顺手翻译"会把"读不懂"变成"余额 0"。
+		out := make([]archivedto.ImportMemberRow, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, archivedto.ImportMemberRow{
+				ID:                strOf(r, "id"),
+				CardFaceNo:        strOf(r, "card_face_no"),
+				CardType:          strOf(r, "card_type"),
+				Name:              strOf(r, "name"),
+				Gender:            strOf(r, "gender"),
+				Phone:             strOf(r, "phone"),
+				Mobile:            strOf(r, "mobile"),
+				Birthday:          strOf(r, "birthday"),
+				IDCardNo:          strOf(r, "id_card_no"),
+				Status:            strOf(r, "status"),
+				FeeAmountYuan:     strOf(r, "fee_amount_yuan"),
+				LimitedUseCount:   strOf(r, "limited_use_count"),
+				PointsAccumulated: strOf(r, "points_accumulated"),
+				PointsUsed:        strOf(r, "points_used"),
+				BalanceYuan:       strOf(r, "balance_yuan"),
+				ConsumedAmountYuan: strOf(r, "consumed_amount_yuan"),
+				ConsumedCount:      strOf(r, "consumed_count"),
+				Favorite:           strOf(r, "favorite"),
+				Remark:             strOf(r, "remark"),
+				BranchNo:           strOf(r, "branch_no"),
+				OperatorID:         strOf(r, "operator_id"),
+				OperatedAt:         strOf(r, "operated_at"),
+				ValidFrom:          strOf(r, "valid_from"),
+				ValidUntil:         strOf(r, "valid_until"),
+				OpenID:             strOf(r, "open_id"),
+			})
+		}
+		return archivedto.ImportData{Members: out}
 	default:
 		// 未知 scope 不静默忽略:那会让"配错了 scope 名"变成
 		// "这个 scope 什么都没导" —— 与"本来就没数据"长得一模一样。

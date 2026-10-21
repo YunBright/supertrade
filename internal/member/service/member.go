@@ -216,27 +216,46 @@ type ListMembersInput struct {
 	Q string
 	// Limit 是条数上限(<=0 用默认)。
 	Limit int
+	// Offset 是**翻页起点**(跳过的行数)。
+	//
+	// ⚠️ 为什么必须有它:一个门店导入后有 4128 个会员,
+	//   而 Limit 上限是 200 ⇒ 不给 offset 就**只能看到前 200 条**,
+	//   而且响应里没有"总数"⇒ 前端会以为"这个店就这么点会员"(静默截断)。
+	Offset int
 }
 
 // ListMembers 查会员列表(图3 的"查询条件"下拉 + 输入框)。
 //
 // ⚠️ **只认白名单字段**(model.QueryFieldColumn)—— 把 query 直接拼进 SQL
 // 是注入面,而这里根本不需要灵活性。
+//
+// ⚠️ 本方法**不返回总数**:要总数用 ListMembersPage(见下)。
 func (s *Service) ListMembers(ctx context.Context, in ListMembersInput) ([]model.Member, error) {
+	rows, _, err := s.ListMembersPage(ctx, in)
+	return rows, err
+}
+
+// ListMembersPage 查会员列表**并给出总命中行数**。
+//
+// # ⚠️ 为什么必须有 total
+//
+//	Limit 上限 200(MaxListLimit)⇒ 一个 4128 人的门店,前端必须能翻页。
+//	而只返"本次返回几行"的话,前端分页器**不知道有没有下一页**
+//	⇒ 症状是"会员档案页只有 200 条,收银员以为这个店就这么点会员"——
+//	静默截断比报错危险。
+//
+// # ⚠️ 计数与列表**必须用同一组条件**(门店 + field + q)
+//
+//	条件不一致 ⇒ total 与实际能翻到的条数对不上,
+//	前端就会"翻到最后一页还有下一页"(或反过来)。
+//
+// # ⚠️ field 不在白名单时**同样 400**
+//
+//	否则 total 会绕过白名单:列表 400、计数却成功 ⇒ 两条路径的语义不一致。
+func (s *Service) ListMembersPage(ctx context.Context, in ListMembersInput) ([]model.Member, int64, error) {
 	branchID := strings.TrimSpace(in.BranchID)
 	if branchID == "" {
-		return nil, fmt.Errorf("%w: branch_id 必填", model.ErrInvalidInput)
-	}
-	q := s.db.WithContext(ctx).Where("branch_id = ?", branchID)
-	field := strings.TrimSpace(in.Field)
-	if field != "" {
-		col, ok := model.QueryFieldColumn(field)
-		if !ok {
-			return nil, fmt.Errorf("%w: field=%q 不是允许的查询字段", model.ErrInvalidQueryField, field)
-		}
-		if v := strings.TrimSpace(in.Q); v != "" {
-			q = q.Where(col+" LIKE ?", "%"+v+"%")
-		}
+		return nil, 0, fmt.Errorf("%w: branch_id 必填", model.ErrInvalidInput)
 	}
 	limit := in.Limit
 	if limit <= 0 {
@@ -245,14 +264,57 @@ func (s *Service) ListMembers(ctx context.Context, in ListMembersInput) ([]model
 	if limit > MaxListLimit {
 		limit = MaxListLimit
 	}
+	offset := in.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	// ⚠️ **两条独立的查询链** —— 复用同一条链时,Count 留下的 SELECT
+	//   会污染后面的 Find(症状:列表恒为空,且不报错)。
+	countQ, err := applyMemberFilter(s.db.WithContext(ctx).Model(&model.Member{}),
+		branchID, in.Field, in.Q)
+	if err != nil {
+		return nil, 0, err
+	}
+	var total int64
+	if err := countQ.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	rowsQ, err := applyMemberFilter(s.db.WithContext(ctx).Model(&model.Member{}),
+		branchID, in.Field, in.Q)
+	if err != nil {
+		return nil, 0, err
+	}
 	var rows []model.Member
-	if err := q.Order("updated_at DESC, id ASC").Limit(limit).Find(&rows).Error; err != nil {
-		return nil, err
+	// ⚠️ 排序键必须是**全序**:updated_at 会并列,id 在本门店内唯一 ⇒
+	//   (updated_at DESC, id ASC) 是全序 ⇒ 翻页不会重复/漏行。
+	if err := rowsQ.Order("updated_at DESC, id ASC").Limit(limit).Offset(offset).Find(&rows).Error; err != nil {
+		return nil, 0, err
 	}
 	for i := range rows {
 		fillDerived(&rows[i])
 	}
-	return rows, nil
+	return rows, total, nil
+}
+
+// applyMemberFilter 把"门店 + 查询字段 + 查询值"的条件加到链上。
+//
+// ⚠️ **列表与计数共用它** —— 两边各写一份条件时,改了一边 total 就与列表对不上。
+func applyMemberFilter(q *gorm.DB, branchID, field, val string) (*gorm.DB, error) {
+	q = q.Where("branch_id = ?", branchID)
+	field = strings.TrimSpace(field)
+	if field == "" {
+		return q, nil
+	}
+	col, ok := model.QueryFieldColumn(field)
+	if !ok {
+		return nil, fmt.Errorf("%w: field=%q 不是允许的查询字段", model.ErrInvalidQueryField, field)
+	}
+	if v := strings.TrimSpace(val); v != "" {
+		q = q.Where(col+" LIKE ?", "%"+v+"%")
+	}
+	return q, nil
 }
 
 // UpdateStatusInput 是改会员状态的入参(冻结/解冻/挂失/解挂/注销)。

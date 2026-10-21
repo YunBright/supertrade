@@ -116,20 +116,42 @@ func (e *SidecarExporter) Export(ctx context.Context, bearer, scope string, offs
 	return &page, nil
 }
 
-// SidecarImporter 经 sidecar 的 HTTP API 调 catalog 的导入端点。
+// DefaultImportPath 是导入端点的**默认**路径。
+//
+// ⚠️ catalog / pricing / inventory 三个下游都是 POST /archive/import。
+const DefaultImportPath = "archive/import"
+
+// SidecarImporter 经 sidecar 的 HTTP API 调导入方的导入端点。
 type SidecarImporter struct {
 	sidecarBase string
 	appID       string
 	branchID    string
-	http        *http.Client
+	// importPath 是导入端点路径(不含前导斜杠)。
+	//
+	// ⚠️ **每个下游可以有自己的路径**:member 的导入端点是 POST /import
+	//   (前端路径 /api/v1/member/import),而 catalog/pricing/inventory
+	//   都是 /archive/import ⇒ 写死一个路径的话,要么 member 端点被迫改名,
+	//   要么这里就得能按下游切换。
+	importPath string
+	http       *http.Client
 }
 
-// NewSidecarImporter 构造。
+// NewSidecarImporter 构造(默认导入路径 /archive/import)。
 func NewSidecarImporter(sidecarBase, appID, branchID string) *SidecarImporter {
+	return NewSidecarImporterAt(sidecarBase, appID, branchID, DefaultImportPath)
+}
+
+// NewSidecarImporterAt 构造(指定导入端点路径)。
+func NewSidecarImporterAt(sidecarBase, appID, branchID, importPath string) *SidecarImporter {
+	p := strings.Trim(strings.TrimSpace(importPath), "/")
+	if p == "" {
+		p = DefaultImportPath
+	}
 	return &SidecarImporter{
 		sidecarBase: strings.TrimRight(strings.TrimSpace(sidecarBase), "/"),
 		appID:       strings.TrimSpace(appID),
 		branchID:    strings.TrimSpace(branchID),
+		importPath:  p,
 		http:        &http.Client{Timeout: 180 * time.Second},
 	}
 }
@@ -148,7 +170,7 @@ func (i *SidecarImporter) Import(ctx context.Context, bearer string, req archive
 	if err != nil {
 		return nil, err
 	}
-	u := i.sidecarBase + "/v1.0/invoke/" + i.appID + "/method/archive/import"
+	u := i.sidecarBase + "/v1.0/invoke/" + i.appID + "/method/" + i.importPath
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err

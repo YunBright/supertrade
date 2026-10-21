@@ -24,7 +24,8 @@
 //	SYNC_TARGET_BRANCH_ID   目标门店(默认 00)
 //	CUBE_ROUTER_APP_ID      导出方 dapr app-id(默认 supertrade-cube-router)
 //	CATALOG_APP_ID          导入方 dapr app-id(默认 supertrade-catalog)
-//	SYNC_SCOPES             资料域,逗号分隔(默认 categories,suppliers,products,item_barcodes)
+//	MEMBER_APP_ID           会员域导入方 dapr app-id(默认 supertrade-member)
+//	SYNC_SCOPES             资料域,逗号分隔(默认 categories,suppliers,products,item_barcodes,prices,promotions,member_types,members)
 //	SYNC_MODE               incremental / overwrite(默认 overwrite)
 //	SYNC_CRON               "HH:MM"(本地时刻)或 6 字段 UTC cron(默认 03:30)
 //	SYNC_PAGE_SIZE          导出每页行数(默认 5000)
@@ -88,18 +89,25 @@ func initApp() error {
 	//
 	// ⚠️ 售价与促销**不归 catalog** —— catalog.products 不存价(两个真相源)。
 	// ⚠️ 库存快照归 **inventory** —— 它拥有 stock_levels 表。
-	//   ⇒ 这里有三个下游,靠路由表把它们分开。
+	// ⚠️ 会员档案归 **member** —— 它拥有 members / member_types 表。
+	//   ⇒ 这里有四个下游,靠路由表把它们分开。
 	catalogImporter := cubesync.NewSidecarImporter(
 		appCfg.SidecarBase, appCfg.CatalogAppID, appCfg.TargetBranchID)
 	pricingImporter := cubesync.NewSidecarImporter(
 		appCfg.SidecarBase, appCfg.PricingAppID, appCfg.TargetBranchID)
 	inventoryImporter := cubesync.NewSidecarImporter(
 		appCfg.SidecarBase, appCfg.InventoryAppID, appCfg.TargetBranchID)
+	// ⚠️ member 的导入端点是 **POST /import**(不是 /archive/import)——
+	//   前端路径是 /api/v1/member/import,nginx 剥掉 /api/v1/member/ 前缀后
+	//   就是 /import ⇒ 这里必须按下游切路径,写死 /archive/import 会 404。
+	memberImporter := cubesync.NewSidecarImporterAt(
+		appCfg.SidecarBase, appCfg.MemberAppID, appCfg.TargetBranchID, "import")
 
 	appSync = cubesync.NewSyncer(appCfg, token, exporter, []cubesync.Owner{
 		{Importer: catalogImporter, Scopes: cubesync.DefaultCatalogScopes()},
 		{Importer: pricingImporter, Scopes: cubesync.DefaultPricingScopes()},
 		{Importer: inventoryImporter, Scopes: cubesync.DefaultInventoryScopes()},
+		{Importer: memberImporter, Scopes: cubesync.DefaultMemberScopes()},
 	}, slog.Default())
 	appH = cubesync.NewHandler(appSync, appCfg.JobToken, slog.Default())
 	appJobs = cubesync.NewDaprJobClient(appCfg.SidecarBase)

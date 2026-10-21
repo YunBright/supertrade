@@ -9,8 +9,15 @@
 //	                    message:"当前收银员没有冲减积分权限，请输入授权",
 //	                    required_scope:"member:point-deduct"}
 //	  → POS 弹【授权对话框】(图4):收银员编码 + 收银员口令
-//	  → 授权通过 ⇒ 带 authorized_by 重新提交 ⇒ member 放行并写审计
+//	  → 授权通过 ⇒ 带 authorization(工号 + 口令)重新提交 ⇒ member 自己验 ⇒ 放行并写审计
 //	      否 ⇒ 403 {code:"member_permission_denied", message:"你没有冲减积分的权限！"}
+//
+// # ⚠️ **"只带 authorized_by"不再放行**(2026-10-21 安全修复)
+//
+//	旧实现里"只带 authorized_by(POS 说它已自行验过)"直接放行 ⇒
+//	**任何调用方只要在 body 里填一个工号,就能在没有任何权限的情况下写数据**。
+//	⇒ 现在:调用方自己没有该 scope 时,必须带 authorization(工号 + 口令)让 member 验;
+//	  调用方自己就有该 scope 时(①),authorized_by 只作为审计信息透传。
 //
 // # 为什么"授权人有没有权限"要在 member 再查一遍
 //
@@ -236,12 +243,31 @@ func (s *Service) Authorize(ctx context.Context, in AuthorizeInput) (*AuthorizeR
 		return &AuthorizeResult{AuthorizedBy: firstNonEmpty(auth.EmployeeCode, in.AuthorizedBy), Scope: scope}, nil
 	}
 
-	// ③ 只带了 authorized_by(POS 已自行调 master-data 验过)⇒ 放行并写审计。
+	// ③ 只带了 authorized_by —— **不放行**(2026-10-21 安全修复)。
+	//
+	// ⚠️ 这里原来是无条件放行 ⇒ **提权漏洞**:
+	//
+	//	任何调用方只要在 body 里填 authorized_by,就能在**没有任何权限**的情况下
+	//	完成写操作(开卡 / 赠分 / 充值 / 改状态 …)——
+	//	而 POST /members 这些端点是**登录用户就能调到的**。
+	//
+	//	症状极安静:请求 200、审计列写着"经 1003 授权",
+	//	而 1003 从头到尾没参与过 ⇒ 事后对账也看不出是谁干的。
+	//
+	// ⇒ 现在的规则:**调用方自己没有该 scope 时,必须走 authorization(工号 + 口令)**
+	//	让 member 侧验(见 ②);只有调用方**自己就有**该 scope 时(①)
+	//	才允许 authorized_by 直接透传(那时它只是审计信息)。
+	//
+	// ⇒ 这里返 member_permission_required(带 required_scope)而不是 denied:
+	//	POS 收到 required 会弹授权框(图4)⇒ 调用方补上工号 + 口令即可继续;
+	//	denied(图5 的 alert)会让收银员以为"这条路走不通"。
 	if by := strings.TrimSpace(in.AuthorizedBy); by != "" {
-		return &AuthorizeResult{AuthorizedBy: by, Scope: scope}, nil
+		slog.Warn("member: 调用方只带 authorized_by 就想执行写操作,已拒绝(必须走工号+口令授权)",
+			"scope", scope, "branch_id", branchID,
+			"operator_id", operatorID, "authorized_by", by)
 	}
 
-	// ④ 什么都没有 ⇒ 403,让 POS 弹授权框(图4)。
+	// ④ 什么都没有(或只带了 authorized_by)⇒ 403,让 POS 弹授权框(图4)。
 	return nil, &PermissionError{
 		Code:          CodePermissionRequired,
 		Message:       fmt.Sprintf("当前收银员没有%s权限，请输入授权", feature),

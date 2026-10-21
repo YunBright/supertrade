@@ -273,12 +273,42 @@ func TestAuthorize_HasScope_Allowed(t *testing.T) {
 	assert.Empty(t, res.AuthorizedBy, "自己有权限 ⇒ 没有越权授权人")
 }
 
-// TestAuthorize_WithAuthorizedBy_Allowed 锁"带 authorized_by ⇒ 放行并写审计"。
-func TestAuthorize_WithAuthorizedBy_Allowed(t *testing.T) {
-	svc, db := newService(t)
-	seedType(t, db, "T1", "10", "会员卡")
-	seedMember(t, db, "M0001", "10")
+// TestAuthorize_OnlyAuthorizedBy_Denied 锁"**只带** authorized_by ⇒ 必须被拒"。
+//
+// ⚠️ 2026-10-21 安全修复:旧实现里这一支直接放行 ⇒
+//   任何调用方只要在 body 里填一个工号,就能在**没有任何权限**的情况下
+//   完成写操作(开卡 / 赠分 / 充值 / 改状态 …)——
+//   而 POST /members 这些端点是**登录用户就能调到的**。
+//
+// ⇒ 现在:调用方自己没有该 scope 时,必须走 authorization(工号 + 口令)让 member 验。
+// ⇒ 返的是 member_permission_required(带 required_scope):
+//   POS 收到它会弹授权框(图4)⇒ 调用方补凭据即可继续。
+func TestAuthorize_OnlyAuthorizedBy_Denied(t *testing.T) {
+	svc, _ := newService(t)
 	svc.SetScopeChecker(fakeChecker{scopes: map[string]bool{}})
+	ctx := context.Background()
+
+	_, err := svc.Authorize(ctx, service.AuthorizeInput{
+		OperatorID: "u-1", BranchID: "10",
+		Scope: model.ScopePointDeduct, Feature: "冲减积分",
+		AuthorizedBy: "1003",
+	})
+	require.Error(t, err, "只带 authorized_by 必须被拒(提权漏洞)")
+	var pe *service.PermissionError
+	require.True(t, errors.As(err, &pe), "应是 PermissionError,实际 %v", err)
+	assert.Equal(t, service.CodePermissionRequired, pe.Code)
+	assert.Equal(t, model.ScopePointDeduct, pe.RequiredScope)
+}
+
+// TestAuthorize_HasScope_AuthorizedByPassedThrough 锁"自己**有** scope ⇒ authorized_by 仍可透传(审计)。
+//
+// ⚠️ 修复只堵"没有权限却自称已授权"这条路;
+//   有权限的调用方带 authorized_by(例如"店长在场")仍然放行并写审计。
+func TestAuthorize_HasScope_AuthorizedByPassedThrough(t *testing.T) {
+	svc, _ := newService(t)
+	svc.SetScopeChecker(fakeChecker{scopes: map[string]bool{
+		"u-1|10|member:point-deduct": true,
+	}})
 	ctx := context.Background()
 
 	res, err := svc.Authorize(ctx, service.AuthorizeInput{
@@ -286,23 +316,8 @@ func TestAuthorize_WithAuthorizedBy_Allowed(t *testing.T) {
 		Scope: model.ScopePointDeduct, Feature: "冲减积分",
 		AuthorizedBy: "1003",
 	})
-	require.NoError(t, err, "带 authorized_by 必须放行")
-	assert.Equal(t, "1003", res.AuthorizedBy)
-
-	// 授权人要**真的落进流水**。
-	require.NoError(t, db.Model(&model.Member{}).
-		Where("id = ? AND branch_id = ?", "M0001", "10").
-		Update("points_accumulated", decimal.NewFromInt(100)).Error)
-	_, err = svc.DeductPoints(ctx, service.DeductPointsInput{
-		OpID: "op-deduct-1", BranchID: "10", MemberID: "M0001",
-		Points: decimal.NewFromInt(1), OperatorID: "u-1",
-		AuthorizedBy: res.AuthorizedBy,
-	})
-	require.NoError(t, err)
-
-	var row model.MemberPointLedger
-	require.NoError(t, db.Where("op_id = ?", "op-deduct-1").First(&row).Error)
-	assert.Equal(t, "1003", row.AuthorizedBy, "authorized_by 必须写进积分流水")
+	require.NoError(t, err, "自己有权限 ⇒ 放行")
+	assert.Equal(t, "1003", res.AuthorizedBy, "authorized_by 作为审计信息透传")
 }
 
 // TestAuthorize_VerificationDenied 锁"授权不通过 ⇒ 403 member_permission_denied"。

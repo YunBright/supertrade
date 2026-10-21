@@ -10,7 +10,7 @@
 //	PUT  /types/:id                       改会员类别(member:config)
 //	DELETE /types/:id                     删会员类别(软删)(member:config)
 //	GET  /payment-ways                    付款方式字典(member:view)
-//	GET  /members?field=&q=               会员查询(member:view)
+//	GET  /members?field=&q=&limit=&offset=  会员查询(member:view;响应含 count + total)
 //	GET  /members/:id                     会员卡信息(图3)(member:view)
 //	GET  /members/:id/points              积分汇总 + 流水(member:view)
 //	GET  /members/:id/account             储值余额 + 流水(member:view)
@@ -19,6 +19,9 @@
 //	GET  /members/:id/recharge-card       充值卡信息(图2 F3)(member:view)
 //	GET  /members/:id/stored-value-card   一卡通/储值卡信息(图2 F7)(member:view)
 //	POST /members                         开卡(member:card-open)
+//	PUT  /members/:id                     局部改会员档案(身份字段)(走图4/图5 授权链路)
+//	DELETE /members/:id                   软删会员(member:config)
+//	POST /import                          导入会员档案(归档同步)(member:config)
 //	POST /members/:id/points/deduct       冲减积分(member:point-deduct)
 //	POST /members/:id/points/grant        赠分(member:point-manage)
 //	POST /members/:id/account/recharge     储值充值(member:account-recharge)
@@ -150,6 +153,25 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 		rbac.RequireScopeWithBranch(model.ScopeConfig, branchFromHeader, resolver),
 		h.deleteType)
 
+	// ---- 归档导入端点:标准 scope 守门 ----
+	//
+	// ⚠️ 导入是**运维的后台批量动作**(一次性建档),不是收银员动作
+	//   ⇒ 用 member:config(与会员类别/门店会员参数同档),不弹授权框。
+	r.POST("/import",
+		rbac.RequireScopeWithBranch(model.ScopeConfig, branchFromHeader, resolver),
+		h.importMembers)
+
+	// ---- 会员档案的编辑 / 删除 ----
+	//
+	// ⚠️ PUT /members/:id 是**写端点** ⇒ 走本域的越权授权链路(见下),
+	//   不是 rbac.RequireScopeWithBranch(它只会返 403 forbidden,
+	//   POS 分不出"要弹授权框"与"授权不通过")。
+	r.PUT("/members/:id", h.updateMember)
+	// ⚠️ DELETE 是**管理员后台动作**(同 DELETE /types/:id)⇒ 标准 scope 守门。
+	r.DELETE("/members/:id",
+		rbac.RequireScopeWithBranch(model.ScopeConfig, branchFromHeader, resolver),
+		h.deleteMember)
+
 	// ---- 写端点:会员域自己的授权链路(图4 / 图5) ----
 	//
 	// ⚠️ **不挂 rbac.RequireScopeWithBranch**:它只会返 403 forbidden,
@@ -243,20 +265,37 @@ func (h *Handler) listPaymentWays(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"payment_ways": rows, "count": len(rows)})
 }
 
-// listMembers GET /members?field=&q=&limit=
+// listMembers GET /members?field=&q=&limit=&offset=
+//
+// ⚠️ 响应里**同时**给 count 与 total:
+//
+//	count = 本次返回的行数(旧语义,不变)
+//	total = 该门店 + 该查询条件下的**总命中行数**
+//
+// ⇒ 门店10 导入后有 4128 个会员,而 limit 上限是 200
+// ⇒ 只给 count 的话前端会以为"这个店就这么点会员"(静默截断)。
 func (h *Handler) listMembers(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.Query("limit"))
-	rows, err := h.svc.ListMembers(c.Request.Context(), service.ListMembersInput{
+	offset, _ := strconv.Atoi(c.Query("offset"))
+	if offset < 0 {
+		offset = 0
+	}
+	rows, total, err := h.svc.ListMembersPage(c.Request.Context(), service.ListMembersInput{
 		BranchID: middleware.SingleBranchFromCtx(c),
 		Field:    c.Query("field"),
 		Q:        c.Query("q"),
 		Limit:    limit,
+		Offset:   offset,
 	})
 	if err != nil {
 		mapErr(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"members": rows, "count": len(rows)})
+	c.JSON(http.StatusOK, gin.H{
+		"members": rows,
+		"count":   len(rows),
+		"total":   total,
+	})
 }
 
 // getMember GET /members/:id(图3)

@@ -167,8 +167,14 @@ func TestHandler_Deduct_NoScope_PermissionRequired(t *testing.T) {
 	assert.Contains(t, body, `"required_scope":"member:point-deduct"`)
 }
 
-// TestHandler_Deduct_WithAuthorizedBy_Allowed_And_Audited 锁"带 authorized_by ⇒ 放行 + 写审计"。
-func TestHandler_Deduct_WithAuthorizedBy_Allowed_And_Audited(t *testing.T) {
+// TestHandler_Deduct_OnlyAuthorizedBy_Denied 锁"**只带** authorized_by ⇒ 403"。
+//
+// ⚠️ 2026-10-21 安全修复:旧实现里"只带 authorized_by"直接放行 ⇒
+//   任何调用方只要在 body 里填一个工号,就能在**没有任何权限**的情况下
+//   完成写操作(这里是冲减积分)。
+//
+// ⇒ 现在必须带 authorization(工号 + 口令)让 member 侧验。
+func TestHandler_Deduct_OnlyAuthorizedBy_Denied(t *testing.T) {
 	r, db := newTestEngine(t, fakeChecker{scopes: map[string]bool{}}, nil)
 	seedType(t, db, "T1", "10", "会员卡")
 	seedMember(t, db, "M0001", "10", decimal.NewFromInt(100))
@@ -178,7 +184,38 @@ func TestHandler_Deduct_WithAuthorizedBy_Allowed_And_Audited(t *testing.T) {
 		"points":        "10",
 		"authorized_by": "1003",
 	})
-	require.Equal(t, http.StatusOK, w.Code, "带 authorized_by 必须放行,body=%s", w.Body.String())
+	require.Equal(t, http.StatusForbidden, w.Code,
+		"只带 authorized_by 必须被拒(提权漏洞),body=%s", w.Body.String())
+	body := w.Body.String()
+	assert.Contains(t, body, `"code":"member_permission_required"`)
+	assert.Contains(t, body, `"required_scope":"member:point-deduct"`)
+
+	// ⚠️ **不能有流水落库** —— 被拒的写操作不能留下痕迹。
+	var n int64
+	require.NoError(t, db.Model(&model.MemberPointLedger{}).Count(&n).Error)
+	assert.Equal(t, int64(0), n, "被拒的写操作不得留下积分流水")
+}
+
+// TestHandler_Deduct_WithAuthorization_Allowed_And_Audited 锁"带工号+口令 ⇒ 放行 + 写审计"。
+func TestHandler_Deduct_WithAuthorization_Allowed_And_Audited(t *testing.T) {
+	r, db := newTestEngine(t,
+		fakeChecker{scopes: map[string]bool{}},
+		fakeVerifier{auth: &service.EmployeeAuth{
+			EmployeeCode: "1003", Verified: true,
+			Scopes: []string{model.ScopePointDeduct},
+		}})
+	seedType(t, db, "T1", "10", "会员卡")
+	seedMember(t, db, "M0001", "10", decimal.NewFromInt(100))
+
+	w := do(t, r, http.MethodPost, "/members/M0001/points/deduct", "10", map[string]any{
+		"op_id":  "op-1",
+		"points": "10",
+		"authorization": map[string]any{
+			"employee_code": "1003",
+			"password":      "pwd",
+		},
+	})
+	require.Equal(t, http.StatusOK, w.Code, "带工号+口令必须放行,body=%s", w.Body.String())
 
 	var row model.MemberPointLedger
 	require.NoError(t, db.Where("op_id = ?", "op-1").First(&row).Error)

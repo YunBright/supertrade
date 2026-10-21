@@ -54,6 +54,10 @@ type Config struct {
 	//
 	// ⚠️ 库存快照归 inventory（它拥有 stock_levels 表）⇒ 第三个归属方。
 	InventoryAppID string
+	// MemberAppID 是**会员域**导入方的 dapr app-id(supertrade-member)。
+	//
+	// ⚠️ 会员档案归 member（它拥有 members / member_types 表）⇒ 第四个归属方。
+	MemberAppID string
 	// Scopes 是本次同步的资料域(**按依赖顺序**)。
 	Scopes []string
 	// Mode 是 incremental / overwrite。
@@ -104,6 +108,7 @@ const (
 	DefaultCatalogApp     = "supertrade-catalog"
 	DefaultPricingApp     = "supertrade-pricing"
 	DefaultInventoryApp   = "supertrade-inventory"
+	DefaultMemberApp      = "supertrade-member"
 	DefaultMode           = "overwrite"
 	// DefaultCron 是**本地时刻**写法,由 normalizeCron 换算成 UTC 6 字段。
 	DefaultCron      = "03:30"
@@ -126,6 +131,14 @@ var DefaultScopes = []string{
 	archivedto.ScopeItemBarcodes,
 	archivedto.ScopePrices,
 	archivedto.ScopePromotions,
+	// ⚠️ 会员 scope **排最后**:一个 scope 失败就整体中止(见 syncer.go),
+	//   而会员导入依赖 auth 侧给 cube-sync 服务账号授 member:config ——
+	//   放最后 ⇒ 万一没授权,商品/价格/库存那几轮**已经导完了**,
+	//   不会因为会员这一段把整轮同步带崩。
+	//
+	// ⚠️ member_types 在 members **之前**:会员引用类别。
+	archivedto.ScopeMemberTypes,
+	archivedto.ScopeMembers,
 }
 
 // DefaultCatalogScopes 是 catalog 拥有的 scope。
@@ -156,6 +169,20 @@ func DefaultInventoryScopes() []string {
 	}
 }
 
+// DefaultMemberScopes 是 member 拥有的 scope。
+//
+// ⚠️ **顺序有讲究**：member_types 在 members **之前** ——
+// 会员引用类别（members.card_type_id → member_types.id），
+// 反过来就是"引用了还不存在的对象"。
+//
+// ⚠️ 会员档案**不是时效数据**（是"当前状态"而不是流水）⇒ 导出不带时间过滤。
+func DefaultMemberScopes() []string {
+	return []string{
+		archivedto.ScopeMemberTypes,
+		archivedto.ScopeMembers,
+	}
+}
+
 // LoadConfig 从环境变量读配置。
 //
 // ⚠️ **服务账号缺失不报错** —— 让服务能起来并把"没配凭据"这件事
@@ -172,6 +199,7 @@ func LoadConfig() Config {
 		CatalogAppID:         envStr("CATALOG_APP_ID", DefaultCatalogApp),
 		PricingAppID:         envStr("PRICING_APP_ID", DefaultPricingApp),
 		InventoryAppID:       envStr("INVENTORY_APP_ID", DefaultInventoryApp),
+		MemberAppID:          envStr("MEMBER_APP_ID", DefaultMemberApp),
 		Scopes:               envList("SYNC_SCOPES", DefaultScopes),
 		Mode:                 envStr("SYNC_MODE", DefaultMode),
 		CronSpec:             envStr("SYNC_CRON", DefaultCron),

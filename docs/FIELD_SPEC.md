@@ -549,7 +549,7 @@ PK = `(id, branch_id, product_id)`。一个促销单可覆盖多个商品,所以
 | `used_count` | int | - | 已用次数 |
 | `points_accumulated` | decimal | - | **累计获得**（思迅 `acc_num` 口径） |
 | `points_used` | decimal | - | **累计扣减**（思迅 `dec_num` 口径） |
-| `balance_yuan` | decimal | yuan | 零钱包余额（⚠️ 思迅的 `residual_amt` 是**密文** ⇒ 只从明文 numeric 源取，取不到留 0） |
+| `balance_yuan` | decimal | yuan | 零钱包余额（⚠️ 思迅的 `residual_amt` 是**密文/脏值**（实测 `@><:6642675` / `86220..` / `,`，另有 764 行为空）⇒ **解析失败则该行不落库** + warning，⛔ 不静默当 0） |
 | `consumed_amount_yuan` / `consumed_count` | decimal / int | yuan | 消费汇总 |
 | `password_hash` | string | - | bcrypt（**不存明文**） |
 | `face_id` / `open_id` | string | - | 人脸 / 微信 |
@@ -588,6 +588,9 @@ PK = `(id, branch_id, product_id)`。一个促销单可覆盖多个商品,所以
 |---|---|
 | `GET /config` `/types` `/payment-ways` `/members` `/members/{id}` `/members/{id}/points` `/members/{id}/account` `/members/{id}/consume` `/members/{id}/last-order` `/members/{id}/recharge-card` `/members/{id}/stored-value-card` | `member:view` |
 | `POST /members` | `member:card-open` |
+| `PUT /members/{id}` | 走越权授权链路（`service.Authorize`），scope `member:config`；**只改身份字段**（姓名/电话/性别/生日/爱好/备注/身份证/有效期/卡面号/类别），⛔ 积分/储值/消费/状态列出现在 body 里 ⇒ **400** |
+| `DELETE /members/{id}` | `member:config`（**软删**，`gorm.DeletedAt`） |
+| `POST /import` | `member:config`（会员档案导入，body = `archivedto.ImportRequest`，响应 = `archivedto.ImportResult`） |
 | `POST /members/{id}/points/deduct` | `member:point-deduct` |
 | `POST /members/{id}/points/grant` | `member:point-manage` |
 | `POST /members/{id}/account/recharge` `/refund` | `member:account-recharge` |
@@ -599,6 +602,28 @@ PK = `(id, branch_id, product_id)`。一个促销单可覆盖多个商品,所以
 ⚠️ **写端点故意不挂 `rbac.RequireScopeWithBranch`** —— 它只会返 `forbidden`，
 会员域要区分**图4**（`member_permission_required` + `required_scope`，弹授权框）与
 **图5**（`member_permission_denied`「你没有冲减积分的权限！」）。
+
+⚠️ **只带 `authorized_by` 不再放行**（2026-10-21 安全修复）：
+旧实现里"只带 authorized_by"直接放行 ⇒ 任何调用方只要在 body 里填一个工号，
+就能在**没有任何权限**的情况下开卡/赠分/充值/改状态。
+⇒ 现在：调用方**自己**没有该 scope 时，必须带 `authorization`（工号 + 口令）让 member 验；
+调用方自己**有**该 scope 时（`member:*` 在本门店已授权），`authorized_by` 只作为审计信息透传。
+
+#### 1.13.1 会员档案导入（`POST /import`）
+
+数据流：`cube-sync` → `cube-router`（导出 scope=`members` / `member_types`）→ `member`（`POST /import`）。
+
+- **目标门店只从 `X-Branch-ID` 取**（body 里的门店不读）。
+- 契约：body = `archivedto.ImportRequest`，响应 = `archivedto.ImportResult`（`by_scope` 两行：`member_types` / `members`）。
+- 导出侧**原样带出**思迅的**源值**（`status` 带 card_status 原值、`limited_use_count` 带 `use_num` 原值、`balance_yuan` 带 `residual_amt` 原值）⇒ **语义归一化在导入端做**。
+- 思迅 → 本域映射：`card_status` `0/1/2/3/5` → `normal/frozen/lost/frozen/cancelled`
+  （⚠️ `3` **无权威文档** ⇒ 保守按 `frozen`；`frozen` 可解冻，而 `normal` 等于放开一张本该停用的卡）；
+  `use_num` `999998`/`999999` → `0`（不限次）；`card_type` `0/1/2` → 类别名 `会员卡`/`储值卡`/`VIP储值卡`。
+- 会员类别**按名字**对齐本域 `member_types.name`（两边 id 体系不同）⇒ **不自动建类别**（类别是门店自己维护的字典）。
+- ⚠️ **默认 `incremental`**：新会员用思迅值初始化；**已存在**的会员**只更新身份字段**，
+  ⛔ 不覆盖 `points_accumulated` / `points_used` / `balance_yuan` / `consumed_*` / `status` / `used_count`
+  （那些是本域 POS 业务的事实源）。
+  `overwrite` 才连财务列一起覆盖（**必须由运维显式选择**）。
 
 ### 1.14 pos-gateway(POS BFF，dapr app `pos-gateway`，2026-10-21 上线)
 

@@ -301,6 +301,98 @@ var exportScopes = map[string]exportScope{
 			"stock.avg_cost":       "avg_cost_yuan",
 		},
 	},
+	// ⚠️ 会员档案:model 是 `member`(思迅 t_pub_member 的会员主档)。
+	//
+	//   **不加 Window**:会员主档是"当前状态"而不是流水,
+	//   导出出来天然就是源库此刻的会员 ⇒ 加时间过滤会**永远导不出行**(而且不报错)。
+	//
+	//   ⚠️ **列名是规范名,值是源值** —— `status` 带的是思迅 card_status 的原值
+	//     ('0'/'1'/'2'/'3'/'5'),`limited_use_count` 带的是 use_num 的原值
+	//     (含 999998/999999 哨兵),`balance_yuan` 带的是 residual_amt 的原值
+	//     (**可能是脏值**,如 "@><:6642675")。
+	//     ⇒ 语义归一化在**导入端**做(见 internal/member/service/import.go):
+	//       导出端"顺手翻译"会把"读不懂"变成"余额 0",而余额 0 没人会去查。
+	//
+	//   ⚠️ 会员的**积分 / 储值 / 消费**在本域是 POS 业务的事实源
+	//     ⇒ 导入端对**已存在**的会员只更新身份字段,不覆盖财务列。
+	"members": {
+		Name:       "members",
+		Model:      "member",
+		Measures:   []string{"member.count"},
+		Dimensions: memberDimensions,
+		RowKey:     "member.id",
+		Fields:     memberFields,
+	},
+	// ⚠️ 会员类别:model 是 `member_type`(思迅的类别字典)。
+	//
+	//   与 members 分开的原因同其它域:**一个 scope 一个归属方**,
+	//   而且类别字典**必须先导**(会员引用类别)。
+	//
+	//   ⚠️ 本域 id 与思迅 id 体系不同(本域 MT-STD-10 / MT-SAV-10 …)⇒ 导入端按**名字**对齐。
+	"member_types": {
+		Name:     "member_types",
+		Model:    "member_type",
+		Measures: []string{"member_type.count"},
+		Dimensions: []string{
+			"member_type.id", "member_type.name", "member_type.discount_rate",
+			"member_type.allow_stored_value", "member_type.allow_points_pay",
+		},
+		RowKey: "member_type.id",
+		Fields: map[string]string{
+			"member_type.id":                 "id",
+			"member_type.name":               "name",
+			"member_type.discount_rate":      "discount_rate",
+			"member_type.allow_stored_value": "allow_stored_value",
+			"member_type.allow_points_pay":   "allow_points_pay",
+		},
+	},
+}
+
+// memberDimensions 是会员档案 scope 要 SELECT 的维度(全限定名)。
+//
+// ⚠️ **与 archivedto.ExportColumns[ScopeMembers] 逐字对应** ——
+// 两边各写一份字面量时,改了一边不会编译报错,
+// 症状是"导出了 4128 条会员,导入后名字/手机全是空的",**且零报错**。
+var memberDimensions = []string{
+	"member.id", "member.card_face_no", "member.card_type", "member.name",
+	"member.gender", "member.phone", "member.mobile", "member.birthday",
+	"member.id_card_no", "member.status", "member.fee_amount_yuan",
+	"member.limited_use_count", "member.points_accumulated", "member.points_used",
+	"member.balance_yuan", "member.consumed_amount_yuan", "member.consumed_count",
+	"member.favorite", "member.remark", "member.branch_no", "member.operator_id",
+	"member.operated_at", "member.valid_from", "member.valid_until", "member.open_id",
+}
+
+// memberFields 把会员行(形如 "member.id")映射成导出契约的字段名。
+//
+// ⚠️ 与 memberDimensions 一一对应(cube 的 order 要求 order 成员在 SELECT 里,
+// 且维度元组是 GROUP BY 的键 ⇒ 按它排序必是全序,翻页不会重复/漏行)。
+var memberFields = map[string]string{
+	"member.id":                     "id",
+	"member.card_face_no":           "card_face_no",
+	"member.card_type":              "card_type",
+	"member.name":                   "name",
+	"member.gender":                 "gender",
+	"member.phone":                  "phone",
+	"member.mobile":                 "mobile",
+	"member.birthday":               "birthday",
+	"member.id_card_no":             "id_card_no",
+	"member.status":                 "status",
+	"member.fee_amount_yuan":        "fee_amount_yuan",
+	"member.limited_use_count":      "limited_use_count",
+	"member.points_accumulated":     "points_accumulated",
+	"member.points_used":            "points_used",
+	"member.balance_yuan":           "balance_yuan",
+	"member.consumed_amount_yuan":   "consumed_amount_yuan",
+	"member.consumed_count":         "consumed_count",
+	"member.favorite":               "favorite",
+	"member.remark":                 "remark",
+	"member.branch_no":              "branch_no",
+	"member.operator_id":            "operator_id",
+	"member.operated_at":            "operated_at",
+	"member.valid_from":             "valid_from",
+	"member.valid_until":            "valid_until",
+	"member.open_id":                "open_id",
 }
 
 // exportQuery 是发给 cube 的查询体。
@@ -542,12 +634,32 @@ func isAmountField(name string) bool {
 // ⚠️ 判定依据同样是约定：
 //   - 以 `_yuan` 结尾 → 金额
 //   - `qty` → 数量（库存快照）
+//   - numericContractFields → 会员域的积分 / 次数 / 折扣率
 //
 // ⚠️ **其它字段绝不能按数字处理**（条码、名称、助记码…）——
 //
 //	它们是思迅的 char 列，误当数字会走 base64 解码分支，得到乱码。
 func isNumericField(name string) bool {
-	return isAmountField(name) || name == "qty"
+	return isAmountField(name) || name == "qty" || numericContractFields[name]
+}
+
+// numericContractFields 是"导出值应该是**数字字符串**"的列名集合(除 `_yuan` / `qty` 之外)。
+//
+// ⚠️ 为什么会员的积分 / 次数列也要走数字通道:
+//   1. **精度**:JSON number 到 Dart 侧会变成 double(9.90 → 9.899999999999999)。
+//   2. **契约**:导入端的字段是 string ⇒ number 会让整批反序列化**直接失败**。
+//   3. **兼容**:思迅 live 源的 decimal 列经 MSSQL 驱动出来是 `[]byte`
+//      ⇒ `encoding/json` 序列化成 **base64** ⇒ 必须走 decodeNumeric 的兼容分支。
+//
+// ⚠️ 脏值(如 residual_amt 的 "@><:6642675")**原样带出**:
+//   decodeNumeric 解析不了就返回 false ⇒ exportValue 落到字符串分支 ⇒ 保留原文
+//   ⇒ 导入端能识别"这个值我读不懂"并报告它(而不是静默当 0)。
+var numericContractFields = map[string]bool{
+	"points_accumulated": true,
+	"points_used":        true,
+	"limited_use_count":  true,
+	"consumed_count":     true,
+	"discount_rate":      true,
 }
 
 // decodeNumeric 把 cube 的原始值转成**数字字符串**。

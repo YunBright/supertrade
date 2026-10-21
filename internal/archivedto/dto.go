@@ -58,6 +58,23 @@ const (
 	//
 	// ⚠️ 与 ScopeProducts 分开:商品档案归 catalog,库存归 inventory。
 	ScopeStock = "stock"
+	// ScopeMemberTypes 是会员类别(归 member 服务)。
+	//
+	// ⚠️ **必须排在 ScopeMembers 之前** —— 会员引用类别
+	//   (members.card_type_id → member_types.id),
+	//   顺序反了 ⇒ 会员落库时引用一个还不存在的类别。
+	//
+	// ⚠️ 与 ScopeMembers 分开:会员类别是**门店自己维护的字典**
+	//   (会员卡 / 储值卡 / VIP储值卡 …),与会员主档不是一回事。
+	ScopeMemberTypes = "member_types"
+	// ScopeMembers 是会员档案(归 member 服务)。
+	//
+	// ⚠️ **不是时效数据**:会员主档是"当前状态"(不是流水),
+	//   导出来的就是源库此刻的会员 ⇒ **不需要任何时间过滤**。
+	//
+	// ⚠️ 会员的**积分 / 储值 / 消费**在本域是 POS 业务的事实源
+	//   (sale.paid 订阅给会员加积分)⇒ 导入时**不得覆盖已存在会员的财务列**。
+	ScopeMembers = "members"
 )
 
 // AllScopes 是全部资料域,**按依赖顺序**排列。
@@ -73,6 +90,10 @@ var AllScopes = []string{
 	ScopePrices,
 	ScopePromotions,
 	ScopeStock,
+	// ⚠️ member_types 在 members **之前**:会员引用类别,
+	//   反过来就是"引用了一个还不存在的对象"。
+	ScopeMemberTypes,
+	ScopeMembers,
 }
 
 // ---- 基准日(as_of)----
@@ -150,6 +171,26 @@ var ExportColumns = map[string][]string{
 	//   没有时间列(不是时效数据,见 ScopeStock 的说明),
 	//   也没有门店列 —— 一个 cube 实例 = 一家门店,天然只含本店数据。
 	ScopeStock: {"product_id", "qty", "avg_cost_yuan"},
+	// ⚠️ 会员档案:**列名是规范名,值是源值(未归一化)**。
+	//
+	//	`status` 带的是思迅 card_status 的原值('0'/'1'/'2'/'3'/'5'),
+	//	`limited_use_count` 带的是 use_num 的原值(含 999998/999999 哨兵),
+	//	`balance_yuan` 带的是 residual_amt 的原值(**可能是脏值**)。
+	//	⇒ **语义归一化在导入端做**(见 internal/member/service/import.go),
+	//	  导出端擅自"翻译"会把"解析失败"变成"静默当 0"。
+	ScopeMembers: {
+		"id", "card_face_no", "card_type", "name", "gender", "phone", "mobile",
+		"birthday", "id_card_no", "status", "fee_amount_yuan", "limited_use_count",
+		"points_accumulated", "points_used", "balance_yuan", "consumed_amount_yuan",
+		"consumed_count", "favorite", "remark", "branch_no", "operator_id",
+		"operated_at", "valid_from", "valid_until", "open_id",
+	},
+	// ⚠️ 会员类别:**只带字典**,不带 id 与本域 id 的对应关系
+	//   (两边 id 体系不同:思迅是 0/1/2,本域是 MT-STD-10 / MT-SAV-10 …)。
+	//   ⇒ 导入端按**类别名**对齐。
+	ScopeMemberTypes: {
+		"id", "name", "discount_rate", "allow_stored_value", "allow_points_pay",
+	},
 }
 
 // ExportPage 是导出端点返回的一页。
@@ -246,6 +287,99 @@ type ImportData struct {
 	// ⚠️ 库存**不归 catalog** —— catalog.products 不存库存(避免两个真相源)。
 	// ⚠️ 数量与金额一律**字符串**:JSON number 到 Dart 侧会变成 double,精度当场丢。
 	Stocks []ImportStockRow `json:"stocks"`
+	// MemberTypes 是会员类别行(归 **member** 服务)。
+	//
+	// ⚠️ 会员类别是**门店自己维护的字典** ⇒ 导入端**不新建类别**,
+	//   只按类别名对齐已有类别(见 internal/member/service/import.go)。
+	MemberTypes []ImportMemberTypeRow `json:"member_types"`
+	// Members 是会员档案行(归 **member** 服务)。
+	Members []ImportMemberRow `json:"members"`
+}
+
+// ImportMemberTypeRow 是会员类别行(思迅的类别字典)。
+//
+// ⚠️ 折扣率一律**字符串**:JSON number 到 Dart 侧会变成 double,精度当场丢。
+//
+// ⚠️ allow_stored_value / allow_points_pay 也用**字符串**("1"/"0"/"true"/"false")
+//   —— 源库那两个列是 0/1 的 char,不是布尔;用 bool 接收时
+//   源值是字符串就会反序列化失败(整批导入报错)。
+type ImportMemberTypeRow struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// DiscountRate 是会员折扣(0.95 = 95 折;字符串)。
+	DiscountRate string `json:"discount_rate"`
+	// AllowStoredValue 是"是否储值卡"(字符串布尔)。
+	AllowStoredValue string `json:"allow_stored_value"`
+	// AllowPointsPay 是"是否可用积分抵扣"(字符串布尔)。
+	AllowPointsPay string `json:"allow_points_pay"`
+}
+
+// ImportMemberRow 是会员档案行。
+//
+// # ⚠️ **列名是规范名,值是源值(未归一化)**
+//
+//	`status`           = 思迅 card_status 的原值('0'/'1'/'2'/'3'/'5')
+//	`limited_use_count`= 思迅 use_num 的原值(含 999998/999999 "不限次"哨兵)
+//	`balance_yuan`     = 思迅 residual_amt 的原值(⚠️ **可能是脏值**,如 "@><:6642675")
+//	`points_accumulated`/`points_used` = 思迅 acc_num / dec_num 的原值
+//	`valid_from`/`valid_until`         = 思迅 vip_start_date / vip_end_date
+//
+// ⇒ **语义归一化一律在导入端做**(见 internal/member/service/import.go):
+// 导出端"顺手翻译"会把"这个值我读不懂"变成"余额 0",而余额 0 没人会去查。
+//
+// ⚠️ 金额 / 积分 / 数量一律**字符串**:JSON number 到 Dart 侧会变成 double,精度当场丢。
+type ImportMemberRow struct {
+	// ID 是会员号(思迅 card_id;导入端去反引号与前导零)。
+	ID string `json:"id"`
+	// CardFaceNo 是卡面卡号。
+	CardFaceNo string `json:"card_face_no"`
+	// CardType 是思迅的类别码('0'=会员卡 / '1'=储值卡 / '2'=VIP储值卡)。
+	CardType string `json:"card_type"`
+	// Name 是姓名。
+	Name string `json:"name"`
+	// Gender 是性别。
+	Gender string `json:"gender"`
+	// Phone / Mobile 是电话 / 手机。
+	Phone  string `json:"phone"`
+	Mobile string `json:"mobile"`
+	// Birthday 是生日(源值;导入端尽力解析)。
+	Birthday string `json:"birthday"`
+	// IDCardNo 是身份证。
+	IDCardNo string `json:"id_card_no"`
+	// Status 是**思迅 card_status 的原值**(不是本域的 normal/frozen/…)。
+	Status string `json:"status"`
+	// FeeAmountYuan 是会员费(字符串)。
+	FeeAmountYuan string `json:"fee_amount_yuan"`
+	// LimitedUseCount 是限用次数(字符串;999998/999999 = 不限次 ⇒ 导入端转 0)。
+	LimitedUseCount string `json:"limited_use_count"`
+	// PointsAccumulated 是累计获得积分(字符串)。
+	PointsAccumulated string `json:"points_accumulated"`
+	// PointsUsed 是累计扣减积分(字符串)。
+	PointsUsed string `json:"points_used"`
+	// BalanceYuan 是储值余额(字符串;⚠️ 源值可能是脏值 ⇒ 解析失败要**报告**,不能静默当 0)。
+	BalanceYuan string `json:"balance_yuan"`
+	// ConsumedAmountYuan 是累计消费金额(字符串)。
+	ConsumedAmountYuan string `json:"consumed_amount_yuan"`
+	// ConsumedCount 是消费次数(字符串)。
+	ConsumedCount string `json:"consumed_count"`
+	// Favorite 是爱好。
+	Favorite string `json:"favorite"`
+	// Remark 是备注。
+	Remark string `json:"remark"`
+	// BranchNo 是**源库**的门店号(思迅里全是 '00')。
+	//
+	// ⚠️ **只作审计记录**:目标门店只认 X-Branch-ID。
+	//   源库里 branch_no 与本系统的 branch_id 毫无关系(那是思迅的门店编号)。
+	BranchNo string `json:"branch_no"`
+	// OperatorID 是源库的操作人工号(审计用)。
+	OperatorID string `json:"operator_id"`
+	// OperatedAt 是源库的操作时刻(审计用;解析得出就当 updated_at)。
+	OperatedAt string `json:"operated_at"`
+	// ValidFrom / ValidUntil 是有效期(源值;导入端解析成 RFC3339)。
+	ValidFrom  string `json:"valid_from"`
+	ValidUntil string `json:"valid_until"`
+	// OpenID 是微信 / 支付宝 openid。
+	OpenID string `json:"open_id"`
 }
 
 // ImportStockRow 是库存快照行。

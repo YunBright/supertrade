@@ -140,14 +140,16 @@ func (f fakeToken) AccessToken(context.Context) (string, error) {
 
 // newTestSyncer 造一个 Syncer(fake 依赖)。
 //
-// ⚠️ 路由表:**catalog 拥有四个档案 scope**,prices/promotions 归 pricing。
+// ⚠️ 路由表:**catalog 拥有四个档案 scope**,prices/promotions 归 pricing,
+//   stock 归 inventory,member_types/members 归 member。
 //
-//	这里两个归属方都指向同一个 fake(测试不关心下游是谁)。
+//	这里几个归属方都指向同一个 fake(测试不关心下游是谁)。
 func newTestSyncer(cfg Config, ex Exporter, im Importer) *Syncer {
 	s := NewSyncer(cfg, fakeToken{token: "T"}, ex, []Owner{
 		{Importer: im, Scopes: DefaultCatalogScopes()},
 		{Importer: im, Scopes: DefaultPricingScopes()},
 		{Importer: im, Scopes: DefaultInventoryScopes()},
+		{Importer: im, Scopes: DefaultMemberScopes()},
 	}, nil)
 	s.chunkSize = 3 // 小块,便于验证分块行为
 	return s
@@ -349,6 +351,14 @@ func TestSync_ScopeOrderFollowsDependencies(t *testing.T) {
 			"begin_day": "2026-09-01", "end_day": "2026-09-30",
 		}},
 		archivedto.ScopeStock: {{"product_id": "P1", "qty": "12", "avg_cost_yuan": "7.10"}},
+		archivedto.ScopeMemberTypes: {{
+			"id": "0", "name": "会员卡", "discount_rate": "1",
+			"allow_stored_value": "0", "allow_points_pay": "1",
+		}},
+		archivedto.ScopeMembers: {{
+			"id": "M1", "card_type": "0", "name": "张三", "status": "0",
+			"balance_yuan": "10", "points_accumulated": "5", "points_used": "1",
+		}},
 	}}
 	im := &fakeImporter{}
 	cfg := Config{SourceBranchID: "00", TargetBranchID: "10", Mode: "overwrite",
@@ -373,6 +383,9 @@ func TestSync_ScopeOrderFollowsDependencies(t *testing.T) {
 		archivedto.ScopePromotions,
 		// 库存快照排在最后(它引用商品)。
 		archivedto.ScopeStock,
+		// ⚠️ 会员类别排在会员**之前**(会员引用类别)。
+		archivedto.ScopeMemberTypes,
+		archivedto.ScopeMembers,
 	}
 	if !reflect.DeepEqual(order, want) {
 		t.Errorf("scope 顺序应为 %v,实际 %v", want, order)
@@ -432,6 +445,16 @@ func TestBuildImportData_MatchesExportColumns(t *testing.T) {
 				return buildImportData(archivedto.ScopeItemBarcodes, []map[string]any{r})
 			},
 			archivedto.ImportBarcodeRow{}},
+		{archivedto.ScopeMemberTypes,
+			func(r map[string]any) archivedto.ImportData {
+				return buildImportData(archivedto.ScopeMemberTypes, []map[string]any{r})
+			},
+			archivedto.ImportMemberTypeRow{}},
+		{archivedto.ScopeMembers,
+			func(r map[string]any) archivedto.ImportData {
+				return buildImportData(archivedto.ScopeMembers, []map[string]any{r})
+			},
+			archivedto.ImportMemberRow{}},
 	}
 
 	for _, tc := range cases {
@@ -480,6 +503,21 @@ func valuesLanded(data archivedto.ImportData, cols []string) bool {
 	case len(data.ItemBarcodes) > 0:
 		r := data.ItemBarcodes[0]
 		got["barcode"], got["product_id"], got["label"] = r.Barcode, r.ProductID, r.Label
+	case len(data.MemberTypes) > 0:
+		r := data.MemberTypes[0]
+		got["id"], got["name"], got["discount_rate"] = r.ID, r.Name, r.DiscountRate
+		got["allow_stored_value"], got["allow_points_pay"] = r.AllowStoredValue, r.AllowPointsPay
+	case len(data.Members) > 0:
+		r := data.Members[0]
+		got["id"], got["card_face_no"], got["card_type"], got["name"] = r.ID, r.CardFaceNo, r.CardType, r.Name
+		got["gender"], got["phone"], got["mobile"], got["birthday"] = r.Gender, r.Phone, r.Mobile, r.Birthday
+		got["id_card_no"], got["status"] = r.IDCardNo, r.Status
+		got["fee_amount_yuan"], got["limited_use_count"] = r.FeeAmountYuan, r.LimitedUseCount
+		got["points_accumulated"], got["points_used"] = r.PointsAccumulated, r.PointsUsed
+		got["balance_yuan"], got["consumed_amount_yuan"] = r.BalanceYuan, r.ConsumedAmountYuan
+		got["consumed_count"], got["favorite"], got["remark"] = r.ConsumedCount, r.Favorite, r.Remark
+		got["branch_no"], got["operator_id"], got["operated_at"] = r.BranchNo, r.OperatorID, r.OperatedAt
+		got["valid_from"], got["valid_until"], got["open_id"] = r.ValidFrom, r.ValidUntil, r.OpenID
 	default:
 		return false
 	}
