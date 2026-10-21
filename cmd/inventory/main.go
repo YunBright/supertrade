@@ -35,12 +35,14 @@ import (
 	"os"
 	"time"
 
+	"github.com/YunBright/authkit/daprclient"
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/internal/cubehttp"
+	"github.com/YunBright/supertrade/internal/cubesource"
 	"github.com/YunBright/supertrade/internal/inventory/db"
 	"github.com/YunBright/supertrade/internal/inventory/handler"
 	"github.com/YunBright/supertrade/internal/inventory/model"
@@ -69,7 +71,10 @@ var (
 	appDB    *gorm.DB
 	appStock *service.StockService
 	appUser  *userinfo.Client
-	appCube  cubeclient.Client
+	// appCube 是**完整的** cube 客户端(不是 cubehttp 的窄接口):
+	// 数据源解析器(ResolveBranchSource)与库存读端(GetStock / LoadCubeQueryPage)
+	// 都在它上面。
+	appCube *cubeclient.DaprCubeClient
 )
 
 func initApp() error {
@@ -109,11 +114,37 @@ func initApp() error {
 		slog.Info("userinfo warmup ok")
 	}
 
-	// cube 转发客户端(老路径 /stock/:product_id 仍在用)。
-	appCube, err = cubehttp.NewClient()
+	// cube 客户端(老路径 /stock/:product_id 与新的数据源路由都用它)。
+	//
+	// ⚠️ **用 authkit/daprclient.New() 而不是 go-sdk 的 dapr.NewClient()**:
+	//   go-sdk 的 api-token 拦截器会**整块替换** outgoing metadata,
+	//   把转发给 cube 的 Authorization 头抹掉
+	//   (2026-10-20 全网加 DAPR_API_TOKEN 之后暴露的)。
+	//   详见 authkit/daprclient 的包注释。
+	daprCli, err := daprclient.New()
 	if err != nil {
 		return err
 	}
+	// ⚠️ 这里**不用** cubehttp.NewClient():它返回的是窄接口(cubeclient.Client),
+	//   拿不到 ResolveBranchSource ⇒ 装配不出数据源解析器。
+	appCube = cubeclient.NewDaprCubeClient(
+		daprCli,
+		cubeclient.DefaultCubeAppID(),
+		cubeclient.DefaultCubeQueryPath(),
+	)
+
+	// ⚠️ **解析器 + 读端一起注入**(两个都注入才走 cube 路径):
+	//   只注入一个 ⇒ 仍走本地 PG ⇒ 有数据源的门店又变成"没有库存"。
+	//
+	// ⚠️ 解析器带 60s 缓存 + stale-on-error:每次读都打一次 dapr 往返不划算,
+	//   而一次网络抖动不该让整个门店的库存服务挂掉。
+	appStock.SetCubeSource(
+		cubesource.NewCachedResolver(appCube, cubesource.DefaultTTL, slog.Default()),
+		appCube,
+	)
+	// 归档导出转发器(有源门店的导出转发给 cube-router 的 /v1/export)。
+	appStock.SetArchiveExporter(service.NewCubeRouterExporter(daprCli, cubeclient.DefaultCubeAppID()))
+	slog.Info("inventory: cube 读路径已启用", "app_id", cubeclient.DefaultCubeAppID())
 	return nil
 }
 
@@ -129,7 +160,11 @@ func registerRoutes(r *gin.Engine) {
 	handler.New(appStock, appUser, slog.Default()).RegisterRoutes(r)
 
 	// 保留老路径:cube stock 转发(cube 门店仍走它)。
-	cubehttp.New(appCube).Register(r, cubehttp.RegisterOptions{
+	//
+	// ⚠️ **套一层路由客户端**:老路径此前**只走 cube** ⇒ 对没配数据源的门店
+	//   (自营店 10)恒返 404 ⇒ 同一个服务里出现"一个端点走 cube、另一个走本地"。
+	//   路由客户端让它走**同一套判据**(有源 ⇒ cube;没配 ⇒ 本域 PG;问不到 ⇒ 503)。
+	cubehttp.New(service.NewRoutingCubeClient(appStock, appCube)).Register(r, cubehttp.RegisterOptions{
 		Stock:         true,
 		RequireBranch: true, // /stock/:product_id 走 claims.AccessibleBranches 守门(branch 从 X-Branch-ID header 取)
 	})

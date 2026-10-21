@@ -40,6 +40,12 @@ const (
 type StockService struct {
 	db  *gorm.DB
 	now func() time.Time
+	// sources 解析"这个门店配了哪个数据源"(nil = 未装配 ⇒ 一律走本地 PG)。
+	sources SourceResolver
+	// cube 读 cube 里的库存快照(nil = 未装配 ⇒ 一律走本地 PG)。
+	cube CubeStockReader
+	// exporter 把归档导出请求转发给 cube-router 的 /v1/export(nil = 未装配)。
+	exporter ArchiveExporter
 }
 
 // NewStockService 构造 StockService。
@@ -91,9 +97,19 @@ func (q StockLevelQuery) normalized() StockLevelQuery {
 // ListLevels 分页查库存快照。
 //
 // 返回 (rows, total):total 是**过滤后的总条数**,不是本页条数。
+//
+// ⚠️ **读路径按数据源分流**（见 source.go）：
+//   - 门店配了数据源 ⇒ 走 cube（该门店的库存在外部系统里，本域 PG 没有它的行）
+//   - 没配 ⇒ 走本域 PG（自营店 10）
+//   - 问不到路由 ⇒ 503（**不回落本地**：回落 = 把故障显示成"这个门店没有库存"）
 func (s *StockService) ListLevels(ctx context.Context, q StockLevelQuery) ([]model.StockLevel, int64, error) {
 	if strings.TrimSpace(q.BranchID) == "" {
 		return nil, 0, model.ErrInvalidInput
+	}
+	if _, useCube, err := s.resolveCubeSource(ctx, q.BranchID); err != nil {
+		return nil, 0, err
+	} else if useCube {
+		return s.listLevelsFromCube(ctx, q)
 	}
 	q = q.normalized()
 
@@ -120,9 +136,16 @@ func (s *StockService) ListLevels(ctx context.Context, q StockLevelQuery) ([]mod
 }
 
 // GetLevel 取某个商品在某门店的库存快照;不存在 → model.ErrStockLevelNotFound。
+//
+// ⚠️ 读路径按数据源分流（见 source.go）：有源 ⇒ 走 cube 的单商品快照。
 func (s *StockService) GetLevel(ctx context.Context, branchID, productID string) (*model.StockLevel, error) {
 	if strings.TrimSpace(branchID) == "" || strings.TrimSpace(productID) == "" {
 		return nil, model.ErrInvalidInput
+	}
+	if _, useCube, err := s.resolveCubeSource(ctx, branchID); err != nil {
+		return nil, err
+	} else if useCube {
+		return s.getLevelFromCube(ctx, branchID, productID)
 	}
 	var row model.StockLevel
 	err := s.db.WithContext(ctx).
@@ -170,9 +193,16 @@ func (q StockMoveQuery) normalized() StockMoveQuery {
 // ListMoves 分页查库存流水。
 //
 // 返回 (rows, total):total 是**过滤后的总条数**,不是本页条数。
+//
+// ⚠️ **读路径按数据源分流**（见 source.go）：有源 ⇒ **不读本域流水**。
 func (s *StockService) ListMoves(ctx context.Context, q StockMoveQuery) ([]model.StockMove, int64, error) {
 	if strings.TrimSpace(q.BranchID) == "" {
 		return nil, 0, model.ErrInvalidInput
+	}
+	if _, useCube, err := s.resolveCubeSource(ctx, q.BranchID); err != nil {
+		return nil, 0, err
+	} else if useCube {
+		return s.listMovesFromCube(ctx, q)
 	}
 	q = q.normalized()
 

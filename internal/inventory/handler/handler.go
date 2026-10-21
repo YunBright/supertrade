@@ -6,17 +6,29 @@
 //	GET /stock-levels/:product_id                                    单个商品库存(inventory:view)
 //	GET /stock-moves?branch_id=&product_id=&move_type=&occurred_from=&occurred_to=&page=&page_size=
 //	                                                                   库存流水列表(inventory:view)
+//	GET /archive/export?scope=stock&offset=&limit=                    库存快照导出(inventory:view)
+//	POST /archive/import                                             库存快照导入(inventory:manage)
+//
+// # ⚠️ **读路径按「门店配了数据源」分流**（2026-10-21 生产实测的修复）
+//
+// 门店在 cube-router 的 branch_cube_sources 里配了数据源
+// (富百家 00 → cube-sixun-ysx-fb、佳乐 01 → cube-sixun-hbposv7-jiale)
+// ⇒ **该门店的库存在外部系统里**，本域 PG 没有它的行
+// ⇒ 读端点必须走那个 cube 实例；没配数据源的门店(自营店 10)⇒ 走本域 PG。
+//
+// 判据与错误语义见 internal/inventory/service/source.go（与 member / catalog /
+// pricing 共用同一份实现）—— **问不到路由 ⇒ 503，不回落本地**。
 //
 // # 权限
 //
-// 三个端点全部挂 `rbac.RequireScopeWithBranch("inventory:view", ...)` ——
+// 读端点 + 导出端点挂 `rbac.RequireScopeWithBranch("inventory:view", ...)` ——
 // scope 是 **per-branch 实时解析**的(走 auth 的 /internal/users/{id}/permissions)。
 //
 // ⚠️ **scope 名来自 auth 的 permissions 表 seed**
 // (auth/migrations/001_init_schema.up.sql:`inventory:view` = "查库存")。
 //
 //	同批还有 `inventory:manage`(改库存 / 盘点单)与 `inventory:approve`(审核盘点单),
-//	本服务只读 ⇒ 只用 `inventory:view`。
+//	导入端点用 manage(它会**改写**库存数量),其余只读端点用 view。
 //
 // # 门店从哪来
 //
@@ -28,6 +40,9 @@
 //
 //	ErrStockLevelNotFound → 404 stock_level_not_found
 //	ErrInvalidInput       → 400 bad_request
+//	ErrCubeSourceUnavailable → 503 cube_unavailable
+//	ErrCubeSourceDisabled   → 503 cube_source_disabled
+//	ErrExternalSourceReadOnly → 409 member_source_is_external
 //	其它                  → 500 internal_error
 package handler
 
@@ -43,6 +58,7 @@ import (
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/gin-gonic/gin"
 
+	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/internal/inventory/model"
 	"github.com/YunBright/supertrade/internal/inventory/service"
 	"github.com/YunBright/supertrade/pkg/middleware"
@@ -77,10 +93,20 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 		rbac.RequireScopeWithBranch("inventory:view", branchFromHeader, resolver),
 		h.listStockMoves)
 
+	// 2026-10-21 新增：库存快照的**归档导出**（一次性归档同步用）。
+	//
+	// ⚠️ 输出契约 = internal/archivedto（与 cube-router 的 /v1/export 同一份字段名）。
+	// ⚠️ 门店配了数据源 ⇒ 转发 cube-router（该门店的库存在外部系统里）；
+	//   没配 ⇒ 从本域 stock_levels 读。
+	r.GET("/archive/export",
+		rbac.RequireScopeWithBranch("inventory:view", branchFromHeader, resolver),
+		h.exportArchive)
+
 	// 2026-10-21 新增：库存快照的**导入**（一次性归档同步用）。
 	//
 	// ⚠️ 守门是 `inventory:manage`（不是 view）—— 导入会**改写**库存数量。
 	// ⚠️ 目标门店只从 X-Branch-ID header 取（body 里带门店就能跨店写）。
+	// ⚠️ **有源门店只读**：该门店的库存在外部系统里 ⇒ 导入一律 409。
 	r.POST("/archive/import",
 		rbac.RequireScopeWithBranch("inventory:manage", branchFromHeader, resolver),
 		h.importArchive)
@@ -227,6 +253,15 @@ type errBody struct {
 
 // mapErr 把 service 错误映射为 HTTP 状态码 + {code, message}。
 func (h *Handler) mapErr(c *gin.Context, err error) {
+	// ⚠️ 导出链路的错误自带 status/code（要区分"没权限"与"数据源挂了"）。
+	var ee *service.ExportError
+	if errors.As(err, &ee) {
+		c.AbortWithStatusJSON(ee.Status, errBody{
+			Code:    ee.Code,
+			Message: ee.Message,
+		})
+		return
+	}
 	switch {
 	case errors.Is(err, model.ErrStockLevelNotFound):
 		c.AbortWithStatusJSON(http.StatusNotFound, errBody{
@@ -237,6 +272,50 @@ func (h *Handler) mapErr(c *gin.Context, err error) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, errBody{
 			Code:    "bad_request",
 			Message: err.Error(),
+		})
+	case errors.Is(err, model.ErrUnsupportedExportScope):
+		// ⚠️ 与 cube-router 的同名 code 保持一致（编排方按 code 分支）。
+		c.AbortWithStatusJSON(http.StatusBadRequest, errBody{
+			Code:    "unsupported_export_scope",
+			Message: err.Error(),
+		})
+	case errors.Is(err, model.ErrCubeSourceUnavailable):
+		// ⚠️ 503 而不是回落成本地：这是链路故障（问不到路由），
+		// 回落会让用户看到一份"空列表"——与故障无关的结论。
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, errBody{
+			Code:    "cube_unavailable",
+			Message: "数据源路由暂不可用，请稍后重试",
+		})
+	case errors.Is(err, model.ErrCubeSourceDisabled):
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, errBody{
+			Code:    "cube_source_disabled",
+			Message: "该门店的数据源已停用",
+		})
+	case errors.Is(err, model.ErrExternalSourceReadOnly):
+		// 409:状态冲突（这个门店的账在外部系统里，不是权限问题）。
+		c.AbortWithStatusJSON(http.StatusConflict, errBody{
+			Code:    "member_source_is_external",
+			Message: err.Error(),
+		})
+	case errors.Is(err, cubeclient.ErrCubeForbidden):
+		c.AbortWithStatusJSON(http.StatusForbidden, errBody{
+			Code:    "forbidden",
+			Message: "没有该门店的数据读权限",
+		})
+	case errors.Is(err, cubeclient.ErrCubeAuthRejected):
+		c.AbortWithStatusJSON(http.StatusUnauthorized, errBody{
+			Code:    "unauthorized",
+			Message: "登录已失效，请重新登录",
+		})
+	case errors.Is(err, cubeclient.ErrCubeBadRequest):
+		c.AbortWithStatusJSON(http.StatusBadRequest, errBody{
+			Code:    "bad_request",
+			Message: err.Error(),
+		})
+	case errors.Is(err, cubeclient.ErrCubeUnavailable):
+		c.AbortWithStatusJSON(http.StatusServiceUnavailable, errBody{
+			Code:    "cube_unavailable",
+			Message: "数据源暂不可用，请稍后重试",
 		})
 	default:
 		h.logger.Error("inventory handler error", "err", err, "path", c.Request.URL.Path)

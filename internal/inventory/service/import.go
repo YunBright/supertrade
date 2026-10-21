@@ -15,6 +15,11 @@
 //     ⇒ 重复导入同一份快照不会产生第二行；
 //   - 库存**数量允许为负**（卖超了 / 盘点亏损）——
 //     ⚠️ **不做夹逼**：夹到 0 会把"超卖"从数据里抹掉，现场再也查不出原因。
+//
+// # ⚠️ **有源门店只读**
+//
+// 门店在 cube-router 里配了数据源 ⇒ 它的库存在外部系统里 ⇒ 本域只读，
+// 导入一律 409（见 EnsureLocalSource）。
 package service
 
 import (
@@ -64,9 +69,19 @@ type StockImportInput struct {
 //
 // ⚠️ **目标门店只从 header 取**（调用方传进来的）——
 // body 里带一份门店就能跨店写入，这是**跨店写**的口子。
+//
+// ⚠️ **有源门店只读**（2026-10-21）：门店配了数据源 ⇒ 它的库存在外部系统里
+// ⇒ 本域 PG 里那份"导入的库存"**没人看**（前台查的是 cube）。
+// 不拒的话：导入报告显示"成功 23833 条"，而门店的库存根本没变
+// ⇒ 账实不符，且**没有任何一行报错**。
 func (s *StockService) ImportStock(ctx context.Context, in StockImportInput) (*StockImportReport, error) {
 	if in.TargetBranchID == "" {
 		return nil, model.ErrInvalidInput
+	}
+	// ⚠️ **闸门在写之前**：有源 ⇒ 409（不写一行）。
+	//   解析失败（问不到路由）⇒ 放行（导入路径自己兜底，见 EnsureLocalSource）。
+	if err := s.EnsureLocalSource(ctx, in.TargetBranchID); err != nil {
+		return nil, err
 	}
 	mode := strings.TrimSpace(in.Mode)
 	if mode == "" {

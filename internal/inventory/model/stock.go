@@ -172,4 +172,26 @@ var (
 	ErrStockLevelNotFound = errors.New("inventory: 库存记录不存在")
 	// ErrInvalidInput:入参非法(缺 branch_id / op_id / lines 为空 / 商品 id 为空)。
 	ErrInvalidInput = errors.New("inventory: 入参非法")
+	// ErrCubeSourceUnavailable:问不到"这个门店配了哪个数据源"(503)。
+	//
+	// ⚠️ 与"没配数据源"严格区分:没配是**正常状态**(自营店 10),
+	// 问不到是**链路故障** ⇒ 后者必须让用户看到"暂不可用",
+	// 而不是让它悄悄回落成本地(那会让用户看到一份空列表,
+	// 而真相是"这个门店的库存现在查不了")。
+	ErrCubeSourceUnavailable = errors.New("inventory: 数据源路由暂不可用")
+	// ErrCubeSourceDisabled:该门店的数据源被管理员停用(503)。
+	//
+	// ⚠️ **不是"没配"**:配了但被关停 ⇒ 这个门店现在查不了,
+	// 回落成本地 = 给用户一份"看起来正常"的空列表。
+	ErrCubeSourceDisabled = errors.New("inventory: 该门店的数据源已停用")
+	// ErrExternalSourceReadOnly:该门店的库存来自外部系统,本域只读(409)。
+	//
+	// ⚠️ 写端点(导入)专用:往本域 PG 写一份"没人看的库存",
+	// 而前台还显示"写成功了" ⇒ 比报错更糟。
+	ErrExternalSourceReadOnly = errors.New("inventory: 该门店的库存来自外部系统,本域只读")
+	// ErrUnsupportedExportScope:导出的 scope 不归本服务(400)。
+	//
+	// ⚠️ 与 cube-router 的同名错误码一致(unsupported_export_scope):
+	// 编排方(cubesync)按 code 分支,两边不一样会让它"看不出是 scope 写错了"。
+	ErrUnsupportedExportScope = errors.New("inventory: 不支持的导出 scope")
 )
