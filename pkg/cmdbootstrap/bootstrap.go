@@ -14,6 +14,8 @@
 //   - 接入 authkit.claims.GinMiddleware(解析 JWT claims 到 ctx,Dapr sidecar 已验签)
 //   - 接入 rbac.RequireAudience(AppID)(拒 aud 不含本服务的 token)
 //   - 注册 /healthz(公开,不走 auth 中间件)
+//   - 业务请求打**访问日志**(slog JSON,见 accesslog.go);
+//     /healthz 与 dapr 内部端点**不打**
 //   - 优雅退出(SIGINT/SIGTERM,5s 超时)
 //
 // 不集成 dapr SDK:pub/sub 订阅与 service invocation 由 dapr sidecar 代理。
@@ -115,9 +117,14 @@ type Options struct {
 //     或给 /events/* 加 dapr-api-token / mTLS。
 //     当前部署依赖"内网可信"这一前提 —— 这是已知且被接受的风险,不是已解决。
 //
-// 3) 业务路由(Options.Register)最后注册 —— 必然带 auth。
+//  3. 业务链上的中间件(访问日志 / 业务错误日志 / panic 兜底)装在 auth **之前** ——
+//     这样被鉴权挡掉的请求(401/403)也有访问日志;
+//     而 /healthz 与 dapr 内部端点注册在**更早**,不在链上 ⇒ 不打日志。
+//     见下面 (3) 段的注释。
 //
-//  4. auth 中间件本身在 2026-10-12 从 `claims.GinMiddleware()`(只解 payload 不验签)
+// 4) 业务路由(Options.Register)最后注册 —— 必然带 auth。
+//
+//  5. auth 中间件本身在 2026-10-12 从 `claims.GinMiddleware()`(只解 payload 不验签)
 //     换成了 `authn.Verifier.GinMiddleware()`(用 JWKS 真验签)。
 //     原因见 pkg/cmdbootstrap/jwtverify.go 顶部的长注释 —— 简版:
 //     侧车的 middleware.http.bearer 对**借道请求根本不生效**,伪造签名的 JWT
@@ -132,7 +139,22 @@ func NewRouter(opts Options) *gin.Engine {
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
-	r.Use(gin.Recovery())
+
+	// 日志用的 logger：优先 Options.Logger（单测注入用），
+	// 退化到 slog.Default()（Run() 里已 SetDefault 成 JSON stdout）。
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	// (0) panic 兜底 —— 覆盖**全部**路由（含 /healthz 与 dapr 内部端点）。
+	//
+	// ⚠️ 用自写的 recoveryMiddleware 而不是 gin.Recovery()：
+	//
+	//	gin 那个会把请求头打到 stderr（Authorization 被它 mask 掉，Cookie 没有），
+	//	而且是纯文本 ⇒ 有漏令牌/漏 Cookie 的风险 + 日志形态不统一。
+	//	详见 accesslog.go 的说明。
+	r.Use(recoveryMiddleware(logger))
 
 	// RunID 溯源（契约测试创建的行打标记）。**必须在这里、在所有路由之前**。
 	//
@@ -146,11 +168,52 @@ func NewRouter(opts Options) *gin.Engine {
 
 	// (1) 公开健康检查
 	r.GET("/healthz", healthzHandler(opts.AppID))
+	// ⚠️ 登记进"免访问日志"集合 —— 探活每 3 秒一次,打进访问日志就是刷屏。
+	//   集合跟着**实际注册的路由**走,不留硬编码路径表(见 accesslog.go)。
+	RegisterAccessLogSkipPaths("/healthz")
 
 	// (2) Dapr 内部路由 —— 必须在 auth 之前
 	if opts.RegisterDapr != nil {
+		// ⚠️ 用**集合差集**而不是 `r.Routes()[before:]` 的切片:
+		//
+		//	gin 的 Routes() 是**按 HTTP method 分组**返回的(GET 树在前、POST 树在后),
+		//	不是注册顺序 ⇒ 按个数切片会漏掉新路由、也可能切进旧路由。
+		before := make(map[string]bool)
+		for _, rt := range r.Routes() {
+			before[rt.Path] = true
+		}
 		opts.RegisterDapr(r)
+		// ⚠️ 把这批**新注册**的路由登记进"免访问日志"集合 ——
+		//
+		//	/dapr/subscribe(每 10 分钟还会重注册 job)、/events/*(sidecar 推 CloudEvents)
+		//	都是高频噪音;而各服务注册的路径**不一样**
+		//	(有的还注册了 /job/*)⇒ 只能跟着实际注册走,不能硬编码一张路径表。
+		for _, rt := range r.Routes() {
+			if !before[rt.Path] {
+				RegisterAccessLogSkipPaths(rt.Path)
+			}
+		}
 	}
+
+	// (3) 业务链上的中间件：访问日志 → 业务错误日志 → panic 兜底
+	//
+	// ⚠️ **位置是可观测性的不变量**，改之前先读这三段：
+	//
+	//  1. 必须在**业务路由注册之前**（业务路由在 MountBusiness 里注册）⇒
+	//     业务端点的每条请求都有访问日志。
+	//     又因为 gin 的 r.Use() 只对**之后**注册的路由生效，
+	//     而 /healthz 与 RegisterDapr 的路由注册在**更早** ⇒ 它们不在链上，不打日志。
+	//     （健康轮询每 3 秒一次、sidecar 每 10 分钟重注册 job ⇒ 打进去就是刷屏。）
+	//
+	//  2. 必须在 **auth 中间件之前** ⇒ 401/403（越权探测、无 token）也会被记录。
+	//     装在 auth 之后的话，被鉴权挡掉的请求**一条日志都不会有** ——
+	//     而"客户端说没收到数据、后端说没收到请求"这类问题恰恰要靠这些行定位。
+	//
+	//  3. 内层再装一次 panic 兜底：让 panic 被转成 500 **之后**，
+	//     访问日志才能记到正确的状态码（否则记的是 200 —— 比没有日志更糟）。
+	r.Use(NewAccessLog(logger).Middleware())
+	r.Use(errorLog(logger))
+	r.Use(recoveryMiddleware(logger))
 
 	// auth 中间件:验签(公钥来自 dapr state)+ 强制 aud 包含本服务
 	//
@@ -177,7 +240,10 @@ func NewRouter(opts Options) *gin.Engine {
 	}
 	r.Use(rbac.RequireAudience(opts.Audience))
 
-	// (3) 业务路由不在这里注册 —— 见下方 MountBusiness 的说明。
+	// (4) 业务路由不在这里注册 —— 见下方 MountBusiness 的说明。
+	//
+	//     业务路由注册在**上面 (3) 的中间件之后** ⇒ 业务端点的每条请求
+	//     都会经过访问日志(而 /healthz 与 dapr 内部端点不会)。
 
 	return r
 }
