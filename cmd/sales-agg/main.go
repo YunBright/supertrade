@@ -40,10 +40,13 @@ import (
 	"time"
 
 	"github.com/YunBright/authkit/daprclient"
+	"github.com/YunBright/authkit/rbac"
+	"github.com/YunBright/authkit/userinfo"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/cubesource"
 	"github.com/YunBright/supertrade/internal/salesagg/collect"
 	"github.com/YunBright/supertrade/internal/salesagg/compare"
 	// ⚠️ 别名：internal/salesagg/service 也叫 service，不加别名编译不过。
@@ -87,8 +90,15 @@ var (
 	// appCipher 是凭据的加解密器（主密钥来自环境变量）。
 	// 主密钥缺失时为 nil ⇒ 采集开关端点会明确拒绝开启。
 	appCipher *collect.Cipher
-	// appCtl 是采集开关的编排器（开启 / 关停 / 查状态）。
+	// appCtl 是采集开关的编排器(开启 / 关停 / 查状态)。
 	appCtl *collect.Control
+	// appArchive 是门店对比模板的归档导出/导入服务。
+	appArchive *compare.ArchiveService
+	// appUser 是 per-branch scope 解析器(userd 权限矩阵)。
+	//
+	// ⚠️ 本服务此前**没有** userinfo 客户端(对比模板那组端点只认 token claims),
+	//   归档端点要按门店守门(inventory:view / inventory:manage)⇒ 必须有它。
+	appUser *userinfo.Client
 )
 
 func initApp() error {
@@ -170,6 +180,33 @@ func initApp() error {
 	appCreds = collect.NewCredentialStore(appDB)
 	if err := appDB.AutoMigrate(collect.CredentialModels()...); err != nil {
 		return fmt.Errorf("auto migrate branch_collect_credentials: %w", err)
+	}
+
+	// ---- 归档导出/导入的「这个门店配了哪个数据源」解析器 ----
+	//
+	// ⚠️ **只用它解析数据源,不拿它查业务数据**:
+	//   门店对比模板是本域自己配的字典,cube 里没有这个 model。
+	//
+	// ⚠️ 解析器带 60s 缓存 + stale-on-error:每次导出都打一次 dapr 往返不划算,
+	//   而一次网络抖动不该让整个门店的导出挂掉。
+	appArchive = compare.NewArchiveService(appStore)
+	appArchive.SetSourceResolver(cubesource.NewCachedResolver(cube, cubesource.DefaultTTL, slog.Default()))
+	slog.Info("sales-agg: 归档导出/导入已启用", "app_id", cubeclient.DefaultCubeAppID())
+
+	// userinfo 客户端:per-branch scope 守门(权限矩阵在 auth)。
+	//
+	// ⚠️ 归档端点的守卫是 per-branch scope(inventory:view / inventory:manage)
+	//   ⇒ 必须能问 userd「这个用户在这家店有没有这个 scope」。
+	appUser, err = userinfo.New("userd")
+	if err != nil {
+		return fmt.Errorf("userinfo client: %w", err)
+	}
+	warmupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := appUser.Warmup(warmupCtx); err != nil {
+		slog.Warn("userinfo warmup 失败,业务首次 userd 调用将走 cold path", "err", err)
+	} else {
+		slog.Info("userinfo warmup ok")
 	}
 
 	// 主密钥缺失**不阻断启动**，但必须响亮地 Warn：
@@ -392,6 +429,8 @@ func registerRoutes(r *gin.Engine) {
 	handler.New(appSvc).RegisterRoutes(r)
 	// 门店对比（模板 CRUD + 逐店取数）。依赖 appStore（OnStart 已建）。
 	handler.NewCompare(appSvc, appStore).RegisterRoutes(r)
+	// 归档导出/导入(独立的契约 + per-branch 守卫 scope)。
+	handler.NewArchiveHandler(appArchive, rbac.HasAnyScopeWithBranch(appUser)).RegisterRoutes(r)
 	// 采集开关（开启 / 关停 / 查状态）。
 	//
 	// ⚠️ 这些端点在**鉴权链内**（走 users 组的 JWT 校验），
