@@ -11,6 +11,7 @@
 //	DELETE /types/:id                     删会员类别(软删)(member:config)
 //	GET  /payment-ways                    付款方式字典(member:view)
 //	GET  /members?field=&q=&limit=&offset=  会员查询(member:view;响应含 count + total)
+//	GET  /members/export                   离线会员包(member:view)—— 不分页,全店
 //	GET  /members/:id                     会员卡信息(图3)(member:view)
 //	GET  /members/:id/points              积分汇总 + 流水(member:view)
 //	GET  /members/:id/account             储值余额 + 流水(member:view)
@@ -56,6 +57,7 @@ import (
 	"github.com/YunBright/authkit/rbac"
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 
 	"github.com/YunBright/supertrade/internal/member/model"
 	"github.com/YunBright/supertrade/internal/member/service"
@@ -110,6 +112,15 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/members",
 		rbac.RequireScopeWithBranch(model.ScopeView, branchFromHeader, resolver),
 		h.listMembers)
+	// 离线会员包(一次给全,不分页)。
+	//
+	// ⚠️ 静态段 `/members/export` 与参数段 `/members/:id` **共存**:
+	// gin 的路由树里静态段优先于参数段(与注册顺序无关)——
+	// 这条依赖 gin 版本,必须有测试锁住
+	// (见 handler/export_test.go 的 TestMembersExportRouteWinsOverParam)。
+	r.GET("/members/export",
+		rbac.RequireScopeWithBranch(model.ScopeView, branchFromHeader, resolver),
+		h.exportMembers)
 	r.GET("/members/:id",
 		rbac.RequireScopeWithBranch(model.ScopeView, branchFromHeader, resolver),
 		h.getMember)
@@ -295,6 +306,99 @@ func (h *Handler) listMembers(c *gin.Context) {
 		"members": rows,
 		"count":   len(rows),
 		"total":   total,
+	})
+}
+
+// exportMemberDTO 是离线会员包里的一行。
+//
+// # ⚠️ 字段名与 model.Member 的 json tag **逐字对齐**
+//
+//	id / branch_id / name / card_face_no / card_type_id / phone / mobile /
+//	status / points_accumulated / points_used / remaining_points /
+//	balance_yuan / updated_at
+//
+// 两处用同一个词的地方含义必须一样,否则客户端按 model.Member 的字段名
+// 解析这个响应会静默取到空值。
+//
+// # ⚠️ 金额/积分一律 decimal.Decimal ⇒ JSON **字符串**
+//
+// JSON number 到了 Dart 侧会被 jsonDecode 变成 double,精度当场丢掉;
+// 字符串则原样落地。
+type exportMemberDTO struct {
+	ID string `json:"id"`
+	// BranchID 是门店(复合主键的第二列,卡号**非全局唯一**)。
+	BranchID string `json:"branch_id"`
+	// Name 是姓名。
+	Name string `json:"name"`
+	// CardFaceNo 是卡面卡号。
+	CardFaceNo string `json:"card_face_no"`
+	// CardTypeID 是会员类别 → member_types.id。
+	CardTypeID string `json:"card_type_id"`
+	// Phone 是电话号码。
+	Phone string `json:"phone"`
+	// Mobile 是手机号码。
+	Mobile string `json:"mobile"`
+	// Status 是状态:normal / frozen / lost / cancelled。
+	Status string `json:"status"`
+	// PointsAccumulated 是**累计获得**积分。
+	PointsAccumulated decimal.Decimal `json:"points_accumulated"`
+	// PointsUsed 是**累计扣减**积分。
+	PointsUsed decimal.Decimal `json:"points_used"`
+	// RemainingPoints 是**剩余积分(派生)**= 累计获得 − 累计扣减。
+	//
+	// ⚠️ 由 service 的 fillDerived 填(gorm:"-" 不落库)——
+	// 忘了填 ⇒ 客户端拿到的全是 0 ⇒ 算积分、抵扣积分全错。
+	RemainingPoints decimal.Decimal `json:"remaining_points"`
+	// BalanceYuan 是零钱包余额(储值卡余额)。
+	BalanceYuan decimal.Decimal `json:"balance_yuan"`
+	// UpdatedAt 是最后修改时刻(RFC3339,与 model.Member 的 JSON 编码一致)。
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// exportMembers GET /members/export —— 离线会员包(一次给全)。
+//
+// # ⚠️ 与 listMembers 的差别
+//
+//	listMembers  limit 上限 200(MaxListLimit)⇒ 4128 人的门店要 21 次往返
+//	exportMembers **不限条数**,一次给全
+//
+// # ⚠️ 门店只从 X-Branch-ID header 取
+//
+// query / body 里**不认**门店 —— 否则 A 店的登录态能把 B 店的会员导走。
+func (h *Handler) exportMembers(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if branchID == "" {
+		writeError(c, http.StatusBadRequest, "branch_required", "X-Branch-ID header 必填")
+		return
+	}
+	rows, err := h.svc.ExportMembers(c.Request.Context(), branchID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	out := make([]exportMemberDTO, 0, len(rows))
+	for _, m := range rows {
+		out = append(out, exportMemberDTO{
+			ID:                m.ID,
+			BranchID:          m.BranchID,
+			Name:              m.Name,
+			CardFaceNo:        m.CardFaceNo,
+			CardTypeID:        m.CardTypeID,
+			Phone:             m.Phone,
+			Mobile:            m.Mobile,
+			Status:            m.Status,
+			PointsAccumulated: m.PointsAccumulated,
+			PointsUsed:        m.PointsUsed,
+			RemainingPoints:   m.RemainingPoints,
+			BalanceYuan:       m.BalanceYuan,
+			UpdatedAt:         m.UpdatedAt,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"branch_id": branchID,
+		"members":   out,
+		"count":     len(out),
+		"total":     len(out),
 	})
 }
 

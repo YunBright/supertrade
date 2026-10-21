@@ -231,9 +231,32 @@ func (s *Service) importMemberTypes(ctx context.Context, branchID, mode string,
 			continue
 		}
 		if mode == "overwrite" {
+			// ⚠️ overwrite 会**覆盖门店自己维护的类别设置**。
+			//
+			//	实测（2026-10-21）：门店把「会员卡 / 储值卡」都设成
+			//	"允许积分抵扣 = 是"，而思迅源库的 acc_flag 是 '0'
+			//	⇒ 一次 overwrite 导入就把两个类别的 allow_points_pay
+			//	**静默改成了 false** ⇒ POS 上会员再也不能用积分抵扣。
+			//
+			//	⇒ 这里在**值真的变了**时给一条 warning（覆盖是不可逆的经营变更，
+			//	   不能只有一行 "updated"）。
+			newStored := parseBoolLoose(row.AllowStoredValue)
+			newPoints := parseBoolLoose(row.AllowPointsPay)
+			if cur.AllowStoredValue != newStored {
+				warns.add(fmt.Sprintf(
+					"member_types:类别 %q 的 allow_stored_value 被 overwrite 从 %v 改成 %v(源库值)"+
+						"——这是门店自己维护的设置,请确认",
+					name, cur.AllowStoredValue, newStored))
+			}
+			if cur.AllowPointsPay != newPoints {
+				warns.add(fmt.Sprintf(
+					"member_types:类别 %q 的 allow_points_pay 被 overwrite 从 %v 改成 %v(源库值)"+
+						"——这会让会员**不能**再用积分抵扣,请确认",
+					name, cur.AllowPointsPay, newPoints))
+			}
 			updates := map[string]any{
-				"allow_stored_value": parseBoolLoose(row.AllowStoredValue),
-				"allow_points_pay":   parseBoolLoose(row.AllowPointsPay),
+				"allow_stored_value": newStored,
+				"allow_points_pay":   newPoints,
 				"updated_by":         importActor,
 				"updated_at":         now,
 			}

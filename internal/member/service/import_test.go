@@ -272,6 +272,39 @@ func TestImportMembers_ErrorIsNotSwallowed(t *testing.T) {
 		"超长会员号是入参问题 ⇒ 应映成 400,不是 500")
 }
 
+// TestImportMemberTypes_OverwriteWarnsOnCategorySettingChange 锁
+// "overwrite 覆盖门店自己维护的类别设置 ⇒ 必须出 warning"。
+//
+// ⚠️ 2026-10-21 生产实测：门店把两个类别都设成"允许积分抵扣 = 是"，
+// 而思迅源库的 acc_flag 是 '0' ⇒ 一次 overwrite 导入就把
+// allow_points_pay **静默改成 false** ⇒ POS 上会员再也不能用积分抵扣。
+//
+// ⇒ 覆盖是不可逆的经营变更，报告里必须看得见。
+func TestImportMemberTypes_OverwriteWarnsOnCategorySettingChange(t *testing.T) {
+	svc, db := newService(t)
+	seedType(t, db, "T1", "10", "会员卡")
+	// 把"允许积分抵扣"设成 true（门店自己配的）。
+	require.NoError(t, db.Model(&model.MemberType{}).
+		Where("id = ? AND branch_id = ?", "T1", "10").
+		Update("allow_points_pay", true).Error)
+
+	rep, err := svc.ImportMembers(importCtx(), service.MemberImportInput{
+		TargetBranchID: "10", Mode: "overwrite",
+		Data: archivedto.ImportData{MemberTypes: []archivedto.ImportMemberTypeRow{{
+			ID: "T1", Name: "会员卡", DiscountRate: "1",
+			AllowStoredValue: "0", AllowPointsPay: "0",
+		}}},
+	})
+	require.NoError(t, err)
+	assert.NotEmpty(t, rep.Warnings, "覆盖门店设置必须出 warning")
+	assert.Contains(t, strings.Join(rep.Warnings, "|"), "allow_points_pay",
+		"warning 必须点名被改的字段: %v", rep.Warnings)
+
+	var mt model.MemberType
+	require.NoError(t, db.Where("id = ? AND branch_id = ?", "T1", "10").First(&mt).Error)
+	assert.False(t, mt.AllowPointsPay, "overwrite 确实会改成源库值(所以必须有 warning)")
+}
+
 // TestImportMembers_EmptyBalance_ImportsWithoutWarning 锁"余额为空 ⇒ 落库、余额 0、**不告警**"。
 //
 // ⚠️ 实测 764 行空余额**全部是会员卡**（card_type=0）——

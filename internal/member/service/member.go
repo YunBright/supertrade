@@ -298,6 +298,41 @@ func (s *Service) ListMembersPage(ctx context.Context, in ListMembersInput) ([]m
 	return rows, total, nil
 }
 
+// ExportMembers 导出该门店的**全部**会员(离线会员包用)。
+//
+// # ⚠️ 与 ListMembersPage 的差别:绕开 MaxListLimit
+//
+// 门店 10 导入后有 **4128** 个会员,而 ListMembersPage 的 limit 上限是 200
+// ⇒ 分页拉全量是 21 次往返,而且每次都要过一次 RBAC。
+// ⇒ 这里**不限条数**,一次给全。
+//
+// # ⚠️ 每行都过 fillDerived
+//
+// `remaining_points` 是**派生**字段(gorm:"-" 不落库),
+// 忘了填 ⇒ 客户端拿到的剩余积分全是 0 ⇒ 算积分、抵扣积分全错。
+//
+// # 排序
+//
+// (updated_at DESC, id ASC) —— 与 ListMembersPage **同一套全序**,
+// 免得同一个门店两次导出顺序不同(客户端拿两次导出做 diff 会全变)。
+func (s *Service) ExportMembers(ctx context.Context, branchID string) ([]model.Member, error) {
+	branchID = strings.TrimSpace(branchID)
+	if branchID == "" {
+		return nil, fmt.Errorf("%w: branch_id 必填", model.ErrInvalidInput)
+	}
+	var rows []model.Member
+	if err := s.db.WithContext(ctx).
+		Where("branch_id = ?", branchID).
+		Order("updated_at DESC, id ASC").
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		fillDerived(&rows[i])
+	}
+	return rows, nil
+}
+
 // applyMemberFilter 把"门店 + 查询字段 + 查询值"的条件加到链上。
 //
 // ⚠️ **列表与计数共用它** —— 两边各写一份条件时,改了一边 total 就与列表对不上。
