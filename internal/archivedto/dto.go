@@ -174,10 +174,14 @@ var ExportColumns = map[string][]string{
 	// ⚠️ 会员档案:**列名是规范名,值是源值(未归一化)**。
 	//
 	//	`status` 带的是思迅 card_status 的原值('0'/'1'/'2'/'3'/'5'),
-	//	`limited_use_count` 带的是 use_num 的原值(含 999998/999999 哨兵),
-	//	`balance_yuan` 带的是 residual_amt 的原值(**可能是脏值**)。
+	//	`limited_use_count` 带的是 use_num 的原值(含 999998/999999 哨兵)。
 	//	⇒ **语义归一化在导入端做**(见 internal/member/service/import.go),
 	//	  导出端擅自"翻译"会把"解析失败"变成"静默当 0"。
+	//
+	//	⚠️ `balance_yuan` / `consumed_amount_yuan` / `consumed_count` 三个
+	//	**已经是真值**(2026-10-21 起):cube 侧在源库侧算好了
+	//	(余额 = Σ充值 − Σ储值支付;累计消费/次数来自 t_rm_vip_consume)，
+	//	不再是从 t_rm_vip_info 那几列脏值里解析出来的。
 	ScopeMembers: {
 		"id", "card_face_no", "card_type", "name", "gender", "phone", "mobile",
 		"birthday", "id_card_no", "status", "fee_amount_yuan", "limited_use_count",
