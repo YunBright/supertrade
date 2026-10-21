@@ -40,6 +40,7 @@ import (
 // Mode 是归档端点该走哪条路。
 //
 // ⚠️ 用**字符串**而不是 int:判据失败时返回的是零值 `""`,
+//
 //	而 `ModeLocal` 恰好也是"0 值邻居"——int 版里两者容易混淆
 //	(调用方忘了判 err 就会把"判据失败"当成"走本地")。
 type Mode string
@@ -133,6 +134,7 @@ func DecideExport(ctx context.Context, resolver Resolver, branchID string) (Mode
 //	⇒ 顺带:cube-router 挂掉时不会挡住自营店(门店 10)的正常写入。
 //
 // ⚠️ **配了但被停用 ⇒ 仍然 409**:源已经配了 ⇒ 这家店的数据在外部系统里
+//
 //	⇒ 往本域 PG 写一份"没人看的记录"就是制造假数据。
 func DecideImport(ctx context.Context, resolver Resolver, branchID string) (Mode, error) {
 	src, err := resolve(ctx, resolver, branchID)
@@ -149,6 +151,7 @@ func DecideImport(ctx context.Context, resolver Resolver, branchID string) (Mode
 // resolve 解析门店的数据源,并把 cubeclient 的错误语义归一成本包的 sentinel。
 //
 // ⚠️ **权限类错误必须与"问不到"分开**:
+//
 //	调用方没有该门店的 cube:read ⇒ 403;
 //	路由问不到 ⇒ 503。
 //	两者混在一起会让"没权限"显示成"暂不可用",用户会去查数据源健康度

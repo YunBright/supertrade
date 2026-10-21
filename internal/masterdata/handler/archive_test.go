@@ -31,6 +31,7 @@ import (
 // fakeSourceResolver 是 cubesource.Resolver 的 fake。
 //
 // ⚠️ 只实现"这个门店配了哪个数据源"这一个能力 ——
+//
 //	归档端点**不查业务数据**,所以不需要别的 fake。
 type fakeSourceResolver struct {
 	src cubesource.Source
@@ -141,6 +142,7 @@ func TestArchiveExport_NoSource_ReturnsLocalRows(t *testing.T) {
 // TestArchiveExport_SourceConfigured_ReturnsEmpty 锁"配了源 ⇒ 导出**空**"。
 //
 // ⚠️ 关键断言:本地明明有 1 行门店档案,导出结果**仍然必须是空的**
+//
 //	——回落本地 = 把"数据在外部系统里"显示成"本地的旧数据",那是假数据。
 func TestArchiveExport_SourceConfigured_ReturnsEmpty(t *testing.T) {
 	db := newArchiveDB(t)
@@ -221,6 +223,7 @@ func TestArchiveImport_Local_WritesAndIsIdempotent(t *testing.T) {
 // TestArchiveExportRows_NoCredentialColumns 锁"导出行里没有凭据列"。
 //
 // ⚠️ 本域 employees 表**本来就没有**口令哈希 / API key / 人脸特征
+//
 //	(身份与令牌在 auth.users)⇒ 没有可导出的敏感列。
 //	这个测试是为了将来有人往 employees 加了 password_hash 之类的列时能变红。
 func TestArchiveExportRows_NoCredentialColumns(t *testing.T) {

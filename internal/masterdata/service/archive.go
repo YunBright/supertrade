@@ -147,6 +147,7 @@ type ShiftRow struct {
 // ExportResult 是导出的响应体。
 //
 // ⚠️ 三个数组**永远存在**(空时是 `[]` 而不是缺省):
+//
 //	"这个 scope 没有数据"与"这个 scope 不在响应里"是两件事,
 //	前者是业务结论,后者是契约事故。
 type ExportResult struct {
@@ -169,6 +170,7 @@ type ExportResult struct {
 // ImportRequest 是导入请求体(与导出响应**同形** ⇒ 导出-导入可往返)。
 //
 // ⚠️ **body 里的 branch_id 不作数**:目标门店只认 X-Branch-ID header
+//
 //	(body 带一份门店就能跨店写入)。
 type ImportRequest struct {
 	// Scope 是本次导入的资料域。
@@ -316,6 +318,7 @@ func (a *ArchiveService) exportEmployees(ctx context.Context, branchID string) (
 // exportShifts 导出班次(按 branch_id 过滤)。
 //
 // ⚠️ 导出**全部**班次(含已交班的),不只未交班的:
+//
 //	归档是"数据恢复",恢复的是**历史**,不是"此刻谁在班"。
 func (a *ArchiveService) exportShifts(ctx context.Context, branchID string) ([]ShiftRow, error) {
 	var rows []model.Shift
@@ -407,9 +410,11 @@ func (a *ArchiveService) Import(ctx context.Context, branchID string, req Import
 // importStores 幂等写入门店档案。
 //
 // ⚠️ **stores 的主键就是 branch_id** ⇒ 一份导入里所有行都落到 header 那家店
+//
 //	(其它门店的行会被拒,见下)。
 //
 // ⚠️ **跨店写入必须拒**:stores 行里带一个别的 branch_id,就能改别家店的
+//
 //	经营参数(盘点周期 / 是否启用会员 / 收银台)——
 //	而守门的 store:manage 只覆盖 **header 那家店**。
 func (a *ArchiveService) importStores(ctx context.Context, branchID string, rows []StoreRow, res *ImportResult) {
@@ -569,6 +574,7 @@ func (a *ArchiveService) importEmployees(ctx context.Context, branchID string, r
 // importShifts 幂等写入班次。
 //
 // ⚠️ **不校验"一个收银员只能有一个未交班的班次"**:
+//
 //	那是**开班**的业务规则;归档恢复的是历史事实(见 Import 的注释)。
 func (a *ArchiveService) importShifts(ctx context.Context, branchID string, rows []ShiftRow, res *ImportResult) {
 	res.Received = len(rows)
@@ -617,14 +623,14 @@ func (a *ArchiveService) importShifts(ctx context.Context, branchID string, rows
 			status = ShiftStatusOpen
 		}
 		row := model.Shift{
-			ID:                id,
-			BranchID:          branchID,
-			EmployeeID:        employeeID,
-			CounterNo:         strings.TrimSpace(r.CounterNo),
-			OpenedAt:          openedAt,
-			ClosedAt:          closedAt,
-			Status:            status,
-			OpeningAmountYuan: parseAmountLoose(r.OpeningAmountYuan),
+			ID:                 id,
+			BranchID:           branchID,
+			EmployeeID:         employeeID,
+			CounterNo:          strings.TrimSpace(r.CounterNo),
+			OpenedAt:           openedAt,
+			ClosedAt:           closedAt,
+			Status:             status,
+			OpeningAmountYuan:  parseAmountLoose(r.OpeningAmountYuan),
 			ExpectedAmountYuan: parseAmountLoose(r.ExpectedAmountYuan),
 			ClosingAmountYuan:  parseAmountLoose(r.ClosingAmountYuan),
 			Remark:             r.Remark,
@@ -657,7 +663,8 @@ func (a *ArchiveService) importShifts(ctx context.Context, branchID string, rows
 // parseAmountLoose 解析金额字符串;解析不了按 0。
 //
 // ⚠️ 与 member 的做法一致:金额是"钱的多少",错的代价远小于丢掉整条记录。
-//   解析不了的行**照样落库**,并在报告里留一条 warning。
+//
+//	解析不了的行**照样落库**,并在报告里留一条 warning。
 func parseAmountLoose(s string) decimal.Decimal {
 	t := strings.TrimSpace(s)
 	if t == "" {

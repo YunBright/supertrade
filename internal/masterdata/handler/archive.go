@@ -124,6 +124,7 @@ func (h *ArchiveHandler) importArchive(c *gin.Context) {
 // mapArchiveErr 把归档端点的错误映射为 HTTP 状态码 + JSON body。
 //
 // ⚠️ **503 而不是空列表**:问不到数据源是一次链路故障,
+//
 //	回落成本地 = 把一次故障显示成「该门店没有门店档案」—— 与故障无关的结论。
 func (h *ArchiveHandler) mapArchiveErr(c *gin.Context, err error) {
 	switch {
@@ -141,7 +142,7 @@ func (h *ArchiveHandler) mapArchiveErr(c *gin.Context, err error) {
 		// ⚠️ message **不暴露**内部 app-id(cube-sixun-ysx-fb 之类):
 		//   那是运维信息,不该出现在给终端用户的报文里。
 		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
-			"code": "member_source_is_external",
+			"code":    "member_source_is_external",
 			"message": "该门店的主数据来自外部数据源,请在原系统操作",
 		})
 	case errors.Is(err, archiveroute.ErrForbidden):
