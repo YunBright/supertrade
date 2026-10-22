@@ -21,6 +21,7 @@
 package service
 
 import (
+	"crypto/sha256"
 	"context"
 	"errors"
 	"fmt"
@@ -48,7 +49,43 @@ const (
 	StatusPaid     = "paid"
 	StatusReturned = "returned"
 	StatusVoid     = "void"
+	// StatusPartiallyReturned 是**行级部分退货**后的状态(2026-10-22 新增)。
+	//
+	// ⚠️ 为什么是"part_returned"而不是"partially_returned"(18 字符):
+	//   `sales_orders.status` 的列宽是 **varchar(16)**
+	//   ⇒ 18 字符会 **value too long for type character varying(16)**
+	//     ⇒ 整个退款事务回滚 ⇒ 端点返 500(症状与真因完全无关)。
+	//   ⇒ 状态值必须 **≤ 16 字符**(见 TestStatusValuesFitColumnWidth)。
+	//
+	// ⚠️ 为什么需要它:整单退 ⇒ status=returned;退了一部分 ⇒ 单子**还没退完**
+	//   ⇒ 不能置 returned(那个状态的含义是"这张单全退完了,不能再退")。
+	//
+	// ⚠️ 它与 returned 的区别不是"退没退",而是"**还能不能再退**":
+	//   returned ⇒ 已退完,再退 ⇒ ErrSaleAlreadyReturned;
+	//   part_returned ⇒ 还能退剩下的行(超退由行级 returned_qty 守卫)。
+	StatusPartiallyReturned = "part_returned"
 )
+
+// PayWayCredit 是**挂账/赊账**的付款方式(2026-10-22 新增)。
+//
+// # 为什么需要它
+//
+//	现实收银里存在"顾客没带够钱/先赊着"的情况(思迅侧叫挂账)。
+//	而"开单 = 收款"这条不变量假设**实收 ≥ 应收** ⇒ 挂账单在旧契约里
+//	**根本无法表达**(找零为负 ⇒ 409 amount_mismatch)。
+//
+// # 语义
+//
+//	一条 pay_way=CRED 的收付,金额 = 应收 − 实收(= 挂账额)。
+//	⇒ Σpayments = paid(实收) + 挂账额 = 应收。
+//	⇒ 找零 change = paid − 应收 = −挂账额(**负数**表示"欠款",不是找零)。
+//
+// # 为什么校验要求"必须显式给出这条收付"
+//
+//	否则"实收不足"就变成了**沉默的负找零** ——
+//	单子看起来收了钱,实际少收,账上没有任何东西说明差在哪。
+//	⇒ 实收不足 ⇒ 必须有一条 CRED 收付把差额显式化。
+const PayWayCredit = "CRED"
 
 // errIdempotentReplay 表示"这是重放请求,应当回滚事务并返回首次结果"。
 var errIdempotentReplay = errors.New("pos: op_id 重放")
@@ -134,6 +171,20 @@ type CreateSaleInput struct {
 	CreatedBy string
 }
 
+// PaymentsCreditTotal 是**挂账收付**(pay_way=CRED)的合计。
+//
+// ⚠️ 它是"实收不足"的那部分钱 —— 必须与 |找零| 精确相等,
+//   否则"欠多少"在账上说不清(见 validateCreate 的挂账分支)。
+func (in CreateSaleInput) PaymentsCreditTotal() decimal.Decimal {
+	sum := decimal.Zero
+	for _, p := range in.Payments {
+		if strings.EqualFold(strings.TrimSpace(p.PayWay), PayWayCredit) {
+			sum = sum.Add(p.AmountYuan)
+		}
+	}
+	return sum
+}
+
 // ListFilter 是列表查询条件。
 type ListFilter struct {
 	// BranchID 是门店(必填;单据按门店隔离)。
@@ -145,6 +196,30 @@ type ListFilter struct {
 	Page int
 	// PageSize 是每页条数(<=0 默认 20;>100 截到 100)。
 	PageSize int
+}
+
+// RefundLineInput 是**行级部分退货**里"要退哪一行、退多少"的入参。
+//
+// # 为什么需要它(2026-10-22)
+//
+//	现实收银里存在**部分退货**:一张 4 行的单只退其中 1 行
+//	(思迅叫"退货台单据" —— 它是一张**独立单据**,退的是某笔卖单里的某几行)。
+//
+//	旧契约只有**整单退** ⇒ 部分退货**根本无法表达** ⇒ 真实收银里的这部分
+//	交易在 POS 上只能"退整单"(把没退的也退了)或干脆退不了。
+//
+// # 语义
+//
+//	LineID 必填 —— 定位到原单的**明细行**(id = <sale_id>-L<n>)。
+//	Qty 可空 —— 空 = 退该行**全部未退数量**。
+//
+// ⚠️ 退的**金额**由服务端按数量比例算(行金额 × 退数量 / 行数量),
+//   客户端**不传金额** —— 传金额就等于允许改价,那是 price-override 的事。
+type RefundLineInput struct {
+	// LineID 是要退的明细行 id。
+	LineID string
+	// Qty 是退多少(空 = 该行全部未退数量)。
+	Qty decimal.Decimal
 }
 
 // RefundInput 是退货的入参。
@@ -161,6 +236,11 @@ type RefundInput struct {
 	AuthorizedBy string
 	// Reason 是退货原因(可空)。
 	Reason string
+	// Lines 是**要退的行子集**(2026-10-22 新增)。
+	//
+	// ⚠️ **空 ⇒ 整单退**(旧行为,一字未改 ⇒ 零回归风险)。
+	//	非空 ⇒ 只退这些行(行级部分退货)。
+	Lines []RefundLineInput
 	// CreatedBy 是审计人。
 	CreatedBy string
 }
@@ -472,13 +552,24 @@ func NormalizePage(page, size int) (int, int) {
 
 // ---- 退货 ----
 
-// Refund 退货:单据置 returned + 写负数收付 + 发一条 order_status="R" 的 sale.paid。
+// Refund 退货:写负数收付 + 发一条 order_status="R" 的 sale.paid。
 //
 // 返回 (单据, 是否重放, error)。
 //
 // ⚠️ 退货**复用 sale.paid topic**,用 order_status="R" 区分;
 //
 //	事件里 qty 与金额**取负**。
+//
+// # 整单退 vs 行级部分退(2026-10-22)
+//
+//	in.Lines 为空 ⇒ **整单退**(旧行为,一字未改)。
+//	in.Lines 非空 ⇒ **只退这些行**:事件只带被退的行(库存只回补这些商品),
+//	退款额按数量比例分摊到各支付方式,单头状态置 partially_returned。
+//
+// # ⚠️ 超退守卫
+//
+//	每行有 `returned_qty` ⇒ 退前必查 `退数量 ≤ qty − returned_qty`。
+//	少了它,"退两次同一行"⇒ 库存凭空多出两件 + 退款额大于应收。
 func (s *SalesService) Refund(ctx context.Context, in RefundInput) (*model.SalesOrder, bool, error) {
 	if strings.TrimSpace(in.SaleID) == "" {
 		return nil, false, fmt.Errorf("%w: sale_id 不能为空", model.ErrInvalidInput)
@@ -524,40 +615,83 @@ func (s *SalesService) Refund(ctx context.Context, in RefundInput) (*model.Sales
 			return err
 		}
 		by := firstNonEmpty(in.CreatedBy, actor)
+
+		// ---- ① 选定要退的行 + 算退款金额 ----
+		refundLines, err := selectRefundLines(lines, in.Lines)
+		if err != nil {
+			return err
+		}
+		refundTotal := refundLinesTotal(refundLines)
+
+		// ---- ② 退款收付(负金额) ----
+		//
+		// 整单退 ⇒ 全额退各支付方式(旧行为)。
+		// 部分退 ⇒ 按**退款额占原单总额的比例**分摊,最后一条吸收分位误差
+		//        (Σ 退款额必须精确 = refundTotal,否则账上会差几分钱)。
+		//
+		// ⚠️ 退款收付的 id 必须**逐次不同** —— 整单退只可能做一次(第二次被
+		//   ErrSaleAlreadyReturned 挡住),而**部分退可以做多次** ⇒
+		//   沿用 "<sale_id>-RF<n>"(n = 支付方式序号)会撞主键,
+		//   症状是"第二笔退款 500:UNIQUE constraint failed: payments.id"。
+		//   ⇒ id 里带上本次退款的 op_id 短哈希(幂等键 ⇒ 天然唯一)。
+		refundPays, err := buildRefundPayments(o, pays, refundTotal, opID, now)
+		if err != nil {
+			return err
+		}
+		if len(refundPays) > 0 {
+			if err := tx.Create(&refundPays).Error; err != nil {
+				return fmt.Errorf("pos: 写退款收付失败: %w", err)
+			}
+		}
+
+		// ---- ③ 记已退量(行级守卫的根据)----
+		//
+		// ⚠️ sale_lines **没有 updated_by 列**(只有 created_by)⇒ 别写它,
+		//   写了就是 "no such column" —— 而这条错误会**把整笔退款回滚**,
+		//   症状是"退款 500",真因却与退款毫无关系。
+		//
+		// ⚠️ 用**条件更新**而不是"先查后写":
+		//   先查后写在并发下会超退(两个退款都查到"还没退完")。
+		//   条件更新把判断放在 SQL 里 ⇒ 跨进程也安全。
+		for _, rl := range refundLines {
+			res := tx.Model(&model.SaleLine{}).
+				Where("id = ? AND returned_qty + ? <= qty", rl.Line.ID, rl.RefundQty).
+				Updates(map[string]any{
+					"returned_qty":          gorm.Expr("returned_qty + ?", rl.RefundQty),
+					"returned_amount_yuan": gorm.Expr("returned_amount_yuan + ?", rl.RefundAmount),
+					"updated_at":            now,
+				})
+			if res.Error != nil {
+				return fmt.Errorf("pos: 记已退量失败: %w", res.Error)
+			}
+			if res.RowsAffected == 0 {
+				// 并发下另一个退款先把这一行退掉了 ⇒ 本次超退 ⇒ 整笔回滚。
+				return fmt.Errorf("%w: 行 %s 的未退数量已不足 %s",
+					model.ErrRefundExceedsSold, rl.Line.ID, rl.RefundQty.String())
+			}
+		}
+
+		// ---- ④ 单头状态:退完 ⇒ returned;退了一部分 ⇒ partially_returned ----
+		//
+		// ⚠️ 判定"退完"要按**全部原单行**算,不是按本次退的行:
+		//   退完第 1 行(共 4 行)不叫退完。
+		status := StatusPartiallyReturned
+		if allLinesFullyReturned(lines, refundLines) {
+			status = StatusReturned
+		}
 		if err := tx.Model(&model.SalesOrder{}).Where("id = ?", o.ID).
 			Updates(map[string]any{
-				"status":     StatusReturned,
+				"status":     status,
 				"updated_by": by,
 				"updated_at": now,
 			}).Error; err != nil {
 			return err
 		}
-		o.Status = StatusReturned
+		o.Status = status
 		o.UpdatedBy = by
 		o.UpdatedAt = now
-		// 退款收付(负金额)。
-		if len(pays) > 0 {
-			refundPays := make([]model.Payment, 0, len(pays))
-			for i, p := range pays {
-				refundPays = append(refundPays, model.Payment{
-					ID:                  fmt.Sprintf("%s-RF%d", o.ID, i+1),
-					SaleID:              o.ID,
-					BranchID:            o.BranchID,
-					PayWay:              p.PayWay,
-					AmountYuan:          p.AmountYuan.Neg(),
-					ExchangeRate:        p.ExchangeRate,
-					ConvertedAmountYuan: p.ConvertedAmountYuan.Neg(),
-					RefFlowNo:           firstNonEmpty(p.RefFlowNo, p.ID),
-					CreatedBy:           by,
-					CreatedAt:           now,
-					UpdatedAt:           now,
-				})
-			}
-			if err := tx.Create(&refundPays).Error; err != nil {
-				return fmt.Errorf("pos: 写退款收付失败: %w", err)
-			}
-		}
-		payload := buildRefundEvent(&o, lines, opID, in, now)
+
+		payload := buildRefundEvent(&o, refundLines, opID, in, now)
 		if err := s.rec.Enqueue(tx, outbox.Event{
 			ID:       opID,
 			BranchID: o.BranchID,
@@ -581,6 +715,211 @@ func (s *SalesService) Refund(ctx context.Context, in RefundInput) (*model.Sales
 		return nil, false, txErr
 	}
 	return order, false, nil
+}
+
+// refundLine 是"本次要退的一行"及其退款量。
+type refundLine struct {
+	// Line 是原单的行。
+	Line model.SaleLine
+	// RefundQty 是本次退的数量(>0)。
+	RefundQty decimal.Decimal
+	// RefundAmount 是本次退的金额(≥0)。
+	RefundAmount decimal.Decimal
+}
+
+// selectRefundLines 选定本次要退的行并算好退款量。
+//
+// # 两种形态
+//
+//	in.Lines 为空 ⇒ **整单退**:所有行都退**全部未退数量**。
+//	in.Lines 非空 ⇒ **行级部分退**:只退指定的行。
+//
+// # ⚠️ 金额按**数量比例**算
+//
+//	退款额 = 行金额 × 退数量 / 行数量。
+//	整行全退时(退数量 = 行数量)恰好 = 行金额 ⇒ 与思迅"整件退"逐字相等。
+//
+// # ⚠️ 超退守卫
+//
+//	退数量必须 ≤ (行数量 − 已退数量) ⇒ 否则 ErrRefundExceedsSold。
+func selectRefundLines(lines []model.SaleLine, want []RefundLineInput) ([]refundLine, error) {
+	byID := make(map[string]model.SaleLine, len(lines))
+	for _, l := range lines {
+		byID[l.ID] = l
+	}
+	// 整单退:所有行都退未退数量。
+	if len(want) == 0 {
+		out := make([]refundLine, 0, len(lines))
+		for _, l := range lines {
+			left := l.Qty.Sub(l.ReturnedQty)
+			if left.LessThanOrEqual(decimal.Zero) {
+				continue // 已退完的行不再重复退
+			}
+			out = append(out, refundLine{
+				Line:         l,
+				RefundQty:    left,
+				RefundAmount: refundAmountFor(l, left),
+			})
+		}
+		if len(out) == 0 {
+			return nil, fmt.Errorf("%w: 该销售单已全部退完", model.ErrSaleAlreadyReturned)
+		}
+		return out, nil
+	}
+	// 行级部分退。
+	out := make([]refundLine, 0, len(want))
+	for i, w := range want {
+		id := strings.TrimSpace(w.LineID)
+		if id == "" {
+			return nil, fmt.Errorf("%w: lines[%d].line_id 不能为空", model.ErrInvalidInput, i)
+		}
+		l, ok := byID[id]
+		if !ok {
+			return nil, fmt.Errorf("%w: lines[%d].line_id=%q", model.ErrLineNotFoundInSale, i, id)
+		}
+		left := l.Qty.Sub(l.ReturnedQty)
+		qty := w.Qty
+		if qty.IsZero() {
+			qty = left
+		}
+		if qty.LessThanOrEqual(decimal.Zero) {
+			return nil, fmt.Errorf("%w: lines[%d](%s) 的退货数量必须大于 0", model.ErrInvalidInput, i, id)
+		}
+		if qty.GreaterThan(left) {
+			return nil, fmt.Errorf("%w: lines[%d](%s) 退 %s,未退数量只有 %s",
+				model.ErrRefundExceedsSold, i, id, qty.String(), left.String())
+		}
+		out = append(out, refundLine{
+			Line:         l,
+			RefundQty:    qty,
+			RefundAmount: refundAmountFor(l, qty),
+		})
+	}
+	return out, nil
+}
+
+// refundAmountFor 按数量比例算某一行本次退的金额。
+//
+// ⚠️ 行数量为 0 ⇒ 退 0(不猜)。
+func refundAmountFor(l model.SaleLine, qty decimal.Decimal) decimal.Decimal {
+	if l.Qty.IsZero() {
+		return decimal.Zero
+	}
+	amt := l.AmountYuan.Mul(qty).Div(l.Qty)
+	return amt.Round(2)
+}
+
+// refundLinesTotal 是本次退款总额(Σ 各行退款额)。
+func refundLinesTotal(lines []refundLine) decimal.Decimal {
+	sum := decimal.Zero
+	for _, l := range lines {
+		sum = sum.Add(l.RefundAmount)
+	}
+	return sum
+}
+
+// allLinesFullyReturned 判断原单**所有**行是否都已退完(含本次退的)。
+//
+// ⚠️ 必须按全部原单行判,不是按本次退的行 ——
+//   "退了 4 行里的 1 行"不叫退完。
+//
+// ⚠️ **必须把本次退的数量算进去** ——
+//   `lines` 是**更新前**的快照(ReturnedQty 还是旧值),
+//   只看它 ⇒ 整单退也会被判成"没退完"(状态永远停在 partially_returned)。
+func allLinesFullyReturned(lines []model.SaleLine, refund []refundLine) bool {
+	if len(lines) == 0 {
+		return false
+	}
+	now := make(map[string]decimal.Decimal, len(refund))
+	for _, r := range refund {
+		now[r.Line.ID] = r.RefundQty
+	}
+	for _, l := range lines {
+		left := l.ReturnedQty.Add(now[l.ID])
+		if left.LessThan(l.Qty) {
+			return false
+		}
+	}
+	return true
+}
+
+// buildRefundPayments 造退款收付(负金额)。
+//
+// # 整单退 ⇒ 全额退各支付方式(旧行为,一字未改)。
+//
+// # 部分退 ⇒ 按**退款额占原单总额的比例**分摊,最后一条吸收分位误差
+//
+//	Σ 退款额必须**精确** = refundTotal,
+//	否则账上会差几分钱(而且没人知道差在哪)。
+func buildRefundPayments(o model.SalesOrder, pays []model.Payment, refundTotal decimal.Decimal, opID string, now time.Time) ([]model.Payment, error) {
+	if len(pays) == 0 {
+		return nil, nil
+	}
+	out := make([]model.Payment, 0, len(pays))
+	if refundTotal.GreaterThanOrEqual(o.TotalAmountYuan) {
+		// 全额退(整单退,或部分退但退光了)⇒ 各支付方式全额退。
+		for i, p := range pays {
+			out = append(out, model.Payment{
+				ID:                  refundPaymentID(o.ID, i+1, opID),
+				SaleID:              o.ID,
+				BranchID:            o.BranchID,
+				PayWay:              p.PayWay,
+				AmountYuan:          p.AmountYuan.Neg(),
+				ExchangeRate:        p.ExchangeRate,
+				ConvertedAmountYuan: p.ConvertedAmountYuan.Neg(),
+				RefFlowNo:           firstNonEmpty(p.RefFlowNo, p.ID),
+				CreatedBy:           firstNonEmpty(p.CreatedBy, actor),
+				CreatedAt:           now,
+				UpdatedAt:           now,
+			})
+		}
+		return out, nil
+	}
+	// 按比例分摊。
+	ratio := refundTotal.Div(o.TotalAmountYuan)
+	acc := decimal.Zero
+	for i, p := range pays {
+		amt := p.AmountYuan.Mul(ratio).Round(2)
+		if i == len(pays)-1 {
+			// 最后一条吸收舍入误差 ⇒ Σ 精确 = refundTotal。
+			amt = refundTotal.Sub(acc)
+		}
+		acc = acc.Add(amt)
+		out = append(out, model.Payment{
+			ID:                  refundPaymentID(o.ID, i+1, opID),
+			SaleID:              o.ID,
+			BranchID:            o.BranchID,
+			PayWay:              p.PayWay,
+			AmountYuan:          amt.Neg(),
+			ExchangeRate:        p.ExchangeRate,
+			ConvertedAmountYuan: p.ConvertedAmountYuan.Mul(ratio).Round(2).Neg(),
+			RefFlowNo:           firstNonEmpty(p.RefFlowNo, p.ID),
+			CreatedBy:           firstNonEmpty(p.CreatedBy, actor),
+			CreatedAt:           now,
+			UpdatedAt:           now,
+		})
+	}
+	return out, nil
+}
+
+// refundPaymentID 造退款收付的 id。
+//
+// # ⚠️ 为什么不能沿用 "<sale_id>-RF<n>"
+//
+//	整单退只可能做一次(第二次被 ErrSaleAlreadyReturned 挡住),
+//	而**行级部分退可以做多次** ⇒ 同一个 n 会被第二次退款复用
+//	⇒ 撞 payments 主键 ⇒ 症状是"第二笔退款 500"。
+//
+// # 做法
+//
+//	id 里带**本次退款的 op_id 短哈希**(幂等键 ⇒ 天然唯一)
+//	+ 序号(可读性)。
+//
+//	⚠️ 幂等不受影响:同 op_id 第二次 ⇒ 走 refundAlreadyDone 直接返回首次,
+//	  根本不会走到这里写 payment ⇒ id 变不变都无所谓。
+func refundPaymentID(saleID string, seq int, opID string) string {
+	sum := sha256.Sum256([]byte(opID))
+	return fmt.Sprintf("%s-RF%d-%x", saleID, seq, sum[:4])
 }
 
 // refundAlreadyDone 判断该 op_id 是否已经退过(发件箱里有同 id 的行)。
@@ -724,7 +1063,16 @@ func buildSalePaidEvent(o *model.SalesOrder, lines []model.SaleLine, status stri
 }
 
 // buildRefundEvent 装配退货事件(order_status="R",qty 与金额取负)。
-func buildRefundEvent(o *model.SalesOrder, lines []model.SaleLine, opID string, in RefundInput, at time.Time) SalePaidEvent {
+//
+// ⚠️ 2026-10-22:**lines 只带本次退掉的行**。
+//
+//	整单退 ⇒ 全部行(旧行为,一字未改)。
+//	部分退 ⇒ 只有被退的行 ⇒ **库存只回补这些商品**
+//	(inventory 按商品聚合后写 stock_moves,没在事件里的商品不受影响)。
+//
+//	⚠️ total_amount_yuan 是**本次退款额**(负数),不是原单合计 ——
+//	部分退时用它会让"退了多少"看得见。
+func buildRefundEvent(o *model.SalesOrder, lines []refundLine, opID string, in RefundInput, at time.Time) SalePaidEvent {
 	operator := strings.TrimSpace(in.OperatorID)
 	if operator == "" {
 		operator = o.OperatorID
@@ -736,18 +1084,18 @@ func buildRefundEvent(o *model.SalesOrder, lines []model.SaleLine, opID string, 
 		MemberID:        o.MemberID,
 		OperatorID:      operator,
 		AuthorizedBy:    strings.TrimSpace(in.AuthorizedBy),
-		TotalAmountYuan: money(o.TotalAmountYuan.Neg()),
+		TotalAmountYuan: money(refundLinesTotal(lines).Neg()),
 		PaidAt:          at.Format(time.RFC3339),
 		OrderStatus:     OrderStatusRefund,
 		Lines:           make([]SalePaidLine, 0, len(lines)),
 	}
 	for _, l := range lines {
 		ev.Lines = append(ev.Lines, SalePaidLine{
-			LineID:        l.ID,
-			ProductID:     l.ProductID,
-			Qty:           l.Qty.Neg().String(),
-			UnitPriceYuan: money(l.UnitPriceYuan),
-			AmountYuan:    money(l.AmountYuan.Neg()),
+			LineID:        l.Line.ID,
+			ProductID:     l.Line.ProductID,
+			Qty:           l.RefundQty.Neg().String(),
+			UnitPriceYuan: money(l.Line.UnitPriceYuan),
+			AmountYuan:    money(l.RefundAmount.Neg()),
 		})
 	}
 	return ev
@@ -809,8 +1157,29 @@ func validateCreate(in CreateSaleInput) error {
 			model.ErrAmountMismatch, in.ChangeAmountYuan.String(),
 			in.PaidAmountYuan.String(), in.TotalAmountYuan.String())
 	}
+	// 找零为负 ⇒ **实收不足**(挂账)。
+	//
+	// ⚠️ 2026-10-22:以前这里直接拒(实收不足 ⇒ 409 amount_mismatch),
+	//   而现实收银里存在"顾客没带够钱/先赊着"(思迅侧叫挂账)
+	//   ⇒ 那部分交易在旧契约里**根本无法表达**。
+	//
+	// 现在允许,但**必须显式给出一条挂账收付**(pay_way=CRED,金额 = 挂账额):
+	//   - 不给 ⇒ 仍然拒(否则"实收不足"就是**沉默的负找零**,
+	//     单子看起来收了钱、实际少收,账上没有任何东西说明差在哪);
+	//   - 给了但金额对不上 ⇒ 仍然拒(挂账额必须精确 = |找零|)。
+	//
+	// ⇒ change_amount_yuan 负数 = "欠款",不是找零。
 	if in.ChangeAmountYuan.IsNegative() {
-		return fmt.Errorf("%w: 实收不足(找零为负 %s)", model.ErrAmountMismatch, in.ChangeAmountYuan.String())
+		credit := in.PaymentsCreditTotal()
+		want := in.ChangeAmountYuan.Neg()
+		if credit.IsZero() {
+			return fmt.Errorf("%w: 实收不足 %s(欠款),必须给一条 pay_way=%s 的挂账收付",
+				model.ErrAmountMismatch, want.String(), PayWayCredit)
+		}
+		if !credit.Equal(want) {
+			return fmt.Errorf("%w: 挂账收付合计 %s ≠ 欠款 %s",
+				model.ErrAmountMismatch, credit.String(), want.String())
+		}
 	}
 	return nil
 }

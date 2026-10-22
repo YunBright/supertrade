@@ -67,7 +67,7 @@ func NewDaprArchiveExporter(d daprInvoker, appID string) *DaprArchiveExporter {
 var _ ArchiveExporter = (*DaprArchiveExporter)(nil)
 
 // Export 取某个 scope 的一页。
-func (e *DaprArchiveExporter) Export(ctx context.Context, bearer, branchID, scope string, offset, limit int) (*ExportPage, error) {
+func (e *DaprArchiveExporter) Export(ctx context.Context, bearer, branchID, scope string, offset, limit int, since string) (*ExportPage, error) {
 	if e == nil || e.dapr == nil {
 		return nil, ErrCubeUnavailable
 	}
@@ -75,6 +75,14 @@ func (e *DaprArchiveExporter) Export(ctx context.Context, bearer, branchID, scop
 	q.Set("scope", scope)
 	q.Set("offset", strconv.Itoa(offset))
 	q.Set("limit", strconv.Itoa(limit))
+	// ⚠️ since = 增量水位 ⇒ 透传给上游导出端点 ⇒ 它给 cube 查询加
+	//   `member gt <since>` ⇒ 只导"变过"的行。
+	//
+	// ⚠️ **漏传的后果**:每次同步都是全量(27569 行),而编排方照样推进水位
+	//   ⇒ 增量形同虚设,且**零报错**。
+	if since != "" {
+		q.Set("since", since)
+	}
 	// ⚠️ query 拼在 method 里:dapr SDK 会把它拆成 method + querystring
 	// (见 go-sdk 的 extractMethodAndQuery)。
 	method := "v1/export?" + q.Encode()

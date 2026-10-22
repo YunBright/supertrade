@@ -291,6 +291,42 @@ func (h *Handler) getConfig(c *gin.Context) {
 	c.JSON(http.StatusOK, view)
 }
 
+// memberSearchKeyword 取会员查询的关键词。
+//
+// # ⚠️ **两个参数名都要认**
+//
+//	`q`       —— 服务端的规范名(本仓其它端点与运维脚本用它)
+//	`keyword` —— **Flutter POS 客户端实际发的名字**
+//	             (supertrade_pos/lib/infra/http/member_api.dart:60
+//	              `query: {'field': field, 'keyword': keyword}`)
+//
+// # 为什么不能只认一个
+//
+//	2026-10-22 生产实测(门店 10,4130 个会员):
+//
+//	?field=card_id&q=100109        → total=1     ✅
+//	?field=card_id&keyword=100109  → total=4130  ❌ **全部门店**
+//
+//	只认 `q` 时,POS 发的 `keyword` 被**静默忽略** ⇒ 过滤条件为空
+//	⇒ 端点**返 200、字段齐全** ⇒ 看起来完全正常
+//	⇒ 症状是「收银员输卡号查会员,弹出几千张卡」。
+//
+//	⚠️ 这类"参数名对不上"的缺陷,只断言"端点在、字段对"的契约测试**抓不到**
+//	—— 端点确实在、确实返 200、确实给会员对象。
+//	必须**用客户端实际发的那份查询串**打,并断言**命中数**。
+//
+// # 为什么**兼容**而不是改前端
+//
+//	改前端 ⇒ 要重新打包发布 POS 客户端(现场设备),周期长、风险大;
+//	改服务端 ⇒ 一次部署,**现场已装的客户端立刻恢复**。
+//	⇒ 服务端兼容(`q` 优先,`keyword` 兜底)。
+func memberSearchKeyword(c *gin.Context) string {
+	if v := strings.TrimSpace(c.Query("q")); v != "" {
+		return v
+	}
+	return strings.TrimSpace(c.Query("keyword"))
+}
+
 // listTypes GET /types
 func (h *Handler) listTypes(c *gin.Context) {
 	rows, err := h.svc.ListTypes(c.Request.Context(), middleware.SingleBranchFromCtx(c))
@@ -325,6 +361,8 @@ func (h *Handler) listPaymentWays(c *gin.Context) {
 //
 //	前端排只能排当前这一页 ⇒ "按积分排序"翻到第 2 页就乱序了。
 //	排序列只认白名单(model.MemberSortColumn)，非法值 ⇒ 400。
+//
+// # ⚠️ 关键词参数名:**`q` 与 `keyword` 都认**(见 memberSearchKeyword)
 func (h *Handler) listMembers(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	offset, _ := strconv.Atoi(c.Query("offset"))
@@ -334,7 +372,7 @@ func (h *Handler) listMembers(c *gin.Context) {
 	rows, total, err := h.svc.ListMembersPage(c.Request.Context(), service.ListMembersInput{
 		BranchID: middleware.SingleBranchFromCtx(c),
 		Field:    c.Query("field"),
-		Q:        c.Query("q"),
+		Q:        memberSearchKeyword(c),
 		Limit:    limit,
 		Offset:   offset,
 		Sort:     c.Query("sort"),

@@ -230,7 +230,7 @@ func TestExportScopeStock_RequestShape(t *testing.T) {
 		t.Fatalf("导出端点没有实现 stock scope")
 	}
 
-	rows, total, err := h.exportFromCube(context.Background(), "cube-00", "00", sc, "2026-10-21", 100, 0)
+	rows, total, err := h.exportFromCube(context.Background(), "cube-00", "00", sc, "2026-10-21", "", 100, 0)
 	if err != nil {
 		t.Fatalf("导出 stock 失败: %v", err)
 	}

@@ -66,7 +66,11 @@ type ExportPage struct {
 type ArchiveExporter interface {
 	// Export 取某个 scope 的一页。offset / limit 由调用方决定
 	// (导出端点**无状态**,分页是调用方的循环)。
-	Export(ctx context.Context, bearer, branchID, scope string, offset, limit int) (*ExportPage, error)
+	//
+	// ⚠️ since 是增量水位(空 = 全量):**必须原样透传给上游**,
+	// 上游才会给 cube 查询加 `member gt <since>` 过滤。
+	// 漏传 ⇒ 每次都是全量,而编排方照样推进水位 ⇒ 增量形同虚设(零报错)。
+	Export(ctx context.Context, bearer, branchID, scope string, offset, limit int, since string) (*ExportPage, error)
 }
 
 // ExportInput 是导出的入参。
@@ -81,6 +85,11 @@ type ExportInput struct {
 	// Offset / Limit 是分页位置。
 	Offset int
 	Limit  int
+	// Since 是增量水位(空 = 全量)。
+	//
+	// ⚠️ 只对**声明支持增量**的资料域有意义
+	// (见 archivedto.ChangedMembers):不支持的域上游会忽略它 ⇒ 仍是全量。
+	Since string
 }
 
 // Export 导出一页档案(按数据源分流)。
@@ -109,7 +118,7 @@ func (s *ArchiveService) Export(ctx context.Context, in ExportInput) (*ExportPag
 			// 回落会把"导不出来"说成"这个门店没有商品"。
 			return nil, ErrCubeUnavailable
 		}
-		return s.exporter.Export(ctx, in.Bearer, in.BranchID, scope, in.Offset, in.Limit)
+		return s.exporter.Export(ctx, in.Bearer, in.BranchID, scope, in.Offset, in.Limit, in.Since)
 	}
 	return s.localExport(ctx, in, scope)
 }
@@ -261,7 +270,7 @@ func (s *ArchiveService) ExportScopeAll(ctx context.Context, bearer, branchID, s
 	out := []map[string]any{}
 	offset := 0
 	for {
-		page, err := s.exporter.Export(ctx, bearer, branchID, scope, offset, pageSize)
+		page, err := s.exporter.Export(ctx, bearer, branchID, scope, offset, pageSize, "")
 		if err != nil {
 			return nil, err
 		}

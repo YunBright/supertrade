@@ -180,6 +180,24 @@ func (h *Handler) createSource(c *gin.Context) {
 		h.mapErr(c, err)
 		return
 	}
+	// ⚠️ **显式 `"enabled": false` 要在这里补一次 Update**(2026-10-23 修)。
+	//
+	// 为什么:service.Create 一律按 enabled=true 建(`model.BranchCubeSource.Enabled`
+	// 是普通 bool,分不出"没传"与"显式 false")⇒ 只把 enabled 塞进 Create 的入参
+	// 是**没用的**,落库仍是 true。
+	//
+	// ⇒ 后果不是"多一个小功能",而是**「配了但被停用」这一态压根建不出来**:
+	// 管理员临时关停某店数据源(维护)⇒ 读端点本该回 503「该门店的数据源已停用」,
+	// 实际却照常走 cube ⇒ 门店在维护期间照样查得到数据。
+	//
+	// ⇒ 两次写只发生在 admin 操作上,可接受。
+	if !enabled {
+		row, err = h.svc.Update(c.Request.Context(), req.BranchID, req.CubeSourceName, false, createdBy)
+		if err != nil {
+			h.mapErr(c, err)
+			return
+		}
+	}
 	c.JSON(http.StatusCreated, row)
 }
 

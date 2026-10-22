@@ -51,6 +51,10 @@ import (
 type archiveExportResponse struct {
 	archivedto.ExportPage
 	AsOf string `json:"as_of"`
+	// Since 是本次导出用的增量水位(空 = 全量)。
+	//
+	// ⚠️ 回显出来:调用方要能确认"我这次要的是哪个水位之后的数据"。
+	Since string `json:"since"`
 }
 
 // getArchiveExport GET /archive/export?scope=&offset=&limit=&as_of=
@@ -80,13 +84,24 @@ func (h *Handler) getArchiveExport(c *gin.Context) {
 		return
 	}
 
+	// ⚠️ since = 增量水位 ⇒ 必须**校验后**再传给取数层:
+	// 非法值不能静默回落成"全量"(那会让调用方以为导了增量,其实导了全量,
+	// 而且**没有一行报错**)。
+	since, err := archivedto.NormalizeSince(c.Query("since"))
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"code": "bad_since", "message": err.Error(),
+		})
+		return
+	}
+
 	offset, limit := parseExportPage(c.Query("offset"), c.Query("limit"))
-	page, err := h.prices.ExportArchive(c.Request.Context(), branchID, scope, offset, limit, asOf)
+	page, err := h.prices.ExportArchive(c.Request.Context(), branchID, scope, offset, limit, asOf, since)
 	if err != nil {
 		h.mapErr(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, archiveExportResponse{ExportPage: *page, AsOf: asOf})
+	c.JSON(http.StatusOK, archiveExportResponse{ExportPage: *page, AsOf: asOf, Since: since})
 }
 
 // parseExportPage 解析 offset / limit。

@@ -33,6 +33,8 @@ type recordingInvoker struct {
 	bodies   []map[string]any
 	responds [][]map[string]any
 	totals   []int
+	// err 非空 ⇒ 每次调用都返这个错(用来测降级路径)。
+	err error
 }
 
 func (r *recordingInvoker) InvokeMethodWithContent(_ context.Context, _, _, _ string,
@@ -44,6 +46,10 @@ func (r *recordingInvoker) InvokeMethodWithContent(_ context.Context, _, _, _ st
 		}
 	}
 	r.bodies = append(r.bodies, body)
+
+	if r.err != nil {
+		return nil, r.err
+	}
 
 	rows := []map[string]any{}
 	if len(r.responds) > 0 {
@@ -351,6 +357,11 @@ func TestListProducts_EmptyCategorySetStillEmitsACategoryFilter(t *testing.T) {
 // 思迅的搜索框是「输入编码、名称或助记码」,而"编码"对它来说是**两个**东西
 // (货号 item_no 唯一 / 自编码 item_subno 不唯一)。
 // 漏掉这一路 ⇒ 用户搜自编码搜不到那个商品。
+//
+// 2026-10-22 又加了**条形码**那一路(第 4 趟):条形码在 cube 的
+// `item_barcode` 模型上(product 是 duck、item_barcode 是 live ⇒ 两者
+// **不能 join**,见 pkg/cubequery/join.go::checkStorage)⇒ 只能单独一趟。
+// ⚠️ 这一趟查的是**另一张模型** ⇒ 断言只对前 3 趟做 containsCI 检查。
 func TestSearchProducts_UsesCaseInsensitiveOperator(t *testing.T) {
 	inv := &recordingInvoker{}
 	c := newRecordingClient(inv)
@@ -360,11 +371,12 @@ func TestSearchProducts_UsesCaseInsensitiveOperator(t *testing.T) {
 		t.Fatalf("SearchProducts: %v", err)
 	}
 	wantMembers := []string{"product.id", "product.name", "product.sub_code"}
-	if len(inv.bodies) != len(wantMembers) {
-		t.Fatalf("应发 %d 次查询(id / name / sub_code),实际 %d 次",
-			len(wantMembers), len(inv.bodies))
+	// 前 3 趟:货号 / 名称 / 自编码(都带 containsCI);第 4 趟:item_barcode 全表。
+	if len(inv.bodies) != len(wantMembers)+1 {
+		t.Fatalf("应发 %d 次查询(id / name / sub_code / item_barcode),实际 %d 次",
+			len(wantMembers)+1, len(inv.bodies))
 	}
-	for i, b := range inv.bodies {
+	for i, b := range inv.bodies[:len(wantMembers)] {
 		f := filterOf(t, b, wantMembers[i])
 		if f == nil {
 			t.Fatalf("第 %d 次查询缺 %s 过滤:%#v", i+1, wantMembers[i], b["filters"])

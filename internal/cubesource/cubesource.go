@@ -84,6 +84,83 @@ type Client interface {
 	ResolveBranchSource(ctx context.Context, branchID string) (cubeclient.BranchSource, error)
 }
 
+// ---- 读路径的三态判据（2026-10-22 新增） ----
+//
+// ErrSourceUnavailable / ErrSourceDisabled 是**判据本身的两个失败结局**,
+// 与各域 model 包里的 ErrCubeSourceUnavailable / ErrCubeSourceDisabled
+// 同义(各域 model 的那两个是为了让 handler 映射到本域的错误码)。
+//
+// ⚠️ 为什么不把这两个 sentinel 放在各域 model 里、让 Decide 直接返回它们?
+//
+//	因为 Decide 住在 cubesource 包里,它不能 import 各域的 model 包
+//	(那会变成 cubesource → catalog / pricing / transaction … 的反向依赖)。
+//	⇒ Decide 返回 cubesource 的 sentinel,各域 service 再包一层成本域 sentinel。
+//	这层包装只做一次,不会漂移。
+var (
+	// ErrSourceUnavailable:问不到"这个门店配了哪个数据源"(链路故障)⇒ 503。
+	//
+	// ⚠️ 与"没配数据源"严格区分:没配是**正常状态**(自营店),
+	// 问不到是**链路故障**。
+	// 回落成本地 = 把一次故障显示成"该门店没有数据"——
+	// 那是 2026-10-21 生产事故的形状,禁止回落。
+	ErrSourceUnavailable = errors.New("cubesource: 数据源路由暂不可用")
+	// ErrSourceDisabled:配了数据源但被管理员停用 ⇒ 503。
+	//
+	// ⚠️ **不等于"没配"**:回落成"没配"会让用户看到一份空列表,
+	// 而真相是"这个门店现在查不了"。
+	ErrSourceDisabled = errors.New("cubesource: 该门店的数据源已停用")
+)
+
+// Decide 判定该门店的**读**端点该走哪条路。
+//
+// 返回 (useCube, err):
+//
+//   - useCube=true  ⇒ 走 cube(该门店配了数据源)
+//   - useCube=false ⇒ 走本域 PG(没配数据源)
+//   - err != nil    ⇒ 问不到路由 / 数据源被停用 ⇒ 上抛(503)
+//
+// # ⚠️ 三态必须严格区分,禁止回落
+//
+//	Configured=false              → 没配(正常)⇒ 本地。
+//	Configured=true, Enabled=false → 配了但被关停 ⇒ **503**,不回落本地。
+//	解析失败(问不到)               → **503**,不回落本地。
+//
+// 回落本地 = 把一次链路故障显示成"这个门店没有数据"。
+// 2026-10-21 生产事故就是这么发生的:catalog 的读端点只走 cube,
+// 自营店(门店 10)直接 404,而它本地明明有 27565 个商品。
+//
+// # 权限类错误**原样上抛**
+//
+// ErrCubeForbidden / ErrCubeAuthRejected ⇒ 调用者缺 cube:read ⇒ 403/401。
+// 与"问不到路由"(503)混在一起会让"没权限"显示成"暂不可用",
+// 用户会去查数据源健康度(而真正的原因是权限)。
+//
+// # resolver == nil ⇒ 走本地
+//
+// 解析器未装配(纯本地部署 / 单测)⇒ 没有"配没配"这个信息,
+// 按"没配"处理。生产**必须**装配
+// (cmd/<app>/main.go 里装 cubesource.NewCachedResolver)。
+func Decide(ctx context.Context, resolver Resolver, branchID string) (bool, error) {
+	branchID = strings.TrimSpace(branchID)
+	if resolver == nil {
+		return false, nil
+	}
+	src, err := resolver.Resolve(ctx, branchID)
+	if err != nil {
+		if errors.Is(err, cubeclient.ErrCubeForbidden) || errors.Is(err, cubeclient.ErrCubeAuthRejected) {
+			return false, err
+		}
+		return false, fmt.Errorf("%w: %v", ErrSourceUnavailable, err)
+	}
+	if src.Configured && !src.Enabled {
+		return false, fmt.Errorf("%w: 门店 %s 的数据源已停用", ErrSourceDisabled, branchID)
+	}
+	if src.Configured {
+		return true, nil
+	}
+	return false, nil
+}
+
 // CachedResolver 是带缓存的 Resolver 实现。
 type CachedResolver struct {
 	client Client

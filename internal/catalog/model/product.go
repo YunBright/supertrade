@@ -79,14 +79,6 @@ type Product struct {
 	// 实测 17 个品名以「（停用）」开头;带括号前缀的共 62 个。
 	// ⇒ 同样是"解析成字段",而不是靠字符串匹配。
 	IsVoid bool `gorm:"column:is_void;type:boolean;not null;default:false;index:idx_product_branch_void" json:"is_void"`
-	// Barcode 是**主条码**(冗余自 product_barcodes)。
-	//
-	// ⚠️ 思迅的**商品条码**在独立表 `t_bd_item_barcode`,与 `item_subno` 是
-	// **两回事**(实测两张表零交集)。该表实测每个 item_barcode 只对应 1 个
-	// item_no,而**一个 item_no 可有 1~7 个条码** ⇒ 1 商品 : N 条码。
-	//
-	// ⚠️ 条码**只在本系统维护**(cube 的 product model 不含 barcode)。
-	Barcode string `gorm:"column:barcode;type:varchar(64);index:idx_product_branch_barcode" json:"barcode"`
 	// Unit 是基本单位(思迅 `unit_no`,实测值直接就是单位名本身如"提")。
 	Unit string `gorm:"column:unit;type:varchar(32)" json:"unit"`
 	// Spec 是规格(思迅 `item_size`,实测有 "1*10" 这类脏值 —— 原样存,不清洗)。
@@ -101,6 +93,32 @@ type Product struct {
 
 // TableName 显式指定表名。
 func (Product) TableName() string { return "products" }
+
+// # ⚠️ 关于"主表里没有 barcode 列"(2026-10-22)
+//
+//	思迅 `t_bd_item_info`(商品主表)**没有 barcode 列**,条码全部在独立表
+//	`t_bd_item_barcode` ⇒ **一品多码**。
+//
+//	本域曾经有一个 `products.barcode` 列(注释写"冗余主条码"),实测是个**双写的僵尸列**:
+//
+//	- **没人写它**:档案导入(archive.go::importProducts)不写 ⇒ 同步过来的
+//	  27567 个商品这一列**全空**(门店 10 实测 27568 行,非空 0 行);
+//	- **只有手工建档**(`POST /products`)会写它;
+//	- **搜索条件里读它**(`ProductService.List` 的 `barcode LIKE ?`)
+//	  ⇒ 对同步来的商品**恒不命中**;
+//	- **响应层不用它**(`ProductItem.Barcode` 恒等于 `id` —— 领域事实
+//	  "思迅 item_no 就是条码")。
+//
+//	⇒ 即"同一条条码有两个可能的存放处,其中一个永远是空的"
+//	  —— 这正是"两处不一致时以本表为准"注释担心的那种不一致。
+//
+//	⇒ 已按思迅设计收敛:**条码只由 `product_barcodes` 表表达(1 商品 : N 条码)**,
+//	  主表不再有条码字段(2026-10-22 移除 model 字段;PG 里的残留列待 DDL 清理)。
+//
+//	⇒ 响应字段 `ProductItem.Barcode` **不变**(仍 = id):
+//	  那是**扫码键**(前端按它扫码),不是"该商品的全部条码"。
+//	  商品的全部条码走 `GET /products/:id/barcodes`。
+
 
 // ---- 业务错误 sentinel(handler 层映 4xx / 5xx) ----
 

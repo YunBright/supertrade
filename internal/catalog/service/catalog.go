@@ -40,6 +40,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/cuberead"
 )
 
 // 分页口径(与商品选择控件契约一致)。
@@ -62,7 +63,15 @@ type CatalogService struct {
 	db *gorm.DB
 	// sources 解析"这个门店配了哪个数据源"(见 source.go)。
 	sources SourceResolver
-	logger  *slog.Logger
+	// reader 是**通用 cube 读端**(model + 维度 + 过滤),商品档案
+	// (product-archive)用它查 product / branch_price / supplier_item。
+	//
+	// ⚠️ 为什么不用 cubeclient.Client:那个窄接口只有"查一个商品"那几族方法,
+	// 没有"按维度分组 + 过滤 + 分页"的通用查询 —— 而商品档案必须自己拼维度。
+	// 生产装配的是**同一个** *cubeclient.DaprCubeClient
+	// (不要建第二个 client:两个 client = 两套超时 / 鉴权 / 路由参数)。
+	reader cuberead.Reader
+	logger *slog.Logger
 }
 
 // NewCatalogService 构造 CatalogService。

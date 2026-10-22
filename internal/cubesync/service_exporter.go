@@ -96,7 +96,7 @@ func NewServiceExporter(sidecarBase, branchID string, endpoints map[string]Servi
 var _ Exporter = (*ServiceExporter)(nil)
 
 // Export 取某个 scope 的一页（导出端点无状态，分页是调用方的循环）。
-func (e *ServiceExporter) Export(ctx context.Context, bearer, scope string, offset, limit int) (*archivedto.ExportPage, error) {
+func (e *ServiceExporter) Export(ctx context.Context, bearer, scope string, offset, limit int, since string) (*archivedto.ExportPage, error) {
 	if e == nil {
 		return nil, fmt.Errorf("cubesync: 导出方未装配")
 	}
@@ -116,6 +116,11 @@ func (e *ServiceExporter) Export(ctx context.Context, bearer, scope string, offs
 	q.Set("scope", scope)
 	q.Set("offset", strconv.Itoa(offset))
 	q.Set("limit", strconv.Itoa(limit))
+	// ⚠️ since = 增量水位 ⇒ 透传给源门店的归档导出端点 ⇒ 它再透传给 cube-router
+	//   ⇒ cube 查询加 `stock.updated_at gt <since>` ⇒ 只导"变过"的行。
+	if since != "" {
+		q.Set("since", since)
+	}
 	u := e.sidecarBase + "/v1.0/invoke/" + ep.AppID + "/method/" + path + "?" + q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)

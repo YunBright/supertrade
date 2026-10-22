@@ -78,6 +78,11 @@ func (e *CubeRouterExporter) ExportRaw(ctx context.Context, in ExportInput) ([]b
 	if asOf := in.AsOf; asOf != "" {
 		q.Set("as_of", asOf)
 	}
+	// ⚠️ since = 增量水位 ⇒ 透传给 cube-router ⇒ 它给 cube 查询加
+	//   `stock.updated_at gt <since>` ⇒ 只导"变过"的行。
+	if since := in.Since; since != "" {
+		q.Set("since", since)
+	}
 	// ⚠️ dapr 的 gRPC 调用把 method 里的 "?query" 拆出来放进 HTTP 扩展的 querystring
 	//   （go-sdk 的 extractMethodAndQuery）⇒ 目标 app 收到的是带 query 的 GET。
 	method := cubeRouterExportPath + "?" + q.Encode()

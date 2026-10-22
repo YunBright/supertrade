@@ -177,3 +177,52 @@ func TestImportStock_RejectsMissingTargetBranch(t *testing.T) {
 	})
 	require.Error(t, err)
 }
+
+// TestImportStock_NeverDeletesRows —— 库存导入**只 upsert,从不删行**。
+//
+// ⚠️ **这是增量同步的安全前提**(2026-10-22)。
+//
+//	增量导入只带"变过的那几行"(源库实测:23837 行里一天只变 91 行)。
+//	若导入端在 overwrite 模式下把"没在报文里的行"删掉(其它 scope 就是这个语义)
+//	⇒ 每跑一次增量 ⇒ 库存表被清空到只剩 91 行
+//	⇒ 症状:前台库存大面积变 0 / 查不到,而导入报告写"成功 91 条"。
+//
+// ⇒ 这条锁住"库存是快照 upsert,不是集合替换"。
+func TestImportStock_NeverDeletesRows(t *testing.T) {
+	db := newImportDB(t)
+	svc := service.NewStockService(db)
+
+	// 先导 3 个商品。
+	_, err := svc.ImportStock(context.Background(), service.StockImportInput{
+		SourceBranchID: "00", TargetBranchID: "10", Mode: "overwrite",
+		Data: archivedto.ImportData{Stocks: []archivedto.ImportStockRow{
+			{ProductID: "p1", Qty: "10", AvgCostYuan: "5.00"},
+			{ProductID: "p2", Qty: "20", AvgCostYuan: "5.00"},
+			{ProductID: "p3", Qty: "30", AvgCostYuan: "5.00"},
+		}},
+	})
+	require.NoError(t, err)
+
+	// 再导 1 个(模拟增量:只有这一个变过)。
+	_, err = svc.ImportStock(context.Background(), service.StockImportInput{
+		SourceBranchID: "00", TargetBranchID: "10", Mode: "overwrite",
+		Data: archivedto.ImportData{Stocks: []archivedto.ImportStockRow{
+			{ProductID: "p2", Qty: "25", AvgCostYuan: "5.00"},
+		}},
+	})
+	require.NoError(t, err)
+
+	var n int64
+	require.NoError(t, db.Model(&model.StockLevel{}).Count(&n).Error)
+	assert.EqualValues(t, 3, n, "增量导入不得删掉没在报文里的行")
+
+	// 被导的那行必须更新成新值。
+	var p2 model.StockLevel
+	require.NoError(t, db.Where("branch_id = ? AND product_id = ?", "10", "p2").First(&p2).Error)
+	assert.Equal(t, "25", p2.Qty.String())
+
+	// 没被导的行必须保持原值。
+	var p1 model.StockLevel
+	require.NoError(t, db.Where("branch_id = ? AND product_id = ?", "10", "p1").First(&p1).Error)
+	assert.Equal(t, "10", p1.Qty.String())
+}

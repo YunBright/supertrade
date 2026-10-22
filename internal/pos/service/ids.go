@@ -25,6 +25,7 @@
 package service
 
 import (
+	"database/sql"
 	"context"
 	"fmt"
 	"sync"
@@ -55,7 +56,7 @@ type saleIDGen struct {
 
 // next 取下一个销售单号。
 //
-// db 用于**每日播种**(数当天已有多少单);播种之后取号不再碰 DB。
+// db 用于**每日播种**(取当天已发出的最大序号);播种之后取号不再碰 DB。
 func (g *saleIDGen) next(ctx context.Context, db *gorm.DB, now time.Time) (string, error) {
 	biz := now.In(bizZone)
 	day := biz.Format("20060102")
@@ -64,7 +65,7 @@ func (g *saleIDGen) next(ctx context.Context, db *gorm.DB, now time.Time) (strin
 	defer g.mu.Unlock()
 
 	if g.day != day {
-		n, err := countSalesOfDay(ctx, db, biz)
+		n, err := maxSaleSeqOfDay(ctx, db, biz)
 		if err != nil {
 			return "", err
 		}
@@ -75,17 +76,46 @@ func (g *saleIDGen) next(ctx context.Context, db *gorm.DB, now time.Time) (strin
 	return fmt.Sprintf("SO%s%06d", day, g.seq), nil
 }
 
-// countSalesOfDay 数出某个业务日已有多少张销售单(跨门店,单号是全局的)。
-func countSalesOfDay(ctx context.Context, db *gorm.DB, biz time.Time) (int64, error) {
-	start := time.Date(biz.Year(), biz.Month(), biz.Day(), 0, 0, 0, 0, bizZone)
-	end := start.AddDate(0, 0, 1)
-	var n int64
-	err := db.WithContext(ctx).
-		Model(&model.SalesOrder{}).
-		Where("sold_at >= ? AND sold_at < ?", start, end).
-		Count(&n).Error
+// maxSaleSeqOfDay 取某个业务日**已发出的最大单号序号**。
+//
+// # ⚠️ 为什么不能用"当天有多少张单"(2026-10-22 修的真实缺陷)
+//
+//	原来的播种是 `countSalesOfDay` = **当天已有多少行**,
+//	然后 `seq = n` ⇒ 下一个号 = n+1。
+//
+//	**这在"号段从 1 开始连续"时才成立**,而现实里不成立:
+//
+//	① **进程在当天中途重启**(每次部署都重启)⇒ 重新播种时
+//	   count = 当时已开的行数,而**当时发出的号可能已经到 100**
+//	   (号段起点不是 1)⇒ 播种算出的 60 ⇒ 下一个号 000061
+//	   **已存在** ⇒ 撞主键 ⇒ 重试 62/63… 也全撞 ⇒ 20 次用尽
+//	   ⇒ **开单 500**(2026-10-22 部署后实测复现)。
+//	② **回放台的行被软删**(`deleted_at` 非空)⇒ count 更小 ⇒ 更偏。
+//
+//	⇒ 正确口径是**已发出的最大序号**:`max(right(id, 6))`。
+//
+// # ⚠️ 必须**含软删行**(`Unscoped`)
+//
+//	软删掉的号**仍然被用过** ⇒ 下一个号不能落在它上面
+//	⇒ 取号要扫**全部**(含软删)当天行。
+//
+//	⚠️ 含软删 ⇒ 播种值 ≥ 真实最大号 ⇒ 第一个新号一定 **> 任何已用过的号**
+//	⇒ 不会撞 ⇒ 重试只是兜底(跨进程并发)。
+func maxSaleSeqOfDay(ctx context.Context, db *gorm.DB, biz time.Time) (int64, error) {
+	prefix := "SO" + biz.Format("20060102")
+	var maxSeq sql.NullInt64
+	err := db.WithContext(ctx).Unscoped().Model(&model.SalesOrder{}).
+		Where("id LIKE ?", prefix+"%").
+		// ⚠️ 表达式必须**PG 与 SQLite 都认**:
+		//   - `::bigint` —— SQLite 不认(SQL logic error: unrecognized token: ":")
+		//   - `right(id, 6)` —— SQLite **没有这个函数**(no such function: right)
+		//   ⇒ 用 `substr(id, <起始位>, 6)` + `CAST(... AS INTEGER)`(两边都有)。
+		//     起始位 = len(prefix)+1(prefix = "SO"+yyyymmdd,序号紧跟其后)。
+		Select(fmt.Sprintf("COALESCE(MAX(CAST(substr(id, %d, 6) AS INTEGER)), 0)", len(prefix)+1)).
+		Scan(&maxSeq).Error
 	if err != nil {
-		return 0, fmt.Errorf("pos: 统计当天单量失败: %w", err)
+		return 0, fmt.Errorf("pos: 统计当天最大单号序号失败: %w", err)
 	}
-	return n, nil
+	return maxSeq.Int64, nil
 }
+

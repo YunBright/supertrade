@@ -35,6 +35,20 @@ import (
 // fakeCube 实现 service.CubeQuerier,灌 S1 全通过数据(货款 100)。
 type fakeCube struct {
 	settlements []service.SettlementRow
+	suppliers   map[string]string // 供应商字典(id → 名称)
+	supplierErr error             // 非 nil ⇒ 字典查询失败(测降级)
+	productNames map[string]string // 货号 → 商品名(信号里写「<名称>-<货号>」)
+}
+
+func (f *fakeCube) ListProductNames(_ context.Context, _ string, _ []string) (map[string]string, error) {
+	return f.productNames, nil
+}
+
+func (f *fakeCube) ListSupplierNames(_ context.Context, _ string) (map[string]string, error) {
+	if f.supplierErr != nil {
+		return nil, f.supplierErr
+	}
+	return f.suppliers, nil
 }
 
 func (f *fakeCube) ListSettlements(_ context.Context, _ string, ids []string) ([]service.SettlementRow, error) {

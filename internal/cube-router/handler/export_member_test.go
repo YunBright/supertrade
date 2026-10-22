@@ -43,7 +43,7 @@ func TestExportScopeMembers_RequestHasNoFilters(t *testing.T) {
 	if !ok {
 		t.Fatalf("导出端点没有实现 members scope")
 	}
-	_, _, err := h.exportFromCube(context.Background(), "cube-00", "00", sc, "2026-10-21", 100, 0)
+	_, _, err := h.exportFromCube(context.Background(), "cube-00", "00", sc, "2026-10-21", "", 100, 0)
 	if err != nil {
 		t.Fatalf("导出失败: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestExportScopeMembers_RowShape(t *testing.T) {
 	if !ok {
 		t.Fatalf("导出端点没有实现 members scope")
 	}
-	rows, _, err := h.exportFromCube(context.Background(), "cube-00", "00", sc, "2026-10-21", 100, 0)
+	rows, _, err := h.exportFromCube(context.Background(), "cube-00", "00", sc, "2026-10-21", "", 100, 0)
 	if err != nil {
 		t.Fatalf("导出失败: %v", err)
 	}

@@ -107,6 +107,25 @@ type SalePaidResult struct {
 // ⚠️ 会员不存在 ⇒ **跳过并记日志**,不返错误:
 //
 //	事件不能因为"会员被删了"就无限重试(那会让整条 bus 卡住)。
+//
+// # ⚠️ 退货(R)⇒ **扣回积分**(2026-10-22 实测新增)
+//
+//	以前这里直接 Skip(注释写着"思迅的退货单也不给积分")—— **那是错的**。
+//
+//	源库实测(ysx 生产库 `t_rm_vip_info_sign`):全库 **18,407 行**里
+//	只有 **8 行** `vip_acc_num < 0`,而这 8 行**全部**是退货台单据
+//	(flow_no 前 2 位 = "07"):
+//
+//		07202610120002  −3     07202610030001  −76
+//		07202610120001  −31    07202609240001  −1
+//		07202609150001  −3     07202609100003  −19
+//		07202609100002  −2     07202609090004  −6
+//
+//	⇒ 思迅**按退掉金额等额扣回积分**(积分率 = 1 分/元)。
+//	⇒ 不扣回的后果:顾客退了货,积分还留在账上 ⇒ 积分虚高
+//	  ⇒ 抵扣时能抵不该抵的钱。
+//
+//	扣回**不能把累计扣成负数**(顾客可能已经把积分用掉了)⇒ 扣到 0 为止。
 func (s *Service) OnSalePaid(ctx context.Context, p SalePaidPayload) (*SalePaidResult, error) {
 	opID := strings.TrimSpace(p.OpID)
 	branchID := strings.TrimSpace(p.BranchID)
@@ -118,10 +137,7 @@ func (s *Service) OnSalePaid(ctx context.Context, p SalePaidPayload) (*SalePaidR
 	if memberID == "" {
 		return &SalePaidResult{Skipped: true}, nil
 	}
-	// 退货(R)⇒ 不累计积分(思迅的退货单也不给积分)。
-	if strings.EqualFold(strings.TrimSpace(p.OrderStatus), "R") {
-		return &SalePaidResult{Skipped: true}, nil
-	}
+	isRefund := strings.EqualFold(strings.TrimSpace(p.OrderStatus), "R")
 
 	// ⚠️ 该门店的会员档案来自**外部系统**(富百家 / 佳乐)⇒ 本域不记积分。
 	// 硬写会写进本域 PG 的一行"没人看的会员",而那个门店的账在外部 ERP 里。
@@ -140,7 +156,12 @@ func (s *Service) OnSalePaid(ctx context.Context, p SalePaidPayload) (*SalePaidR
 		return nil, err
 	}
 	rate := s.pointsRateOf(ctx, branchID)
-	points := CalculatePoints(p.TotalAmountYuan, rate)
+	// ⚠️ 事件里的 total_amount_yuan 在退货时是**负数** ⇒ 取绝对值算积分。
+	amount := p.TotalAmountYuan
+	if isRefund {
+		amount = amount.Abs()
+	}
+	points := CalculatePoints(amount, rate)
 	if points.LessThanOrEqual(decimal.Zero) {
 		return &SalePaidResult{Skipped: true}, nil
 	}
@@ -152,6 +173,10 @@ func (s *Service) OnSalePaid(ctx context.Context, p SalePaidPayload) (*SalePaidR
 	}
 	var out *SalePaidResult
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if isRefund {
+			return s.applyRefundPoints(tx, member, opID, branchID, memberID, points,
+				strings.TrimSpace(p.SaleID), firstNonEmpty(p.OperatorID, actor), operatedAt, now, &out)
+		}
 		pointsAfter := member.PointsAccumulated.Add(points)
 		row := &model.MemberPointLedger{
 			ID:          newLedgerID("PL", now),
@@ -204,4 +229,71 @@ func (s *Service) OnSalePaid(ctx context.Context, p SalePaidPayload) (*SalePaidR
 		return nil, err
 	}
 	return out, nil
+}
+
+// applyRefundPoints 记一笔**退货冲回**的积分流水并扣回累计积分。
+//
+// ⚠️ 扣回量**不能超过当前累计**(顾客可能已经把积分用掉了)
+//   ⇒ 扣到 0 为止,而不是把累计扣成负数。
+//
+// ⚠️ `consumed_amount_yuan` / `consumed_count` **不动**:
+//   思迅那边这两个字段在退货时怎么处理**无从验证**
+//   (源库的会员域是脏的,见 deployer 的"会员消费额"一栏),
+//   ⇒ 保守:只动能验证的积分。
+func (s *Service) applyRefundPoints(tx *gorm.DB, member *model.Member, opID, branchID, memberID string,
+	points decimal.Decimal, saleID, operatorID string, operatedAt, now time.Time, out **SalePaidResult) error {
+	deduct := points
+	if deduct.GreaterThan(member.PointsAccumulated) {
+		deduct = member.PointsAccumulated
+	}
+	if deduct.LessThanOrEqual(decimal.Zero) {
+		// 没有可扣的积分(已用光)⇒ 不记流水、不改账(否则累计会变负)。
+		*out = &SalePaidResult{Skipped: true}
+		return nil
+	}
+	pointsAfter := member.PointsAccumulated.Sub(deduct)
+	row := &model.MemberPointLedger{
+		ID:       newLedgerID("PL", now),
+		BranchID: branchID,
+		MemberID: memberID,
+		OpID:     opID,
+		// ⚠️ deduct 的 points 是**负数**(见 model.MemberPointLedger.Points 的约定)。
+		Direction:   model.PointDirectionDeduct,
+		Points:      deduct.Neg(),
+		PointsAfter: pointsAfter,
+		Reason:      model.PointReasonSale,
+		RefFlowNo:   saleID,
+		OperatorID:  operatorID,
+		OperatedAt:  operatedAt,
+		CreatedAt:   now,
+	}
+	res := tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "op_id"}},
+		DoNothing: true,
+	}).Create(row)
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		*out = &SalePaidResult{Replayed: true, Points: deduct}
+		return nil
+	}
+	upd := tx.Model(&model.Member{}).
+		Where("id = ? AND branch_id = ?", memberID, branchID).
+		Updates(map[string]any{
+			"points_accumulated": gorm.Expr("points_accumulated - ?", deduct),
+			"updated_by":         operatorID,
+			"updated_at":         now,
+		})
+	if upd.Error != nil {
+		return upd.Error
+	}
+	if upd.RowsAffected == 0 {
+		return model.ErrMemberNotFound
+	}
+	if err := s.enqueuePointsChanged(tx, row); err != nil {
+		return err
+	}
+	*out = &SalePaidResult{Points: deduct}
+	return nil
 }

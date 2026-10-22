@@ -25,6 +25,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/YunBright/supertrade/internal/archivedto"
 	"github.com/YunBright/supertrade/internal/catalog/model"
 	"github.com/YunBright/supertrade/internal/catalog/service"
 	"github.com/YunBright/supertrade/pkg/middleware"
@@ -111,6 +112,17 @@ func (h *Handler) exportArchive(c *gin.Context) {
 		return
 	}
 	offset, limit := parseExportPaging(c)
+	// ⚠️ since = 增量水位 ⇒ 必须**校验后**再传给取数层:
+	// 非法值不能静默回落成"全量"(那会让调用方以为导了增量,其实导了全量,
+	// 而且**没有一行报错**)。
+	since, err := archivedto.NormalizeSince(c.Query("since"))
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"code":    "bad_since",
+			"message": err.Error(),
+		})
+		return
+	}
 	page, err := h.archive.Export(c.Request.Context(), service.ExportInput{
 		BranchID: branchID,
 		// ⚠️ 调用者的 Authorization **原样**转给上游:
@@ -119,6 +131,7 @@ func (h *Handler) exportArchive(c *gin.Context) {
 		Scope:  scope,
 		Offset: offset,
 		Limit:  limit,
+		Since:  since,
 	})
 	if err != nil {
 		h.mapArchiveErr(c, err)

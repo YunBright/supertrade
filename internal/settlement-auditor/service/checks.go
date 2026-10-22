@@ -12,6 +12,9 @@ package service
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
+	"time"
 
 	"github.com/shopspring/decimal"
 
@@ -134,12 +137,60 @@ func checkSheets(lines []SettlementLineRow, sheets []PurchaseSheetRow, settlemen
 
 // ---- check 3: 金额勾稽 ----
 
-// checkAmounts 三层勾稽:
+// AmountCheck 是金额勾稽的结论摘要。
 //
-//	a) 每张结算单:Σ(PI/RO 行 total_goods_yuan) vs settlement.total_goods_yuan;
-//	b) 全部结算单货款合计 vs 申请人手工累加金额;
-//	容差 cfg.AmountToleranceYuan(默认 0.01)。
-func checkAmounts(settlements []SettlementRow, linesBySettlement map[string][]SettlementLineRow, manualAmount, tolerance decimal.Decimal) []signalDraft {
+// # 它为什么必须由引擎算好、再原样喂给 LLM
+//
+// 2026-10-22 生产实踩(审批 54bb82421a08480bbcfdacaf6c814b5e):
+// 引擎算出的真实差额是 **0.0054 元**(结算单货款合计 8206.1946 vs 手工 8206.20),
+// 在容差内 ⇒ 引擎产出 **0 条**金额信号(audit_logs 里 check_amounts 步写明
+// "新增 0 条金额信号")。
+//
+// 但喂给 LLM 的 user prompt 里是 **StringFixed(2) 的显示值**
+// (7765.19 + 441.00 = 8206.19),LLM 自己加出"手工 8206.20 与合计 8206.19 差 0.01",
+// 当成 block 理由把整单拒了 —— **凭空造出一个引擎没发现的"账实不符"**。
+//
+// ⇒ 金额结论只有一个口径:引擎算完给 LLM,**不给它自己相加的机会**。
+type AmountCheck struct {
+	// ManualAmountYuan 是申请人手工累加的付款额。
+	ManualAmountYuan decimal.Decimal
+	// SettledTotalYuan 是勾选结算单的货款合计(引擎口径)。
+	SettledTotalYuan decimal.Decimal
+	// DiffYuan 是 |手工 - 合计|。
+	DiffYuan decimal.Decimal
+	// ToleranceYuan 是付款取整容差(元)。
+	ToleranceYuan decimal.Decimal
+	// Consistent 为 true 表示差异在取整容差内 —— 属正常取整,不构成阻断。
+	Consistent bool
+}
+
+// yuanText 把金额打成"人看得懂"的样子:最多 4 位小数、去掉尾随 0。
+//
+// # 为什么不用 StringFixed(2)
+//
+// 生产实踩(2026-10-22):差额 0.014 元被 StringFixed(2) 打成 "0.01",
+// 看的人(包括 LLM)以为只差 1 分,实际已经过了 0.01 的数值容差 ——
+// **显示值比真实值小 ⇒ 人会低估问题的量级**,于是该拦的没拦、不该拦的拦了。
+// ⇒ 差额一律按"能显示几位就显示几位"打印。
+func yuanText(d decimal.Decimal) string {
+	return d.Round(4).String()
+}
+
+// checkAmounts 两层勾稽:
+//
+//	a) 每张结算单:Σ(PI/RO 行 total_goods_yuan) vs settlement.total_goods_yuan
+//	   —— **同一套源数据的自洽性**,容差用数值容差(默认 0.01 元),不放宽:
+//	   单头与明细都来自思迅同一张单,差一分钱都要看;
+//	b) 全部结算单货款合计 vs 申请人手工累加金额
+//	   —— **付款口径**,容差用付款取整容差(默认 1 元):
+//	   实际付款按元付,分位一般不实际支付、角位也可能被舍去,
+//	   分位/角位差异是正常取整,不是账实不符(2026-10-22 生产实踩,见 AmountCheck 注释)。
+//
+// 两层容差**刻意不同**:把付款的取整口径套到"单头 vs 明细"上,
+// 会把源数据自身的不自洽也一并放过。
+//
+// 返回信号 + 金额结论摘要(给 LLM 用,见 AmountCheck)。
+func checkAmounts(settlements []SettlementRow, linesBySettlement map[string][]SettlementLineRow, manualAmount, tolerance, paymentTolerance decimal.Decimal) ([]signalDraft, AmountCheck) {
 	var out []signalDraft
 	grandTotal := decimal.Zero
 	for _, st := range settlements {
@@ -151,8 +202,8 @@ func checkAmounts(settlements []SettlementRow, linesBySettlement map[string][]Se
 		diff := lineSum.Sub(st.TotalGoodsYuan).Abs()
 		if diff.GreaterThan(tolerance) {
 			out = append(out, newSignal(model.SignalBlock, SigLineAmountMismatch, st.ID, "",
-				fmt.Sprintf("结算单 %s 金额勾稽不符:明细合计 %s ≠ 单头货款 %s(差 %s)",
-					st.ID, lineSum.StringFixed(2), st.TotalGoodsYuan.StringFixed(2), diff.StringFixed(2)),
+				fmt.Sprintf("结算单 %s 金额勾稽不符:明细合计 %s ≠ 单头货款 %s(差 %s 元)",
+					st.ID, yuanText(lineSum), yuanText(st.TotalGoodsYuan), yuanText(diff)),
 				map[string]any{
 					"settlement_id": st.ID,
 					"line_sum":      lineSum.String(),
@@ -162,20 +213,61 @@ func checkAmounts(settlements []SettlementRow, linesBySettlement map[string][]Se
 		}
 	}
 	diff := grandTotal.Sub(manualAmount).Abs()
-	if diff.GreaterThan(tolerance) {
+	// 付款取整口径:差额 **小于** 1 元 = 同一笔付款(分位不实际支付、角位可能被舍去)。
+	summary := AmountCheck{
+		ManualAmountYuan: manualAmount,
+		SettledTotalYuan: grandTotal,
+		DiffYuan:         diff,
+		ToleranceYuan:    paymentTolerance,
+		Consistent:       diff.LessThan(paymentTolerance),
+	}
+	if !summary.Consistent {
 		out = append(out, newSignal(model.SignalBlock, SigManualAmountMismatch, "", "",
-			fmt.Sprintf("手工累加付款金额 %s 与结算单货款合计 %s 不符(差 %s)",
-				manualAmount.StringFixed(2), grandTotal.StringFixed(2), diff.StringFixed(2)),
+			fmt.Sprintf("手工累加付款金额 %s 元 与结算单货款合计 %s 元 不符(差 %s 元,已达付款取整容差 %s 元)",
+				yuanText(manualAmount), yuanText(grandTotal), yuanText(diff), yuanText(paymentTolerance)),
 			map[string]any{
 				"manual_amount": manualAmount.String(),
 				"settled_total": grandTotal.String(),
 				"diff":          diff.String(),
+				"tolerance":     paymentTolerance.String(),
 			}))
 	}
-	return out
+	return out, summary
 }
 
 // ---- check 4: 数量信号(采购量 vs 销售/库存) ----
+
+// ProductLabel 给商品起一个"人能认出来"的名字:「<商品名称>-<商品货号>」。
+//
+// # 为什么信号里要带名字(2026-10-22 用户口径)
+//
+// 审批结论里涉及到商品时要写「<商品名称>-<商品货号>」:
+// 店长看到 "02000116" 无从判断这是不是自家在卖的商品;
+// 看到 "16.8升琅悦泉水桶装水-02000116" 立刻知道是桶装水。
+//
+// 查不到名字时**回退到纯货号** —— 不编造名字,也不因为查不到名字就不发信号。
+func ProductLabel(names map[string]string, productID string) string {
+	name := strings.TrimSpace(names[productID])
+	if name == "" {
+		return productID
+	}
+	return name + "-" + productID
+}
+
+// QuantityContext 是数量信号的上下文。
+//
+// # 为什么信号要带商品名和窗口起点
+//
+// - **商品名**:审批结论给发起人看,只写货号没人认得(用户口径 2026-10-22:
+//   写「<商品名称>-<商品货号>」)。
+// - **窗口起点**:信号的结论是"从哪天起没有销售记录" —— 把日期写进消息,
+//   人才判断得了(而不是看一个"窗口内无销售"的空口径)。
+type QuantityContext struct {
+	// Names 是货号 → 商品名(可空 ⇒ 只写货号)。
+	Names map[string]string
+	// WindowFrom 是货号 → 销量窗口起点(该商品最后一次采购入库日,YYYY-MM-DD)。
+	WindowFrom map[string]string
+}
 
 // checkQuantity 对每个进货商品比较窗口采购量与窗口销量:
 //
@@ -185,7 +277,11 @@ func checkAmounts(settlements []SettlementRow, linesBySettlement map[string][]Se
 //
 // received 只统计 PI(进货);RO(退货)按负量冲减由 caller 聚合时处理
 // (退货量大是另一类信号,本期不做)。
-func checkQuantity(receivedByProduct map[string]decimal.Decimal, salesByProduct map[string]SaleRow, factor float64) []signalDraft {
+//
+// ⚠️ **消息只陈述事实**(哪个商品、进了多少、从哪天起没卖),不做动机推断 ——
+// 这些文字是给**发起人**看的,推断性措辞("虚进""套取付款""风险")会让人不适,
+// 而且判断本来就不该由机器下(见 llm.go 的措辞约束)。
+func checkQuantity(receivedByProduct map[string]decimal.Decimal, salesByProduct map[string]SaleRow, factor float64, qc QuantityContext) []signalDraft {
 	var out []signalDraft
 	f := decimal.NewFromFloat(factor)
 	f2 := decimal.NewFromFloat(factor * 2)
@@ -193,25 +289,168 @@ func checkQuantity(receivedByProduct map[string]decimal.Decimal, salesByProduct 
 		if !recv.GreaterThan(decimal.Zero) {
 			continue
 		}
+		label := ProductLabel(qc.Names, pid)
+		from := qc.WindowFrom[pid]
 		sale := salesByProduct[pid]
 		sold := sale.NetSaleQuantity
 		if !sold.GreaterThan(decimal.Zero) {
+			msg := fmt.Sprintf("商品 %s 自最后一次采购入库日至今无销售记录,本次进货 %s", label, recv.String())
+			if from != "" {
+				msg = fmt.Sprintf("商品 %s 自 %s 采购入库后无销售记录,本次进货 %s", label, from, recv.String())
+			}
 			out = append(out, newSignal(model.SignalBlock, SigPurchaseWithoutSales, "", pid,
-				fmt.Sprintf("商品 %s 窗口内无销售记录却进货 %s", pid, recv.String()),
-				map[string]any{"product_id": pid, "received": recv.String(), "sold": "0"}))
+				msg,
+				map[string]any{"product_id": pid, "received": recv.String(), "sold": "0", "window_from": from}))
 			continue
 		}
 		ratio := recv.Div(sold)
 		switch {
 		case recv.GreaterThan(sold.Mul(f2)):
 			out = append(out, newSignal(model.SignalBlock, SigQtyDeviation, "", pid,
-				fmt.Sprintf("商品 %s 窗口进货 %s 达销量 %s 的 %s 倍(>%.0f×)", pid, recv.String(), sold.String(), ratio.StringFixed(1), factor*2),
-				map[string]any{"product_id": pid, "received": recv.String(), "sold": sold.String(), "ratio": ratio.String()}))
+				fmt.Sprintf("商品 %s 本次进货 %s,为 %s 以来销量 %s 的 %s 倍", label, recv.String(), windowText(from), sold.String(), ratio.StringFixed(1)),
+				map[string]any{"product_id": pid, "received": recv.String(), "sold": sold.String(), "ratio": ratio.String(), "window_from": from}))
 		case recv.GreaterThan(sold.Mul(f)):
 			out = append(out, newSignal(model.SignalWarn, SigQtyDeviation, "", pid,
-				fmt.Sprintf("商品 %s 窗口进货 %s 为销量 %s 的 %s 倍(>%.0f×)", pid, recv.String(), sold.String(), ratio.StringFixed(1), factor),
-				map[string]any{"product_id": pid, "received": recv.String(), "sold": sold.String(), "ratio": ratio.String()}))
+				fmt.Sprintf("商品 %s 本次进货 %s,为 %s 以来销量 %s 的 %s 倍", label, recv.String(), windowText(from), sold.String(), ratio.StringFixed(1)),
+				map[string]any{"product_id": pid, "received": recv.String(), "sold": sold.String(), "ratio": ratio.String(), "window_from": from}))
 		}
 	}
 	return out
+}
+
+// windowText 把窗口起点渲染成一句话里的片段。
+func windowText(from string) string {
+	if from == "" {
+		return "上次采购入库"
+	}
+	return from + " 采购入库"
+}
+
+// ---- 销量窗口(按商品):从最后一次采购入库日到今天 ----
+
+// saleWindowGroup 是一组"窗口起点相同"的商品 —— 它们共用一次 sale_day 查询。
+type saleWindowGroup struct {
+	// From 是窗口起点(YYYY-MM-DD,含)。
+	From string
+	// Products 是该组的商品货号。
+	Products []string
+}
+
+// maxSaleWindowGroups 是窗口分组的**查询次数上限**。
+//
+// 每次分组 = 一次 cube sale_day 查询(源表 t_rm_daysum 120 万行,每次约 1.2s),
+// 而"分组数 = 不同采购日期数"。一次审批可能勾选几十张结算单、对应上百张采购单
+// ⇒ 日期数不可控 ⇒ 查询次数不可控(一次审批跑一分钟)。
+//
+// ⇒ 超过上限时**把起点最近的两组合并**(取更早的那个起点)。
+// 合并方向是**放宽**:窗口更早 ⇒ 统计到的销量更多 ⇒ 只会少拦、不会多拦。
+const maxSaleWindowGroups = 8
+
+// buildSaleWindowGroups 按"最后一次采购的采购入库单日期"给商品分组。
+//
+// # 口径(2026-10-22 用户口径)
+//
+// 销量窗口 = **从最后一次采购的采购入库单日期到当前日期**。
+//
+// 为什么不用"今天往前 N 天"的固定窗口:
+// 进货发生在 2026-08-25,却拿 2026-09-22~10-22 的销量去比 ——
+// **被审的那次进货根本不在窗口里**,判的是"这批货卖不卖得动"却用了一个
+// 与进货无关的窗口。滞销口径应该是"自我们进货以来,它卖了多少"。
+//
+// # 为什么起点取"本次审核里的最后一次进货",不是"该商品历史上的最后一次进货"
+//
+// 商品可能在本次审核之后又进过货(那批货不在本次结算里)⇒
+// 用历史上的最后一次进货当起点,窗口反而不含**被审的这次进货** ——
+// 正是上面要修的那个毛病。
+//
+// 参数:
+//
+//   - sheetDates:采购单 id → 制单日期(YYYY-MM-DD)
+//   - productSheets:商品 → 它出现过的采购单 id 列表
+//   - today:今天
+//   - fallback:取不到日期时的回退起点(今天 - SaleWindowDays)
+//   - maxGroups:分组数上限(≤0 ⇒ 用 maxSaleWindowGroups)
+func buildSaleWindowGroups(sheetDates map[string]string, productSheets map[string][]string, today, fallback string, maxGroups int) []saleWindowGroup {
+	if maxGroups <= 0 {
+		maxGroups = maxSaleWindowGroups
+	}
+	// 每个商品 → 窗口起点(它出现过的采购单里**最晚**的制单日期)。
+	fromByProduct := make(map[string]string, len(productSheets))
+	for pid, sheetIDs := range productSheets {
+		from := ""
+		for _, sid := range sheetIDs {
+			d, ok := sheetDates[sid]
+			if !ok || d == "" {
+				continue
+			}
+			if from == "" || d > from {
+				from = d
+			}
+		}
+		if from == "" || from > today {
+			// 取不到日期 / 日期在未来(脏数据)⇒ 回退固定窗口。
+			from = fallback
+		}
+		fromByProduct[pid] = from
+	}
+	// 按起点归组(起点升序,商品按货号排序 ⇒ 输出稳定可测)。
+	byFrom := make(map[string][]string, len(fromByProduct))
+	for pid, from := range fromByProduct {
+		byFrom[from] = append(byFrom[from], pid)
+	}
+	groups := make([]saleWindowGroup, 0, len(byFrom))
+	for from, pids := range byFrom {
+		sort.Strings(pids)
+		groups = append(groups, saleWindowGroup{From: from, Products: pids})
+	}
+	sort.Slice(groups, func(i, j int) bool { return groups[i].From < groups[j].From })
+
+	// 分组数超上限 ⇒ 反复合并"起点最近"的两组(取更早的起点)。
+	for len(groups) > maxGroups {
+		best, bestGap := -1, 0
+		for i := 0; i+1 < len(groups); i++ {
+			gap := dateGapDays(groups[i].From, groups[i+1].From)
+			if best == -1 || gap < bestGap {
+				best, bestGap = i, gap
+			}
+		}
+		if best < 0 {
+			break
+		}
+		merged := saleWindowGroup{
+			From:     groups[best].From, // 取更早的起点(放宽方向)
+			Products: append(append([]string{}, groups[best].Products...), groups[best+1].Products...),
+		}
+		sort.Strings(merged.Products)
+		groups = append(groups[:best], append([]saleWindowGroup{merged}, groups[best+2:]...)...)
+	}
+	return groups
+}
+
+// windowFromByProduct 从分组反推每个商品的窗口起点。
+//
+// 用**分组后**的起点(分组可能被合并,见 buildSaleWindowGroups)——
+// 信号里写的日期必须与实际用的窗口一致,否则文字和口径对不上。
+func windowFromByProduct(groups []saleWindowGroup) map[string]string {
+	out := make(map[string]string)
+	for _, g := range groups {
+		for _, pid := range g.Products {
+			out[pid] = g.From
+		}
+	}
+	return out
+}
+
+// dateGapDays 两个 YYYY-MM-DD 之间的天数差(后 - 前);解析失败按 0。
+func dateGapDays(a, b string) int {
+	ta, err1 := time.Parse("2006-01-02", a)
+	tb, err2 := time.Parse("2006-01-02", b)
+	if err1 != nil || err2 != nil {
+		return 0
+	}
+	d := int(tb.Sub(ta).Hours() / 24)
+	if d < 0 {
+		d = 0
+	}
+	return d
 }

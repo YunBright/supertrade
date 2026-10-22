@@ -66,7 +66,9 @@ var (
 	appPrice      *service.PriceService
 	appPriceLists *service.PriceListService
 	appPromos     *service.PromotionService
-	appUser       *userinfo.Client
+	// appPlans 是促销方案头服务(图4)。
+	appPlans *service.PromotionPlanService
+	appUser *userinfo.Client
 )
 
 func main() {
@@ -96,6 +98,9 @@ func initApp() error {
 	if err := appDB.AutoMigrate(
 		&model.PriceList{},
 		&model.Promotion{},
+		// 促销**方案头**(图4,2026-10-22 新增):自营门店(10)没有 cube 源,
+		// 它的促销方案没有别的地方可取 ⇒ 必须本域有一张表。
+		&model.PromotionPlan{},
 	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
 	}
@@ -119,6 +124,14 @@ func initApp() error {
 	// 解析器带 60s 缓存 + stale-on-error:每次读都打一次 dapr 往返不划算,
 	// 而一次网络抖动不该让整个门店的服务挂掉。
 	appPrice.SetCubeSource(
+		cubesource.NewCachedResolver(daprCube, cubesource.DefaultTTL, slog.Default()),
+		daprCube,
+	)
+	// 促销方案头(图4)用**同一个**解析器与读端 ——
+	// 判据必须全服务一致(同一个门店在不同服务里给出不同的解释,
+	// 排查时每个服务看起来都"有道理")。
+	appPlans = service.NewPromotionPlanService(appDB, slog.Default())
+	appPlans.SetCubeSource(
 		cubesource.NewCachedResolver(daprCube, cubesource.DefaultTTL, slog.Default()),
 		daprCube,
 	)
@@ -146,7 +159,9 @@ func registerRoutes(r *gin.Engine) {
 	}
 	r.Use(middleware.XBranchID())
 	r.Use(forwardBearerToOutgoing())
-	handler.New(appPrice, appPriceLists, appPromos, appUser, nil).RegisterRoutes(r)
+	h := handler.New(appPrice, appPriceLists, appPromos, appUser, nil)
+	h.SetPromotionPlans(appPlans)
+	h.RegisterRoutes(r)
 }
 
 // forwardBearerToOutgoing 把 caller's Authorization / X-Branch-ID 注入 ctx,

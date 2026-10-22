@@ -126,8 +126,12 @@ type Syncer struct {
 	pageSize int
 	// chunkSize 是单次导入请求的行数。
 	chunkSize int
-	logger    *slog.Logger
-	now       func() time.Time
+	// watermarks 是**增量水位**(每个 scope 一个时间点)。
+	//
+	// ⚠️ nil / 未启用 ⇒ 所有 scope 都走全量(安全默认)。
+	watermarks *WatermarkStore
+	logger     *slog.Logger
+	now        func() time.Time
 }
 
 // NewSyncer 构造。
@@ -143,7 +147,7 @@ func NewSyncer(cfg Config, token TokenIssuer, exporter Exporter, owners []Owner,
 	if pageSize <= 0 {
 		pageSize = DefaultPageSize
 	}
-	return &Syncer{
+	s := &Syncer{
 		cfg:       cfg,
 		token:     token,
 		exporter:  exporter,
@@ -153,6 +157,13 @@ func NewSyncer(cfg Config, token TokenIssuer, exporter Exporter, owners []Owner,
 		logger:    logger,
 		now:       func() time.Time { return time.Now() },
 	}
+	// ⚠️ 水位存储的时钟**必须**与 Syncer 用同一个 ⇒
+	//   否则"水位记的时刻"与"基准日算的时刻"来自两套时钟
+	//   ⇒ 差几毫秒无所谓,但**测试注入固定时钟时会算出两个不同的 now**
+	//   ⇒ 断言"水位推进到哪"就会假红。
+	s.watermarks = NewWatermarkStore(cfg.WatermarkFile,
+		cfg.WatermarkOverlapSeconds, cfg.WatermarkMaxAgeDays, s.now)
+	return s
 }
 
 // ownerFor 找某个 scope 的归属方。
@@ -291,16 +302,67 @@ func (s *Syncer) syncScope(ctx context.Context, bearer, scope string) (*ScopeRep
 		return sr, fmt.Errorf("scope %q 没有归属方(路由表里找不到)—— 它该写进谁家的表?", scope)
 	}
 
-	rows, err := s.exportAll(ctx, bearer, scope)
+	// ⚠️ **增量**:只有**声明支持增量**的 scope 才带 since 水位。
+	//
+	//	理由:不支持增量的 scope 若带上 since(而端点忽略了它)⇒ 仍然是全量导出
+	//	⇒ 但**水位被推进了** ⇒ 下次它带 since ⇒ **只导一部分却当成全量** ⇒ 漏数据。
+	//	⇒ 白名单(IncrementalScopes)+ 能力表(archivedto.ChangedMembers)双闸。
+	since := ""
+	if s.supportsIncremental(scope) {
+		// ⚠️ 两种情况都让这一轮**无视水位**:
+		//
+		//	① **强制全量**(cfg.ForceFull):人工的一次性决定
+		//	   (换门店 / 重建目标库 / 怀疑漂移 ⇒ 增量导不出基础数据)。
+		//	② **定期全量校准**(距上次全量太久):增量只保证"不漏",
+		//	   但**任何一次**故障漏掉的行都会**一直缺着**
+		//	   (下次增量只导"变过的行")⇒ 没有校准就是永久漂移。
+		if !s.cfg.ForceFull && !s.watermarks.ShouldFullRefresh(scope) {
+			since = s.watermarks.Get(scope)
+		}
+	}
+	// ⚠️ since == "" ⇒ 这一轮是**全量**(没有水位 / 定期校准 / 该 scope 不支持增量)。
+	fullRound := since == ""
+	// ⚠️ **水位要减去该 scope 的"源数据滞后"**:
+	//   源是 cube 的离线 DuckDB 快照时,导出那一刻它可能还没刷新到最新
+	//   ⇒ 水位按"导出时刻"记就会把那段时间的变更**永远落在水位之前** ⇒ 永久漏。
+	//   详见 archivedto.ChangedMemberLag 的说明。
+	//
+	// ⚠️ Config.IncrementalLag 可**按 scope 覆盖**(默认取 archivedto 的登记值)。
+	lag := archivedto.ChangedMemberLagOf(scope)
+	if v, ok := s.cfg.IncrementalLag[scope]; ok {
+		lag = v
+	}
+	watermarkValue := s.watermarks.NowAt(lag)
+
+	rows, err := s.exportAll(ctx, bearer, scope, since)
 	if err != nil {
 		return sr, err
 	}
 	sr.Exported = len(rows)
 	if len(rows) == 0 {
-		// 空结果**不是**"这个 scope 没有数据",而是"没拉到"。
-		// 继续往下走会把"商品全空"当成事实导进去(覆盖模式:把目标门店清空)。
-		// ⇒ 空结果直接中止,并把这一点说清楚。
-		return sr, fmt.Errorf("导出方返回空结果(scope=%s)—— 拒绝把空当事实导入", scope)
+		// ⚠️ **空结果有两种含义,必须分开**:
+		//
+		//	① **全量轮次**的 0 行 = "没拉到"(端点挂了 / cube 源没了)
+		//	   ⇒ 当成事实导进去(覆盖模式:把目标门店清空)⇒ 必须报错。
+		//	② **增量轮次**的 0 行 = "自上次水位以来没有变动"
+		//	   ⇒ 这是**正常状态**(源库实测:23837 行里一天只变 91 行
+		//	   ⇒ 绝大多数夜晚就是 0 行)⇒ 报错只会让每晚的同步都失败。
+		//
+		// ⇒ 判据是"这一轮有没有带 since",不是"行数是不是 0"。
+		if fullRound {
+			return sr, fmt.Errorf("导出方返回空结果(scope=%s)—— 拒绝把空当事实导入", scope)
+		}
+		// ⚠️ 增量轮次 0 行:没有东西要导 ⇒ 但**水位照常推进**。
+		//
+		//	为什么推进:这一轮查询确实覆盖了 [上次水位, 本次起点] 这个窗口,
+		//	窗口里没有变动的行 ⇒ 把它记下来,下次不必重查同一个窗口。
+		//
+		//	⚠️ 万一 cube 的过滤条件失效(恒返 0 行)⇒ 库存会一直不同步;
+		//	  兜底是**定期全量校准**(ShouldFullRefresh)⇒ 最多一个周期就补齐。
+		s.watermarks.Set(scope, watermarkValue)
+		s.logger.Info("cubesync: 增量窗口内没有变动",
+			"scope", scope, "since", since, "watermark", watermarkValue)
+		return sr, nil
 	}
 
 	chunks := s.chunkFor(scope, rows)
@@ -326,7 +388,51 @@ func (s *Syncer) syncScope(ctx context.Context, bearer, scope string) (*ScopeRep
 		sr.Chunks++
 		s.mergeResult(sr, res)
 	}
+	// ⚠️ **推进水位**:只在**该 scope 真的走了增量**之后。
+	//
+	//	水位 = 本次**导出开始**的时刻(减 overlap)。
+	//	⇒ 导出期间发生的变动会落在水位之后 ⇒ 下次再导一次(幂等 upsert ⇒ 无害);
+	//	⇒ 而导出之前发生的变动一定被这次捕获 ⇒ **不漏**。
+	//
+	// ⚠️ 只在**导入全部成功**之后推进:中途失败 ⇒ 水位不动 ⇒ 下次重来 ⇒ 不漏。
+	if s.supportsIncremental(scope) && watermarkValue != "" {
+		s.watermarks.Set(scope, watermarkValue)
+		// ⚠️ **只有真的导了全量**才记全量校准时间。
+		//
+		//	把增量轮次记成全量 ⇒ 定期校准被推迟 ⇒ 漏掉的行一直缺着。
+		if fullRound {
+			s.watermarks.MarkFullSync(scope, watermarkValue)
+		}
+		s.logger.Info("cubesync: 推进增量水位",
+			"scope", scope, "since", since, "watermark", watermarkValue,
+			"exported", len(rows), "full_round", fullRound)
+	}
 	return sr, nil
+}
+
+// supportsIncremental 判断某 scope 是否**声明支持增量**。
+//
+// ⚠️ 这是**白名单**(cfg.IncrementalScopes),不是黑名单 ——
+//   不在名单里的 scope 一律全量。
+//   ⇒ 名单写错的后果是"多导一次"(幂等,无害),而不是"漏数据"。
+//
+// ⚠️ 还要过第二道闸(archivedto.SupportsIncremental)——
+//   名单里写了但 cube 侧其实没有"变动时间"成员 ⇒ 端点会**忽略** since
+//   ⇒ 水位却被推进 ⇒ 漏数据。
+//   ⇒ 配置期有 Validate 拦一道,这里再兜一道(防止 Config 被手工构造)。
+func (s *Syncer) supportsIncremental(scope string) bool {
+	if s == nil || s.watermarks == nil || !s.watermarks.Enabled() {
+		return false
+	}
+	if !archivedto.SupportsIncremental(scope) {
+		return false
+	}
+	for _, sc := range s.cfg.IncrementalScopes {
+		if strings.TrimSpace(sc) == scope {
+			return true
+		}
+	}
+	return false
 }
 
 // mergeResult 把导入方的结果并进 scope 报告。
@@ -345,11 +451,11 @@ func (s *Syncer) mergeResult(sr *ScopeReport, res *archivedto.ImportResult) {
 }
 
 // exportAll 分页拉完某个 scope。
-func (s *Syncer) exportAll(ctx context.Context, bearer, scope string) ([]map[string]any, error) {
+func (s *Syncer) exportAll(ctx context.Context, bearer, scope, since string) ([]map[string]any, error) {
 	var all []map[string]any
 	offset := 0
 	for {
-		page, err := s.exporter.Export(ctx, bearer, scope, offset, s.pageSize)
+		page, err := s.exporter.Export(ctx, bearer, scope, offset, s.pageSize, since)
 		if err != nil {
 			return nil, err
 		}

@@ -43,13 +43,15 @@ type exportCall struct {
 	Scope  string
 	Offset int
 	Limit  int
+	// Since 是本次导出带的**增量水位**(空 = 全量)。
+	Since string
 }
 
-func (f *fakeExporter) Export(_ context.Context, _, scope string, offset, limit int) (*archivedto.ExportPage, error) {
+func (f *fakeExporter) Export(_ context.Context, _, scope string, offset, limit int, since string) (*archivedto.ExportPage, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
-	f.calls = append(f.calls, exportCall{Scope: scope, Offset: offset, Limit: limit})
+	f.calls = append(f.calls, exportCall{Scope: scope, Offset: offset, Limit: limit, Since: since})
 	rows := f.pages[scope]
 	if offset >= len(rows) {
 		return &archivedto.ExportPage{Scope: scope, Rows: nil, Total: len(rows)}, nil

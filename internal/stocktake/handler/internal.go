@@ -46,8 +46,23 @@ type CreatePlanHeaderResponse struct {
 //
 // db 是给 /internal/datastore/purge 用的(兜底 sweep 需要直接访问 DB)。
 // 显式传参而不是从 svc 里掏:这样"purge 有没有装上"是一件可以被断言的事。
-func (h *Handler) RegisterInternalRoutes(r *gin.Engine, db *gorm.DB) {
-	r.POST("/internal/stocktake-plan-headers", h.CreatePlanHeaderInternal)
+//
+// # mw(可选中间件)为什么必须显式传
+//
+// Gin 的 `r.Use()` **只对之后注册的路由生效** —— 本端点注册在
+// cmdbootstrap 的 RegisterDapr 窗口(早于 cmd/stocktake/main.go 的
+// `r.Use(forwardBearerToOutgoing())`),所以全局的 bearer/门店透传中间件
+// **不在本路由的链上**。
+//
+// 后果(2026-10-22 生产实踩):settlement-auditor 建议盘点 → 调本端点建单 →
+// AddPlanItems 内部要从 cube 现拉商品名/条码 → cube 调用**没有凭证**
+// ⇒ cube 返 Unauthenticated ⇒ 本端点 500 ⇒ 审批日志里留下
+// "建盘点计划失败: … Internal Server Error",盘点计划单**根本没建出来**。
+//
+// ⇒ 调用方(cmd/stocktake/main.go)必须把 forwardBearerToOutgoing() 显式传进来:
+// 它把 Authorization 与 X-Branch-ID 注入 ctx,cube 调用才带得上门店与凭证。
+func (h *Handler) RegisterInternalRoutes(r *gin.Engine, db *gorm.DB, mw ...gin.HandlerFunc) {
+	r.POST("/internal/stocktake-plan-headers", append(append([]gin.HandlerFunc{}, mw...), h.CreatePlanHeaderInternal)...)
 	RegisterPurgeRoutes(r, db)
 }
 

@@ -107,6 +107,17 @@ type TaskCardPayload struct {
 	Description string   `json:"description"`
 	URL         string   `json:"url"`
 	TaskID      string   `json:"task_id"`
+
+	// ToChat 是企业微信**群聊** id(appchat 的 chatid)。
+	//
+	// 用户口径(2026-10-22):盘点计划的消息发到门店指定的群,而不是固定的人。
+	// 非空 ⇒ 走群聊通道(群消息用 markdown/text,企微的 taskcard 只支持成员消息)。
+	//
+	// AppID 是这个群所属的**自建应用** handle:
+	// 企微要求 chatid 必须由持有当前 Secret 的那个应用创建,
+	// 用别的应用的 token 发会被拒(301002 一族)⇒ 群与应用必须成对传。
+	ToChat string `json:"to_chat,omitempty"`
+	AppID  string `json:"app_id,omitempty"`
 }
 
 // WecomCommandResult 是 wecom.approval.command_result 的载荷(订阅侧)。

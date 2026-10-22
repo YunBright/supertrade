@@ -45,6 +45,10 @@
 //	SYNC_JOB_PREFIX         job 名前缀（默认 cube-async）
 //	SYNC_PAGE_SIZE          导出每页行数（默认 5000）
 //	SYNC_JOB_TOKEN          回调共享密钥（**必填**）
+//	SYNC_INCREMENTAL_SCOPES 走增量的资料域（默认空 = 全走全量）
+//	SYNC_WATERMARK_FILE     水位文件路径（空 = 不启用水位 = 全走全量）
+//	SYNC_WATERMARK_OVERLAP_SECONDS 水位回退秒数（默认 5）
+//	SYNC_WATERMARK_MAX_AGE_DAYS  距上次全量校准的天数（默认 7，超期强制全量）
 //	AUTH_SERVICE_CLIENT_ID / AUTH_SERVICE_CLIENT_SECRET  机器身份（**必填**）
 //	CATALOG_APP_ID / PRICING_APP_ID / INVENTORY_APP_ID / MEMBER_APP_ID  下游 app-id
 package main
@@ -139,6 +143,14 @@ func initApp() error {
 		"target_branch", appCfg.TargetBranchID,
 		"mode", appCfg.Mode,
 		"scopes", appCfg.Scopes,
+		// ⚠️ 增量三件套必须打进日志:
+		//   排障时第一个要确认的就是"这一轮到底走没走增量"
+		//   —— 而它在**导出响应与水位文件**里,服务日志里没有 ⇒
+		//   症状是"同步好像没变快",却查不出配置有没有生效。
+		"incremental_scopes", appCfg.IncrementalScopes,
+		"watermark_file", appCfg.WatermarkFile,
+		"watermark_overlap_seconds", appCfg.WatermarkOverlapSeconds,
+		"watermark_max_age_days", appCfg.WatermarkMaxAgeDays,
 		"cron_spec", appCfg.CronSpec,
 		"cron_utc", appCfg.Cron,
 		// ⚠️ 用 appH.JobName()(与回调路径同源),不用 appCfg.JobName() ——

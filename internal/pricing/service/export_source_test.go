@@ -58,7 +58,7 @@ func TestExportArchive_ConfiguredBranchReadsCube(t *testing.T) {
 	}
 	s.SetCubeSource(&fakeSource{src: externalSource()}, reader)
 
-	page, err := s.ExportArchive(context.Background(), "00", archivedto.ScopePrices, 0, 100, "2026-10-21")
+	page, err := s.ExportArchive(context.Background(), "00", archivedto.ScopePrices, 0, 100, "2026-10-21", "")
 	require.NoError(t, err)
 	assert.Equal(t, archivedto.ScopePrices, page.Scope)
 	assert.Equal(t, "00", page.BranchID)
@@ -96,7 +96,7 @@ func TestExportArchive_UnconfiguredBranchReadsLocal(t *testing.T) {
 		[]PriceInput{{ProductID: "P-LOCAL", PriceYuan: "15.00"}})
 	require.NoError(t, err)
 
-	page, err := s.ExportArchive(ctx, "10", archivedto.ScopePrices, 0, 100, "2026-10-21")
+	page, err := s.ExportArchive(ctx, "10", archivedto.ScopePrices, 0, 100, "2026-10-21", "")
 	require.NoError(t, err)
 	require.Len(t, page.Rows, 1)
 	assert.Equal(t, "P-LOCAL", page.Rows[0]["product_id"], "必须来自本地表")
@@ -109,7 +109,7 @@ func TestExportArchive_UnsupportedScope(t *testing.T) {
 	s, _, _ := newLocalService(t, &countingCube{})
 	s.SetCubeSource(&fakeSource{src: localSource()}, nil)
 
-	_, err := s.ExportArchive(context.Background(), "10", "products", 0, 100, "2026-10-21")
+	_, err := s.ExportArchive(context.Background(), "10", "products", 0, 100, "2026-10-21", "")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, model.ErrUnsupportedExportScope)
 }
@@ -126,7 +126,7 @@ func TestExportArchive_ResolveFailureDoesNotFallBack(t *testing.T) {
 		[]PriceInput{{ProductID: "P-0001", PriceYuan: "9.90"}})
 	require.NoError(t, err)
 
-	page, err := s.ExportArchive(ctx, "00", archivedto.ScopePrices, 0, 100, "2026-10-21")
+	page, err := s.ExportArchive(ctx, "00", archivedto.ScopePrices, 0, 100, "2026-10-21", "")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, model.ErrCubeSourceUnavailable)
 	assert.Nil(t, page, "失败时不该返回一页数据")
@@ -139,7 +139,7 @@ func TestExportArchive_DisabledSourceIsUnavailable(t *testing.T) {
 	disabled.Enabled = false
 	s.SetCubeSource(&fakeSource{src: disabled}, nil)
 
-	_, err := s.ExportArchive(context.Background(), "00", archivedto.ScopePrices, 0, 100, "2026-10-21")
+	_, err := s.ExportArchive(context.Background(), "00", archivedto.ScopePrices, 0, 100, "2026-10-21", "")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, model.ErrCubeSourceDisabled)
 }
@@ -153,7 +153,7 @@ func TestExportArchive_PromotionsUseTimeWindow(t *testing.T) {
 	reader := &fakeCubeReader{}
 	s.SetCubeSource(&fakeSource{src: externalSource()}, reader)
 
-	_, err := s.ExportArchive(context.Background(), "00", archivedto.ScopePromotions, 0, 100, "2026-10-21")
+	_, err := s.ExportArchive(context.Background(), "00", archivedto.ScopePromotions, 0, 100, "2026-10-21", "")
 	require.NoError(t, err)
 	require.Len(t, reader.queries, 1)
 	q := reader.queries[0]
@@ -188,7 +188,7 @@ func TestExportArchive_RowKeysFollowContract(t *testing.T) {
 			}
 			s.SetCubeSource(&fakeSource{src: externalSource()}, reader)
 
-			page, err := s.ExportArchive(context.Background(), "00", scope, 0, 100, "2026-10-21")
+			page, err := s.ExportArchive(context.Background(), "00", scope, 0, 100, "2026-10-21", "")
 			require.NoError(t, err)
 			require.Len(t, page.Rows, 1)
 

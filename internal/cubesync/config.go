@@ -60,6 +60,77 @@ type Config struct {
 	MemberAppID string
 	// Scopes 是本次同步的资料域(**按依赖顺序**)。
 	Scopes []string
+	// IncrementalScopes 是**支持增量**的资料域(只导"上次同步之后变过"的行)。
+	//
+	// ⚠️ **白名单,不是黑名单** —— 只有列在这里的 scope 才带 since 水位:
+	//
+	//	- 支持增量的 scope(cube 侧有"最后变动时间"维度)⇒ 带 since;
+	//	- 不支持的 ⇒ **绝不能带** ⇒ 带了就变成"只导一部分却推进了水位"
+	//	  ⇒ 下次漏数据,而且**全程不报错**。
+	//
+	// ⚠️ 实测(2026-10-22,源库 ysx/hbposv10):
+	//
+	//	scope        源表行数   一天变动   变动时间戳
+	//	stock        23837      91        t_im_branch_stock.oper_date ✅
+	//	products     27569      4         t_bd_item_info.modify_date ✅(但 cube 未暴露该维度)
+	//	prices       27569      4         同上
+	//	promotions   31371      -         ❌ 无 modify_date(但按生效期只剩 741 行)
+	//	members      4133       5         t_rm_vip_info.modify_date ✅(但 cube 未暴露该维度)
+	//
+	// ⇒ 目前**只有 stock** 能真增量(cube 的 stock model 暴露了 stock.updated_at)。
+	//   products/members 要增量得先给 cube 的 model 加"最后修改时间"维度。
+	//
+	// ⚠️ **默认空** —— 没配就全部走全量(旧行为)。
+	//   ⇒ 上线时"忘了配"的后果是"慢",不是"漏数据"。
+	IncrementalScopes []string
+	// WatermarkFile 是水位文件路径(相对工作目录)。
+	//
+	// ⚠️ 水位是**搬运方**的状态(它知道"我上次搬到哪里")⇒ 放编排器自己这儿,
+	//   编排器"不连任何数据库"的设计原则不受影响。
+	//   - 文件丢失/损坏 ⇒ 读不到水位 ⇒ **退化成全量**(安全方向);
+	//   - 多实例 ⇒ 各存各的 ⇒ 最多重复搬,不会漏(重复是幂等 upsert)。
+	//
+	// ⚠️ 空 ⇒ **不启用水位** ⇒ 所有 scope 都走全量(安全默认)。
+	WatermarkFile string
+	// WatermarkOverlapSeconds 是水位的**回退秒数**(防"同秒内多次更新"漏掉)。
+	//
+	// ⚠️ 实测源库的 oper_date 精确到秒 ⇒ 同一秒内的两次更新,
+	//   "gt 上次水位"会漏掉后一次 ⇒ 水位回退几秒 ⇒ 那一秒会被**重导一次**
+	//   (upsert 幂等 ⇒ 无害)。
+	//
+	// ⚠️ 0 是**合法值**(不要"回退")—— 允许零值的读取见 envIntAllowZero。
+	WatermarkOverlapSeconds int
+	// WatermarkMaxAgeDays 是"距上次**全量校准**"的最长天数:超了就强制全量。
+	//
+	// ⚠️ 这是"一次漏了永久漂移"的兜底:增量只保证"不漏",
+	//   但**任何一次故障漏掉的行都会一直缺**,除非定期全量校准一次。
+	//   0 = 不限(不建议)。
+	WatermarkMaxAgeDays int
+	// IncrementalLag 是**按 scope 覆盖**源数据滞后(秒)。
+	//
+	// ⚠️ 默认值来自 archivedto.ChangedMemberLag(当前全部为 0,
+	//   因为 cube 去 DuckDB 后所有 model 都是 live ⇒ 源数据实时)。
+	//   ⇒ 这个覆盖项是给"将来某个 scope 引入了缓存/物化"准备的:
+	//   那时只要在这里配一行,水位就会自动回退,不会漏数据。
+	//
+	// ⚠️ 配**小于**源的刷新间隔 ⇒ 漏数据,且零报错 ——
+	//   这是"宁可多导一万倍,也不能漏一行"的又一个实例。
+	IncrementalLag map[string]int
+	// ForceFull 是"本轮**无视水位**,强制全量"。
+	//
+	// ⚠️ 只给**人工触发**用(定时回调不接受这个开关):
+	//   它会改"今晚搬什么" ⇒ 必须是显式的一次性决定,不能藏在定时任务里。
+	//
+	// # 为什么需要它(而不是"删水位文件")
+	//
+	//	① 换门店 / 重建目标库 ⇒ 增量**导不出基础数据**
+	//	   (增量只导"变过的行",没变过的行永远不会出现)
+	//	   ⇒ 必须显式跑一次全量。
+	//	② 怀疑数据漂了 ⇒ 需要"立刻全量对齐",而不是等 7 天的定期校准。
+	//
+	// ⚠️ 强制全量**也会刷新"上次全量校准"时间** ⇒ 定期校准的计时从这一轮重新开始
+	//   (语义正确:确实刚做过全量)。
+	ForceFull bool
 	// JobPrefix 是 dapr job 名的前缀(SYNC_JOB_PREFIX)。
 	//
 	// ⚠️ **必须与其它编排器不同名**:dapr scheduler 的 job 按名字 upsert,
@@ -122,6 +193,18 @@ const (
 	DefaultCron      = "03:30"
 	DefaultPageSize  = 5000
 	DefaultAuthAppID = "userd"
+	// DefaultWatermarkOverlapSeconds 是水位的默认回退秒数。
+	//
+	// ⚠️ 5 秒:实测源库的 oper_date 精确到秒 ⇒ 同一秒内的两次更新,
+	//   "gt 上次水位"会漏掉后一次 ⇒ 回退几秒 ⇒ 那一秒会被重导一次
+	//   (upsert 幂等 ⇒ 无害)。
+	DefaultWatermarkOverlapSeconds = 5
+	// DefaultWatermarkMaxAgeDays 是"距上次全量校准"的默认天数。
+	//
+	// ⚠️ 7 天:增量只保证"不漏",但**任何一次**故障漏掉的行都会一直缺着
+	//   ⇒ 必须定期全量校准一次。7 天 = 一周一次全量(实测 7 秒,
+	//   且分批导入后不影响 POS 延迟)。
+	DefaultWatermarkMaxAgeDays = 7
 )
 
 // DefaultScopes 是默认同步的资料域。
@@ -209,16 +292,22 @@ func LoadConfig() Config {
 		InventoryAppID:       envStr("INVENTORY_APP_ID", DefaultInventoryApp),
 		MemberAppID:          envStr("MEMBER_APP_ID", DefaultMemberApp),
 		Scopes:               envList("SYNC_SCOPES", DefaultScopes),
-		JobPrefix:            envStr("SYNC_JOB_PREFIX", DefaultJobPrefix),
-		Mode:                 envStr("SYNC_MODE", DefaultMode),
-		CronSpec:             envStr("SYNC_CRON", DefaultCron),
-		PageSize:             envInt("SYNC_PAGE_SIZE", DefaultPageSize),
-		JobToken:             strings.TrimSpace(os.Getenv("SYNC_JOB_TOKEN")),
-		ServiceAccountID:     strings.TrimSpace(os.Getenv("AUTH_SERVICE_CLIENT_ID")),
-		ServiceAccountSecret: strings.TrimSpace(os.Getenv("AUTH_SERVICE_CLIENT_SECRET")),
-		AuthAppID:            envStr("AUTH_TOKEN_APP_ID", DefaultAuthAppID),
-		CallbackHost:         envStr("SYNC_CALLBACK_HOST", "127.0.0.1"),
-		CallbackPort:         strings.TrimPrefix(envStr("APP_PORT", ":8116"), ":"),
+		// ⚠️ **增量白名单默认空** —— 没配就全走全量(旧行为)。
+		//   ⇒ "忘了配"的后果是慢,不是漏数据。
+		IncrementalScopes:       envList("SYNC_INCREMENTAL_SCOPES", nil),
+		WatermarkFile:           envStr("SYNC_WATERMARK_FILE", ""),
+		WatermarkOverlapSeconds: envIntAllowZero("SYNC_WATERMARK_OVERLAP_SECONDS", DefaultWatermarkOverlapSeconds),
+		WatermarkMaxAgeDays:     envIntAllowZero("SYNC_WATERMARK_MAX_AGE_DAYS", DefaultWatermarkMaxAgeDays),
+		JobPrefix:               envStr("SYNC_JOB_PREFIX", DefaultJobPrefix),
+		Mode:                    envStr("SYNC_MODE", DefaultMode),
+		CronSpec:                envStr("SYNC_CRON", DefaultCron),
+		PageSize:                envInt("SYNC_PAGE_SIZE", DefaultPageSize),
+		JobToken:                strings.TrimSpace(os.Getenv("SYNC_JOB_TOKEN")),
+		ServiceAccountID:        strings.TrimSpace(os.Getenv("AUTH_SERVICE_CLIENT_ID")),
+		ServiceAccountSecret:    strings.TrimSpace(os.Getenv("AUTH_SERVICE_CLIENT_SECRET")),
+		AuthAppID:               envStr("AUTH_TOKEN_APP_ID", DefaultAuthAppID),
+		CallbackHost:            envStr("SYNC_CALLBACK_HOST", "127.0.0.1"),
+		CallbackPort:            strings.TrimPrefix(envStr("APP_PORT", ":8116"), ":"),
 	}
 	c.Cron = c.CronSpec
 	if norm, err := normalizeCron(c.CronSpec); err == nil {
@@ -252,6 +341,19 @@ func (c Config) Validate() error {
 	}
 	if c.JobToken == "" {
 		return fmt.Errorf("cubesync: 缺 SYNC_JOB_TOKEN(回调端点在免鉴权窗口,没有共享密钥就等于谁都能触发同步)")
+	}
+	// ⚠️ 增量白名单里的 scope **必须**在 cube 侧有"最后变动时间"成员。
+	//
+	//	否则:导出端会**忽略** since(仍全量导出)⇒ 而水位被推进了
+	//	⇒ 下次只导"最近变过的一部分"却当成全量 ⇒ **漏数据,且全程零报错**。
+	//
+	// ⇒ 这条校验把"配错一个 scope 名"从**永久漏数据**变成**启动失败**。
+	for _, sc := range c.IncrementalScopes {
+		if !archivedto.SupportsIncremental(sc) {
+			return fmt.Errorf("cubesync: SYNC_INCREMENTAL_SCOPES 里的 %q 不支持增量"+
+				"(导出端没有该 scope 的'最后变动时间'成员 ⇒ 带上 since 会被忽略而水位仍被推进 ⇒ 漏数据);"+
+				"当前可用的增量 scope:%v", sc, archivedto.IncrementalScopes())
+		}
 	}
 	return nil
 }
@@ -400,6 +502,24 @@ func envStr(key, def string) string {
 func envInt(key string, def int) int {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+// envIntAllowZero 取整数环境变量,**允许 0**(非法或负数时回落默认值)。
+//
+// ⚠️ 为什么不能复用 envInt:envInt 把 0 当"非法"⇒ 回落默认值。
+//
+//	而"回退 0 秒"与"最长有效期 0 天(不限)"都是**合法且有意义的**配置:
+//	  - 回退 0 秒 = 明确不要回退;
+//	  - 有效期 0 天 = 明确不做定期全量校准。
+//	⇒ 用 envInt 读它们,配置写 0 会被悄悄换成 5 / 7,
+//	  而症状只是"行为与配置不一致",没有任何报错。
+func envIntAllowZero(key string, def int) int {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			return n
 		}
 	}

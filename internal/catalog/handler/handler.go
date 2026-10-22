@@ -67,6 +67,7 @@ import (
 	"github.com/YunBright/supertrade/internal/catalog/model"
 	"github.com/YunBright/supertrade/internal/catalog/service"
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/cuberead"
 	"github.com/YunBright/supertrade/pkg/middleware"
 )
 
@@ -119,6 +120,17 @@ func (h *Handler) SetSourceResolver(r service.SourceResolver) {
 // SetLocalDB 装配本域 PG(没配数据源的门店走本地时用)。
 func (h *Handler) SetLocalDB(db *gorm.DB) {
 	h.catalog.SetLocalDB(db)
+}
+
+// SetCubeReader 装配**通用** cube 读端(model + 维度 + 过滤 + 分页)。
+//
+// ⚠️ 商品档案(product-archive)需要按维度分组查 product / branch_price /
+// supplier_item,那些方法不在 cubeclient.Client 窄接口上。
+//
+// ⚠️ 生产传**同一个** *cubeclient.DaprCubeClient —— 不要建第二个 client
+// (两个 client = 两套超时 / 鉴权 / 路由参数)。
+func (h *Handler) SetCubeReader(r cuberead.Reader) {
+	h.catalog.SetCubeReader(r)
 }
 
 // SetArchiveExporter 装配上游导出端点客户端(cube-router 的 GET /v1/export)。
@@ -281,6 +293,24 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 		rbac.RequireScopeWithBranch("product:manage", branchFromHeader, resolver),
 		h.requireLocalSource,
 		h.deleteCategory)
+
+	// 商品档案(图1):列表 + 供货信息。
+	//
+	// ⚠️ 与 picker 的 `/products` **不是同一件事**:picker 只要一个价,
+	//   档案要品牌 + 四个价 + 供货约定 ⇒ 响应字段不同,另开一组端点。
+	//
+	// ⚠️ 分流判据与 picker **完全相同**(internal/cubesource):
+	//   配了源 ⇒ cube;没配 ⇒ 本域 PG;问不到 / 被停用 ⇒ 503(不回落本地)。
+	//
+	// ⚠️ `GET /product-archive/:id/supplier-prices` 与
+	//   `GET /product-archive` **必须并存**:gin 的路由树里静态段优先于
+	//   参数段(与注册顺序无关),但这条依赖 gin 版本 —— 实测过才敢这么写。
+	r.GET("/product-archive",
+		rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver),
+		h.listProductArchive)
+	r.GET("/product-archive/:id/supplier-prices",
+		rbac.RequireScopeWithBranch("product:view", branchFromHeader, resolver),
+		h.getProductSupplierPrices)
 
 	// 商品选择控件(ProductPicker)的 4 条端点。
 	//

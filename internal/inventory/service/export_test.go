@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -212,4 +213,63 @@ func TestExternalSourceShape(t *testing.T) {
 	assert.True(t, src.Configured)
 	assert.True(t, src.Enabled)
 	assert.Equal(t, "cube-sixun-ysx-fb", src.CubeSourceName)
+}
+
+// TestExportStock_LocalBranchHonorsSince 锁"本地路径也认 since"。
+//
+// ⚠️ **两条路径口径必须一致**(2026-10-22 增量改造):
+//
+//	有源门店 ⇒ 转发 cube-router ⇒ cube 查询加 `stock.updated_at gt <since>`
+//	无源门店 ⇒ 从本域 stock_levels 读
+//
+// ⇒ 若本地路径**忽略** since,同一个端点在两种门店下语义不同
+// ⇒ 症状:增量同步对无源门店"看起来没生效"(每轮都是全量),
+//   而响应里**没有任何字段**能看出差别 ⇒ 零报错。
+func TestExportStock_LocalBranchHonorsSince(t *testing.T) {
+	db := newTestDB(t)
+	svc := service.NewStockService(db)
+	seedLevels(t, svc, "10", "P001", "P002", "P003")
+	svc.SetCubeSource(&fakeSource{src: localSource()}, &fakeCubeReader{})
+
+	// 把 P001 的 updated_at 拨到"很早" ⇒ 它不该出现在 since 之后的导出里。
+	early := time.Date(2020, 1, 1, 0, 0, 0, 0, time.Local)
+	require.NoError(t, db.Model(&model.StockLevel{}).
+		Where("branch_id = ? AND product_id = ?", "10", "P001").
+		Update("updated_at", early).Error)
+
+	raw, err := svc.ExportStock(context.Background(), service.ExportInput{
+		BranchID: "10", Scope: archivedto.ScopeStock, Offset: 0, Limit: 5000,
+		Since: "2026-10-22 12:00:00",
+	})
+	require.NoError(t, err)
+
+	var page struct {
+		Rows  []map[string]any `json:"rows"`
+		Count int              `json:"count"`
+		Total int              `json:"total"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &page))
+	assert.Equal(t, 2, page.Count, "只有 updated_at 晚于 since 的两行该被导出")
+	assert.Equal(t, 2, page.Total, "total 也必须按同一个过滤条件算(否则分页会错)")
+	for _, r := range page.Rows {
+		assert.NotEqual(t, "P001", r["product_id"], "updated_at 早于 since 的行不该被导出")
+	}
+
+	// 不带 since ⇒ 全量(旧行为不变)。
+	raw2, err := svc.ExportStock(context.Background(), service.ExportInput{
+		BranchID: "10", Scope: archivedto.ScopeStock, Offset: 0, Limit: 5000,
+	})
+	require.NoError(t, err)
+	var page2 struct {
+		Count int `json:"count"`
+	}
+	require.NoError(t, json.Unmarshal(raw2, &page2))
+	assert.Equal(t, 3, page2.Count, "不带 since 必须是全量")
+
+	// 非法 since ⇒ 报错(不静默回落成"全量")。
+	_, err = svc.ExportStock(context.Background(), service.ExportInput{
+		BranchID: "10", Scope: archivedto.ScopeStock, Offset: 0, Limit: 5000,
+		Since: "not-a-time",
+	})
+	require.Error(t, err, "非法 since 必须报错,不能静默变成全量")
 }

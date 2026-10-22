@@ -81,6 +81,20 @@ type refundReq struct {
 	AuthorizedBy string `json:"authorized_by"`
 	// Reason 是退货原因(可空)。
 	Reason string `json:"reason"`
+	// Lines 是**要退的行子集**(2026-10-22 新增)。
+	//
+	// ⚠️ **空 ⇒ 整单退**(旧行为);非空 ⇒ 行级部分退货。
+	//
+	// ⚠️ 数量一律**字符串**(与开单同款)—— JSON number 到 Dart 侧会变 double。
+	Lines []refundLineReq `json:"lines"`
+}
+
+// refundLineReq 是"要退哪一行、退多少"。
+type refundLineReq struct {
+	// LineID 是明细行 id(= <sale_id>-L<n>)。
+	LineID string `json:"line_id"`
+	// Qty 是退多少(可空 ⇒ 该行全部未退数量)。
+	Qty string `json:"qty"`
 }
 
 // priceOverrideReq 是改价的请求体。
@@ -333,6 +347,25 @@ func (h *Handler) refundSale(c *gin.Context) {
 			return
 		}
 	}
+	// 行级部分退货(2026-10-22):把 lines 解析成 service 入参。
+	refundLines := make([]service.RefundLineInput, 0, len(req.Lines))
+	for i, l := range req.Lines {
+		li := service.RefundLineInput{LineID: strings.TrimSpace(l.LineID)}
+		if li.LineID == "" {
+			writeError(c, http.StatusBadRequest, "bad_request",
+				"lines["+strconv.Itoa(i)+"].line_id 不能为空")
+			return
+		}
+		if strings.TrimSpace(l.Qty) != "" {
+			qty, err := parseAmount("lines["+strconv.Itoa(i)+"].qty", l.Qty)
+			if err != nil {
+				writeError(c, http.StatusBadRequest, "bad_request", err.Error())
+				return
+			}
+			li.Qty = qty
+		}
+		refundLines = append(refundLines, li)
+	}
 	order, replayed, err := h.sales.Refund(c.Request.Context(), service.RefundInput{
 		OpID:         strings.TrimSpace(req.OpID),
 		SaleID:       id,
@@ -340,6 +373,7 @@ func (h *Handler) refundSale(c *gin.Context) {
 		OperatorID:   strings.TrimSpace(req.OperatorID),
 		AuthorizedBy: strings.TrimSpace(req.AuthorizedBy),
 		Reason:       req.Reason,
+		Lines:        refundLines,
 		CreatedBy:    callerSub(c),
 	})
 	if err != nil {

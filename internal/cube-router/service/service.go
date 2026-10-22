@@ -139,13 +139,16 @@ func (s *Service) Invalidate(branchID string) {
 //
 // branch_id 已存在 → 返 model.ErrAlreadyExists。
 //
-// Enabled 默认 true(caller 不显式置 true 时 service 兜底,避免 GORM 把零值
-// 误读成"未设"而插入 false)。
+// ⚠️ **Enabled 一律按 true 建**(2026-10-23 记):`model.BranchCubeSource.Enabled` 是
+// 普通 bool,**分不出"没传"与"显式 false"** ⇒ service 层没法既"默认 true"又
+// "尊重调用方的 false"。
+// ⇒ 「显式停用」由 **handler 层**在 Create 之后补一次 Update 实现
+// (见 handler.go 的 createBranchSource 注释)—— 两次写只发生在 admin 操作上。
 func (s *Service) Create(ctx context.Context, in model.BranchCubeSource) (*model.BranchCubeSource, error) {
 	if in.BranchID == "" || in.CubeSourceName == "" || in.CreatedBy == "" {
 		return nil, errors.New("cube_router: BranchID / CubeSourceName / CreatedBy 必填")
 	}
-	in.Enabled = true // 默认启用;要禁用请在 Create 后调 Update
+	in.Enabled = true // 默认启用;显式停用请在 Create 后调 Update(见上方注释)
 	in.CreatedAt = s.now()
 	in.UpdatedAt = s.now()
 	if err := s.db.WithContext(ctx).Create(&in).Error; err != nil {

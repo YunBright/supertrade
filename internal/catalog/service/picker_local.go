@@ -20,7 +20,9 @@
 // # 本地侧与 cube 侧的口径对齐(逐条)
 //
 //	过滤      category_id → **子树**(与 cube 的 categorySubtree 同口径);
-//	          supplier_id → 精确;关键字 → id / sub_code / name(大小写无关)。
+//	          supplier_id → 精确;关键字 → id / sub_code / name / 条形码(大小写无关)。
+//	          ⚠️ 条形码比 cube 多一种(cube 的 product model 没有 barcode 维度)——
+//	            见 localProductPage 的注释。
 //	分页      page / page_size ⇒ OFFSET / LIMIT。
 //	计数      total = 过滤后的总行数(不是本页条数)。
 //	排序      **id 升序**(cube 路径也是 product.id asc)⇒ 两条路径翻页顺序一致。
@@ -66,15 +68,41 @@ func (s *CatalogService) localProductPage(ctx context.Context, branchID string, 
 
 	tx := s.db.WithContext(ctx).Model(&model.Product{}).Where("branch_id = ?", branchID)
 
-	// 关键字:命中货号 / 自编码 / 名称(与 cube 的三个 containsCI 查询同口径)。
+	// 关键字:命中**货号 / 自编码 / 名称 / 条形码**四种(思迅的商品标识体系)。
 	//
 	// ⚠️ 用 LOWER(...) LIKE 而不是 ILIKE:PG 的 LIKE 大小写敏感,
 	// 而 SQLite 没有 ILIKE ⇒ LOWER() 两边都能跑,行为一致。
+	//
+	// # ⚠️ **条形码在另一张表上**(`product_barcodes`,一品多码)
+	//
+	//	`products.barcode` 是"主条码"**冗余列**,生产实测**大面积为空**
+	//	(门店 10:27568 行全空)—— 领域事实是"思迅 item_no 就是条码"
+	//	(见 localProductItems:`Barcode = r.ID`)。
+	//	真正的商品条码在 `t_bd_item_barcode` ⇒ 同步后落在 `product_barcodes`。
+	//
+	//	⇒ 只在 `products` 表上做 LIKE 是**扫不到条形码**的:
+	//	  2026-10-22 生产实测,商品 `02000089` 的条形码 `6970367140630`
+	//	  在 `products/search` 里 count=0 ⇒ **POS 上扫这个码搜不出来**。
+	//
+	//	⇒ 必须用子查询反查 `product_barcodes`。
+	//
+	// # ⚠️ 四种标识的**唯一性**不同 ⇒ 命中数可能 > 1
+	//
+	//	自编码(思迅不唯一:9 组"正常品+换购品"共用)、条形码(一品多码:1 商品 1~7 条)
+	//	⇒ 端点必须返回**候选列表**(它已经是 candidates[] 了)⇒ 收银员要能选。
+	//
+	// # ⚠️ cube 路径(配了数据源的门店)目前**只有三种**
+	//
+	//	cube 的 product model 没有 barcode 维度 ⇒ 门店 00 走 cube 时扫不出条形码。
+	//	⇒ POS 实际跑在门店 10(本地路径)⇒ 不影响收银;
+	//	  要与 cube 对齐得改 cube 仓的 product model(加 barcode 维度 + join)。
 	if q.Keyword != "" {
 		like := "%" + strings.ToLower(q.Keyword) + "%"
 		tx = tx.Where(
-			"LOWER(id) LIKE ? OR LOWER(sub_code) LIKE ? OR LOWER(name) LIKE ?",
-			like, like, like)
+			"(LOWER(id) LIKE ? OR LOWER(sub_code) LIKE ? OR LOWER(name) LIKE ? OR "+
+				"id IN (SELECT product_id FROM product_barcodes "+
+				"WHERE branch_id = ? AND deleted_at IS NULL AND LOWER(barcode) LIKE ?))",
+			like, like, like, branchID, like)
 	}
 	if q.CategoryID != "" {
 		ids, err := s.localCategorySubtree(ctx, branchID, q.CategoryID)

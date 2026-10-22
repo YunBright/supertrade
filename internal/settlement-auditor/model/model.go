@@ -87,10 +87,25 @@ func (ApprovalInstance) TableName() string { return "approval_instances" }
 
 // ApprovalSettlement 审批 ↔ 结算单多对多(含 cube 侧货款金额快照)。
 type ApprovalSettlement struct {
-	ID              string          `gorm:"primaryKey;size:36" json:"id"`
-	ApprovalID      string          `gorm:"size:32;index" json:"approval_id"`
-	SettlementID    string          `gorm:"size:64;index" json:"settlement_id"`
-	SupplierID      string          `gorm:"size:64" json:"supplier_id"`
+	ID           string `gorm:"primaryKey;size:36" json:"id"`
+	ApprovalID   string `gorm:"size:32;index" json:"approval_id"`
+	SettlementID string `gorm:"size:64;index" json:"settlement_id"`
+	SupplierID   string `gorm:"size:64" json:"supplier_id"`
+	// SupplierName 是**读时补上**的供应商名称(不落库,gorm:"-" 不参与读写)。
+	//
+	// # 为什么不给它加列
+	//
+	// 审批快照表的语义是"这笔审批勾了哪些单、货款多少"。供应商名称是
+	// **字典里的当前值**,不是审批当时的值:
+	//   - 历史行要回填也只能拿**当前**字典名回填 ⇒ 并不比读时 join 更"准",
+	//     一样不是历史快照;
+	//   - 而加列意味着:生产表迁移 + 历史回填 + 把审核流水线
+	//     (最敏感的那条路,runAudit)也拖进来取名字。
+	// ⇒ 详情端点读出来时用 Go 侧 join 补(cube JOIN 不了 live↔duck,
+	//   见 service/cube.go 的 fillSupplierNames)。
+	//
+	// ⚠️ 读时 join 拿不到(cube 不可用)时该字段为空串,详情页其余内容照常。
+	SupplierName    string          `gorm:"-" json:"supplier_name"`
 	DocumentType    string          `gorm:"size:8" json:"document_type"` // DP/CP
 	GoodsAmountYuan decimal.Decimal `gorm:"type:numeric(14,2)" json:"goods_amount_yuan"`
 	// Checked 表示机器审核时该结算单在 cube 中存在且已审核。
@@ -170,6 +185,37 @@ type ApprovalApproverPreference struct {
 }
 
 func (ApprovalApproverPreference) TableName() string { return "approval_approver_preferences" }
+
+// ---- 门店级「盘点计划推送群」配置 ----
+
+// StocktakeNotifyGroup 是某个门店的"结算审核发现库存异常 → 盘点计划推送到哪个群"的配置。
+//
+// # 为什么存 app_id + chat_id 两个字段
+//
+// 企业微信的群(appchat)有一个硬约束:**chatid 必须由持有当前 Secret 的那个自建应用创建**,
+// 用别的应用的 access_token 发这个群会被拒(301002 一族)。
+// ⇒ 只存 chat_id 是不够的,必须连"这个群属于哪个自建应用"一起存。
+//
+// # 谁来填
+//
+// Flutter 管理后台 →「仓库-设置」→ 选定门店 → 点「设置盘点计划推送群」
+// → 层级选择控件(自建应用 → 群聊)→ 保存。
+type StocktakeNotifyGroup struct {
+	// BranchID 是门店 id(主键:一店一条)。
+	BranchID string `gorm:"primaryKey;column:branch_id;type:varchar(64)"`
+	// ChatID 是企业微信群 id(appchat 的 chatid)。
+	ChatID string `gorm:"column:chat_id;type:varchar(64)"`
+	// ChatName 是群名(只用于回显,发消息不用)。
+	ChatName string `gorm:"column:chat_name;type:varchar(128)"`
+	// AppID 是这个群所属的**自建应用** handle(不是 agentid)。
+	AppID string `gorm:"column:app_id;type:varchar(64)"`
+	// AppName 是自建应用名称(只用于回显)。
+	AppName    string    `gorm:"column:app_name;type:varchar(128)"`
+	UpdatedBy  string    `gorm:"column:updated_by;type:varchar(64)"`
+	UpdatedAt  time.Time `gorm:"column:updated_at"`
+}
+
+func (StocktakeNotifyGroup) TableName() string { return "stocktake_notify_groups" }
 
 // ---- 结算付款状态台账(初始化记账 / 已付款过滤的共同事实源) ----
 

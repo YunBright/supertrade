@@ -307,6 +307,43 @@ func (c *DaprCubeClient) SearchProducts(ctx context.Context, q ProductQuery) (*P
 	}
 	hits = append(hits, hit{rows: productRows(rows), total: total})
 
+	// (4) 条形码命中(思迅 t_bd_item_barcode,一品多码)
+	//
+	// # 为什么第 4 种是**单独一趟**而不是并进上面三次
+	//
+	//	cube **没有 OR 算子** ⇒ 四种命中只能拆开查再在 Go 里合并。
+	//	而条形码在**另一张模型**上(`item_barcode`,live)⇒ 一次 cube 查询
+	//	只能命中一张模型 ⇒ 只能单独查。
+	//
+	// # 为什么条形码这一趟**大多数时候不发查询**
+	//
+	//	条形码表只有 **155 行**(111 个商品)⇒ 整表缓存 60 秒,
+	//	Go 侧做子串匹配(口径与 cube 的 containsCI 一致)。
+	//	⇒ 关键词不是条形码时 **product_ids 为空 ⇒ 一趟 cube 查询都不发**。
+	//	⇒ 门店 00 的搜索延迟(实测 ~880ms)基本不变。
+	//
+	//	真命中时才多发一趟 `product.id in (...)`。
+	//
+	// # ⚠️ 与本地路径(本域 PG)的口径必须一致
+	//
+	//	本地路径用子查询反查 `product_barcodes`;这里查 cube 的 `item_barcode`。
+	//	⇒ **同一个关键词,两条路径必须给出同一批候选** ——
+	//	  否则"门店 10 扫得出、门店 00 扫不出"⇒ 契约就废了。
+	barcodeIDs := barcodeProductIDs(c.itemBarcodeSnapshot(ctx), kw)
+	if len(barcodeIDs) > 0 {
+		cq = productPageQuery(q)
+		cq.Limit = fetch
+		cq.Offset = 0
+		cq.Filters = append(cq.Filters, CubeFilter{
+			Member: "product.id", Operator: OperatorIn, Values: toAnySlice(barcodeIDs),
+		})
+		rows, total, err = c.LoadCubeQueryPage(ctx, "product", cq)
+		if err != nil {
+			return nil, err
+		}
+		hits = append(hits, hit{rows: productRows(rows), total: total})
+	}
+
 	// 按 id 去重合并(同一个商品可能同时命中编码、自编码与名称)。
 	seen := make(map[string]bool)
 	merged := make([]ProductDTO, 0, len(hits)*fetch)

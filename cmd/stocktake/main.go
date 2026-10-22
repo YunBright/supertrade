@@ -189,7 +189,13 @@ func registerDaprRoutes(r *gin.Engine) {
 	h.RegisterSubscribeRoutes(r, slog.Default())
 	// S2S 内部端点(settlement-auditor 建计划盘点单):同样不能走 JWT,
 	// 靠 dapr 内网 + nginx 不暴露 /internal/* 保护。
-	h.RegisterInternalRoutes(r, appDB)
+	//
+	// ⚠️ **必须显式传 forwardBearerToOutgoing()**:
+	// 本路由注册在 RegisterDapr 窗口,早于上面的 `r.Use(forwardBearerToOutgoing())`,
+	// 而 Gin 的 r.Use 只对**之后**注册的路由生效 ⇒ 全局中间件不在本路由的链上。
+	// 少了它:AddPlanItems 从 cube 现拉商品名时没有凭证 ⇒ cube 返 Unauthenticated
+	// ⇒ 本端点 500 ⇒ 结算审批的"建议盘点"永远建不出盘点单(2026-10-22 生产实踩)。
+	h.RegisterInternalRoutes(r, appDB, forwardBearerToOutgoing())
 }
 
 // forwardBearerToOutgoing 把 gin request 的 Authorization header 注入 ctx。

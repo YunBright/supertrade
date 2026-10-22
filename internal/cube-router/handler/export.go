@@ -106,6 +106,27 @@ type exportScope struct {
 	// ⚠️ 其它 scope(商品 / 分类 / 供应商 / 条码 / 售价)**不带**时间过滤 ——
 	//   误加会让它们永远导不出行(而且不报错)。
 	Window *exportWindow
+	// ChangedMember 是该 scope 的"**最后变动时间**"成员(全限定名)。
+	//
+	// ⚠️ **它与 Window 是两回事**:
+	//   - Window  = "在基准日**有效**"(促销的生效期)⇒ 用 inDateRange;
+	//   - ChangedMember = "在基准日**变过**"(库存的最后变动时间)⇒ 用 gt。
+	//
+	// # 为什么库存需要它(2026-10-22 生产实测)
+	//
+	//	源库 `t_im_branch_stock` 23837 行,而**一天只变 91 行**
+	//	(最近 2 小时 54 行)⇒ 全量导出 + 全量 upsert 是**两个数量级的浪费**,
+	//	而且会把本地 PG 压出长事务 ⇒ 拖慢同库的 POS 开单(实测:同步时收银上传延迟)。
+	//
+	//	⇒ 带 since 导出时,cube 查询加 `stock.updated_at gt <since>`
+	//	   ⇒ 只导"变过的那些行"(实测与源库直查**行数完全一致**)。
+	//
+	// ⚠️ 源列是 `t_im_branch_stock.oper_date`(= cube 的 stock.updated_at),
+	//   覆盖**全部**库存变动来源(销售/退货/采购入库/盘点/调拨/损耗)
+	//   —— 比"从收银流水反推商品"更准(后者会漏采购与盘点)。
+	//
+	// ⚠️ `oper_date IS NULL` 的 4191 行**库存全是 0** ⇒ 增量跳过它们无害。
+	ChangedMember string
 }
 
 // exportWindow 描述一个 scope 的时效窗口列(全限定名)。
@@ -152,6 +173,19 @@ var exportScopes = map[string]exportScope{
 			"product.sub_code", "product.spec",
 		},
 		RowKey: "product.id",
+		// ⚠️ **变动成员**:支持"只导 since 之后变过的行"(增量)。
+		//
+		//	cube 侧 product model 的 updated_at = COALESCE(modify_date, created_at)
+		//	(新建商品 80% 的 modify_date 是 NULL ⇒ 用建档时间兜底,
+		//	 否则新商品永远导不出去 ⇒ POS 上搜不到新上的货)。
+		//
+		//	⚠️ 该成员的 gt 比较是 **ISO 文本比较**(不是 CAST AS DATE):
+		//	   CAST 成 DATE 会抹掉时分秒 ⇒ 当天的变动被漏掉。
+		//	   详见 cube 仓 pkg/cubequery/product_updated_at_test.go。
+		//
+		//	⚠️ **部署顺序**:cube 那边必须先做过一次全量刷新
+		//	   (DuckDB 表结构变了才有 modify_date 列)⇒ 否则这里会 column not found。
+		ChangedMember: archivedto.ChangedMembers[archivedto.ScopeProducts],
 		Fields: map[string]string{
 			"product.id":              "id",
 			"product.name":            "name",
@@ -227,6 +261,11 @@ var exportScopes = map[string]exportScope{
 		Measures:   []string{"product.avg_price_yuan", "product.total_cost_yuan"},
 		Dimensions: []string{"product.id"},
 		RowKey:     "product.id",
+		// ⚠️ **变动成员**:与 products 用**同一个** product model
+		//   ⇒ 同一个"最后变动时间"成员。
+		//   ⚠️ 价与商品在**源库的同一行**里(思迅 t_bd_item_info.sale_price)
+		//   ⇒ 改了价就等于改了那一行 ⇒ 商品的变动时间就是价的变动时间 ✅。
+		ChangedMember: archivedto.ChangedMembers[archivedto.ScopePrices],
 		Fields: map[string]string{
 			"product.id":              "product_id",
 			"product.avg_price_yuan":  "price_yuan",
@@ -295,6 +334,18 @@ var exportScopes = map[string]exportScope{
 		// ⚠️ 分页要**全序**:唯一的维度就是排序键 ⇒ 天然全序,
 		//   且它同时在 SELECT 里(cube 的硬要求)。
 		RowKey: "stock.product_id",
+		// ⚠️ **变动成员**:支持"只导 since 之后变过的行"(增量)。
+		//   源列 `t_im_branch_stock.oper_date`(= cube 的 stock.updated_at)。
+		//   实测:23837 行里**一天只变 91 行** ⇒ 增量省掉 99.6% 的导出与写入。
+		//
+		//   ⚠️ 它覆盖**全部**库存变动来源(销售/退货/采购入库/盘点/调拨/损耗)
+		//   —— 比"从收银流水反推商品"更准(后者会漏采购与盘点)。
+		//
+		// ⚠️ **从 archivedto.ChangedMembers 取**(不写死字面量):
+		//   它是"哪些 scope 能做增量"的唯一真相源(导出端 + 编排端共用)
+		//   ⇒ 两边各写一份时,改了一边不会编译报错
+		//   ⇒ 症状是"编排端推进了水位,而导出端没加过滤" ⇒ 漏数据且零报错。
+		ChangedMember: archivedto.ChangedMembers[archivedto.ScopeStock],
 		Fields: map[string]string{
 			"stock.product_id":     "product_id",
 			"stock.total_quantity": "qty",
@@ -479,13 +530,29 @@ func (h *Handler) handleExport(c *gin.Context) {
 		offset = 0
 	}
 
+	// ⚠️ **since = 增量导出的水位**("只导这个时间点之后变过的东西")。
+	//
+	//	空 ⇒ 全量(默认行为,不变)。
+	//	非空 ⇒ cube 查询加 `stock.updated_at gt <since>` ⇒ 只导变过的行。
+	//
+	//	⚠️ 格式必须**先校验再传给 cube** —— 非法值不能静默回落成"全量"
+	//	(那会让调用方以为导了增量,其实导了全量,而且没有一行报错)。
+	since, err := archivedto.NormalizeSince(c.Query("since"))
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"code":    "bad_since",
+			"message": err.Error(),
+		})
+		return
+	}
+
 	cubeSourceName, _, err := h.svc.ResolveCubeSource(c.Request.Context(), branchID)
 	if err != nil {
 		h.mapErr(c, err)
 		return
 	}
 
-	rows, total, err := h.exportFromCube(c.Request.Context(), cubeSourceName, branchID, sc, asOf, limit, offset)
+	rows, total, err := h.exportFromCube(c.Request.Context(), cubeSourceName, branchID, sc, asOf, since, limit, offset)
 	if err != nil {
 		h.mapErr(c, err)
 		return
@@ -497,12 +564,21 @@ func (h *Handler) handleExport(c *gin.Context) {
 		"cube_source": cubeSourceName,
 		// as_of 回给调用方:让"导了哪一天的数据"从响应里就能看出来。
 		"as_of":  asOf,
+		// ⚠️ since 也要回显:增量导出时,调用方要能确认"我这次要的是哪个水位之后的数据"。
+		"since": since,
 		"rows":   rows,
 		"count":  len(rows),
 		"total":  total,
 		"offset": offset,
 		"limit":  limit,
 	})
+}
+
+// NormalizeSince 校验并规整增量导出的水位参数。
+//
+// ⚠️ **实现放在 internal/archivedto**(三跳共用同一份):见那里的说明。
+func NormalizeSince(raw string) (string, error) {
+	return archivedto.NormalizeSince(raw)
 }
 
 // exportScopeFilters 造该 scope 的 cube 过滤条件。
@@ -515,33 +591,46 @@ func (h *Handler) handleExport(c *gin.Context) {
 // ⚠️ 返回**非 nil** 切片:exportQuery.Filters 没有 omitempty,
 //
 //	返 nil 会让 cube 收到 "filters": null。
-func exportScopeFilters(sc exportScope, asOf string) []exportFilter {
+func exportScopeFilters(sc exportScope, asOf string, since string) []exportFilter {
 	out := []exportFilter{}
-	if sc.Window == nil {
-		return out
+	if sc.Window != nil {
+		out = append(out,
+			exportFilter{
+				Member:   sc.Window.BeginMember,
+				Operator: "inDateRange",
+				Values:   []any{exportWindowLower, asOf},
+			},
+			exportFilter{
+				Member:   sc.Window.EndMember,
+				Operator: "inDateRange",
+				Values:   []any{asOf, exportWindowUpper},
+			},
+		)
 	}
-	return append(out,
-		exportFilter{
-			Member:   sc.Window.BeginMember,
-			Operator: "inDateRange",
-			Values:   []any{exportWindowLower, asOf},
-		},
-		exportFilter{
-			Member:   sc.Window.EndMember,
-			Operator: "inDateRange",
-			Values:   []any{asOf, exportWindowUpper},
-		},
-	)
+	// ⚠️ **变动过滤与时效过滤是两回事**:
+	//   时效(Window)= "在基准日**有效**" ⇒ inDateRange;
+	//   变动(ChangedMember)= "在基准日**变过**" ⇒ gt。
+	//
+	// ⚠️ 只有**该 scope 自己声明了** ChangedMember 才加 ⇒
+	//   给没声明的 scope 乱加时间过滤 ⇒ **永远导不出行**(而且不报错)。
+	if sc.ChangedMember != "" && since != "" {
+		out = append(out, exportFilter{
+			Member:   sc.ChangedMember,
+			Operator: "gt",
+			Values:   []any{since},
+		})
+	}
+	return out
 }
 
 // exportFromCube 调目标 cube 实例取一页,再把 cube 行整形成导出契约。
 func (h *Handler) exportFromCube(ctx context.Context, cubeSourceName, branchID string,
-	sc exportScope, asOf string, limit, offset int) ([]map[string]any, int, error) {
+	sc exportScope, asOf string, since string, limit, offset int) ([]map[string]any, int, error) {
 
 	body, err := json.Marshal(exportQuery{
 		Measures:   sc.Measures,
 		Dimensions: sc.Dimensions,
-		Filters:    exportScopeFilters(sc, asOf),
+		Filters:    exportScopeFilters(sc, asOf, since),
 		Limit:      limit,
 		Offset:     offset,
 		// ⚠️ order 必须给:cube 的 offset>0 强制要求 order,

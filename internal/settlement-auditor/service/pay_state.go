@@ -234,6 +234,15 @@ func (s *Service) ResolveSettlementSet(ctx context.Context, branchID string, f S
 	if err != nil {
 		return nil, err
 	}
+	// 补供应商名(cube 侧 JOIN 不了 live↔duck,只能在 Go 侧补)。
+	//
+	// ⚠️ 必须在**过滤之前**补:关键字要能按供应商**名称**命中
+	// (店长/财务记得的是"泰鼎粮油"这种简称,不是 "001" 这个编号),
+	// 而名称只有 join 过字典才有。补晚了 ⇒ 名称那一路恒不命中,
+	// 表现为"搜索框输了名字,服务端命中 0 张"。
+	//
+	// 补上之后,返回给客户端的样本行也带着名字(前端要显示 "<id>-<name>")。
+	s.fillSupplierNames(ctx, branchID, rows)
 	out := make([]SettlementRow, 0, len(rows))
 	// pick 是筛选判据,**全程只读**;seen 单独用于去重计数。
 	//
@@ -280,13 +289,23 @@ func (s *Service) ResolveSettlementSet(ctx context.Context, branchID string, f S
 	}, nil
 }
 
-// settlementRowMatches 判断结算单是否命中关键字(单号或供应商 id,忽略大小写)。
+// settlementRowMatches 判断结算单是否命中关键字(单号 / 供应商 id / **供应商名称**,忽略大小写)。
+//
+// ⚠️ 供应商名称这一路依赖 rows[i].SupplierName **已经被填过**:
+//
+//	字典是另一个 cube model(supplier,duck),settlement 是 live,
+//	cube 侧 JOIN 不了 ⇒ 名称只能由调用方用 Go 侧 join 补上(见 fillSupplierNames)。
+//	名称没填上时这一路恒不命中 —— 也就是退回到"只能按编号搜",
+//	而不是给出错误的答案。
 func settlementRowMatches(r SettlementRow, query string) bool {
 	q := strings.ToLower(query)
 	if strings.Contains(strings.ToLower(strings.TrimSpace(r.ID)), q) {
 		return true
 	}
-	return strings.Contains(strings.ToLower(strings.TrimSpace(r.SupplierID)), q)
+	if strings.Contains(strings.ToLower(strings.TrimSpace(r.SupplierID)), q) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(strings.TrimSpace(r.SupplierName)), q)
 }
 
 // payStatesOf 读候选 id 在台账里的现状(台账里没有的单不返回)。

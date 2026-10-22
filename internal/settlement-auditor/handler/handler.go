@@ -28,6 +28,7 @@ import (
 	"html/template"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/YunBright/authkit/claims"
@@ -77,6 +78,92 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.POST("/settlement-init/preview", requireBranch, h.PreviewInit)
 	r.POST("/settlement-init/apply", requireBranch, h.ApplyInit)
 	r.POST("/settlement-init/revert", requireBranch, h.RevertInit)
+
+	// ---- 门店级「盘点计划推送群」配置 ----
+	//
+	// 运维在 Flutter 管理后台「仓库-设置」里选定门店后配置:
+	// GET 读当前配置(未配置返 404,前端翻成空态),
+	// PUT upsert,DELETE 清掉(回到"不推送到群")。
+	r.GET("/stocktake-notify-group", requireBranch, h.GetStocktakeNotifyGroup)
+	r.PUT("/stocktake-notify-group", requireBranch, h.SetStocktakeNotifyGroup)
+	r.DELETE("/stocktake-notify-group", requireBranch, h.DeleteStocktakeNotifyGroup)
+}
+
+// stocktakeNotifyGroupResp 是推送群配置的响应体。
+type stocktakeNotifyGroupResp struct {
+	BranchID string `json:"branch_id"`
+	ChatID   string `json:"chat_id"`
+	ChatName string `json:"chat_name"`
+	AppID    string `json:"app_id"`
+	AppName  string `json:"app_name"`
+	UpdatedBy string `json:"updated_by,omitempty"`
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
+}
+
+// GetStocktakeNotifyGroup GET /stocktake-notify-group
+//
+// 未配置 ⇒ 404(前端翻成"还没设"空态),与"读失败"区分开。
+func (h *Handler) GetStocktakeNotifyGroup(c *gin.Context) {
+	branchID := h.branchIDOf(c)
+	row, err := h.svc.GetStocktakeNotifyGroup(c.Request.Context(), branchID)
+	if errors.Is(err, service.ErrNotifyGroupNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"code": "not_found", "message": "该门店尚未设置盘点计划推送群"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, stocktakeNotifyGroupResp{
+		BranchID: row.BranchID, ChatID: row.ChatID, ChatName: row.ChatName,
+		AppID: row.AppID, AppName: row.AppName, UpdatedBy: row.UpdatedBy, UpdatedAt: &row.UpdatedAt,
+	})
+}
+
+// SetStocktakeNotifyGroup PUT /stocktake-notify-group
+func (h *Handler) SetStocktakeNotifyGroup(c *gin.Context) {
+	var req struct {
+		ChatID   string `json:"chat_id"`
+		ChatName string `json:"chat_name"`
+		AppID    string `json:"app_id"`
+		AppName  string `json:"app_name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "bad_request", "message": "请求体非法: " + err.Error()})
+		return
+	}
+	operator := ""
+	if cl, ok := claims.FromContext(c.Request.Context()); ok && cl != nil {
+		operator = cl.Sub
+	}
+	row, err := h.svc.SetStocktakeNotifyGroup(c.Request.Context(), h.branchIDOf(c), service.SetStocktakeNotifyGroupInput{
+		ChatID: req.ChatID, ChatName: req.ChatName, AppID: req.AppID, AppName: req.AppName,
+	}, operator)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": "bad_request", "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, stocktakeNotifyGroupResp{
+		BranchID: row.BranchID, ChatID: row.ChatID, ChatName: row.ChatName,
+		AppID: row.AppID, AppName: row.AppName, UpdatedBy: row.UpdatedBy, UpdatedAt: &row.UpdatedAt,
+	})
+}
+
+// DeleteStocktakeNotifyGroup DELETE /stocktake-notify-group
+func (h *Handler) DeleteStocktakeNotifyGroup(c *gin.Context) {
+	if err := h.svc.DeleteStocktakeNotifyGroup(c.Request.Context(), h.branchIDOf(c)); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// branchIDOf 取本次请求的门店 id(X-Branch-ID 由中间件注入 ctx)。
+func (h *Handler) branchIDOf(c *gin.Context) string {
+	if v := middleware.SingleBranchFromCtx(c); v != "" {
+		return v
+	}
+	return strings.TrimSpace(c.GetHeader("X-Branch-ID"))
 }
 
 // settlementInitReq 是初始化记账三个写端点共用的请求体。

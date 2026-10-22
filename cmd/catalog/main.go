@@ -84,6 +84,14 @@ func initApp() error {
 		&model.Product{},
 		&model.ProductBarcode{},
 		&model.Category{},
+		// 商品档案的价格与供货信息(2026-10-22 新增)。
+		//
+		// ⚠️ **本轮没有写端点**:这两张表由后续的档案导入 / 价格同步写入。
+		// 建它们是为了让"没配数据源的门店"(自营店 10)的本地路径
+		// **有表可查** —— 否则本地路径只能永远返空,
+		// 分不清"这家店没维护价"与"这条路没实现"。
+		&model.ProductBranchPrice{},
+		&model.ProductSupplierPrice{},
 	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
 	}
@@ -165,6 +173,9 @@ func registerRoutes(r *gin.Engine) {
 	h.SetSourceResolver(appSrc)
 	h.SetLocalDB(appDB)
 	h.SetArchiveExporter(appExp)
+	// 商品档案(product-archive)要用**通用** cube 读端
+	// (model + 维度 + 过滤 + 分页)—— 传**同一个** client,不要建第二个。
+	h.SetCubeReader(appCube)
 	h.RegisterRoutes(r)
 }
 

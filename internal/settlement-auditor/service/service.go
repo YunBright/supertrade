@@ -36,8 +36,22 @@ type Config struct {
 	CorpID string
 	// TemplateID 是企微"结算付款审批"模板 id(apply_event 用)。
 	TemplateID string
-	// AmountToleranceYuan 金额勾稽容差(默认 0.01)。
+	// AmountToleranceYuan 是**数值容差**(默认 0.01 元):同一套源数据内部的勾稽
+	// (结算单明细合计 vs 单头货款)允许的误差,只挡源数据的精度噪声。
 	AmountToleranceYuan float64
+	// PaymentToleranceYuan 是**付款取整容差**(默认 1 元):手工累加付款额与
+	// 结算单货款合计之间允许的差异。
+	//
+	// # 为什么是 1 元而不是 1 分
+	//
+	// 实际付款按元付 —— **分位一般不实际支付,角位也可能被舍去**。
+	// 2026-10-22 生产实踩:手工 8206.20 vs 结算单货款合计 8206.1946,
+	// 真实差额 0.0054 元,却因为容差只有 0.01 元而被当成"账实不符"。
+	// ⇒ 付款口径按**元**取整:差额小于 1 元 = 同一笔付款,不阻断。
+	//
+	// ⚠️ 这条容差**只用于付款口径**;单头 vs 明细仍用数值容差(0.01 元),
+	// 否则源数据自身的不自洽也会被一并放过。
+	PaymentToleranceYuan float64
 	// SaleWindowDays 数量信号的销售回看窗口(默认 30 天)。
 	SaleWindowDays int
 	// QtyDeviationFactor 采购量/销售量偏离倍数阈值(默认 3;>factor warn,>2*factor block)。
@@ -64,6 +78,9 @@ type Config struct {
 func (c *Config) withDefaults() {
 	if c.AmountToleranceYuan <= 0 {
 		c.AmountToleranceYuan = 0.01
+	}
+	if c.PaymentToleranceYuan <= 0 {
+		c.PaymentToleranceYuan = 1
 	}
 	if c.SaleWindowDays <= 0 {
 		c.SaleWindowDays = 30

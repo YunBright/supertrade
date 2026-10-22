@@ -35,7 +35,6 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -389,16 +388,16 @@ func rowString(row map[string]any, key string) string {
 //
 // ⚠️ 扫码键的组装顺序:
 //  1. 子表条码(主条码在前)
-//  2. 回落后的主扫码键(products.barcode 非空用它,否则用 id)
+//  2. 回落后的主扫码键(**就是 id**)
 //
 // 去重 ⇒ 同一商品的多个条码不重复出现。
+//
+// ⚠️ 2026-10-22:回落的"主条码"原本读 `products.barcode` 冗余列 ——
+//   那一列生产实测**大面积为空**(导入不赋值)⇒ 回落实际上永远是 id。
+//   而主表已不再有 barcode 列(条码只由 product_barcodes 子表表达,思迅同款)
+//   ⇒ 回落直接用 id(领域事实:"思迅 item_no 就是条码")。
 func buildExportProduct(p model.Product, subBarcodes []string) exportProductDTO {
-	// ⚠️ barcode 回落:products.barcode 在生产是空串(导入不赋值),
-	//   而绝大多数商品的扫码键就是 id ⇒ 空则用 id 兜底。
-	code := strings.TrimSpace(p.Barcode)
-	if code == "" {
-		code = p.ID
-	}
+	code := p.ID
 	codes := make([]string, 0, len(subBarcodes)+1)
 	seen := make(map[string]bool, len(subBarcodes)+1)
 	for _, b := range subBarcodes {

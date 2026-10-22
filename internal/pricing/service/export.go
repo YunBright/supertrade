@@ -64,6 +64,13 @@ const cubeExportPageSize = 1000
 // ⇒ 返 0 行**且不报错**。同一个坑见 internal/cubeclient 的 GetActivePromotion。
 const cubeOperatorInDateRange = "inDateRange"
 
+// cubeOperatorGt 是 cube 的「大于」算子(增量过滤用:只导变过的行)。
+//
+// ⚠️ **与 inDateRange 不是一回事**:gt 编译成 `col > @p1`,
+// 对 live 源的 datetime 列会 CAST 成 DATETIME(保留时分秒)⇒
+// "今天 17:20 变过的商品"不会被"今天 12:00 的水位"漏掉。
+const cubeOperatorGt = "gt"
+
 // 时间窗的哨兵边界(够宽,不代表业务边界)。
 const (
 	exportWindowLower = "1900-01-01"
@@ -85,6 +92,17 @@ type cubeExportScope struct {
 	fields map[string]string
 	// window 为 true ⇒ 按基准日过滤(**只有促销是时效数据**)。
 	window bool
+	// changedMember 是该 scope 的"**最后变动时间**"成员(全限定名)。
+	//
+	// ⚠️ 它与 window 是两回事:
+	//   - window         = "在基准日**有效**"(促销的生效期)⇒ inDateRange;
+	//   - changedMember = "在基准日**变过**"(商品的改动时间)⇒ gt。
+	//
+	// ⚠️ **取自 archivedto.ChangedMembers**(不写死字面量):
+	// 那是"哪些 scope 能做增量"的唯一真相源(导出端 + 编排端共用)
+	// ⇒ 两边各写一份时,改了一边不会编译报错
+	// ⇒ 症状是"编排端推进了水位,而导出端没加过滤" ⇒ 漏数据且零报错。
+	changedMember string
 }
 
 // cubeExportScopes 是 pricing 域可导出的资料域。
@@ -102,6 +120,9 @@ var cubeExportScopes = map[string]cubeExportScope{
 			"product.avg_price_yuan":  "price_yuan",
 			"product.total_cost_yuan": "cost_yuan",
 		},
+		// ⚠️ 售价与商品在**源库的同一行**里(思迅 t_bd_item_info.sale_price)
+		//   ⇒ 改了价就等于改了那一行 ⇒ 商品的变动时间就是价的变动时间 ✅。
+		changedMember: archivedto.ChangedMembers[archivedto.ScopePrices],
 	},
 	archivedto.ScopePromotions: {
 		name:     archivedto.ScopePromotions,
@@ -143,7 +164,15 @@ func ExportScopeNames() []string {
 // ⚠️ **判据与查价同一套**:配了数据源 ⇒ cube;没配 ⇒ 本域 PG。
 //
 // ⚠️ 解析失败 / 数据源被关停 ⇒ 上抛(503),**不回落本地**。
-func (s *PriceService) ExportArchive(ctx context.Context, branchID, scope string, offset, limit int, asOf string) (*archivedto.ExportPage, error) {
+//
+// # since = 增量水位
+//
+// 空   ⇒ 全量(默认行为,不变);
+// 非空 ⇒ 只导"自该时刻之后变过"的行(cube 查询加 gt 过滤)。
+//
+// ⚠️ **必须真的落到 cube 查询里**:只在上层记一个 since 却不过滤,
+// 等于"编排端推进了水位,导出端仍导全量" ⇒ 增量形同虚设(且零报错)。
+func (s *PriceService) ExportArchive(ctx context.Context, branchID, scope string, offset, limit int, asOf, since string) (*archivedto.ExportPage, error) {
 	sc, ok := cubeExportScopes[scope]
 	if !ok {
 		return nil, fmt.Errorf("%w: scope=%q(可用:%s)",
@@ -164,7 +193,7 @@ func (s *PriceService) ExportArchive(ctx context.Context, branchID, scope string
 	}
 
 	if useCube {
-		rows, total, err := s.exportFromCube(ctx, sc, asOf, offset, limit)
+		rows, total, err := s.exportFromCube(ctx, sc, asOf, since, offset, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -185,14 +214,14 @@ func (s *PriceService) ExportArchive(ctx context.Context, branchID, scope string
 }
 
 // exportFromCube 从该门店的 cube 实例取一页(archivedto 契约)。
-func (s *PriceService) exportFromCube(ctx context.Context, sc cubeExportScope, asOf string, offset, limit int) ([]map[string]any, int, error) {
+func (s *PriceService) exportFromCube(ctx context.Context, sc cubeExportScope, asOf, since string, offset, limit int) ([]map[string]any, int, error) {
 	if s.reader == nil {
 		return nil, 0, fmt.Errorf("%w: cube 读端未装配", model.ErrCubeSourceUnavailable)
 	}
 	q := cubeclient.CubeQuery{
 		Measures:   sc.measures,
 		Dimensions: sc.dimensions,
-		Filters:    sc.filters(asOf),
+		Filters:    sc.filters(asOf, since),
 		Limit:      limit,
 		Offset:     offset,
 		// ⚠️ order 必须给:offset>0 时 cube 直接 400;
@@ -264,25 +293,43 @@ func (s *PriceService) exportFromLocal(ctx context.Context, sc cubeExportScope, 
 
 // filters 造该 scope 的 cube 过滤条件。
 //
-// ⚠️ **只有时效数据(promotions)带时间过滤** ——
-// 售价不是时效数据,误加时间过滤会让它**永远导不出行**(而且不报错)。
-func (sc cubeExportScope) filters(asOf string) []cubeclient.CubeFilter {
+// ⚠️ **两类过滤不能混**:
+//   - **时效过滤**(window)= "在基准日**有效**"(促销的生效期)⇒ inDateRange;
+//   - **变动过滤**(changedMember)= "在基准日**变过**"(商品的最后改动时间)⇒ gt。
+//
+// ⚠️ **只有时效数据(promotions)带时间窗过滤** ——
+// 售价不是时效数据,误加时间窗过滤会让它**永远导不出行**(而且不报错)。
+//
+// ⚠️ **变动过滤只在 since 非空时加**:
+// 没给 since(= 全量轮次)就不该加,否则"全量"会变成"只导变过的"。
+func (sc cubeExportScope) filters(asOf, since string) []cubeclient.CubeFilter {
 	out := []cubeclient.CubeFilter{}
-	if !sc.window {
-		return out
+	if sc.window {
+		out = append(out,
+			cubeclient.CubeFilter{
+				Member:   "promotion.begin_date",
+				Operator: cubeOperatorInDateRange,
+				Values:   []any{exportWindowLower, asOf},
+			},
+			cubeclient.CubeFilter{
+				Member:   "promotion.end_date",
+				Operator: cubeOperatorInDateRange,
+				Values:   []any{asOf, exportWindowUpper},
+			},
+		)
 	}
-	return append(out,
-		cubeclient.CubeFilter{
-			Member:   "promotion.begin_date",
-			Operator: cubeOperatorInDateRange,
-			Values:   []any{exportWindowLower, asOf},
-		},
-		cubeclient.CubeFilter{
-			Member:   "promotion.end_date",
-			Operator: cubeOperatorInDateRange,
-			Values:   []any{asOf, exportWindowUpper},
-		},
-	)
+	// ⚠️ **增量过滤**:只导"自上次水位之后变过"的行。
+	//
+	// 少了这一条 ⇒ 每次同步都是全量(27569 行),
+	// 而**编排方照样推进水位** ⇒ 下次仍然全量 ⇒ 增量形同虚设。
+	if sc.changedMember != "" && since != "" {
+		out = append(out, cubeclient.CubeFilter{
+			Member:   sc.changedMember,
+			Operator: cubeOperatorGt,
+			Values:   []any{since},
+		})
+	}
+	return out
 }
 
 // order 按**全部维度**升序(cube-router 的 exportOrderFor 同款)。
@@ -320,8 +367,19 @@ func (sc cubeExportScope) buildRow(raw map[string]any) map[string]any {
 //
 // ⚠️ null ⇒ nil(不是 "0"):"没维护价"与"价是 0"必须能区分。
 //
-// ⚠️ 读不懂的值(脏值 / base64)**原样带出** ⇒ 导入端能识别
-// "这个值我读不懂"并报告它,而不是静默当 0。
+// # ⚠️ 必须能吃 base64(MSSQL live 源)
+//
+// 思迅直查(product 是 live model)的 decimal 列经 go-mssqldb 以 []byte 返回,
+// encoding/json 把 []byte 序列化成 **base64**:
+//
+//	product.avg_price_yuan = "MTIuMDAwMDAw"  → base64 → "12.000000"
+//
+// ⇒ 若只按"字面数字"解析,就会把 base64 串**原样带出**
+// ⇒ 导入端 parseMoney 失败 ⇒ 那一行被当成"没维护价"跳过
+// ⇒ **全量价格一行都没落库,报告只写 skipped 27569,零报错**。
+//
+// ⚠️ 读不懂的值(脏值)**原样带出** ⇒ 导入端能识别"这个值我读不懂"并报告它
+// (而不是静默当 0 —— 那会把脏数据变成"售价 0 元",POS 会照印)。
 func exportAmountValue(v any) any {
 	if v == nil {
 		return nil
@@ -334,9 +392,16 @@ func exportAmountValue(v any) any {
 		if d, err := decimal.NewFromString(s); err == nil {
 			return d.String()
 		}
+		// base64(MSSQL live 源的 decimal):见上面的说明。
+		if d, ok := cubeclient.ParseDecimalOK(s); ok {
+			return d.String()
+		}
 		return s
 	}
-	return cubeclient.ParseDecimal(v).String()
+	if d, ok := cubeclient.ParseDecimalOK(v); ok {
+		return d.String()
+	}
+	return nil
 }
 
 // exportTextValue 把 cube 原始值转成导出契约的文本值。

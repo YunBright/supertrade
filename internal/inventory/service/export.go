@@ -70,6 +70,13 @@ type ExportInput struct {
 	// AsOf 是基准日(yyyy-mm-dd)。库存**不是时效数据**（cube 的 stock 是 live 快照）
 	// ⇒ 它不参与过滤，只是回给调用方的一个字段（与 cube-router 的响应同形）。
 	AsOf string
+	// Since 是**增量水位**（yyyy-mm-dd hh:mm:ss）：只导"这个时间点之后变过"的行。
+	//
+	// ⚠️ 空 = 全量（默认行为，不变）。
+	// ⚠️ 源库 `t_im_branch_stock.oper_date` 覆盖**全部**库存变动来源
+	//   （销售/退货/采购入库/盘点/调拨/损耗）⇒ 增量不会漏；
+	//   而"从收银流水反推商品"会漏采购与盘点 ⇒ 本域不采用那种口径。
+	Since string
 	// Bearer 是调用者的 JWT（原样透传给 cube-router，让它做 per-branch scope 解析）。
 	Bearer string
 }
@@ -141,6 +148,33 @@ func (s *StockService) exportLocalStock(ctx context.Context, in ExportInput) ([]
 	}
 
 	tx := s.db.WithContext(ctx).Model(&model.StockLevel{}).Where("branch_id = ?", in.BranchID)
+	// ⚠️ **本地路径也必须认 since**(两条路径口径一致)。
+	//
+	//	有源门店走 cube-router ⇒ cube 查询加 `stock.updated_at gt <since>`
+	//	⇒ 只导"变过的行"。
+	//	无源门店从本域 stock_levels 读 ⇒ 若**忽略** since
+	//	⇒ 同一个端点在两种门店下语义不同(一个过滤、一个不过滤)
+	//	⇒ 症状:增量同步对无源门店"看起来没生效"(每次都是全量),
+	//	  而响应里**没有任何字段**能看出差别。
+	//
+	//	⇒ 本域用 `updated_at`(本域最后一次被写入的时刻)做代理。
+	//	  它是"本域这一行上次变过是什么时候" ⇒ 语义正确。
+	//
+	// ⚠️ 代理口径的边界:本域的 updated_at 是**导入时刻**,不是源库的变动时刻
+	//   ⇒ 无源门店的增量是"本域视角的变动",不是"源库视角的变动"。
+	//   对"本域 → 目标门店"的搬运,前者才是对的。
+	if since := strings.TrimSpace(in.Since); since != "" {
+		// ⚠️ **解析成 time.Time 再比**,不要把字符串直接丢给 PG。
+		//
+		//	`updated_at > '2026-10-22 20:56:55'` 能不能work 取决于驱动怎么送参数
+		//	(pgx 会把未知类型参数推断成 timestamp,但换驱动/换写法就不一定)
+		//	⇒ 自己解析 ⇒ 时间列比较永远是"时间列比时间"。
+		t, err := time.ParseInLocation(archivedto.SinceLayout, since, time.Local)
+		if err != nil {
+			return nil, fmt.Errorf("%w: since 不是合法时间点(%q)", model.ErrInvalidInput, since)
+		}
+		tx = tx.Where("updated_at > ?", t)
+	}
 	var total int64
 	if err := tx.Count(&total).Error; err != nil {
 		return nil, err

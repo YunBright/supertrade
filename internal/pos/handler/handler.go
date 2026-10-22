@@ -196,6 +196,13 @@ func (h *Handler) mapErr(c *gin.Context, err error) {
 		writeError(c, http.StatusNotFound, "sale_line_not_found", err.Error())
 	case errors.Is(err, model.ErrSaleAlreadyReturned):
 		writeError(c, http.StatusConflict, "sale_already_returned", err.Error())
+	case errors.Is(err, model.ErrLineNotFoundInSale):
+		// 404:要退的行不属于这张单 —— 是"指错了",不是"状态冲突"。
+		writeError(c, http.StatusNotFound, "sale_line_not_found", err.Error())
+	case errors.Is(err, model.ErrRefundExceedsSold):
+		// 409:超退是**状态冲突**(退的量超过了还没退的量)——
+		// 改参数重来一次也不会好,除非先退掉别的部分。
+		writeError(c, http.StatusConflict, "refund_exceeds_sold", err.Error())
 	case errors.Is(err, model.ErrAmountMismatch):
 		// 409:金额不自洽是**状态冲突**(改参数重来一次也不会好),
 		// 不是请求格式错(那才是 400)。

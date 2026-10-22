@@ -37,7 +37,7 @@ func TestSidecarExporter_CallsExportEndpoint(t *testing.T) {
 	defer srv.Close()
 
 	e := NewSidecarExporter(srv.URL, "supertrade-cube-router", "00")
-	page, err := e.Export(context.Background(), "TOKEN", "products", 100, 500)
+	page, err := e.Export(context.Background(), "TOKEN", "products", 100, 500, "")
 	if err != nil {
 		t.Fatalf("导出失败: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestDownstreamError_CarriesCode(t *testing.T) {
 	defer srv.Close()
 
 	e := NewSidecarExporter(srv.URL, "supertrade-cube-router", "00")
-	_, err := e.Export(context.Background(), "TOKEN", "products", 0, 100)
+	_, err := e.Export(context.Background(), "TOKEN", "products", 0, 100, "")
 	if err == nil {
 		t.Fatal("404 应报错")
 	}

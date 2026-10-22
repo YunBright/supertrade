@@ -41,11 +41,20 @@ import (
 type ProductService struct {
 	db  *gorm.DB
 	now func() time.Time
+	// barcodes 是**条码子表**服务(1 商品 : N 条码)。
+	//
+	// ⚠️ 条码**只由子表表达**(思迅同款:主表没有 barcode 列)⇒
+	//   建档/改档时入参的 barcode 落到这里,而不是主表的一列。
+	barcodes *ProductBarcodeService
 }
 
 // NewProductService 构造 ProductService。
 func NewProductService(db *gorm.DB) *ProductService {
-	return &ProductService{db: db, now: func() time.Time { return time.Now() }}
+	return &ProductService{
+		db:       db,
+		now:      func() time.Time { return time.Now() },
+		barcodes: NewProductBarcodeService(db),
+	}
 }
 
 // 分页口径(与商品选择控件契约一致,见 service/catalog.go 的常量)。
@@ -127,6 +136,14 @@ type CreateProductInput struct {
 }
 
 // Create 新建一个商品(同 (id, branch_id) 已存在 → 409)。
+//
+// # ⚠️ 入参 Barcode 写进**条码子表**,不写主表
+//
+//	思迅 `t_bd_item_info` 没有 barcode 列,条码全在 `t_bd_item_barcode`
+//	⇒ 本域也**只让 `product_barcodes` 表表达条码**(1 商品 : N 条码)。
+//
+//	⇒ 新建商品时带 barcode ⇒ 落成子表的一行(而不是主表的一列)。
+//	⇒ 主表**不再有**条码字段 ⇒ 不存在"两处不一致"的可能。
 func (s *ProductService) Create(ctx context.Context, in CreateProductInput) (*model.Product, error) {
 	if err := validateProductInput(in.ID, in.BranchID, in.Name); err != nil {
 		return nil, err
@@ -144,7 +161,6 @@ func (s *ProductService) Create(ctx context.Context, in CreateProductInput) (*mo
 		SubCode:    in.SubCode,
 		IsExchange: in.IsExchange,
 		IsVoid:     in.IsVoid,
-		Barcode:    in.Barcode,
 		Unit:       in.Unit,
 		Spec:       in.Spec,
 		Status:     in.Status,
@@ -157,6 +173,19 @@ func (s *ProductService) Create(ctx context.Context, in CreateProductInput) (*mo
 			return nil, model.ErrProductAlreadyExists
 		}
 		return nil, err
+	}
+	// 条码:写子表(与思迅同款:条码只有一处)。
+	//
+	// ⚠️ 主表已经建好了,条码写失败**不回滚**主表 ——
+	//   商品建档成功、条码没加上,是一个**可修**的状态;
+	//   而"条码没写"在旧设计下是**看不见的**(主表列全空)⇒ 更危险。
+	// ⇒ 写失败要**报错**,让调用方知道要补条码(可 POST /products/:id/barcodes 补)。
+	if bc := strings.TrimSpace(in.Barcode); bc != "" {
+		if _, err := s.barcodes.Upsert(ctx, BarcodeInput{
+			ProductID: in.ID, BranchID: in.BranchID, Barcode: bc,
+		}); err != nil {
+			return nil, err
+		}
 	}
 	return row, nil
 }
@@ -195,9 +224,16 @@ func (s *ProductService) List(ctx context.Context, branchID string, q LocalProdu
 		//   自编码 = item_subno   —— **不唯一**(9 组"正常品+换购品"共用)
 		//   条码   = item_barcode —— 1 商品 : 1~7 条
 		// 思迅的搜索框是「输入编码、名称或助记码(Q)」⇒ 四个都要命中。
+		//
+		// ⚠️ **条形码只在 `product_barcodes` 子表上**(一品多码,思迅同款)⇒
+		//   必须用子查询反查。
+		//   (旧实现还匹配主表的 `barcode` 冗余列 —— 那一列生产实测**大面积为空**
+		//    ⇒ 那一路对同步来的商品**恒不命中**,是条死路;主表已不再有该列。)
 		tx = tx.Where(
-			"id LIKE ? OR sub_code LIKE ? OR name LIKE ? OR barcode LIKE ?",
-			like, like, like, like)
+			"(id LIKE ? OR sub_code LIKE ? OR name LIKE ? OR "+
+				"id IN (SELECT product_id FROM product_barcodes "+
+				"WHERE branch_id = ? AND deleted_at IS NULL AND barcode LIKE ?))",
+			like, like, like, branchID, like)
 	}
 	if q.CategoryID != "" {
 		tx = tx.Where("category_id = ?", q.CategoryID)
@@ -304,9 +340,12 @@ func (s *ProductService) FindCandidatesByCode(ctx context.Context, branchID, cod
 	out := []model.Product{}
 
 	// ① 货号 / 自编码(products 表)。
+	//
+	// ⚠️ **不再匹配主表的 barcode 列**:条码只由 `product_barcodes` 子表表达
+	//   (思迅同款)⇒ 主表没有条码可匹配。
 	var direct []model.Product
 	if err := s.db.WithContext(ctx).
-		Where("branch_id = ? AND (id = ? OR sub_code = ? OR barcode = ?)", branchID, code, code, code).
+		Where("branch_id = ? AND (id = ? OR sub_code = ?)", branchID, code, code).
 		Order("id").
 		Find(&direct).Error; err != nil {
 		return nil, err
@@ -381,9 +420,6 @@ func (s *ProductService) Update(ctx context.Context, branchID, id string, in Upd
 	if in.IsVoid != nil {
 		updates["is_void"] = *in.IsVoid
 	}
-	if in.Barcode != nil {
-		updates["barcode"] = *in.Barcode
-	}
 	if in.Unit != nil {
 		updates["unit"] = *in.Unit
 	}
@@ -406,6 +442,21 @@ func (s *ProductService) Update(ctx context.Context, branchID, id string, in Upd
 	}
 	if res.RowsAffected == 0 {
 		return nil, model.ErrProductNotFound
+	}
+	// 条码:入参的 barcode 走**子表**(主表不再有 barcode 列)。
+	//
+	// ⚠️ **空串 = 删掉这条条码**?—— 不是:空串只是"不传条码" ⇒ 什么都不做。
+	//   删条码走 `DELETE /products/:id/barcodes/:barcode`(有独立端点)。
+	//   理由:PUT 是"局部更新"语义,body 里带一个空串却删数据是意外。
+	if in.Barcode != nil {
+		bc := strings.TrimSpace(*in.Barcode)
+		if bc != "" {
+			if _, err := s.barcodes.Upsert(ctx, BarcodeInput{
+				ProductID: id, BranchID: branchID, Barcode: bc,
+			}); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return s.Get(ctx, branchID, id)
 }

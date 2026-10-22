@@ -258,3 +258,72 @@ func TestBuildAuditUserPrompt_Truncates(t *testing.T) {
 		t.Error("信号超 20 应截断提示")
 	}
 }
+
+// TestBuildAuditSystemPrompt_AmountRoundingRule 锁 2026-10-22 事故的修复点。
+//
+// 事故:引擎判"金额一致"(真实差额 0.0054 元,0 条金额信号),
+// LLM 却拿 user prompt 里的显示值自己相加,造出"差 0.01"并当成 block 理由拒单。
+// ⇒ prompt 必须同时写死三件事:
+//  1. 付款按元取整 ⇒ 分/角级差异不是问题;
+//  2. 金额勾稽以引擎结论为准,不许自己相加;
+//  3. 拒绝理由只引用信号列表。
+func TestBuildAuditSystemPrompt_AmountRoundingRule(t *testing.T) {
+	p := buildAuditSystemPrompt()
+	must := []string{
+		"按元取整",                    // 取整口径
+		"分位一般不实际支付",              // 取整口径
+		"不得作为拒绝理由",                // 分/角级差异不阻断
+		"不要**再自己把结算单金额相加", // 禁止自行重算
+		"只能引用信号列表里的信号",        // 不许凭空造事实
+	}
+	for _, m := range must {
+		if !strings.Contains(p, m) {
+			t.Errorf("system prompt 缺少金额口径约束 %q", m)
+		}
+	}
+}
+
+// TestBuildAuditUserPrompt_AmountVerdictFromEngine 锁"金额结论由引擎给"。
+//
+// user prompt 必须直接写明:手工付款额 / 结算单合计 / 差额 / 结论,
+// 且金额用**原始精度**(8206.1946 而不是 8206.19 ——
+// 显示值自己相加会造出假差异)。
+func TestBuildAuditUserPrompt_AmountVerdictFromEngine(t *testing.T) {
+	ap := &model.ApprovalInstance{ID: "ap-1", ManualAmountYuan: dec("8206.20")}
+	out := buildAuditUserPrompt(&AuditInput{
+		Approval: ap,
+		Settlements: []SettlementRow{
+			{ID: "CP002609014321", SupplierID: "019", TotalGoodsYuan: dec("7765.1946")},
+			{ID: "CP002609014322", SupplierID: "074", TotalGoodsYuan: dec("441.0000")},
+		},
+		Amount: &AmountCheck{
+			ManualAmountYuan: dec("8206.20"),
+			SettledTotalYuan: dec("8206.1946"),
+			DiffYuan:         dec("0.0054"),
+			ToleranceYuan:    dec("1"),
+			Consistent:       true,
+		},
+	})
+	must := []string{
+		"金额勾稽结论",
+		"一致",
+		"8206.1946",
+		"0.0054",
+		"8206.2", // 手工付款额(原始精度,不四舍五入到分)
+	}
+	for _, m := range must {
+		if !strings.Contains(out, m) {
+			t.Errorf("user prompt 缺少金额结论要素 %q\n---\n%s", m, out)
+		}
+	}
+	// 显示值不能出现:一旦 LLM 拿到 "货款=7765.19 " 这样的四舍五入值,
+	// 自己相加就会造出"差 0.01"的假差异。
+	// ⚠️ 不能用 strings.Contains(out, "7765.19") 判断 ——
+	// "7765.1946" 里本来就含 "7765.19" 这段字符,那样断言永远为真(假绿)。
+	if strings.Contains(out, "货款=7765.19 ") {
+		t.Errorf("user prompt 不应出现四舍五入后的显示值:\n%s", out)
+	}
+	if !strings.Contains(out, "货款=7765.1946") {
+		t.Errorf("user prompt 应给出原始精度金额:\n%s", out)
+	}
+}

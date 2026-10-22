@@ -47,7 +47,13 @@ const maxErrBody = 8 << 10
 type Exporter interface {
 	// Export 取某个 scope 的一页。offset / limit 由调用方决定
 	// (导出端点**无状态**,分页是调用方的循环)。
-	Export(ctx context.Context, bearer, scope string, offset, limit int) (*archivedto.ExportPage, error)
+	//
+	// since 是**增量水位**("只导这个时间点之后变过的行");空 = 全量。
+	//
+	// ⚠️ **只有声明支持增量的 scope 才会带它** ——
+	//   不支持增量的 scope 带上 since ⇒ 端点会忽略它(仍全量导出)⇒ 安全;
+	//   但**绝不能**给不支持增量的 scope 推进水位(见 Syncer.syncScope)。
+	Export(ctx context.Context, bearer, scope string, offset, limit int, since string) (*archivedto.ExportPage, error)
 }
 
 // Importer 把一批档案写进导入方。
@@ -77,7 +83,7 @@ func NewSidecarExporter(sidecarBase, appID, branchID string) *SidecarExporter {
 var _ Exporter = (*SidecarExporter)(nil)
 
 // Export 实现 Exporter。
-func (e *SidecarExporter) Export(ctx context.Context, bearer, scope string, offset, limit int) (*archivedto.ExportPage, error) {
+func (e *SidecarExporter) Export(ctx context.Context, bearer, scope string, offset, limit int, since string) (*archivedto.ExportPage, error) {
 	if e == nil {
 		return nil, fmt.Errorf("cubesync: 导出方未装配")
 	}
@@ -88,6 +94,11 @@ func (e *SidecarExporter) Export(ctx context.Context, bearer, scope string, offs
 	q.Set("scope", scope)
 	q.Set("offset", strconv.Itoa(offset))
 	q.Set("limit", strconv.Itoa(limit))
+	// ⚠️ since = 增量水位 ⇒ 透传给 cube-router ⇒ 它给 cube 查询加
+	//   `stock.updated_at gt <since>` ⇒ 只导"变过"的行。
+	if since != "" {
+		q.Set("since", since)
+	}
 	u := e.sidecarBase + "/v1.0/invoke/" + e.appID + "/method/v1/export?" + q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)

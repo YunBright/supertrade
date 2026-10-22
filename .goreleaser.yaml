@@ -213,6 +213,29 @@ builds:
       - goos: linux
         goarch: 386
 
+  # 2026-10-22 新增:transaction(商品销售流水 + 收银流水)。
+  #
+  # ⚠️ 端口 8119:8110~8118 已占(sales-agg 8110 / pricing 8111 / sales-insight 8112 /
+  #    member 8113 / pos 8114 / pos-gateway 8115 / cube-sync 8116 / cube-sync-member 8117 /
+  #    cube-async 8118)。
+  #
+  # ⚠️ 它**需要** POSTGRES_DSN:没配数据源的门店(自营店 10)读本域的
+  #    sale_flows / pay_flows 表。缺 DSN 就拒绝启动,否则自营店的流水
+  #    永远查不了,而症状是"查不出来"(真因不出现在任何日志里)。
+  #    ⇒ 与 cube-sync / cube-async 那两个"不连数据库"的服务不同。
+  - main: ./cmd/transaction
+    id: "transaction"
+    binary: "transaction"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
   - main: ./cmd/sales-agg
     id: "sales-agg"
     binary: "sales-agg"
@@ -497,6 +520,16 @@ archives:
       - procurement
     wrap_in_directory: false
     name_template: 'apps/procurement/procurement_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  # 2026-10-22 新增:transaction(商品销售流水 + 收银流水)。
+  #
+  # ⚠️ 没有 files 块:它不订阅任何 topic,也不带 dapr Component。
+  - id: "transaction"
+    format: tar.gz
+    builds:
+      - transaction
+    wrap_in_directory: false
+    name_template: 'apps/transaction/transaction_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
 
   - id: "sales-agg"
     format: tar.gz

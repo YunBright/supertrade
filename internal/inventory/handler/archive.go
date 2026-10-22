@@ -82,12 +82,26 @@ func (h *Handler) exportArchive(c *gin.Context) {
 	}
 	offset, limit := service.ParseExportPaging(c.Query("offset"), c.Query("limit"))
 
+	// ⚠️ **增量水位**(可选):只导"这个时间点之后变过"的行。
+	//   空 = 全量(默认行为不变)。
+	//   ⇒ 源库 `t_im_branch_stock.oper_date` 一天只变 91 行(实测 23837 行)
+	//   ⇒ 增量导出/写入省掉 99.6%。
+	since, err := archivedto.NormalizeSince(c.Query("since"))
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"code":    "bad_since",
+			"message": err.Error(),
+		})
+		return
+	}
+
 	raw, err := h.stock.ExportStock(c.Request.Context(), service.ExportInput{
 		BranchID: branchID,
 		Scope:    scope,
 		Offset:   offset,
 		Limit:    limit,
 		AsOf:     asOf,
+		Since:    since,
 		// ⚠️ **JWT 一起透传**：cube-router 的 /v1/export 挂 cube:read scope
 		//   （per-branch 实时解析）⇒ 没有它就 401。
 		Bearer: c.Request.Header.Get("Authorization"),

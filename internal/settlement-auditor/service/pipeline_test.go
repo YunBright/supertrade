@@ -29,10 +29,22 @@ type fakeCube struct {
 	mu             sync.Mutex
 	settlements    []SettlementRow
 	settlementsErr error
+	suppliers      map[string]string // 供应商字典(id → 名称)
+	supplierErr    error             // 非 nil ⇒ 字典查询失败(测降级)
 	lines          map[string][]SettlementLineRow
 	sheets         []PurchaseSheetRow
 	sheetLines     []SheetLineRow
 	sales          []SaleRow
+	productNames   map[string]string // 货号 → 商品名
+}
+
+func (f *fakeCube) ListSupplierNames(_ context.Context, _ string) (map[string]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.supplierErr != nil {
+		return nil, f.supplierErr
+	}
+	return f.suppliers, nil
 }
 
 func (f *fakeCube) ListSettlements(_ context.Context, _ string, ids []string) ([]SettlementRow, error) {
@@ -116,6 +128,13 @@ func (f *fakeCube) SumSalesByProduct(_ context.Context, _ string, productIDs []s
 
 func (f *fakeCube) GetStocks(_ context.Context, _ string, _ []string) ([]StockRow, error) {
 	return nil, nil
+}
+
+// ListProductNames 货号 → 商品名(信号里写「<名称>-<货号>」;测试默认没有名字 ⇒ 回退纯货号)。
+func (f *fakeCube) ListProductNames(_ context.Context, _ string, _ []string) (map[string]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.productNames, nil
 }
 
 // seedPassData 灌一套全通过的 cube 数据:S1(货款 100)→ P1(PI)→ PR1 收 10 销 10。
@@ -218,7 +237,7 @@ func newTestService(t *testing.T) (*Service, *gorm.DB, *fakeCube, *fakePublisher
 	if err := db.AutoMigrate(
 		&model.ApprovalInstance{}, &model.ApprovalSettlement{}, &model.AuditSignal{},
 		&model.AuditLog{}, &model.LLMVerdict{}, &model.ApprovalStocktakeLink{},
-		&model.SettlementPayState{},
+		&model.SettlementPayState{}, &model.StocktakeNotifyGroup{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -424,6 +443,208 @@ func waitTerminalPtr(t *testing.T, db *gorm.DB, id string) *model.ApprovalInstan
 }
 
 // ---- 流水线:规则拒绝 ----
+
+// TestRunAudit_ProductionCase_20261022 是 2026-10-22 生产实单的端到端回归锁。
+//
+// 审批 54bb82421a08480bbcfdacaf6c814b5e(门店 00,两张 CP 结算单)实测数据:
+//
+//	CP002609014321(供应商 019)货款 7765.1946,PI 明细 4 行合计 7765.1946
+//	CP002609014322(供应商 074)货款 441.0000,PI 明细 1 行 441.0000
+//	手工付款额 8206.20 ⇒ 结算单货款合计 8206.1946,真实差额 **0.0054 元**
+//
+// 生产上这一单被拒时,LLM 给出的理由里写着"手工 8206.20 与两张结算单合计 8206.19 差 0.01" ——
+// 那是它拿 user prompt 里的**显示值**(7765.19 + 441.00)自己加出来的假差异,
+// 引擎当时判的是"新增 0 条金额信号"。
+//
+// ⇒ 期望:金额**一条信号都不产生**;真正该拦的只有数量信号
+// (商品 02000116 窗口内无销售却进货 18);拒绝理由里不得出现假差异。
+func TestRunAudit_ProductionCase_20261022(t *testing.T) {
+	svc, db, cube, _, _ := newTestService(t)
+
+	cube.mu.Lock()
+	cube.settlements = []SettlementRow{
+		{ID: "CP002609014321", SupplierID: "019", DocumentType: "CP", ApproveStatus: "1", TotalGoodsYuan: dec("7765.1946")},
+		{ID: "CP002609014322", SupplierID: "074", DocumentType: "CP", ApproveStatus: "1", TotalGoodsYuan: dec("441.0000")},
+	}
+	cube.lines = map[string][]SettlementLineRow{
+		"CP002609014321": {
+			{SettlementID: "CP002609014321", VoucherID: "PI002608234017", SourceDocType: "PI", TotalGoodsYuan: dec("1604.4993")},
+			{SettlementID: "CP002609014321", VoucherID: "PI002608254029", SourceDocType: "PI", TotalGoodsYuan: dec("2263.6996")},
+			{SettlementID: "CP002609014321", VoucherID: "PI002608254030", SourceDocType: "PI", TotalGoodsYuan: dec("1976.9987")},
+			{SettlementID: "CP002609014321", VoucherID: "PI002608264044", SourceDocType: "PI", TotalGoodsYuan: dec("1919.9970")},
+		},
+		"CP002609014322": {
+			{SettlementID: "CP002609014322", VoucherID: "PI002608254024", SourceDocType: "PI", TotalGoodsYuan: dec("441.0000")},
+		},
+	}
+	cube.sheets = []PurchaseSheetRow{
+		{ID: "PI002608234017", SupplierID: "019", DocumentType: "PI", ApproveStatus: "1"},
+		{ID: "PI002608254029", SupplierID: "019", DocumentType: "PI", ApproveStatus: "1"},
+		{ID: "PI002608254030", SupplierID: "019", DocumentType: "PI", ApproveStatus: "1"},
+		{ID: "PI002608264044", SupplierID: "019", DocumentType: "PI", ApproveStatus: "1"},
+		{ID: "PI002608254024", SupplierID: "074", DocumentType: "PI", ApproveStatus: "1"},
+	}
+	cube.sheetLines = []SheetLineRow{
+		{SheetID: "PI002608254024", ProductID: "02000116", ReceivedQuantity: dec("18")},
+	}
+	cube.sales = nil // 02000116 在窗口内没有销售(生产实况)
+	cube.mu.Unlock()
+
+	ap, err := svc.SubmitApproval(context.Background(), "B1", SubmitInput{
+		ApplicantUserID:  "u-1",
+		ApplicantWecomID: "wecom-u1",
+		ApplicantBearer:  "Bearer test-token",
+		SettlementIDs:    []string{"CP002609014321", "CP002609014322"},
+		ManualAmountYuan: dec("8206.20"),
+		Remark:           "9月货款",
+		ApproverUserIDs:  []string{"apr1"},
+		CcUserIDs:        []string{"cc1"},
+	})
+	if err != nil {
+		t.Fatalf("SubmitApproval: %v", err)
+	}
+	ap = waitTerminalPtr(t, db, ap.ID)
+
+	// ① 金额一条信号都不该有(0.0054 元 = 按元取整内的同一笔付款)。
+	for _, sigType := range []string{SigManualAmountMismatch, SigLineAmountMismatch} {
+		var n int64
+		db.Model(&model.AuditSignal{}).Where("approval_id = ? AND signal_type = ?", ap.ID, sigType).Count(&n)
+		if n != 0 {
+			t.Errorf("金额信号 %s = %d 条, want 0(差额 0.0054 元,取整内)", sigType, n)
+		}
+	}
+
+	// ② 真正该拦的:02000116 无销售却进货 18。
+	var sig model.AuditSignal
+	if err := db.First(&sig, "approval_id = ? AND signal_type = ?", ap.ID, SigPurchaseWithoutSales).Error; err != nil {
+		t.Fatalf("缺 purchase_without_sales 信号: %v", err)
+	}
+	if sig.ProductID != "02000116" {
+		t.Errorf("product_id = %s, want 02000116", sig.ProductID)
+	}
+
+	// ③ 拒绝理由里不得出现"差 0.01"这种由显示值相加造出来的假差异。
+	if ap.Status != model.StatusRejected {
+		t.Fatalf("status = %s, want rejected", ap.Status)
+	}
+	if strings.Contains(ap.RejectReason, "0.01") || strings.Contains(ap.RejectReason, "8206.19") {
+		t.Errorf("拒绝理由含金额假差异: %q", ap.RejectReason)
+	}
+	if !strings.Contains(ap.RejectReason, "02000116") {
+		t.Errorf("拒绝理由应引用数量信号: %q", ap.RejectReason)
+	}
+}
+
+// TestStepFinish_RejectNotifiesApplicant 锁"机器审核未通过的通知发给**发起人**"。
+//
+// 用户口径 2026-10-22 终稿:仍通知发起人(不是审批人),但措辞必须中性。
+func TestStepFinish_RejectNotifiesApplicant(t *testing.T) {
+	svc, db, _, pub, _ := newTestService(t)
+	ap := &model.ApprovalInstance{
+		ID: "ap-rej-applicant", CorpID: "wcorp-test", BranchID: "B1",
+		ApplicantUserID: "u-1", ApplicantWecomID: "wecom-u1",
+		ApproverUserIDs: datatypes.JSON([]byte(`["wecom-apr1","wecom-apr2"]`)),
+		Status:           model.StatusAuditing,
+	}
+	if err := db.Create(ap).Error; err != nil {
+		t.Fatalf("create ap: %v", err)
+	}
+	svc.stepFinish(context.Background(), ap, &VerdictResult{
+		Conclusion: ConclusionReject,
+		Reason:     "商品 16.8升琅悦泉水桶装水-02000116 自 2026-08-25 采购入库后无销售记录,本次进货 18",
+	}, nil)
+
+	cmds := pub.commands(CmdNotifyText)
+	if len(cmds) != 1 {
+		t.Fatalf("notify_text 命令数 = %d, want 1", len(cmds))
+	}
+	var payload NotifyTextPayload
+	if err := json.Unmarshal(cmds[0].Payload, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if len(payload.ToUser) != 1 || payload.ToUser[0] != "wecom-u1" {
+		t.Errorf("to_user = %v, want [wecom-u1](发起人)", payload.ToUser)
+	}
+}
+
+// TestStepStocktake_PublishesToConfiguredGroup 锁"盘点计划推到门店指定的群"。
+//
+// 用户口径 2026-10-22:盘点计划的消息发到指定的微信企业群。
+// ⇒ taskcard 命令要带 to_chat + app_id(企微要求 chatid 与 token 同应用)。
+func TestStepStocktake_PublishesToConfiguredGroup(t *testing.T) {
+	svc, db, _, pub, st := newTestService(t)
+	if _, err := svc.SetStocktakeNotifyGroup(context.Background(), "B1", SetStocktakeNotifyGroupInput{
+		ChatID: "wrwPWvUwAAuh_cAFXQMq6wYOdrLPk4HQ", ChatName: "门店盘点群",
+		AppID: "ns-app1", AppName: "盘点应用",
+	}, "admin-1"); err != nil {
+		t.Fatalf("SetStocktakeNotifyGroup: %v", err)
+	}
+	ap := &model.ApprovalInstance{
+		ID: "ap-st-group", CorpID: "wcorp-test", BranchID: "B1",
+		ApplicantUserID: "u-1", ApplicantWecomID: "wecom-u1",
+		Status: model.StatusAuditing,
+	}
+	if err := db.Create(ap).Error; err != nil {
+		t.Fatalf("create ap: %v", err)
+	}
+	db.Create(&model.ApprovalSettlement{ID: "x1", ApprovalID: ap.ID, SettlementID: "CP1"})
+	svc.stepStocktake(context.Background(), ap, &VerdictResult{
+		SuggestStocktake: &StocktakeSuggestion{Scope: "product", IDs: []string{"02000116"}},
+	})
+	if st.calls != 1 {
+		t.Fatalf("建单应调 1 次, got %d", st.calls)
+	}
+	cmds := pub.commands(CmdTaskCard)
+	if len(cmds) != 1 {
+		t.Fatalf("taskcard 命令数 = %d, want 1", len(cmds))
+	}
+	var payload TaskCardPayload
+	if err := json.Unmarshal(cmds[0].Payload, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload.ToChat != "wrwPWvUwAAuh_cAFXQMq6wYOdrLPk4HQ" {
+		t.Errorf("to_chat = %q, want 群 id", payload.ToChat)
+	}
+	if payload.AppID != "ns-app1" {
+		t.Errorf("app_id = %q, want ns-app1(群所属自建应用)", payload.AppID)
+	}
+	if len(payload.ToUser) != 0 {
+		t.Errorf("配了群就不该再发成员, got %v", payload.ToUser)
+	}
+}
+
+// TestSetStocktakeNotifyGroup_Crud 锁配置的读写删。
+func TestSetStocktakeNotifyGroup_Crud(t *testing.T) {
+	svc, _, _, _, _ := newTestService(t)
+	ctx := context.Background()
+	if _, err := svc.GetStocktakeNotifyGroup(ctx, "B1"); !errors.Is(err, ErrNotifyGroupNotFound) {
+		t.Fatalf("未配置应返 ErrNotifyGroupNotFound, got %v", err)
+	}
+	if _, err := svc.SetStocktakeNotifyGroup(ctx, "B1", SetStocktakeNotifyGroupInput{
+		ChatID: "CHAT1", AppID: "app1",
+	}, "admin-1"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	got, err := svc.GetStocktakeNotifyGroup(ctx, "B1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.ChatID != "CHAT1" || got.AppID != "app1" || got.UpdatedBy != "admin-1" {
+		t.Errorf("配置读回不对: %+v", got)
+	}
+	// 缺 app_id 必须拒(企微要求 chatid 与 token 同应用)。
+	if _, err := svc.SetStocktakeNotifyGroup(ctx, "B1", SetStocktakeNotifyGroupInput{
+		ChatID: "CHAT2",
+	}, "admin-1"); err == nil {
+		t.Error("缺 app_id 应报错")
+	}
+	if err := svc.DeleteStocktakeNotifyGroup(ctx, "B1"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := svc.GetStocktakeNotifyGroup(ctx, "B1"); !errors.Is(err, ErrNotifyGroupNotFound) {
+		t.Errorf("删除后应回到未配置, got %v", err)
+	}
+}
 
 func TestRunAudit_RejectManualMismatch(t *testing.T) {
 	svc, db, cube, pub, _ := newTestService(t)

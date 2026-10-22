@@ -105,7 +105,12 @@ func TestOnSalePaid_NoMemberID_Skipped(t *testing.T) {
 	assert.Equal(t, int64(0), n, "不该有积分流水")
 }
 
-// TestOnSalePaid_ReturnOrder_Skipped 锁"退货单(R)不累计积分"。
+// TestOnSalePaid_ReturnOrder_Skipped 锁"退货单(R)⇒ **没有积分可扣时**跳过"。
+//
+// ⚠️ 2026-10-22 起,R **不再是无条件跳过** ——
+//   思迅会按退掉金额**扣回积分**(源库实测:全库 8 行负积分全是退货台单据),
+//   见 subscribe_refund_points_test.go。
+//   ⇒ 这里之所以仍跳过,是因为这个会员**一分积分都没有** ⇒ 没得扣。
 func TestOnSalePaid_ReturnOrder_Skipped(t *testing.T) {
 	svc, db := newService(t)
 	seedType(t, db, "T1", "10", "会员卡")

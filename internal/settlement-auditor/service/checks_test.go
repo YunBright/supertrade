@@ -1,6 +1,7 @@
 package service
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -93,7 +94,7 @@ func TestCheckAmounts_LineMismatch(t *testing.T) {
 		"S1": {{SettlementID: "S1", TotalGoodsYuan: dec("100")}},
 		"S2": {{SettlementID: "S2", TotalGoodsYuan: dec("40")}}, // 差 10
 	}
-	sigs := checkAmounts(settlements, lines, dec("150"), dec("0.01"))
+	sigs, _ := checkAmounts(settlements, lines, dec("150"), dec("0.01"), dec("1"))
 	if len(sigs) != 1 {
 		t.Fatalf("信号数 = %d, want 1(仅 S2 行勾稽)", len(sigs))
 	}
@@ -110,12 +111,15 @@ func TestCheckAmounts_ManualMismatch(t *testing.T) {
 	lines := map[string][]SettlementLineRow{
 		"S1": {{SettlementID: "S1", TotalGoodsYuan: dec("100")}},
 	}
-	sigs := checkAmounts(settlements, lines, dec("95"), dec("0.01"))
+	sigs, summary := checkAmounts(settlements, lines, dec("95"), dec("0.01"), dec("1"))
 	if len(sigs) != 1 {
 		t.Fatalf("信号数 = %d, want 1(手工金额勾稽)", len(sigs))
 	}
 	if sigs[0].SignalType != SigManualAmountMismatch || sigs[0].Level != model.SignalBlock {
 		t.Errorf("type=%s level=%s, want manual_amount_mismatch/block", sigs[0].SignalType, sigs[0].Level)
+	}
+	if summary.Consistent {
+		t.Error("差 5 元应判定为不一致")
 	}
 }
 
@@ -124,8 +128,133 @@ func TestCheckAmounts_WithinTolerance(t *testing.T) {
 	lines := map[string][]SettlementLineRow{
 		"S1": {{SettlementID: "S1", TotalGoodsYuan: dec("100.005")}}, // 差 0.005 < 0.01
 	}
-	if sigs := checkAmounts(settlements, lines, dec("100"), dec("0.01")); len(sigs) != 0 {
+	if sigs, _ := checkAmounts(settlements, lines, dec("100"), dec("0.01"), dec("1")); len(sigs) != 0 {
 		t.Errorf("容差内应无信号, got %d", len(sigs))
+	}
+}
+
+// TestCheckAmounts_PaymentRoundingIsNotAnError 是 2026-10-22 生产事故的回归锁。
+//
+// 实测(审批 54bb82421a08480bbcfdacaf6c814b5e):手工付款额 8206.20,
+// 结算单货款合计 8206.1946(7765.1946 + 441.0000),真实差额 **0.0054 元** ——
+// 实际付款按元取整,这根本不是账实不符,引擎原本也判为容差内(0 条信号)。
+// 但 LLM 拿显示值自己加了一遍,造出"差 0.01"并拒了单。
+//
+// ⇒ 付款口径必须按**元**取整:差额 < 1 元 = 同一笔付款,不阻断。
+func TestCheckAmounts_PaymentRoundingIsNotAnError(t *testing.T) {
+	settlements := []SettlementRow{
+		{ID: "CP002609014321", TotalGoodsYuan: dec("7765.1946")},
+		{ID: "CP002609014322", TotalGoodsYuan: dec("441.0000")},
+	}
+	lines := map[string][]SettlementLineRow{
+		"CP002609014321": {{SettlementID: "CP002609014321", TotalGoodsYuan: dec("7765.1946")}},
+		"CP002609014322": {{SettlementID: "CP002609014322", TotalGoodsYuan: dec("441.0000")}},
+	}
+	sigs, summary := checkAmounts(settlements, lines, dec("8206.20"), dec("0.01"), dec("1"))
+	if len(sigs) != 0 {
+		t.Fatalf("0.0054 元的取整差异不应产生信号, got %d: %+v", len(sigs), sigs)
+	}
+	if !summary.Consistent {
+		t.Error("金额勾稽结论应为「一致」")
+	}
+	if summary.DiffYuan.String() != "0.0054" {
+		t.Errorf("差额 = %s, want 0.0054", summary.DiffYuan.String())
+	}
+	if summary.SettledTotalYuan.String() != "8206.1946" {
+		t.Errorf("合计 = %s, want 8206.1946", summary.SettledTotalYuan.String())
+	}
+}
+
+// TestCheckAmounts_FenAndJiaoDiffNeverBlocks 锁"分位/角位差异不是问题"。
+//
+// 用户口径(2026-10-22):实际付款按元付,分位一般不实际支付,角位也可能被舍去。
+// ⇒ 任何小于 1 元的差额都是取整内的同一笔付款。
+func TestCheckAmounts_FenAndJiaoDiffNeverBlocks(t *testing.T) {
+	for _, manual := range []string{"8206.21", "8206.29", "8206.49", "8207.18"} {
+		t.Run(manual, func(t *testing.T) {
+			settlements := []SettlementRow{{ID: "S1", TotalGoodsYuan: dec("8206.1946")}}
+			lines := map[string][]SettlementLineRow{
+				"S1": {{SettlementID: "S1", TotalGoodsYuan: dec("8206.1946")}},
+			}
+			sigs, summary := checkAmounts(settlements, lines, dec(manual), dec("0.01"), dec("1"))
+			if len(sigs) != 0 {
+				t.Fatalf("差额 %s 元应不阻断, got %d 条信号", manual, len(sigs))
+			}
+			if !summary.Consistent {
+				t.Errorf("差额 %s 元应判定为一致", manual)
+			}
+		})
+	}
+}
+
+// TestCheckAmounts_YuanLevelDiffBlocks 反向锁:达到"元"级就必须拦。
+func TestCheckAmounts_YuanLevelDiffBlocks(t *testing.T) {
+	settlements := []SettlementRow{{ID: "S1", TotalGoodsYuan: dec("8206.1946")}}
+	lines := map[string][]SettlementLineRow{
+		"S1": {{SettlementID: "S1", TotalGoodsYuan: dec("8206.1946")}},
+	}
+	sigs, summary := checkAmounts(settlements, lines, dec("8207.20"), dec("0.01"), dec("1"))
+	if len(sigs) != 1 {
+		t.Fatalf("差 1.0054 元应产生 1 条信号, got %d", len(sigs))
+	}
+	if sigs[0].SignalType != SigManualAmountMismatch {
+		t.Errorf("type = %s, want manual_amount_mismatch", sigs[0].SignalType)
+	}
+	if summary.Consistent {
+		t.Error("达元级的差异应判定为不一致")
+	}
+}
+
+// TestCheckAmounts_LineCheckKeepsStrictNumericTolerance 锁"付款取整不放宽源数据勾稽"。
+//
+// 单头 vs 明细是**同一套源数据**的自洽性检查(不是付款口径),
+// 所以仍然用数值容差 0.01 元 —— 差 0.5 元也要报。
+func TestCheckAmounts_LineCheckKeepsStrictNumericTolerance(t *testing.T) {
+	settlements := []SettlementRow{{ID: "S1", TotalGoodsYuan: dec("100")}}
+	lines := map[string][]SettlementLineRow{
+		"S1": {{SettlementID: "S1", TotalGoodsYuan: dec("100.5")}}, // 差 0.5 > 数值容差 0.01
+	}
+	sigs, _ := checkAmounts(settlements, lines, dec("100"), dec("0.01"), dec("1"))
+	if len(sigs) != 1 {
+		t.Fatalf("单头 vs 明细差 0.5 元应产生 1 条信号, got %d", len(sigs))
+	}
+	if sigs[0].SignalType != SigLineAmountMismatch {
+		t.Errorf("type = %s, want line_amount_mismatch", sigs[0].SignalType)
+	}
+}
+
+// TestConfig_AmountTolerances 锁住两层容差的**默认值**。
+//
+// 付款口径默认 1 元(实际付款按元取整:分位不实际支付、角位可能被舍去);
+// 数值容差仍是 0.01 元(同一套源数据内部的自洽性,不放宽)。
+//
+// 2026-10-22 事故的直接教训:付款口径若沿用 0.01 元,
+// 任何"角位被舍去"的正常付款都会被当成账实不符。
+func TestConfig_AmountTolerances(t *testing.T) {
+	cfg := New(nil, Config{}).Config()
+	if cfg.PaymentToleranceYuan != 1 {
+		t.Errorf("PaymentToleranceYuan = %v, want 1(付款按元取整)", cfg.PaymentToleranceYuan)
+	}
+	if cfg.AmountToleranceYuan != 0.01 {
+		t.Errorf("AmountToleranceYuan = %v, want 0.01(数值容差,单头 vs 明细)", cfg.AmountToleranceYuan)
+	}
+}
+
+// TestYuanText_KeepsSubCentPrecision 锁"差额不能被显示精度掩盖"。
+//
+// 0.014 元被 StringFixed(2) 打成 "0.01" ⇒ 看的人以为只差 1 分,
+// 实际已经过了 0.01 的数值容差 —— 显示值比真实值小 ⇒ 低估问题量级。
+func TestYuanText_KeepsSubCentPrecision(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"0.014", "0.014"},
+		{"0.0054", "0.0054"},
+		{"8206.1946", "8206.1946"},
+		{"8206.2", "8206.2"},
+	}
+	for _, c := range cases {
+		if got := yuanText(dec(c.in)); got != c.want {
+			t.Errorf("yuanText(%s) = %s, want %s", c.in, got, c.want)
+		}
 	}
 }
 
@@ -149,7 +278,7 @@ func TestCheckQuantity(t *testing.T) {
 			if tt.sold != "" {
 				sales["PR1"] = SaleRow{ProductID: "PR1", NetSaleQuantity: dec(tt.sold)}
 			}
-			sigs := checkQuantity(receivedByProduct, sales, 3)
+			sigs := checkQuantity(receivedByProduct, sales, 3, QuantityContext{})
 			if tt.wantType == "" {
 				if len(sigs) != 0 {
 					t.Fatalf("应无信号, got %v", sigs)
@@ -171,8 +300,107 @@ func TestCheckQuantity(t *testing.T) {
 
 func TestCheckQuantity_ZeroReceivedSkip(t *testing.T) {
 	received := map[string]decimal.Decimal{"PR1": dec("0")}
-	if sigs := checkQuantity(received, nil, 3); len(sigs) != 0 {
+	if sigs := checkQuantity(received, nil, 3, QuantityContext{}); len(sigs) != 0 {
 		t.Errorf("进货 0 应跳过, got %d", len(sigs))
+	}
+}
+
+// TestBuildSaleWindowGroups_UsesLastPurchaseDate 锁 2026-10-22 用户口径:
+// 销量窗口 = **从最后一次采购的采购入库单日期到当前日期**。
+//
+// 生产实况(审批 54bb…):进货发生在 2026-08-25,旧规则却拿
+// 2026-09-22~10-22 的销量去比 —— 被审的那次进货根本不在窗口里。
+func TestBuildSaleWindowGroups_UsesLastPurchaseDate(t *testing.T) {
+	sheetDates := map[string]string{
+		"PI-A": "2026-08-23",
+		"PI-B": "2026-08-26",
+	}
+	productSheets := map[string][]string{
+		"PR1": {"PI-A"},          // 只在 08-23 进过货
+		"PR2": {"PI-A", "PI-B"},  // 两次都进 ⇒ 起点取**最晚**的 08-26
+		"PR3": {"PI-MISSING"},    // 取不到日期 ⇒ 回退固定窗口
+	}
+	groups := buildSaleWindowGroups(sheetDates, productSheets, "2026-10-22", "2026-09-22", 0)
+	got := map[string]string{}
+	for _, g := range groups {
+		for _, pid := range g.Products {
+			got[pid] = g.From
+		}
+	}
+	if got["PR1"] != "2026-08-23" {
+		t.Errorf("PR1 窗口起点 = %s, want 2026-08-23", got["PR1"])
+	}
+	if got["PR2"] != "2026-08-26" {
+		t.Errorf("PR2 窗口起点 = %s, want 2026-08-26(取最晚那次进货)", got["PR2"])
+	}
+	if got["PR3"] != "2026-09-22" {
+		t.Errorf("PR3 取不到日期应回退 %s, got %s", "2026-09-22", got["PR3"])
+	}
+}
+
+// TestBuildSaleWindowGroups_MergesWhenTooMany 锁"分组数有上限"。
+//
+// 一次审批可能勾几十张结算单 ⇒ 采购日期数不可控 ⇒ 查询次数不可控。
+// 超上限时把起点最近的两组合并(取更早的起点 = 放宽方向:只少拦不多拦)。
+func TestBuildSaleWindowGroups_MergesWhenTooMany(t *testing.T) {
+	sheetDates := map[string]string{}
+	productSheets := map[string][]string{}
+	for i := 0; i < 20; i++ {
+		sid := "PI-" + string(rune('A'+i))
+		sheetDates[sid] = "2026-08-" + fmt.Sprintf("%02d", i+1)
+		productSheets["PR"+string(rune('A'+i))] = []string{sid}
+	}
+	groups := buildSaleWindowGroups(sheetDates, productSheets, "2026-10-22", "2026-09-22", 3)
+	if len(groups) != 3 {
+		t.Fatalf("分组数 = %d, want 3(上限)", len(groups))
+	}
+	// 合并取更早的起点 ⇒ 每个商品都还在某个组里(不丢商品)。
+	total := 0
+	for _, g := range groups {
+		total += len(g.Products)
+	}
+	if total != 20 {
+		t.Errorf("合并后商品数 = %d, want 20(不能丢)", total)
+	}
+}
+
+// TestProductLabel 锁「<商品名称>-<商品货号>」的展示格式(用户口径 2026-10-22)。
+func TestProductLabel(t *testing.T) {
+	names := map[string]string{"02000116": "16.8升琅悦泉水桶装水"}
+	if got := ProductLabel(names, "02000116"); got != "16.8升琅悦泉水桶装水-02000116" {
+		t.Errorf("label = %q", got)
+	}
+	if got := ProductLabel(names, "02000999"); got != "02000999" {
+		t.Errorf("查不到名字应回退纯货号, got %q", got)
+	}
+	if got := ProductLabel(nil, "02000116"); got != "02000116" {
+		t.Errorf("无名字字典应回退纯货号, got %q", got)
+	}
+}
+
+// TestCheckQuantity_NeutralWording 锁"信号只陈述事实、不做动机推断"。
+//
+// 这些文字是给**发起人**看的(用户口径 2026-10-22):禁止"虚进""套取付款"
+// 这类推断性结论 —— 判断本来就不该由机器下。
+func TestCheckQuantity_NeutralWording(t *testing.T) {
+	received := map[string]decimal.Decimal{"02000116": dec("18")}
+	sigs := checkQuantity(received, map[string]SaleRow{}, 3, QuantityContext{
+		Names:      map[string]string{"02000116": "16.8升琅悦泉水桶装水"},
+		WindowFrom: map[string]string{"02000116": "2026-08-25"},
+	})
+	if len(sigs) != 1 {
+		t.Fatalf("信号数 = %d, want 1", len(sigs))
+	}
+	msg := sigs[0].Message
+	for _, bad := range []string{"虚进", "套取", "刷单", "舞弊", "风险", "异常"} {
+		if strings.Contains(msg, bad) {
+			t.Errorf("信号措辞不应出现 %q: %s", bad, msg)
+		}
+	}
+	for _, want := range []string{"16.8升琅悦泉水桶装水-02000116", "2026-08-25", "18"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("信号应含 %q: %s", want, msg)
+		}
 	}
 }
 

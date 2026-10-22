@@ -63,8 +63,10 @@ type Handler struct {
 	// priceLists / promos 是本地表服务(写侧 + 批量读侧用)。
 	priceLists *service.PriceListService
 	promos     *service.PromotionService
-	users      *userinfo.Client
-	logger     *slog.Logger
+	// plans 是促销**方案头**的读服务(图4,2026-10-22 新增)。
+	plans *service.PromotionPlanService
+	users *userinfo.Client
+	logger *slog.Logger
 }
 
 // New 构造 Handler。users 传 nil 时业务端点一律 503 userd_unavailable。
@@ -81,6 +83,14 @@ func New(prices *service.PriceService, priceLists *service.PriceListService, pro
 		users:      users,
 		logger:     logger,
 	}
+}
+
+// SetPromotionPlans 装配促销方案头服务(图4)。
+//
+// ⚠️ 没装配 ⇒ `/promotion-plans` 返 503 not_ready(装配错误要大声,
+// 不能表现成"这家店没有促销方案")。
+func (h *Handler) SetPromotionPlans(plans *service.PromotionPlanService) {
+	h.plans = plans
 }
 
 // RegisterRoutes 挂载全部路由(nginx 已剥过 /api/v1/pricing/)。
@@ -116,6 +126,17 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/archive/export",
 		rbac.RequireScopeWithBranch("pricing:view", branchFromHeader, resolver),
 		h.getArchiveExport)
+	// 促销方案(图4,**只读**)。
+	//
+	// ⚠️ 与 `/promotions`(促销**行**)是两个东西:
+	//   /promotions     批量查某批商品当前生效的促销(给 POS / 价签用)
+	//   /promotion-plans 查促销**方案单**(图4 的列表 + 详情)
+	r.GET("/promotion-plans",
+		rbac.RequireScopeWithBranch("pricing:view", branchFromHeader, resolver),
+		h.listPromotionPlans)
+	r.GET("/promotion-plans/:plan_no",
+		rbac.RequireScopeWithBranch("pricing:view", branchFromHeader, resolver),
+		h.getPromotionPlan)
 	// 写侧(导入)。scope 是 pricing:manage(见包注释:目前未 seed ⇒ 403)。
 	r.POST("/archive/import",
 		rbac.RequireScopeWithBranch("pricing:manage", branchFromHeader, resolver),

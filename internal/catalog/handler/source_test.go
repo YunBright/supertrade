@@ -97,10 +97,16 @@ type fakeExporter struct {
 	rows map[string][]map[string]any
 	// scopes 记录被请求过的 scope。
 	scopes []string
+	// sinces 记录每次请求带上的增量水位(顺序与 scopes 一致)。
+	//
+	// ⚠️ 用来断言"since 真的透传到了上游"——
+	// 漏传 ⇒ 每次都是全量,而编排方照样推进水位 ⇒ 增量形同虚设(零报错)。
+	sinces []string
 }
 
-func (f *fakeExporter) Export(_ context.Context, _, _, scope string, offset, limit int) (*service.ExportPage, error) {
+func (f *fakeExporter) Export(_ context.Context, _, _, scope string, offset, limit int, since string) (*service.ExportPage, error) {
 	f.scopes = append(f.scopes, scope)
+	f.sinces = append(f.sinces, since)
 	rows := f.rows[scope]
 	if offset >= len(rows) {
 		rows = nil

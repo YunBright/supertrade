@@ -12,7 +12,8 @@
 //
 //	SETTLEMENT_AUDITOR_CORP_ID                wcorp 友好 id(wecom 命令路由键)
 //	SETTLEMENT_AUDITOR_WECOM_TEMPLATE_ID      企微审批模板 id
-//	SETTLEMENT_AUDITOR_AMOUNT_TOLERANCE       金额容差(默认 0.01)
+//	SETTLEMENT_AUDITOR_AMOUNT_TOLERANCE       数值容差(默认 0.01 元;单头 vs 明细勾稽)
+//	SETTLEMENT_AUDITOR_PAYMENT_TOLERANCE      付款取整容差(默认 1 元;实际付款按元取整)
 //	SETTLEMENT_AUDITOR_SALE_WINDOW_DAYS       销售回看窗口(默认 30)
 //	SETTLEMENT_AUDITOR_QTY_FACTOR             数量偏离倍数(默认 3)
 //	SETTLEMENT_AUDITOR_STOCKTAKE_APP_ID       stocktake dapr app-id(默认 stocktake)
@@ -89,6 +90,7 @@ func initApp() error {
 		&model.ApprovalStocktakeLink{},
 		&model.ApprovalApproverPreference{},
 		&model.SettlementPayState{},
+		&model.StocktakeNotifyGroup{},
 	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
 	}
@@ -97,6 +99,7 @@ func initApp() error {
 		CorpID:               os.Getenv("SETTLEMENT_AUDITOR_CORP_ID"),
 		TemplateID:           os.Getenv("SETTLEMENT_AUDITOR_WECOM_TEMPLATE_ID"),
 		AmountToleranceYuan:  envFloat("SETTLEMENT_AUDITOR_AMOUNT_TOLERANCE", 0.01),
+		PaymentToleranceYuan: envFloat("SETTLEMENT_AUDITOR_PAYMENT_TOLERANCE", 1),
 		SaleWindowDays:       envInt("SETTLEMENT_AUDITOR_SALE_WINDOW_DAYS", 30),
 		QtyDeviationFactor:   envFloat("SETTLEMENT_AUDITOR_QTY_FACTOR", 3),
 		StocktakeAppID:       os.Getenv("SETTLEMENT_AUDITOR_STOCKTAKE_APP_ID"),

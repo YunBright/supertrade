@@ -46,6 +46,13 @@ type AuditInput struct {
 	Sheets []PurchaseSheetRow
 	// Signals 规则核对引擎产出的信号(供 LLM 参考,不重复发现)。
 	Signals []signalDraft
+	// Amount 是规则引擎算好的金额勾稽结论。
+	//
+	// ⚠️ **它存在的唯一理由是"别让 LLM 自己重算金额"**:
+	// 2026-10-22 生产实踩,LLM 拿 user prompt 里的显示值自己相加,
+	// 把 0.0054 元的差额算成"差 0.01"并当成 block 理由拒了单。
+	// 金额结论只有一个口径:引擎算完给 LLM。
+	Amount *AmountCheck
 }
 
 // VerdictResult 是 VerdictFn 的返回值。
@@ -259,6 +266,22 @@ func parseVerdictJSON(raw []byte) (*VerdictResult, error) {
 }
 
 // buildAuditSystemPrompt LLM 角色设定(只输出 JSON)。
+//
+// # 金额口径这一段是 2026-10-22 生产事故的直接修复
+//
+// 实测(审批 54bb82421a08480bbcfdacaf6c814b5e):规则引擎算出的真实差额是
+// **0.0054 元**(结算单货款合计 8206.1946 vs 手工付款额 8206.20),在容差内,
+// 引擎产出 **0 条**金额信号(audit_logs 的 check_amounts 步写明"新增 0 条金额信号")。
+//
+// 但当时的 system prompt 只说"规则引擎已标 block 的信号(…/金额勾稽不上/…)通常应 reject",
+// 没告诉 LLM "金额勾稽这件事引擎已经做完了",于是 LLM 拿着 user prompt 里的
+// **显示值**(StringFixed(2) 的 7765.19 + 441.00 = 8206.19)自己加了一遍,
+// 得出"手工 8206.20 与合计 8206.19 差 0.01",当成 block 理由把整单拒了。
+//
+// ⇒ 三条硬规矩(缺一条就会重演):
+//  1. 付款按**元**取整:分位一般不实际支付,角位也可能被舍去 ⇒ 分/角级差异不是问题;
+//  2. 金额勾稽**以引擎结论为准**,不许自己把结算单金额相加再和手工付款额比;
+//  3. 拒绝理由只引用信号列表里的信号,不写引擎没给出的事实。
 func buildAuditSystemPrompt() string {
 	return `你是商场采购结算付款审核员。给你一次付款申请的数据:勾选结算单、
 每张结算单拆出的采购进货(PI)/退货(RO)单、采购单头、规则核对引擎已发现的信号、
@@ -267,11 +290,36 @@ func buildAuditSystemPrompt() string {
 判断要点:
 - 规则引擎已标 block 的信号(单据缺失/未审核/金额勾稽不上/无销售进货/数量严重偏离)
   通常应 reject,并在 reason 中引用最关键的几条;
-- 只有 warn 信号时,结合销售/供应商/商品常识判断是否人为失误或套利嫌疑,
+- 只有 warn 信号时,结合销售/供应商/商品常识判断是否需要人工复核,
   无明显问题则 pass,把 warn 摘要写进 reason 供人工终审关注;
-- 若发现某类商品/某供应商/个别商品数据可疑,建议针对性盘点:
+- 若发现某类商品/某供应商/个别商品数据需要盘点,建议针对性盘点:
   suggest_stocktake.scope 取 category|supplier|product,ids 填商品/分类/供应商 id 列表;
   无建议则省略该字段或置 null。
+
+措辞(必须遵守,这条是给**发起人**看的):
+- 只陈述事实:哪个商品、进了多少、从哪天起没销售记录、金额差多少。
+- **不要推断动机、不要给发起人贴负面判断**。禁止出现
+  「虚进」「套取付款」「刷单」「人为操作」「舞弊」「风险」这类词,
+  也不要把"数据对不上"说成"存在问题" —— 陈述事实即可,判断留给人工终审。
+- 例:写「商品 16.8升琅悦泉水桶装水-02000116 自 2026-08-25 采购入库后无销售记录,本次进货 18 桶,
+  请核实该商品近期是否有销售」;不要写「存在虚进、滞销或套取付款风险」。
+
+金额口径(必须遵守,违反会误拒单):
+- 实际付款按元取整:分位一般不实际支付,角位也可能被舍去。
+  ⇒ 分位/角位的差异(小于 1 元)属于正常取整,**不得作为拒绝理由**,一个字都不要提;
+- 金额勾稽由规则引擎完成,结论写在本轮数据的「金额勾稽结论」里,直接采信:
+  结论为「一致」时,**不要**再自己把结算单金额相加去和手工付款额比较 ——
+  你看到的结算单金额是显示值(可能已四舍五入),自己相加会造出几厘的假差异;
+- 只有引擎给出了金额勾稽信号(block)才能把金额写进拒绝理由;
+  即便如此,差异达到「元」级才值得写,分位差异只字不提;
+- 拒绝理由只能引用信号列表里的信号,不要写引擎没有给出的事实。
+
+申请人的备注(重要上下文):
+- 备注随付款申请一起上来,是**申请人给出的解释**,要当推理依据用。
+- 若备注说明了信号背后的合理原因(例如「该商品为换购品,不产生销量」「试销品」「样品」
+  「本次为铺货」),可据此认为相应的数量信号**不需要拦截**,应当 pass,
+  并在 reason 里写明依据是申请人的备注(例如「申请人备注:该商品为换购品,不产生销量,本次无销售记录可接受」)。
+- 备注与信号无关时,按常规判断;备注只是解释,**不能推翻**单据缺失/未审核/金额勾稽这类硬异常。
 
 只输出 JSON,不要 markdown,不要解释:
 {"conclusion":"pass|reject","reason":"中文,200字内","confidence":0.0~1.0,
@@ -279,11 +327,38 @@ func buildAuditSystemPrompt() string {
 }
 
 // buildAuditUserPrompt 拼数据快照(控制长度:信号最多 20 条,结算单最多 20 张)。
+//
+// # 金额怎么写进去(2026-10-22 事故的直接修复)
+//
+// 1. **给引擎的结论,不给它自己相加的机会**:第一段就是「金额勾稽结论」——
+//    手工付款额、结算单货款合计、差额、结论,由规则引擎算好直接给。
+// 2. **金额一律用原始精度打印**(yuanText,不是 StringFixed(2)):
+//    显示值四舍五入过一次,LLM 自己相加就会造出假差异
+//    (8206.1946 被打成 8206.19,加出 8206.19 vs 8206.20 = "差 0.01")。
 func buildAuditUserPrompt(in *AuditInput) string {
 	var sb strings.Builder
 	ap := in.Approval
-	fmt.Fprintf(&sb, "付款申请:approval_id=%s, 手工累加付款金额=%s 元, 备注=%s\n",
-		ap.ID, ap.ManualAmountYuan.StringFixed(2), ap.Remark)
+	fmt.Fprintf(&sb, "付款申请:approval_id=%s, 手工累加付款金额=%s 元\n",
+		ap.ID, yuanText(ap.ManualAmountYuan))
+	// 申请人备注 —— **推理上下文**,不是普通字段:申请人可能已经解释了
+	// 某个信号背后的原因(换购品/试销品/铺货)。用户口径 2026-10-22:
+	// 备注要参与判断,这样第二次发起时机器审核能给出更贴切的结论。
+	if remark := strings.TrimSpace(ap.Remark); remark != "" {
+		fmt.Fprintf(&sb, "申请人备注(推理依据):%s\n", remark)
+	} else {
+		sb.WriteString("申请人备注(推理依据):(空)\n")
+	}
+
+	// 金额勾稽结论(规则引擎已核对,直接采信,不要自己再把结算单金额相加)。
+	if in.Amount != nil {
+		verdict := "不一致"
+		if in.Amount.Consistent {
+			verdict = "一致(差额在付款取整容差内,属正常取整)"
+		}
+		fmt.Fprintf(&sb, "金额勾稽结论:%s —— 手工付款额 %s 元,结算单货款合计 %s 元,差额 %s 元,付款取整容差 %s 元。\n",
+			verdict, yuanText(in.Amount.ManualAmountYuan), yuanText(in.Amount.SettledTotalYuan),
+			yuanText(in.Amount.DiffYuan), yuanText(in.Amount.ToleranceYuan))
+	}
 
 	fmt.Fprintf(&sb, "勾选结算单 %d 张:\n", len(in.Settlements))
 	for i, st := range in.Settlements {
@@ -292,14 +367,14 @@ func buildAuditUserPrompt(in *AuditInput) string {
 			break
 		}
 		fmt.Fprintf(&sb, "  - %s 供应商=%s 类型=%s 货款=%s 账期=%s~%s\n",
-			st.ID, st.SupplierID, st.DocumentType, st.TotalGoodsYuan.StringFixed(2), st.PeriodStart, st.PeriodEnd)
+			st.ID, st.SupplierID, st.DocumentType, yuanText(st.TotalGoodsYuan), st.PeriodStart, st.PeriodEnd)
 		if lns := in.Lines[st.ID]; len(lns) > 0 {
 			for j, ln := range lns {
 				if j >= 10 {
 					fmt.Fprintf(&sb, "    ... 其余 %d 行略\n", len(lns)-10)
 					break
 				}
-				fmt.Fprintf(&sb, "    · %s %s 货款=%s\n", ln.SourceDocType, ln.VoucherID, ln.TotalGoodsYuan.StringFixed(2))
+				fmt.Fprintf(&sb, "    · %s %s 货款=%s\n", ln.SourceDocType, ln.VoucherID, yuanText(ln.TotalGoodsYuan))
 			}
 		}
 	}

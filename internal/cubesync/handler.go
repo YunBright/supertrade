@@ -126,6 +126,18 @@ type triggerReq struct {
 	Token   string   `json:"token"`
 	Mode    string   `json:"mode"`
 	Scopes  []string `json:"scopes"`
+	// ForceFull 是"本轮无视水位,强制全量"。
+	//
+	// ⚠️ **只对人工触发生效** —— 定时回调不接受它:
+	//   定时任务的搬什么由环境变量决定,不该被 body 改。
+	//
+	// # 为什么需要它
+	//
+	//	增量**导不出基础数据**:它只导"变过的行",
+	//	没变过的行永远不会出现在增量结果里。
+	//	⇒ 换门店 / 重建目标库之后,必须显式跑一次全量,
+	//	  否则目标门店**永远缺着那些"没变过"的行**,而且没有任何报错。
+	ForceFull bool `json:"force_full"`
 }
 
 // Handler 是同步端点的 handler。
@@ -302,6 +314,10 @@ func (h *Handler) trigger(c *gin.Context, kind string) {
 			}
 			cfg.Scopes = scopes
 		}
+		// ⚠️ 强制全量**只认人工触发**(见 triggerReq.ForceFull 的注释)。
+		if body.ForceFull {
+			cfg.ForceFull = true
+		}
 	}
 
 	syncer := h.syncer.WithConfig(cfg)
@@ -329,6 +345,27 @@ func (h *Handler) trigger(c *gin.Context, kind string) {
 	}
 
 	// ② 人工触发:同步跑并直接返回报告(调用方要的就是报告)。
+	//
+	// ⚠️ **人工触发也必须抢"运行中"标记**(定时回调已经抢了)。
+	//
+	//	**为什么有了增量水位之后它从"重复劳动"升级成"永久漏数据"**:
+	//
+	//	两轮并发跑,一轮读到的水位 W_old 比另一轮**新**(因为后者先成功了)。
+	//	⇒ 读着旧水位的那轮导的是**更宽**的窗口(W_old, …],
+	//	  而它**失败**了 ⇒ 那段窗口没被导入。
+	//	⇒ 另一轮成功 ⇒ 水位推进到 W_new > W_old
+	//	⇒ **下一轮只会导 (W_new, …]** ⇒ (W_old, W_new] 这段**永远补不回来**。
+	//
+	//	⇒ 所以人工触发与定时回调**不得并发**。撞上了就回 sync_busy。
+	if !h.beginRun() {
+		c.JSON(http.StatusConflict, gin.H{
+			"code":    "sync_busy",
+			"message": "已有一轮同步在跑,本次触发被忽略(并发两轮会把增量水位推进过头 ⇒ 漏数据)",
+		})
+		return
+	}
+	defer h.endRun()
+
 	rep, err := syncer.Sync(c.Request.Context())
 	h.remember(rep, err)
 	if err != nil {

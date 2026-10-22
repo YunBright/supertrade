@@ -110,6 +110,19 @@ type SaleLine struct {
 	DiscountAmountYuan decimal.Decimal `gorm:"column:discount_amount_yuan;type:numeric(18,4);not null;default:0" json:"discount_amount_yuan"`
 	// AmountYuan 是本行成交金额(已扣行级优惠)。
 	AmountYuan decimal.Decimal `gorm:"column:amount_yuan;type:numeric(18,4);not null;default:0" json:"amount_yuan"`
+	// ReturnedQty 是**已退数量**(行级部分退货用)。
+	//
+	// ⚠️ **必须有它**,否则"退两次同一行"会超退:
+	//	超退 ⇒ 库存被回补两次(凭空多货)+ 退款额大于应收。
+	//	⇒ 退前必查 `qty - returned_qty > 0`。
+	//
+	// ⚠️ 整单退货**不**清零它(整单退 ⇒ 这行已经全退 ⇒ 后续不能再退)。
+	ReturnedQty decimal.Decimal `gorm:"column:returned_qty;type:numeric(18,4);not null;default:0" json:"returned_qty"`
+	// ReturnedAmountYuan 是**已退金额**(与 ReturnedQty 对应的金额)。
+	//
+	// ⚠️ 不是"原金额 × 比例"的推导值,而是**实际退掉的那部分**——
+	//	比例退时可能有分位误差,记实际值才能对得上账。
+	ReturnedAmountYuan decimal.Decimal `gorm:"column:returned_amount_yuan;type:numeric(18,4);not null;default:0" json:"returned_amount_yuan"`
 	// IsExchange 是换购品标记。
 	IsExchange bool `gorm:"column:is_exchange;type:boolean;not null;default:false" json:"is_exchange"`
 	// IsVoid 是停用品标记。
@@ -165,4 +178,10 @@ var (
 	ErrAmountMismatch = errors.New("pos: 金额不自洽")
 	// ErrInvalidInput:入参非法。
 	ErrInvalidInput = errors.New("pos: 入参非法")
+	// ErrRefundExceedsSold:退的数量超过该行**未退**的数量。
+	//
+	// ⚠️ 这是**超退**的守卫 —— 少了它,"退两次同一行"会让库存凭空多出两件。
+	ErrRefundExceedsSold = errors.New("pos: 退货数量超过未退数量")
+	// ErrLineNotFoundInSale:指定要退的行不属于这张单。
+	ErrLineNotFoundInSale = errors.New("pos: 要退的行不属于该销售单")
 )

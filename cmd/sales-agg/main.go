@@ -99,6 +99,8 @@ var (
 	// ⚠️ 本服务此前**没有** userinfo 客户端(对比模板那组端点只认 token claims),
 	//   归档端点要按门店守门(inventory:view / inventory:manage)⇒ 必须有它。
 	appUser *userinfo.Client
+	// appReports 是图7 的通用报表服务(11 个 code)。
+	appReports *service.ReportsService
 )
 
 func initApp() error {
@@ -240,6 +242,17 @@ func initApp() error {
 		collect.NewBranchJobRegistrar(collect.NewDaprJobClient(sidecarBaseURL()), collectCallbackAddress()),
 		nil,
 	)
+
+	// 图7 的通用报表(11 个 code)。
+	//
+	// ⚠️ **用同一个 dapr client / 同一个 cube 实例**:不要建第二个。
+	//
+	// ⚠️ **数据源解析器必须装配**:没装 ⇒ 所有门店都走本地 ⇒
+	//   自营店(门店 10)会拿到一份"没有数据源"的空报表,
+	//   而真相是"判据没装"。
+	appReports = service.NewReportsService(cube, slog.Default())
+	appReports.SetSourceResolver(
+		cubesource.NewCachedResolver(cube, cubesource.DefaultTTL, slog.Default()))
 
 	slog.Info("sales-agg app initialized",
 		"cube_app_id", cubeclient.DefaultCubeAppID(),
@@ -438,6 +451,12 @@ func registerRoutes(r *gin.Engine) {
 	//	两者身份来源不同（真人 vs 服务账号），挂错窗口的后果分别是
 	//	"任何人都能开/关采集" 与 "每晚采集必 401"。
 	handler.NewCollectControlHandler(appCtl).RegisterRoutes(r)
+	// 图7 的销售报表(11 个 code)。
+	//
+	// ⚠️ 这组端点**挂 sales:view 的 per-branch 守门**——
+	// 现有的 `/reports/sales` **漏挂了**(handler.go 里直接 r.GET),
+	// PLAN §3.5 明确要求新端点不要沿用这个疏漏。
+	handler.NewReportsHandler(appReports, appUser, slog.Default()).RegisterRoutes(r)
 }
 
 // registerDaprRoutes 在 auth 中间件**之前**注册免鉴权端点。
@@ -495,12 +514,41 @@ func registerDaprRoutes(r *gin.Engine) {
 // 与 stocktake 的同名函数逐字一致（都是 cubeclient.WithBearer 的标准用法）：
 // handler 收到的 Authorization → ctx → cubeclient 拼进 outgoing gRPC metadata
 // → sidecar 转成 outgoing HTTP Authorization 给 cube-gateway。
+//
+// # ⚠️ userinfo.WithBearer **必须一起写**(与 catalog / cube-router 同款)
+//
+// 本服务的 **per-branch 守门**(rbac.RequireScopeWithBranch → HasAnyScopeWithBranch(appUser))
+// 会**回头问 userd**"这个用户在哪个门店有什么 scope"。
+// 那次调用走的是 userinfo.Client,而 userd 端的 middleware.http.bearer
+// **无 Authorization 头必被 401(Unauthenticated)**。
+//
+// ⇒ 只写 cubeclient.WithBearer ⇒ userinfo 拿不到 token ⇒
+//   userd 返 Unauthenticated ⇒ 本服务把它翻成 **503 userd_unavailable**。
+//
+// ⚠️ 这个症状极具误导性:服务健康、healthz 200、**报表菜单这种纯静态端点也 503**,
+//   而管理台看到的只有"系统繁忙" —— 真因在**出站调用**上,不在业务逻辑里。
+//
+// ⇒ catalog / cube-router / fresh-meat / stocktake 全都双写,这里也必须双写。
 func forwardBearerToOutgoing() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if bearer := c.Request.Header.Get("Authorization"); bearer != "" {
-			c.Request = c.Request.WithContext(
-				cubeclient.WithBearer(c.Request.Context(), bearer),
-			)
+			ctx := cubeclient.WithBearer(c.Request.Context(), bearer)
+			ctx = userinfo.WithBearer(ctx, bearer)
+			c.Request = c.Request.WithContext(ctx)
+		}
+		// ⚠️ X-Branch-ID **必须一起注入**(与 catalog / cube-router 同款)。
+		//
+		//	cubeclient 出站时从 **request.Context** 读门店,再拼成 outgoing
+		//	gRPC metadata `x-branch-id` 给 cube-router。
+		//	少注入一次 ⇒ cube-router 收不到 X-Branch-ID ⇒ 直接返 400
+		//	`branch_required` ⇒ 本服务把这条链路故障翻成 **503 cube_unavailable**,
+		//	文案是"数据源路由暂不可用"—— 真因(少一个门店头)完全看不出来。
+		//
+		//	⚠️ 注意 `middleware.XBranchID()` 只把门店写进 **gin.Context**,
+		//	不动 Go 的 request.Context —— 两者不是同一个 context。
+		if branchID := c.Request.Header.Get("X-Branch-ID"); branchID != "" {
+			ctx := cubeclient.WithBranchID(c.Request.Context(), branchID)
+			c.Request = c.Request.WithContext(ctx)
 		}
 		c.Next()
 	}

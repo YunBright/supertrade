@@ -26,6 +26,7 @@
 package cubeclient
 
 import (
+	"log/slog"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -128,6 +129,20 @@ type DaprCubeClient struct {
 	appID     string
 	queryPath string // 该 app-id 上的查询方法路径,随 appID 变化
 	timeout   time.Duration
+	// barcodes 是"商品条码全表"的短 TTL 快照(见 item_barcode.go)。
+	barcodes *itemBarcodeCache
+	// log 是该 client 的 logger(nil ⇒ 用 slog.Default())。
+	//
+	// ⚠️ 只给"降级路径"用:条形码快照拉不到时不能把整个搜索带崩,
+	//   但**也不能静默** —— 静默降级会让"扫条码搜不到"变成一个没人知道的原因。
+	log *slog.Logger
+}
+
+// SetLogger 给 client 设 logger(可选;不设就用 slog.Default())。
+func (c *DaprCubeClient) SetLogger(l *slog.Logger) {
+	if l != nil {
+		c.log = l
+	}
 }
 
 // NewDaprCubeClient 构造 dapr cube client。
@@ -154,7 +169,15 @@ func NewDaprCubeClient(daprClient daprInvoker, appID, queryPath string) *DaprCub
 		dapr:      daprClient,
 		appID:     appID,
 		queryPath: queryPath,
-		timeout:   10 * time.Second,
+		// ⚠️ 10s 太紧(2026-10-23 实测):逐笔流水表 330 万行,一条"按天 + 关联商品档案"的
+		// live 查询在 cube 侧就要 1.4s 原始 SQL + cube app 自身开销 + 两跳 dapr 转发
+		// ⇒ 端到端 5~6s。**并发几个请求同时打过来时就会撞 10s ⇒ 端点返 503**,
+		// 而那个 503 的文案是「数据源暂不可用」⇒ 会被误读成"cube 挂了"。
+		//
+		// ⇒ 放宽到 30s:慢查询照样能出结果,而不是变成一个误导性的 503。
+		// (真正的 cube 故障仍会按 gRPC code 分类成 503/403/401,不受影响。)
+		timeout: 30 * time.Second,
+		barcodes:  newItemBarcodeCache(itemBarcodeTTL, nil),
 	}
 }
 
@@ -218,6 +241,11 @@ const (
 	// cube 侧把列与模式都转小写再比;模式在**编译期** lower,值仍走参数绑定。
 	// 只影响 ASCII 字母,中文与数字原样通过。
 	OperatorContainsCI = "containsCI"
+	// OperatorIn 集合成员(2026-10-22 新增)。
+	//
+	// ⚠️ cube 的 `in` **至少要一个值**(空集合直接 400)⇒ 空集合要用
+	//   `equals` + 一个不可能为真的哨兵值表达(见 emptySetSentinel)。
+	OperatorIn = "in"
 )
 
 // invoke 发一次 POST 调用(带 JSON body),返回原始响应体。
@@ -732,39 +760,75 @@ func asTimePtr(v any) *time.Time {
 }
 
 // ParseDecimal 把 cube 返回的任意数值字段转为 decimal.Decimal(导出,测试可见)。
+//
+// ⚠️ **读不懂的值一律当 0** —— 调用方若需要区分"0"与"读不懂",
+// 必须用 ParseDecimalOK(见下)。把脏值静默当 0,会让"售价 0 元"混进
+// 商品档案,而 POS 会照印出去。
 func ParseDecimal(v any) decimal.Decimal {
+	d, _ := ParseDecimalOK(v)
+	return d
+}
+
+// ParseDecimalOK 与 ParseDecimal 同语义,但**把"读不懂"与"0"区分开**。
+//
+// # 为什么需要它
+//
+// MSSQL live 源(思迅直查)的 decimal 列经 go-mssqldb 以 []byte 返回,
+// encoding/json 把 []byte 序列化成 **base64**:
+//
+//	product.avg_price_yuan = "MTIuMDAwMDAw"  → base64 → "12.000000"
+//
+// ⇒ 导出端若只按"字面数字"解析,就会把 base64 串**原样带出**
+// ⇒ 导入端解析失败 ⇒ 那一行被当成"没维护价"跳过
+// ⇒ **全量价格一行都没落库,而报告只写"skipped 27569"**,零报错。
+//
+// # 判据
+//
+//  1. nil        ⇒ (0, false)—— 调用方据此输出 null 而不是 "0"
+//     ("没维护价"与"价是 0"必须能区分)
+//  2. 明文数字   ⇒ (该数, true)
+//  3. base64 串  ⇒ 解码后是数字 ⇒ (该数, true)
+//  4. 其它       ⇒ (0, false)—— **绝不**静默当 0
+func ParseDecimalOK(v any) (decimal.Decimal, bool) {
 	if v == nil {
-		return decimal.Zero
+		return decimal.Zero, false
 	}
 	switch x := v.(type) {
 	case float64:
-		return decimal.NewFromFloat(x)
+		return decimal.NewFromFloat(x), true
 	case float32:
-		return decimal.NewFromFloat32(x)
+		return decimal.NewFromFloat32(x), true
 	case int:
-		return decimal.NewFromInt(int64(x))
+		return decimal.NewFromInt(int64(x)), true
 	case int64:
-		return decimal.NewFromInt(x)
+		return decimal.NewFromInt(x), true
 	case string:
-		if d, err := decimal.NewFromString(x); err == nil {
-			return d
+		s := strings.TrimSpace(x)
+		if s == "" {
+			return decimal.Zero, false
 		}
-		// MSSQL live 源(sixun 直查,如 settlement/stock/sale_day)的 decimal 经
+		if d, err := decimal.NewFromString(s); err == nil {
+			return d, true
+		}
+		// MSSQL live 源(sixun 直查,如 settlement/stock/sale_day/product)的 decimal 经
 		// go-mssqldb 以 []byte 返回,encoding/json 把 []byte 序列化成 base64
 		// (如 SUM(sheet_amt) "NDY0OTIuMDIwMA==" = "46492.0200")。
 		// 直接 NewFromString 失败时按 base64 解码再试;纯数字串在第一分支就
-		// 命中,不会被误当 base64。解出来仍不是合法数字 → 保持 Zero 语义。
-		if raw, berr := base64.StdEncoding.DecodeString(x); berr == nil {
-			if s := strings.TrimSpace(string(raw)); s != "" {
-				if d, nerr := decimal.NewFromString(s); nerr == nil {
-					return d
+		// 命中,不会被误当 base64。
+		if raw, berr := base64.StdEncoding.DecodeString(s); berr == nil {
+			if t := strings.TrimSpace(string(raw)); t != "" {
+				if d, nerr := decimal.NewFromString(t); nerr == nil {
+					return d, true
 				}
 			}
 		}
-		return decimal.Zero
+		return decimal.Zero, false
 	case json.Number:
-		d, _ := decimal.NewFromString(x.String())
-		return d
+		d, err := decimal.NewFromString(x.String())
+		if err != nil {
+			return decimal.Zero, false
+		}
+		return d, true
 	}
-	return decimal.Zero
+	return decimal.Zero, false
 }

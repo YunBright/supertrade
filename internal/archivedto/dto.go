@@ -24,6 +24,7 @@ package archivedto
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -128,6 +129,166 @@ func NormalizeAsOf(raw string, now time.Time) (string, error) {
 		return "", fmt.Errorf("%q 不是 yyyy-mm-dd", raw)
 	}
 	return parsed.Format(AsOfLayout), nil
+}
+
+// SinceLayout 是增量导出水位的格式。
+//
+// ⚠️ 水位是**时间点**,必须精确到秒 ——
+//
+//	"昨天 00:00" 与 "昨天 23:59" 差了一整天,
+//	含糊解析会让增量**漏导**或**重导**,而且**全程不报错**。
+const SinceLayout = "2006-01-02 15:04:05"
+
+// NormalizeSince 校验并规整增量导出的水位参数。
+//
+// # 语义
+//
+//	空 ⇒ 全量(默认行为,不变)。
+//	非空 ⇒ 只导"这个时间点之后**变过**"的行。
+//
+// # 为什么只接受两种格式
+//
+//	"yyyy-mm-dd hh:mm:ss" 与 "yyyy-mm-dd"。
+//	其它一律 400 —— 静默回落成"全量"会让调用方以为导了增量,其实导了全量,
+//	而且**没有任何一行报错**。
+//
+// # 为什么放在这里(而不是某个 handler 包)
+//
+//	水位要经过**三跳**:编排器 → 源门店的归档导出端点 → cube-router。
+//	⇒ 三处必须用**同一份**实现,否则解析口径会分叉
+//	(一处认 "2026-10-22"、另一处只认 "2026-10-22 00:00:00")
+//	⇒ 而"看起来一样、过滤结果不同"是最难查的一类缺陷。
+func NormalizeSince(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", nil
+	}
+	for _, layout := range []string{SinceLayout, "2006-01-02"} {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t.Format(SinceLayout), nil
+		}
+	}
+	return "", fmt.Errorf("since 必须是 yyyy-mm-dd hh:mm:ss 或 yyyy-mm-dd,收到 %q", raw)
+}
+
+// ---- 增量导出:哪些 scope 能做增量 ----
+
+// ChangedMembers 是 scope → cube model 里"最后变动时间"成员的映射。
+//
+// # 它是"哪些 scope 能做增量"的**唯一真相源**
+//
+//	只有 cube 侧暴露了"这一行最后一次什么时候变的"的成员,
+//	导出端才能加 `member gt <since>` 过滤 ⇒ 才谈得上增量。
+//
+// # 为什么必须是**一份**表而不是各写各的
+//
+//	cube-router(导出端)按它决定"加不加 gt 过滤";
+//	cubesync(编排端)按它决定"允不允许给这个 scope 推进水位"。
+//
+//	两边各写一份时,改了一边不会编译报错 ⇒ 症状是:
+//
+//	编排端认为"products 支持增量" ⇒ 带上 since ⇒
+//	  导出端不知道 products 没有变动成员 ⇒ **忽略 since**(仍全量导出)
+//	  ⇒ 但水位被推进了 ⇒ 下次只导"最近变过的一部分"却当成全量
+//	  ⇒ **漏数据,而且全程零报错**。
+//
+// ⇒ 一份表 + 两侧都从它派生 ⇒ 漏数据这条路被堵死。
+//
+// # 实测(2026-10-22,源库 ysx/hbposv10)
+//
+//	scope        源表               一天变动   变动时间戳
+//	stock        t_im_branch_stock   91        oper_date    ✅ live 源,已暴露
+//	products     t_bd_item_info        4        modify_date  ✅ 2026-10-22 加了维度
+//	prices       t_bd_item_info        4        同上
+//	promotions   t_pub_plan_flow       -        ❌ 源表无该列
+//	members      t_rm_vip_info         5        modify_date  ❌ cube 未暴露
+//
+// ⇒ **能增量的是 stock / products / prices**。
+//   promotions **不能**(而且它的 overwrite 导入会删行 ⇒ 更不能走增量);
+//   members 收益小(4133 行)且会员导入有"不覆盖财务列"的特殊语义 ⇒ 暂不做。
+//
+// ⚠️ **2026-10-22:cube 去 DuckDB 之后,product 也成了 live model**
+//   (查询实时透传源库)⇒ 不再有"DuckDB 快照滞后 30 分钟"的问题。
+//   ⇒ ChangedMemberLag 里 products/prices 的滞后归零。
+var ChangedMembers = map[string]string{
+	// ⚠️ 源列 `t_im_branch_stock.oper_date`(= cube 的 stock.updated_at),
+	//   覆盖**全部**库存变动来源(销售/退货/采购入库/盘点/调拨/损耗)
+	//   —— 比"从收银流水反推商品"更准(后者会漏采购与盘点)。
+	ScopeStock: "stock.updated_at",
+	// ⚠️ cube 的 product model 现在是 **live**(实时透传源库)。
+	//   它的"最后变动时间"是 `COALESCE(modify_date, created_at)`
+	//   (新建商品 80% 的 modify_date 是 NULL ⇒ 必须用建档时间兜底)。
+	ScopeProducts: "product.updated_at",
+	// ⚠️ prices 用的是**同一个** product model ⇒ 同一个变动成员。
+	ScopePrices: "product.updated_at",
+}
+
+// ChangedMemberLag 是各 scope 的**源数据滞后**(秒):
+// "这个 scope 的源数据,相对我们导出那一刻,最多可能落后多久"。
+//
+// # 为什么这个数字决定"会不会漏"
+//
+//	我们的水位语义是"**我导到哪了**",而 since 的语义是"**源数据最后变动的时刻**"。
+//	两者**只在源数据是实时的**时候才相等。
+//
+//	源数据是 **live**(直接查源库,库存就是它):两者相等 ⇒ 水位回退几秒即可。
+//
+//	源数据是 **duck**(cube 的离线快照,每 30 分钟增量刷新一次):
+//	我们导出那一刻,cube 里的数据可能还是 **30 分钟前**的
+//	⇒ 水位若按"导出时刻"记,那 30 分钟里的变更就**永远落在水位之前**
+//	⇒ **永久漏**,且报告照样写"成功"。
+//
+// # 正确的口径:水位 = 导出起点 − 源数据滞后
+//
+//	⇒ 下一轮的窗口 = (上一轮导出起点 − 滞后, ∞)
+//	⇒ 窗口**连续**地覆盖了源的延迟 ⇒ 不漏。
+//
+// # 取值:全部为 0(2026-10-22 起)
+//
+//	cube **去掉 DuckDB 之后,所有 model 都是 live** —— 查询实时透传源库
+//	⇒ 不再有"快照滞后 30 分钟"这回事 ⇒ 滞后 = 0。
+//
+//	⚠️ 这个机制**保留**而不删:它是"源将来若引入缓存/物化"时的安全网,
+//	  而且值是**按 scope** 登记的 ⇒ 哪个 scope 将来变慢了,改一行即可。
+//
+//	⚠️ 取值若**小于**源的延迟 ⇒ 漏数据,且零报错 ——
+//	  这是"宁可多导一万倍,也不能漏一行"的又一个实例。
+var ChangedMemberLag = map[string]int{
+	// stock 是 **live** 源(透传思迅 t_im_branch_stock 的当前值)⇒ 无滞后。
+	ScopeStock: 0,
+	// products / prices 也是 **live** 源(2026-10-22 cube 去 DuckDB 后)⇒ 无滞后。
+	ScopeProducts: 0,
+	ScopePrices:   0,
+}
+
+// ChangedMemberLagOf 返回某 scope 的源数据滞后(秒);没登记 = 0。
+func ChangedMemberLagOf(scope string) int {
+	return ChangedMemberLag[scope]
+}
+
+// SupportsIncremental 报告某 scope 是否**能**做增量
+// (cube 侧有没有"最后变动时间"成员 ⇒ 能不能加 gt 过滤)。
+//
+// ⚠️ "能不能"与"要不要"是两件事:
+//   能不能 = 导出端**技术上**支持(本函数);
+//   要不要 = 本次同步**配置上**要用(cubesync 的 IncrementalScopes 白名单)。
+//   ⇒ 两个条件都要满足才走增量。
+func SupportsIncremental(scope string) bool {
+	_, ok := ChangedMembers[scope]
+	return ok
+}
+
+// IncrementalScopes 列出当前**能**做增量的 scope 名(排序后)。
+//
+// ⚠️ 给配置错误的报错信息用 ——
+//   让人一眼看到"到底哪些能开",而不是只知道自己写错了。
+func IncrementalScopes() []string {
+	out := make([]string, 0, len(ChangedMembers))
+	for k := range ChangedMembers {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ---- 导出方向 ----

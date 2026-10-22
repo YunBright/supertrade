@@ -20,6 +20,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/settlement-auditor/model"
 )
 
 // CubeQuerier 是流水线对 cube 的依赖面(单测注入 fake)。
@@ -28,14 +29,24 @@ type CubeQuerier interface {
 	ListSettlements(ctx context.Context, branchID string, ids []string) ([]SettlementRow, error)
 	// ListAuditedSettlements 查时间段内已审核的采购结款单(H5 勾选数据源)。
 	ListAuditedSettlements(ctx context.Context, branchID, from, to, supplierID string, limit int) ([]SettlementRow, error)
+	// ListSupplierNames 取供应商字典(id → 名称)。
+	//
+	// ⚠️ 这是**另一个 cube model** 的数据,不是 settlement 上的列:settlement 是
+	// live model(实时打思迅源库),supplier 是 duck model(同步落 DuckDB)。
+	// cube 的 JOIN 目前**只支持 live↔live**(跨 storage 明确报错,见 cube
+	// pkg/cubequery/join.go),所以 supplier.name **拿不到** settlement 查询里 ——
+	// 只能在 Go 侧 join,与 catalog 域取"商品→供应商名"同一套路。
+	ListSupplierNames(ctx context.Context, branchID string) (map[string]string, error)
 	// ListPurchaseLines 查一张结算单关联的采购进货/退货行(仅 PI/RO)。
 	ListPurchaseLines(ctx context.Context, branchID, settlementID string) ([]SettlementLineRow, error)
-	// ListPurchaseSheets 按 id 批量查采购单头。
+	// ListPurchaseSheets 按 id 批量查采购单头(含制单日期,见 PurchaseSheetRow.CreatedAt)。
 	ListPurchaseSheets(ctx context.Context, branchID string, ids []string) ([]PurchaseSheetRow, error)
 	// ListSheetLines 按 sheet id 批量查采购单行(商品粒度)。
 	ListSheetLines(ctx context.Context, branchID string, sheetIDs []string) ([]SheetLineRow, error)
-	// SumSalesByProduct 拉商品近 N 天销售汇总(net 销量/销额)。
+	// SumSalesByProduct 拉商品 [fromDate, toDate) 销售汇总(net 销量/销额)。
 	SumSalesByProduct(ctx context.Context, branchID string, productIDs []string, fromDate, toDate string) ([]SaleRow, error)
+	// ListProductNames 取商品名(货号 → 名称),给信号/拒绝理由用。
+	ListProductNames(ctx context.Context, branchID string, productIDs []string) (map[string]string, error)
 	// GetStocks 拉商品当前库存。
 	GetStocks(ctx context.Context, branchID string, productIDs []string) ([]StockRow, error)
 }
@@ -46,6 +57,7 @@ type CubeQuerier interface {
 type SettlementRow struct {
 	ID             string
 	SupplierID     string
+	SupplierName   string // 供应商名称(Go 侧 join supplier 字典补上;查不到为空)
 	DocumentType   string // DP/CP
 	ApproveStatus  string // "1"=已审核
 	PeriodStart    string
@@ -64,11 +76,20 @@ type SettlementLineRow struct {
 
 // PurchaseSheetRow cube purchase_sheet 头行。
 type PurchaseSheetRow struct {
-	ID                 string
-	SupplierID         string
-	DocumentType       string // PI/RO
-	ApproveStatus      string // "1"=已审核
-	TotalAmountYuan    decimal.Decimal
+	ID            string
+	SupplierID    string
+	DocumentType  string // PI/RO
+	ApproveStatus string // "1"=已审核
+	// CreatedAt 是采购入库单的制单日期(YYYY-MM-DD)。
+	//
+	// ⚠️ 它是数量信号的**销售窗口起点**:规则改成"自最后一次采购入库单日期到今天"
+	// (2026-10-22 用户口径)—— 进货发生在哪天,就该从哪天开始看卖不卖得动,
+	// 不能拿一个与进货无关的固定窗口(今天-30 天)去比。
+	//
+	// 源列 oper_date(思迅 t_pm_sheet_master)是**真 datetime**,
+	// cube 返回形如 "08 23 2026  4:19PM" ⇒ 用 normalizeCubeDate 规范化。
+	CreatedAt         string
+	TotalAmountYuan   decimal.Decimal
 	TotalNetAmountYuan decimal.Decimal
 }
 
@@ -272,6 +293,36 @@ func (q *DaprCubeQuerier) ListAuditedSettlements(ctx context.Context, branchID, 
 	return out, nil
 }
 
+// ListSupplierNames 取供应商字典(id → 名称)。
+//
+// 复用 cubeclient.ListSuppliers(同一个 cube `supplier` model 的字典查询,
+// catalog 域也在用它)—— **不另写一份查询**:字典查询一旦有两份定义,
+// 迟早有一份漏掉 limit/维度,表现为"部分供应商查不到名字"这种静默缺陷。
+//
+// ⚠️ supplier 是 **duck model**(同步落 DuckDB),不是 live:这条查询**不碰**
+//
+//	思迅源库,代价可以忽略(对比 settlement 的 live 查询要拉 5000 行)。
+//
+// ⚠️ 键要 TrimSpace:思迅的 sup_no / supcust_no 是 char 定长,源库带尾随
+//
+//	空格。cube 查询层虽然已统一 RTRIM,但两边都再 trim 一次才敢当 map 键
+//	—— 键对不上是"静默查不到名字",不报错。
+func (q *DaprCubeQuerier) ListSupplierNames(ctx context.Context, branchID string) (map[string]string, error) {
+	list, err := q.c.ListSuppliers(ctxWithBranch(ctx, branchID))
+	if err != nil {
+		return nil, fmt.Errorf("cube supplier query: %w", err)
+	}
+	out := make(map[string]string, len(list.Rows))
+	for _, s := range list.Rows {
+		id := strings.TrimSpace(s.ID)
+		if id == "" {
+			continue
+		}
+		out[id] = strings.TrimSpace(s.Name)
+	}
+	return out, nil
+}
+
 // parseCubeTime 解析 cube 日期串,覆盖两种来源:
 //   - MSSQL live 源(sixun 直查):"09  1 2021 12:00AM" —— go-mssqldb 把 datetime
 //     RTRIM 成 "01 _2 2006 3:04PM" 形态(月/日空格补位),布局 "01 _2 2006 3:04PM"。
@@ -363,6 +414,10 @@ func (q *DaprCubeQuerier) ListPurchaseLines(ctx context.Context, branchID, settl
 }
 
 // ListPurchaseSheets 按 id in (...) 查 purchase_sheet。
+//
+// ⚠️ created_at(制单日期)进了维度:它是数量信号的**销售窗口起点**
+// (见 PurchaseSheetRow.CreatedAt)。实测思迅采购单头**一个 sheet_no 一行**
+// (同一次查询 5 张单返回 5 行),所以加维度不会把一张单拆成多行。
 func (q *DaprCubeQuerier) ListPurchaseSheets(ctx context.Context, branchID string, ids []string) ([]PurchaseSheetRow, error) {
 	if len(ids) == 0 {
 		return nil, nil
@@ -376,6 +431,7 @@ func (q *DaprCubeQuerier) ListPurchaseSheets(ctx context.Context, branchID strin
 		Dimensions: []string{
 			"purchase_sheet.id", "purchase_sheet.supplier_id",
 			"purchase_sheet.document_type", "purchase_sheet.approve_status",
+			"purchase_sheet.created_at",
 		},
 		Filters: []cubeclient.CubeFilter{
 			{Member: "purchase_sheet.id", Operator: "in", Values: vals},
@@ -392,9 +448,50 @@ func (q *DaprCubeQuerier) ListPurchaseSheets(ctx context.Context, branchID strin
 			SupplierID:         rowStr(r, "purchase_sheet.supplier_id"),
 			DocumentType:       rowStr(r, "purchase_sheet.document_type"),
 			ApproveStatus:      rowStr(r, "purchase_sheet.approve_status"),
+			CreatedAt:          normalizeCubeDate(rowStr(r, "purchase_sheet.created_at")),
 			TotalAmountYuan:    rowDec(r, "purchase_sheet.total_amount_yuan"),
 			TotalNetAmountYuan: rowDec(r, "purchase_sheet.total_net_amount_yuan"),
 		})
+	}
+	return out, nil
+}
+
+// ListProductNames 取商品名(货号 → 名称),给信号/拒绝理由用。
+//
+// # 为什么信号里要带名字
+//
+// 用户口径(2026-10-22):审批结论里涉及到商品时要写「<商品名称>-<商品货号>」,
+// 不能只给一串货号 —— 店长看到 "02000116" 无从判断这是不是自家在卖的商品,
+// 看到 "16.8升琅悦泉水桶装水-02000116" 立刻知道是桶装水。
+//
+// product 是 **duck model**(同步落 DuckDB,不是实时打思迅源库)⇒ 查询很便宜。
+// 查不到名字时调用方回退到纯货号(见 productLabel)。
+func (q *DaprCubeQuerier) ListProductNames(ctx context.Context, branchID string, productIDs []string) (map[string]string, error) {
+	if len(productIDs) == 0 {
+		return nil, nil
+	}
+	vals := make([]any, 0, len(productIDs))
+	for _, id := range productIDs {
+		vals = append(vals, id)
+	}
+	data, err := q.c.LoadCubeQuery(ctxWithBranch(ctx, branchID), "product", cubeclient.CubeQuery{
+		Measures:   []string{"product.count"},
+		Dimensions: []string{"product.id", "product.name"},
+		Filters: []cubeclient.CubeFilter{
+			{Member: "product.id", Operator: "in", Values: vals},
+		},
+		Limit: len(productIDs) * 4,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cube product name query: %w", err)
+	}
+	out := make(map[string]string, len(data))
+	for _, r := range data {
+		id := strings.TrimSpace(rowStr(r, "product.id"))
+		if id == "" {
+			continue
+		}
+		out[id] = strings.TrimSpace(rowStr(r, "product.name"))
 	}
 	return out, nil
 }
@@ -516,6 +613,8 @@ func (s *Service) ListCubeSettlements(ctx context.Context, branchID, from, to, s
 	if err != nil {
 		return nil, 0, err
 	}
+	// 补供应商名(cube 侧 JOIN 不了 live↔duck,只能在 Go 侧补)。
+	s.fillSupplierNames(ctx, branchID, rows)
 	if includePaid {
 		return rows, 0, nil
 	}
@@ -529,6 +628,61 @@ func (s *Service) ListCubeSettlements(ctx context.Context, branchID, from, to, s
 	}
 	kept, hidden := FilterOutPaidSettlements(rows, paid)
 	return kept, hidden, nil
+}
+
+// fillSupplierNames 用供应商字典补 rows[].SupplierName。
+//
+// # 为什么字典拉不到只告警、不让整个请求失败
+//
+// 结算单本身是主数据,供应商名是**显示层**。让"名字查不到"升级成"整个列表
+// 503",等于为了让一行小字把付款审批的入口堵死 —— 店长看到的是"数据源不可用",
+// 完全猜不到真正发生的是供应商字典这个**旁路**挂了。
+// 与 catalog 域取商品供应商名同一取舍(catalog/service/catalog.go:
+// "取供应商字典失败,供应商名留空")。
+//
+// 降级后的表现:列表照常出,供应商列只有编号(前端渲染成"编号"而不是
+// "编号-"),按名称搜索自然也搜不到 —— 这与"字典里真没这个供应商"无法区分,
+// 但至少不挡付款。
+func (s *Service) fillSupplierNames(ctx context.Context, branchID string, rows []SettlementRow) {
+	if len(rows) == 0 || s.cube == nil {
+		return
+	}
+	names, err := s.cube.ListSupplierNames(ctx, branchID)
+	if err != nil {
+		s.logger.Warn("settlement-auditor: 取供应商字典失败,供应商名留空", "err", err)
+		return
+	}
+	for i := range rows {
+		if n, ok := names[strings.TrimSpace(rows[i].SupplierID)]; ok {
+			rows[i].SupplierName = n
+		}
+	}
+}
+
+// fillApprovalSettlementNames 给审批快照的结算单行补供应商名称(读时 join)。
+//
+// 与 [fillSupplierNames] 同一个字典、同一套键处理,只是目标结构不同
+// (approval_settlements 的行不是 cube 行,是 PG 快照行)。
+//
+// ⚠️ **读时**补而不是落库:理由见 model.ApprovalSettlement.SupplierName 的注释
+// (历史行只能拿当前字典名回填,加列并不能得到"历史真值",却要动生产表 +
+// 把审核流水线拖进来)。
+//
+// 降级:字典拿不到 ⇒ 名称留空,详情页其余内容照常(与列表页同一取舍)。
+func (s *Service) fillApprovalSettlementNames(ctx context.Context, branchID string, rows []model.ApprovalSettlement) {
+	if len(rows) == 0 || s.cube == nil {
+		return
+	}
+	names, err := s.cube.ListSupplierNames(ctx, branchID)
+	if err != nil {
+		s.logger.Warn("settlement-auditor: 取供应商字典失败,审批详情里的供应商名留空", "err", err)
+		return
+	}
+	for i := range rows {
+		if n, ok := names[strings.TrimSpace(rows[i].SupplierID)]; ok {
+			rows[i].SupplierName = n
+		}
+	}
 }
 
 // saleWindowDates 计算销售回看窗口 [from, to)(to = 今天,YYYY-MM-DD)。
