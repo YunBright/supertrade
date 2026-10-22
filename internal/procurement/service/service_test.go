@@ -270,6 +270,15 @@ func TestListSheets_LocalFilterNarrowsResult(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, byType.Total, "单据类型过滤必须真的收窄命中数")
 
+	// ⚠️ 制单人过滤:前端已经在发 created_by ⇒ 后端静默忽略的话,
+	// "点了筛选没反应"与"参数被忽略"长得一模一样。
+	byCreator, err := svc.List(branchCtx("10"), "10", service.Query{CreatedBy: "3001", Page: 1, PageSize: 50})
+	require.NoError(t, err)
+	assert.Equal(t, 2, byCreator.Total, "制单人过滤必须真的生效(两行都是 3001)")
+	none2, err := svc.List(branchCtx("10"), "10", service.Query{CreatedBy: "NOPE", Page: 1, PageSize: 50})
+	require.NoError(t, err)
+	assert.Equal(t, 0, none2.Total, "制单人过滤必须真的收窄命中数")
+
 	byStatus, err := svc.List(branchCtx("10"), "10", service.Query{ApproveStatus: "approved", Page: 1, PageSize: 50})
 	require.NoError(t, err)
 	assert.Equal(t, 1, byStatus.Total, "审核状态过滤必须真的收窄命中数")
@@ -285,7 +294,7 @@ func TestListSheets_CubeQueryCarriesFilters(t *testing.T) {
 
 	_, err := svc.List(branchCtx("00"), "00", service.Query{
 		SupplierID: "084", OrderNo: "PI-1", ApproveStatus: "approved",
-		DocumentType: "PI", BranchID: "0001", Page: 1, PageSize: 50,
+		DocumentType: "PI", BranchID: "0001", CreatedBy: "3001", Page: 1, PageSize: 50,
 	})
 	require.NoError(t, err)
 	q, ok := reader.LastQuery("purchase_sheet")
@@ -295,6 +304,10 @@ func TestListSheets_CubeQueryCarriesFilters(t *testing.T) {
 	assert.True(t, q.HasFilter("purchase_sheet.approve_status"))
 	assert.True(t, q.HasFilter("purchase_sheet.document_type"))
 	assert.True(t, q.HasFilter("purchase_sheet.branch_id"))
+	// ⚠️ 制单人:前端已经在发 created_by ⇒ 必须真的进 cube 过滤。
+	// (cube 侧的列名是 operator_id —— 思迅 oper_id。)
+	assert.True(t, q.HasFilter("purchase_sheet.operator_id"),
+		"created_by 必须落到 cube 过滤里(前端已经在发这个参数)")
 	// ⚠️ 状态是译文 ⇒ 必须反查源码集合。
 	assert.Equal(t, []any{"1"}, q.FilterValues("purchase_sheet.approve_status"))
 }

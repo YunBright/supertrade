@@ -130,6 +130,16 @@ type Query struct {
 	// ⚠️ PLAN §3.4 的参数表里没有这一项 —— 这是**附加**的:
 	// 图5 的左侧单据列表要能按"收货单 / 退货单"分开看。
 	DocumentType string
+	// CreatedBy 是制单人(精确)。空 = 不过滤。
+	//
+	// ⚠️ cube 侧对应的是 **operator_id**(思迅 oper_id),
+	// 本域 PG 侧对应 created_by —— 两条路径**同一个口径**(都是"制单人")。
+	//
+	// ⚠️ **amount_gte 不在这里**:金额是**度量**(total_net_amount_yuan),
+	// 而 cube 的过滤只作用于**维度** ⇒ "金额 ≥ X"没法表达。
+	// ⇒ 它保持"不支持"(前端已在 UI 上标注),**不要**悄悄改成按度量近似过滤
+	// (那会让两条路径给出不同答案)。
+	CreatedBy string
 	// Page 从 1 开始;PageSize 是每页条数。
 	Page     int
 	PageSize int
@@ -187,6 +197,12 @@ func sheetFilters(q Query) []cubeclient.CubeFilter {
 	if q.DocumentType != "" {
 		out = append(out, cuberead.Filter("purchase_sheet.document_type",
 			cubeclient.OperatorEquals, q.DocumentType))
+	}
+	if q.CreatedBy != "" {
+		// ⚠️ cube 侧的"制单人"列叫 operator_id(思迅 oper_id)
+		// —— 响应里也是从它取 created_by 的(见 purchaseSheetItemOf)。
+		out = append(out, cuberead.Filter("purchase_sheet.operator_id",
+			cubeclient.OperatorEquals, q.CreatedBy))
 	}
 	if q.ApproveStatus != "" {
 		// ⚠️ 调用方给的是**译文**(draft / approved),cube 侧存的是 "0" / "1"
@@ -475,6 +491,10 @@ func (s *Service) localList(ctx context.Context, branchID string, q Query) (*mod
 	}
 	if q.DocumentType != "" {
 		tx = tx.Where("document_type = ?", q.DocumentType)
+	}
+	if q.CreatedBy != "" {
+		// ⚠️ 本域 PG 的 created_by 存的就是**制单人**(与 cube 的 operator_id 同口径)。
+		tx = tx.Where("created_by = ?", q.CreatedBy)
 	}
 	if q.ApproveStatus != "" {
 		tx = tx.Where("approve_status = ?", q.ApproveStatus)

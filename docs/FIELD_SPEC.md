@@ -670,10 +670,23 @@ FIELD_SPEC §3 字段映射只引用这些 cube dimension/measure。
 | cube model | 关键 dimension | 关键 measure |
 |---|---|---|
 | `product` | id, name, category_id, supplier_id, status, created_at | count, avg_price_yuan, total_cost_yuan |
-| `sale_detail` | id, flow_no, branch_id, product_id, sold_at, order_status(S/R) | count, total_qty, total_amount_yuan, net_amount_yuan |
+| `sale_detail` | id, order_no, random_order_no, flow_no, branch_no, product_id, qty, **net_qty**, sale_price, sale_amount, sold_at, sale_way, cashier_id, salesman_id, counter_no, online_flag, discount_amount, cost_price, shift_no, pos_id, spec_sheet_no, uptime | count, total_qty, total_amount_yuan, **net_amount_yuan**(净额) |
 | `stock` | product_id, branch_id, updated_at | total_quantity, total_value_yuan, low_stock_count |
 | `supplier` | id, name, type(0=供应商/1=客户), contact, phone, email, address, status | count, total_credit_yuan |
 | `category` | id, name, parent_id | count |
+
+> ⚠️ **`sale_detail` 没有"单据类型(S/R)"维度 —— 这是源库事实,不是漏做**
+> (2026-10-23 两个生产源库实测):
+>
+> - 逐笔流水表 `t_rm_saleflow` 里**没有退货行**:`sale_qnty` / `sale_money` / `sale_price`
+>   的**负值行都是 0 行** ⇒ 不能用"负数 = 退货"判(那样恒等于"全是销售")。
+> - 退货是**同一行里的另一列**:ysx 的 `ret_qnty`(实测 1939 行非 0,恒等于同行 `sale_qnty`
+>   ⇒ 卖 2.545 件、其中 2.545 件被退);hbposv7 **没有**这一列。
+> - ⇒ 共享 schema 给不出"S/R"(没有两库共有的可判列)⇒ 该维度**已删除**。
+> - ⇒ **净额**由 family 私有的 live 片段算(见 `net_qty` / `net_amount_yuan`):
+>   ysx = (sale_qnty − ret_qnty) × sale_price;hbposv7 = sale_qnty × sale_price。
+> - ⇒ **单据级退货**(采购退货单)走 `purchase_sheet` 的 `purchase_return` segment;
+>   **销售报表的净销售**走 `sales_report`(`t_rm_daysum` 的 `ret_amt`/`ret_qty`)。
 
 ---
 

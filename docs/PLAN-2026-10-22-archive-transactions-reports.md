@@ -42,10 +42,14 @@
 | `t_rm_saleflow` | **3,327,514** | **1,743,882** |
 | `t_rm_payflow` | **1,143,219** | **550,213** |
 | `t_mp_saleflow`（现 `sale_detail` 配的） | 0 | — |
-| `t_rm_order_saleflow`（现 hbposv7 配的） | — | **表不存在** |
+| `t_rm_order_saleflow`（现 hbposv7 配的） | — | **存在但是空壳**:0 行、只有 3 列(com_no / flow_id / flow_no) |
 
-⇒ 现有 `sale_detail` model **两库都拿不到数据**：ysx 配的表是空的，hbposv7 配的表压根不存在。
+⇒ 现有 `sale_detail` model **两库都拿不到数据**：ysx 配的表是空的，hbposv7 配的表是空壳。
 ⇒ **`t_rm_saleflow` 两库都有、都有真实数据、列大体一致** ⇒ 可以进**共享 schema**（只映射两库共有的列）。
+
+> ⚠️ **2026-10-23 订正**：`t_rm_order_saleflow` **不是"表不存在"**，而是**空壳表**
+> （0 行 / 3 列）。结论不变（取不到数据），但"表不存在"会让排障时去查
+> "是不是表名写错了" ⇒ 真实原因是那张表**从来没用过**。
 
 ` t_rm_saleflow` 列（两库共有 25 列，⚠️ **只映射共有列**）：
 
@@ -73,7 +77,26 @@
 | `pos_id` | `posid` | char(4) | POS 号 |
 | `spec_sheet_no` | `spec_sheet_no` | char | 促销单号 |
 
-两库**不一致**、**不映射**的列：`n_stan`/`flowno_type`（仅 ysx）；`paysum_flag`/`voucher_no`/`pr_spec_*`/`ot_spec_*`/`item_no_Fresh`（仅 hbposv7）。
+两库**不一致**、**不映射**的列：`n_stan`/`flowno_type`/`ret_qnty`/`cic_sheet_no`（仅 ysx）；`paysum_flag`/`voucher_no`/`pr_spec_*`/`ot_spec_*`/`item_no_Fresh`（仅 hbposv7）。
+
+> ⚠️ **2026-10-23 补：退货口径（重要，之前 PLAN 里没写清）**
+>
+> 实测两个生产源库：
+>
+> - 逐笔流水表里**没有"退货行"**：`sale_qnty` / `sale_money` / `sale_price` 的
+>   **负值行都是 0 行** ⇒ **不能用"负数 = 退货"**（那样恒等于"全是销售"）。
+> - 退货是**同一行里的另一列**：ysx 的 `ret_qnty`
+>   （实测 1939 行非 0，且**恒等于同行 `sale_qnty`** ⇒ 卖 2.545 件、其中 2.545 件被退）。
+>   hbposv7 **没有**这一列 ⇒ 该库逐笔流水里没有退货。
+> - ⇒ **共享 schema 给不出"S/R"**（没有两库共有的可判列）⇒
+>   `order_status` 维度**已删除**（它此前恒为 'S'，是个会骗人的假维度）。
+> - ⇒ **净额**由 family 私有的 live 片段算（`net_qty` / `net_amount_yuan`）：
+>   ysx = (sale_qnty − ret_qnty) × sale_price；hbposv7 = sale_qnty × sale_price。
+>   ⇒ 片段见 `cube/semantic-layers/sixun/internal/source/sale_detail_sql.go`，
+>   配置项 `source.sale_detail_return_qty_col`（ysx = ret_qnty；hbposv7 不配）。
+> - ⇒ **单据级退货**走 `purchase_sheet` 的 `purchase_return` segment；
+>   **销售报表的净销售**走 `sales_report`（`t_rm_daysum` 的 `ret_amt`/`ret_qty`，
+>   实测 1217894 天里 1801 天有退货）。
 
 ### 1.2 收银流水 ⇒ `t_rm_payflow`（两库共有 25 列）
 
@@ -153,12 +176,12 @@
 
 | model | 动作 | 源表 | storage | 用途 |
 |---|---|---|---|---|
-| `sale_detail` | **改**：源表 `t_mp_saleflow` → `t_rm_saleflow`；schema 按 §1.1 重写维度 | `t_rm_saleflow` | live | 图2/图3 |
+| `sale_detail` | **改**：源表 `t_mp_saleflow` → `t_rm_saleflow`；schema 按 §1.1 重写维度；live 源是**片段**(净额要扣退货，见 §1.1 补注) | `t_rm_saleflow` | live | 图2/图3 |
 | `payflow` | **新增** | `t_rm_payflow` | live | 图6 |
 | `promotion_plan` | **新增** | `t_pub_plan_master` | live | 图4 |
 | `supplier_item` | **新增** | `t_bd_supcust_item` | live | 图1 供货信息 |
 | `branch_price` | **新增** | `t_pc_branch_price` | live | 图1 价格四列 |
-| `product` | **改**：加 `brand_name` 维度（源列 `item_brandname`，两库都有、覆盖率 100%） | `t_bd_item_info` | duck | 图1 品牌 |
+| `product` | **改**：加 `brand_name` 维度（源列 `item_brandname`，两库都有、覆盖率 100%） | `t_bd_item_info` | live | 图1 品牌 |
 | `purchase_sheet(_line)` | 不改 | — | live | 图5 |
 | `sales_report` / `sale_day` | 不改 | — | live | 图7 |
 
@@ -292,9 +315,14 @@ GET /transactions/payments?q=&from=&to=&branch_id=&pay_way=&cashier_id=
 ### 3.3 pricing（AppID `pricing`）—— 促销方案（只读）
 
 ```
-GET /promotion-plans?from=&to=&plan_no=&plan_name=&approve_status=&created_by=&exclude_expired=true&page=1&page_size=50
+GET /promotion-plans?from=&to=&plan_no=&plan_name=&approve_status=&created_by=&member_level=&exclude_expired=true&page=1&page_size=50
 GET /promotion-plans/:plan_no
 ```
+
+> ⚠️ **2026-10-23 补 `member_level`**:前端一直在发这个参数,后端此前**静默忽略**
+> ⇒ "点了筛选没反应"与"参数被忽略"长得一模一样。
+> 现在后端真的过滤(cube 侧 `promotion_plan.member_level` ← 思迅 `vip_type`)。
+> ⚠️ 实测两个源库的取值**恒为"无"** ⇒ 过滤它通常不改变结果,但**必须真的在过滤里**。
 
 列表行：
 
@@ -315,9 +343,18 @@ GET /promotion-plans/:plan_no
 ### 3.4 procurement（**新增域**，AppID `procurement`，dapr app-id `supertrade-procurement`，端口 8120）—— 采购收货（只读）
 
 ```
-GET /purchase-sheets?from=&to=&branch_id=&supplier_id=&approve_status=&order_no=&page=1&page_size=50
+GET /purchase-sheets?from=&to=&branch_id=&supplier_id=&approve_status=&order_no=&document_type=&created_by=&page=1&page_size=50
 GET /purchase-sheets/:sheet_no
 ```
+
+> ⚠️ **2026-10-23 补 `created_by`**:前端一直在发这个参数,后端此前**静默忽略**
+> ⇒ 现在真的过滤(cube 侧 `purchase_sheet.operator_id` ← 思迅 `oper_id`;
+> 本域 PG 侧 `created_by`,两条路径**同一个口径**:制单人)。
+>
+> ⚠️ **`amount_gte` 仍然不支持**(前端已标注):金额是**度量**
+> (`total_net_amount_yuan`),而 cube 的过滤只作用于**维度**
+> ⇒ "金额 ≥ X"没法表达。
+> ⇒ **不要**悄悄改成按度量近似过滤(那会让 cube 路径与本域路径给出不同答案)。
 
 列表行：
 

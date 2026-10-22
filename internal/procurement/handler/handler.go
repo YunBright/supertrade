@@ -82,6 +82,9 @@ func (h *Handler) listSheets(c *gin.Context) {
 		ApproveStatus: c.Query("approve_status"),
 		OrderNo:       c.Query("order_no"),
 		DocumentType:  c.Query("document_type"),
+		// ⚠️ 前端已经在发 created_by(制单人)⇒ 后端必须真的过滤,
+		// 否则"点了筛选没反应"与"参数被忽略"长得一模一样。
+		CreatedBy: c.Query("created_by"),
 		Page:          1,
 		PageSize:      service.DefaultPageSize,
 	}

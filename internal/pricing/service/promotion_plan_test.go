@@ -128,6 +128,14 @@ func seedLocalPlans(t *testing.T, db *gorm.DB) {
 			BeginDate: &begin, EndDate: &end,
 			CreatedAt: &created, CreatedBy: "2001",
 			ApproveFlag: "1", ApproveStatus: "draft", MemberLevel: "无"},
+		// ⚠️ 第三行只为"会员等级过滤能真的收窄"而存在:
+		// 源库实测会员等级恒为"无",但**过滤器本身必须能区分**,
+		// 否则"点了筛选没反应"与"参数被忽略"看起来一模一样。
+		&model.PromotionPlan{PlanNo: "PS002109160003", BranchID: "10",
+			PlanName: "会员等级方案",
+			BeginDate: &begin, EndDate: &end,
+			CreatedAt: &created, CreatedBy: "2001",
+			ApproveFlag: "2", ApproveStatus: "approved", MemberLevel: "银卡"},
 	}
 	for _, r := range rows {
 		require.NoError(t, db.Create(r).Error, "seed")
@@ -167,7 +175,7 @@ func TestPromotionPlans_NoSourceReadsLocal(t *testing.T) {
 
 	page, err := svc.List(context.Background(), "10", PromotionPlanQuery{Page: 1, PageSize: 50})
 	require.NoError(t, err)
-	require.Len(t, page.Items, 2)
+	require.Len(t, page.Items, 3, "本地路径返回全部三行(含会员等级那行)")
 	assert.Equal(t, "local", page.DataSource)
 	assert.Equal(t, "approved", page.Items[0].ApproveStatus)
 }
@@ -203,7 +211,7 @@ func TestPromotionPlans_LocalFilterNarrowsResult(t *testing.T) {
 
 	all, err := svc.List(context.Background(), "10", PromotionPlanQuery{Page: 1, PageSize: 50})
 	require.NoError(t, err)
-	require.Equal(t, 2, all.Total)
+	require.Equal(t, 3, all.Total)
 
 	byNo, err := svc.List(context.Background(), "10", PromotionPlanQuery{
 		PlanNo: "PS002109160001", Page: 1, PageSize: 50,
@@ -222,6 +230,14 @@ func TestPromotionPlans_LocalFilterNarrowsResult(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, 1, byName.Total, "方案名过滤必须真的收窄命中数")
+
+	// ⚠️ 会员等级过滤:前端已经在发 member_level,后端静默忽略的话
+	// "点了筛选没反应"与"参数被忽略"长得一模一样 ⇒ 必须能断言它真的生效。
+	byLevel, err := svc.List(context.Background(), "10", PromotionPlanQuery{
+		MemberLevel: "银卡", Page: 1, PageSize: 50,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, byLevel.Total, "会员等级过滤必须真的收窄命中数")
 }
 
 func TestPromotionPlans_CubeQueryCarriesFilters(t *testing.T) {
@@ -230,7 +246,7 @@ func TestPromotionPlans_CubeQueryCarriesFilters(t *testing.T) {
 
 	_, err := svc.List(context.Background(), "00", PromotionPlanQuery{
 		PlanNo: "PS002109160001", PlanName: "开业", ApproveStatus: "approved",
-		CreatedBy: "2001", Page: 1, PageSize: 50,
+		CreatedBy: "2001", MemberLevel: "无", Page: 1, PageSize: 50,
 	})
 	require.NoError(t, err)
 	q, ok := reader.LastQuery("promotion_plan")
@@ -238,6 +254,10 @@ func TestPromotionPlans_CubeQueryCarriesFilters(t *testing.T) {
 	assert.True(t, q.HasFilter("promotion_plan.plan_no"))
 	assert.True(t, q.HasFilter("promotion_plan.plan_name"))
 	assert.True(t, q.HasFilter("promotion_plan.created_by"))
+	// ⚠️ 会员等级也必须真的进过滤:前端已经在发 member_level,
+	// 后端静默忽略 ⇒ 用户点了筛选、列表没变,零提示。
+	assert.True(t, q.HasFilter("promotion_plan.member_level"),
+		"member_level 必须落到 cube 过滤里(前端已经在发这个参数)")
 	// ⚠️ 状态是译文 ⇒ 必须反查源码集合。
 	assert.Equal(t, []any{"2"}, q.FilterValues("promotion_plan.approve_flag"))
 }

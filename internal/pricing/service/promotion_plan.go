@@ -64,6 +64,14 @@ type PromotionPlanQuery struct {
 	ApproveStatus string
 	// CreatedBy 是制单人(精确)。空 = 不过滤。
 	CreatedBy string
+	// MemberLevel 是会员等级(思迅 vip_type,精确)。空 = 不过滤。
+	//
+	// ⚠️ **实测两个源库的取值恒为"无"**(思迅促销方案表不区分会员等级)
+	// ⇒ 过滤它几乎不会改变结果 —— 但**参数必须真的落到过滤里**:
+	// 前端已经在发它,后端却静默忽略 ⇒ 用户点了筛选、列表没变,**没有任何提示**。
+	// ⇒ 与"合同外的参数"不同:这个参数两库都有(cube 的 promotion_plan.member_level),
+	// 所以能实现,就实现(实现不了也要显式说,不能静默吞)。
+	MemberLevel string
 	// ExcludeExpired 为 true 时剔除"已过结束日期"的方案。
 	//
 	// ⚠️ 默认 true:图4 的默认视图是"当前有效的方案",
@@ -289,6 +297,11 @@ func promotionPlanFilters(q PromotionPlanQuery) []cubeclient.CubeFilter {
 		out = append(out, cuberead.Filter("promotion_plan.created_by",
 			cubeclient.OperatorEquals, q.CreatedBy))
 	}
+	if q.MemberLevel != "" {
+		// ⚠️ 会员等级是**源值**(思迅 vip_type),两库都映射了 ⇒ 可以直接等值过滤。
+		out = append(out, cuberead.Filter("promotion_plan.member_level",
+			cubeclient.OperatorEquals, q.MemberLevel))
+	}
 	if q.ExcludeExpired {
 		out = append(out, cuberead.Filter("promotion_plan.end_date",
 			"gte", time.Now().Format("2006-01-02")))
@@ -319,6 +332,9 @@ func (s *PromotionPlanService) localList(ctx context.Context, branchID string, q
 	}
 	if q.CreatedBy != "" {
 		tx = tx.Where("created_by = ?", q.CreatedBy)
+	}
+	if q.MemberLevel != "" {
+		tx = tx.Where("member_level = ?", q.MemberLevel)
 	}
 	if q.ExcludeExpired {
 		tx = tx.Where("end_date IS NULL OR end_date >= ?", time.Now().Format("2006-01-02"))

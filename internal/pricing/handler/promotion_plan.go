@@ -46,6 +46,7 @@ func (h *Handler) listPromotionPlans(c *gin.Context) {
 		PlanName:       strings.TrimSpace(c.Query("plan_name")),
 		ApproveStatus:  strings.TrimSpace(c.Query("approve_status")),
 		CreatedBy:      strings.TrimSpace(c.Query("created_by")),
+		MemberLevel:    strings.TrimSpace(c.Query("member_level")),
 		ExcludeExpired: true,
 		Page:           1,
 		PageSize:       50,
