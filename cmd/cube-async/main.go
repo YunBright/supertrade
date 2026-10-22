@@ -141,7 +141,10 @@ func initApp() error {
 		"scopes", appCfg.Scopes,
 		"cron_spec", appCfg.CronSpec,
 		"cron_utc", appCfg.Cron,
-		"job", appCfg.JobName(),
+		// ⚠️ 用 appH.JobName()(与回调路径同源),不用 appCfg.JobName() ——
+		//   两者一旦分叉,dapr 打的路径就没人接 ⇒ 定时同步静默消失。
+		"job", appH.JobName(),
+		"job_callback_path", appH.JobCallbackPath(),
 	)
 
 	// 注册定时 job。
@@ -192,16 +195,18 @@ func registerJobWithLog() {
 		return
 	}
 	slog.Info("cube-async: 定时同步 job 已注册",
-		"job", appCfg.JobName(),
+		"job", appH.JobName(),
 		"cron_utc", appCfg.Cron,
-		"address", appCfg.CallbackAddress(cubesync.JobCallbackPath))
+		"address", appCfg.JobCallbackURL())
 }
 
 // registerJob 注册(或重注册)定时同步 job。
 func registerJob(ctx context.Context) error {
 	data := map[string]any{
 		"trigger":       "dapr-job",
-		"job":           appCfg.JobName(),
+		// ⚠️ job 名用 appH.JobName() —— 回调路径由它算出,
+		//   两边必须同源(见 internal/cubesync/handler.go 的 JobCallbackPath)。
+		"job":           appH.JobName(),
 		"source_branch": appCfg.SourceBranchID,
 		"target_branch": appCfg.TargetBranchID,
 		// ⚠️ 共享密钥放在 job data 里:回调端点在免鉴权窗口,
@@ -210,8 +215,8 @@ func registerJob(ctx context.Context) error {
 		// 它只授予"触发本机跑一次同步"这一项能力,不是服务账号凭据。
 		"token": appCfg.JobToken,
 	}
-	return appJobs.Register(ctx, appCfg.JobName(), appCfg.Cron,
-		appCfg.CallbackAddress(cubesync.JobCallbackPath), data)
+	return appJobs.Register(ctx, appH.JobName(), appCfg.Cron,
+		appCfg.JobCallbackURL(), data)
 }
 
 // registerDaprRoutes 在 auth 中间件**之前**注册免鉴权端点。

@@ -2,9 +2,11 @@
 //
 // # 三个端点
 //
-//	POST /v1/sync/job     dapr scheduler 的回调(免鉴权窗口)
+//	POST /job/<job 名>    dapr scheduler 的回调(免鉴权窗口)—— **路径由 dapr 定**
 //	POST /v1/sync/run     人工触发(免鉴权窗口)
 //	GET  /v1/sync/status  上一次同步的结果(免鉴权窗口)
+//
+// (另有 POST /v1/sync/job 作旧别名,dapr 不打它;见 JobCallbackPath。)
 //
 // # ⚠️ 为什么都落在**免鉴权窗口**
 //
@@ -58,12 +60,51 @@ import (
 // TokenHeader 是携带共享密钥的头名。
 const TokenHeader = "X-Sync-Token"
 
-// JobCallbackPath 是 dapr scheduler 回调的路径。
+// JobCallbackPath 返回 dapr scheduler 回调本 app 时的**实际**路径。
 //
-// ⚠️ 与人工触发路径**分开**:两者共用一个路径时,
-// 就无法从请求形态上区分"定时任务"与"人工触发",
-// 于是人工触发会**绕过**定时任务那套参数固定规则(环境变量说了算)。
-const JobCallbackPath = "/v1/sync/job"
+// # ⚠️ 这个路径**不是我们能挑的** —— 它由 dapr 决定
+//
+// ✅ MEASURED 2026-10-22(dapr v1.18 源码 + 生产日志双向核对):
+//
+//	pkg/channel/http/http_channel.go → constructJobRequest:
+//	    uri := h.baseAddress + "/job/" + strings.TrimPrefix(name, "/")
+//
+//	pkg/runtime/scheduler/internal/cluster/streamer.go → invokeApp:
+//	    appChannel.TriggerJob(ctx, job.GetName(), job.GetData())
+//
+// ⇒ 回调恒为 **POST {app}/job/{job 名}**;而且
+// **job spec 里的 address 字段被完全忽略**(invokeApp 只传 name + data)。
+//
+// # 为什么这段注释值这么多钱
+//
+// 之前这里写死 "/v1/sync/job",于是 dapr 每次回调都打到**没注册**的路径:
+//
+//	① gin 落进 NoRoute —— 但**全局中间件链照跑**
+//	   ⇒ RequireAudience 发现没有 claims ⇒ 401
+//	   `{"code":"unauthenticated","message":"缺少已签 token"}`(57 字节)
+//	② dapr 把 401 折成 gRPC code 16,日志只有一句
+//	   "unexpected status code returned from app ... status code returned: 16"
+//
+// ⇒ **带上正确的 token 也没用**:RequireAudience 在 NoRoute 之前就中止了。
+// (实测 2026-10-22:带对 token 打 /job/<name> 仍然是 57 字节的 401。)
+//
+// 症状安静得可怕:服务正常、healthz 200、job 注册成功、
+// 人工触发(/v1/sync/run)一切正常 —— **只有定时那一路从来没跑过**。
+//
+// ⇒ 判据:**回调路径必须与 job 名对上**,而且 job 名只有一处真相源
+// (Handler.JobName)。两边各写各的字符串,就是下一次"同步没跑"的配方。
+func JobCallbackPath(jobName string) string {
+	return "/job/" + strings.TrimPrefix(strings.TrimSpace(jobName), "/")
+}
+
+// LegacyJobPath 是旧的手工别名。
+//
+// ⚠️ dapr **不会**打这个路径(它只打 JobCallbackPath 算出来的那条)。
+//
+// 保留它的理由只有一个:运维脚本 / 习惯用法可能还指着这里。
+// 两条路径都由同一个共享密钥收口,多一个别名不扩大攻击面;
+// 而"删掉之后老脚本 404"比"多留一个别名"更容易让人踩坑。
+const LegacyJobPath = "/v1/sync/job"
 
 // RunPath 是人工触发的路径。
 const RunPath = "/v1/sync/run"
@@ -92,7 +133,14 @@ type Handler struct {
 	syncer *Syncer
 	// jobToken 是共享密钥(明文,与 env 一致)。
 	jobToken string
-	logger   *slog.Logger
+	// jobName 是本实例在 dapr scheduler 里的 job 名。
+	//
+	// ⚠️ 它决定回调路径(/job/<job 名>)—— 而 dapr **只认路径**,
+	// 不认 job spec 里的 address ⇒ 名字与路由必须同源。
+	// 取自 syncer 的 cfg(与注册 job 时用的是同一份 Config),
+	// 这样"注册名"与"回调路径"在构造上就不可能分叉。
+	jobName string
+	logger  *slog.Logger
 
 	// mu 保护下面两个字段。
 	//
@@ -124,19 +172,52 @@ func NewHandler(syncer *Syncer, jobToken string, logger *slog.Logger) *Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	// ⚠️ job 名从 syncer 的 cfg 取 —— 与注册 job 时用的是同一份 Config。
+	//   (调用方必须用**同一份** cfg 去 NewSyncer 与注册 job,
+	//   否则名字与回调路径会分叉 ⇒ 定时回调永远 401。)
+	jobName := ""
+	if syncer != nil {
+		jobName = syncer.cfg.JobName()
+	}
 	return &Handler{
 		syncer:   syncer,
 		jobToken: strings.TrimSpace(jobToken),
+		jobName:  jobName,
 		logger:   logger,
 	}
+}
+
+// JobName 是本实例的 dapr job 名。
+//
+// ⚠️ **注册 job 时必须用这个值** —— 回调路径由它算出,
+//   两边不一致 = dapr 打的路径没人接 = 定时同步静默消失。
+func (h *Handler) JobName() string {
+	if h == nil {
+		return ""
+	}
+	return h.jobName
+}
+
+// JobCallbackPath 是本实例实际注册的 dapr 回调路径。
+func (h *Handler) JobCallbackPath() string {
+	return JobCallbackPath(h.JobName())
 }
 
 // RegisterDaprRoutes 注册免鉴权窗口的端点。
 //
 // ⚠️ 由 cmdbootstrap 在**鉴权中间件之前**调用,顺序是安全不变量 ——
 // 改到中间件之后会让每晚的同步都 401(症状:服务正常、同步从未发生)。
+//
+// ⚠️ **回调路径必须是 /job/<job 名>**(dapr 只打这一条,见 JobCallbackPath)。
+// 注册成别的路径的后果不是"404"那么简单:未匹配的路径会落进
+// gin 的 NoRoute,而 NoRoute **照跑全局中间件链** ⇒ 被 RequireAudience
+// 挡成 401 ⇒ dapr 折成 gRPC code 16 ⇒ 现场只看到一句
+// "status code returned: 16",**连"路径不对"三个字都没有**。
 func (h *Handler) RegisterDaprRoutes(r *gin.Engine) {
-	r.POST(JobCallbackPath, h.handleJob)
+	// ① dapr scheduler 的回调(**dapr 唯一会打的路径**)。
+	r.POST(h.JobCallbackPath(), h.handleJob)
+	// ② 旧别名(人工 / 运维脚本);dapr 不打这里。
+	r.POST(LegacyJobPath, h.handleJob)
 	r.POST(RunPath, h.handleRun)
 	r.GET(StatusPath, h.handleStatus)
 }

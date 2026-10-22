@@ -31,13 +31,29 @@ import (
 
 const testToken = "s3cr3t-token"
 
+// testJobPath 是 dapr scheduler **实际会打**的回调路径。
+//
+// ⚠️ 这里是**硬编码字面量**,不是从实现里算出来的 ——
+//   算出来的话,实现错了测试也会跟着错(同义反复,测了个寂寞)。
+//
+// 依据(dapr v1.18 源码):
+//
+//	pkg/channel/http/http_channel.go → constructJobRequest:
+//	    uri := h.baseAddress + "/job/" + strings.TrimPrefix(name, "/")
+//
+// ⇒ 回调恒为 POST {app}/job/{job 名},job 名 = "cube-async-00-10"。
+const testJobPath = "/job/cube-async-00-10"
+
 // newTestHandler 造一个带 fake 依赖的 Handler。
 func newTestHandler() (*Handler, *fakeExporter, *fakeImporter) {
 	ex := &fakeExporter{pages: map[string][]map[string]any{
 		archivedto.ScopeProducts: {productRow("P1", "商品一")},
 	}}
 	im := &fakeImporter{}
-	cfg := Config{SourceBranchID: "00", TargetBranchID: "10", Mode: "overwrite",
+	// ⚠️ JobPrefix 固定成 "cube-async"(与生产一致)⇒ job 名固定为
+	//   "cube-async-00-10" ⇒ 回调路径固定为 testJobPath。
+	cfg := Config{SourceBranchID: "00", TargetBranchID: "10", JobPrefix: "cube-async",
+		Mode:  "overwrite",
 		Scopes: []string{archivedto.ScopeProducts}, PageSize: 10}
 	h := NewHandler(newTestSyncer(cfg, ex, im), testToken, nil)
 	return h, ex, im
@@ -109,9 +125,9 @@ func TestTrigger_TokenFromAnySource(t *testing.T) {
 		path  string
 	}{
 		{"请求头", testToken, "", RunPath},
-		{"请求头 + job 路径", testToken, "", JobCallbackPath},
+		{"请求头 + job 路径", testToken, "", testJobPath},
 		{"body 字段", "", `{"token":"` + testToken + `"}`, RunPath},
-		{"body 字段 + job 路径", "", `{"token":"` + testToken + `"}`, JobCallbackPath},
+		{"body 字段 + job 路径", "", `{"token":"` + testToken + `"}`, testJobPath},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -177,7 +193,7 @@ func TestJobCallback_IgnoresModeOverride(t *testing.T) {
 	h, _, im := newTestHandler()
 	r := newTestRouter(h)
 
-	w := do(r, http.MethodPost, JobCallbackPath, testToken, `{"mode":"incremental"}`)
+	w := do(r, http.MethodPost, testJobPath, testToken, `{"mode":"incremental"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("应 200,实际 %d: %s", w.Code, w.Body.String())
 	}
@@ -203,7 +219,7 @@ func TestJobCallback_AcksImmediately(t *testing.T) {
 	h, _, _ := newTestHandler()
 	r := newTestRouter(h)
 
-	w := do(r, http.MethodPost, JobCallbackPath, testToken, "")
+	w := do(r, http.MethodPost, testJobPath, testToken, "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("应 200,实际 %d: %s", w.Code, w.Body.String())
 	}

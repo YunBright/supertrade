@@ -261,6 +261,19 @@ func (c Config) CallbackAddress(path string) string {
 	return "http://" + c.CallbackHost + ":" + c.CallbackPort + path
 }
 
+// JobCallbackURL 是 dapr 回调打到的完整地址。
+//
+// ⚠️ **登记在案而已** —— dapr 的 HTTP app channel **不读 job spec 的
+// address 字段**(见 handler.go 里 JobCallbackPath 的注释:
+// pkg/runtime/scheduler/internal/cluster/streamer.go → invokeApp 只传 name + data)。
+// 真正生效的路径恒为 /job/<job 名>。
+//
+// 这里仍然填成**真实路径**,是为了让"读 job spec 的人"看到真相,
+// 而不是让它继续误导下一个改这里的人。
+func (c Config) JobCallbackURL() string {
+	return c.CallbackAddress(JobCallbackPath(c.JobName()))
+}
+
 // JobName 是本同步任务的 job 名。
 //
 // ⚠️ 门店 id 会被写进 job 名,而 job 名会出现在 dapr 的 URL 路径里,
