@@ -27,9 +27,12 @@
 //
 // purchase_sheet(源表 t_pm_sheet_master):
 //
-//	id / supplier_id / document_type / approve_status / order_status /
+// id / supplier_id / document_type / approve_status / order_status /
 //	branch_id / pay_way / currency / created_at / finished_at /
 //	operator_id / confirmer / remark
+//	amount / order_amount(2026-10-23 补:单据金额 / 订单金额,
+//	  源列 sheet_amt / order_amt —— 度量**不能被过滤**,
+//	  "金额 ≥ X"必须靠**维度**才能表达)
 //	measure: total_amount_yuan / total_net_amount_yuan
 //
 // purchase_sheet_line(源表 t_pm_sheet_detail):
@@ -50,6 +53,8 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+
+	"github.com/shopspring/decimal"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/internal/cuberead"
@@ -134,12 +139,32 @@ type Query struct {
 	//
 	// ⚠️ cube 侧对应的是 **operator_id**(思迅 oper_id),
 	// 本域 PG 侧对应 created_by —— 两条路径**同一个口径**(都是"制单人")。
-	//
-	// ⚠️ **amount_gte 不在这里**:金额是**度量**(total_net_amount_yuan),
-	// 而 cube 的过滤只作用于**维度** ⇒ "金额 ≥ X"没法表达。
-	// ⇒ 它保持"不支持"(前端已在 UI 上标注),**不要**悄悄改成按度量近似过滤
-	// (那会让两条路径给出不同答案)。
 	CreatedBy string
+	// AmountGte 是**单据金额下限**(元)。nil = 不过滤。
+	//
+	// # 为什么现在能做了(2026-10-23)
+	//
+	// 之前它"做不到"的原因不是功能没写,而是**cube 侧缺一个维度**:
+	// 金额只有**度量**(total_amount_yuan = SUM(amount)),
+	// 而 cube 的过滤只作用于**维度** ⇒ "金额 ≥ X"在协议层就表达不出来。
+	// ⇒ 当时的选择是"保持不支持",并在前端 UI 上标注。
+	//
+	// 现在 cube 的 purchase_sheet 补了 **amount 维度**(源列 sheet_amt,
+	// 单据金额)⇒ 过滤成立,且语义等价于 SQL 的 HAVING。
+	// (采购单是**单据头表,一行一单** ⇒ 金额就是行上的列,不是聚合值。)
+	//
+	// # 为什么用**单据金额**而不是净额
+	//
+	// 采购侧的退货单(RO)在源库里金额是**正数**(实测 ysx RO 3565 张
+	// 合计 +175.2 万 / hbposv7 2081 张 +130.5 万),
+	// 净额是**另一列** total_net_amount_yuan(RO 才取负)。
+	// "金额 ≥ X"业务上问的是"这单多少钱" ⇒ 两条路径都用**单据金额**口径:
+	//	cube 侧 = purchase_sheet.amount(sheet_amt)
+	//	本域 PG 侧 = total_amount_yuan
+	//
+	// ⚠️ 用指针而不是 decimal.Decimal 零值:0 是一个**合法**的下限
+	// ("只要金额 ≥ 0 的单"),不能用零值当"没传"。
+	AmountGte *decimal.Decimal
 	// Page 从 1 开始;PageSize 是每页条数。
 	Page     int
 	PageSize int
@@ -209,6 +234,23 @@ func sheetFilters(q Query) []cubeclient.CubeFilter {
 		// ⇒ 必须反查源码(翻译规则见 approveStatusOf)。
 		out = append(out, cuberead.Filter("purchase_sheet.approve_status",
 			cubeclient.OperatorIn, toAnySlice(approveFlagsFor(q.ApproveStatus))...))
+	}
+	if q.AmountGte != nil {
+		// ⚠️ 金额是**维度**(源列 sheet_amt = 单据金额),不是度量。
+		//
+		// 度量**不能被过滤**(cube 的 filter 只作用于维度)⇒
+		// cube 侧必须有一个 amount 维度才能表达"金额 ≥ X"。
+		// 它是 2026-10-23 补上的(见 sixun-models/purchase_sheet/schema.yaml)。
+		//
+		// ⚠️ 值下发成**字符串**而不是 JSON 数字:
+		//   MSSQL 比较 numeric 列与参数时,按**类型优先级**决定把谁转成谁。
+		//   - 参数是 nvarchar ⇒ nvarchar 优先级低于 numeric ⇒ 转成 numeric
+		//     ⇒ 精确十进制比较 ✅
+		//   - 参数是 JSON 数字(float64)⇒ float 优先级**高于** numeric
+		//     ⇒ 会把 numeric 列转成 float 再比 ⇒ 丢掉末位精度 ⚠️
+		// ⇒ 用 decimal.String() 下发,保证与本域 PG 的 numeric(18,4) 同精度。
+		out = append(out, cuberead.Filter("purchase_sheet.amount",
+			"gte", q.AmountGte.String()))
 	}
 	if q.From != "" {
 		out = append(out, cuberead.Filter("purchase_sheet.created_at",
@@ -498,6 +540,13 @@ func (s *Service) localList(ctx context.Context, branchID string, q Query) (*mod
 	}
 	if q.ApproveStatus != "" {
 		tx = tx.Where("approve_status = ?", q.ApproveStatus)
+	}
+	if q.AmountGte != nil {
+		// ⚠️ 与 cube 路径**同一个口径**:本域 PG 的 total_amount_yuan
+		// 装的就是**单据金额**(源列 sheet_amt),不是净额。
+		// (净额在 total_net_amount_yuan,RO 才取负 —— 用它会让"金额≥"
+		//  在两条路径上给出不同答案。)
+		tx = tx.Where("total_amount_yuan >= ?", *q.AmountGte)
 	}
 	if q.From != "" {
 		tx = tx.Where("created_at >= ?", dayStart(q.From))

@@ -3,7 +3,8 @@
 // 路由(nginx 已剥过 /api/v1/procurement/):
 //
 //	GET /purchase-sheets?from=&to=&branch_id=&supplier_id=&approve_status=
-//	                   &order_no=&document_type=&page=1&page_size=50
+//	                   &order_no=&document_type=&created_by=&amount_gte=
+//	                   &page=1&page_size=50
 //	    采购单列表(procurement:view,per branch)
 //	GET /purchase-sheets/:sheet_no
 //	    采购单详情(头 + 明细)(procurement:view,per branch)
@@ -29,6 +30,7 @@ import (
 	"github.com/YunBright/authkit/rbac"
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/internal/procurement/model"
@@ -97,6 +99,24 @@ func (h *Handler) listSheets(c *gin.Context) {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			q.PageSize = n
 		}
+	}
+	// ⚠️ amount_gte(单据金额下限)是**可选数值参数**,但**非法值必须 400**。
+	//
+	// 为什么不能"解析失败就当没传":
+	//   "点了筛选没反应"与"参数被忽略"长得一模一样 —— 用户会以为功能坏了,
+	//   而真相是后端把非法值悄悄丢了。
+	//   而且它是**金额**:把 "abc" 当成"不过滤"会返回**全量单据**,
+	//   用户以为"金额≥ 的单据就这么几条",实际看到的是全部。
+	// ⇒ 诚实报错(400),让调用方知道这个参数没被接受。
+	if v := strings.TrimSpace(c.Query("amount_gte")); v != "" {
+		d, err := decimal.NewFromString(v)
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"code": "bad_request", "message": "amount_gte 必须是合法的金额数字",
+			})
+			return
+		}
+		q.AmountGte = &d
 	}
 	page, err := h.svc.List(c.Request.Context(), branchID, q)
 	if err != nil {
