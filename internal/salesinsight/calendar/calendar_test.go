@@ -77,12 +77,25 @@ func TestMakeupWorkdayBeatsWeekend(t *testing.T) {
 	}
 }
 
-// ⚠️ 本包的**核心**防回归测试：周报/月报的上期必须是"同期口径"，
-// 日报本期必须是"今日"（22:50 推送默认 DailySendTime）。
+// ⚠️ 本包的**核心**防回归测试：三种周期各自的锚点。
 //
-// 如果上期退化成自然上期（上周一~上周日 / 上月1号~上月底），
-// 在周中/月中就会拿 4 天比 7 天，金额必然显示"大幅下滑"，
-// 而那只是"本周还没过完"。这个错误每次都像坏消息，但毫无经营含义。
+//	日报：今日 vs 昨日
+//	周报：上周一~上周日 vs 上上周一~上上周日
+//	月报：上月1号~上月末 vs 上上月1号~上上月末
+//
+// ⚠️ 三者**不共用**一个锚点，这是有意的：
+//
+//	日报 22:50 推是营业日中段，店长看的是「今天怎么样」；
+//	周报在**周一**推 —— 若取"本周一~今天"就只有 1 天，那不是周报；
+//	月报在**每月 1 号**推 —— 同理，取"本月1号~今天"只有 1 天。
+//
+// ⇒ 周报/月报必须取**上一个完整周期**。这与 Flutter 端文案逐字一致
+//（`ai_report_rules.dart`：「每天推送当天汇总」/「每周一推送上周汇总」
+// /「每月 1 日推送上月汇总」）。
+//
+// 如果上期退化成自然上期，在周中/月中就会拿 4 天比 7 天，
+// 金额必然显示"大幅下滑"，而那只是"本周还没过完"。
+// 这个错误每次都像坏消息，但毫无经营含义。
 //
 // 日报退化成"昨天"会让 22:50 在 D 推送的报告变成 D-1，而店长看的就是 D 当下 ——
 // 那条 bug 在 2026-10-19 现场实测：用户看到「现在是 2026-10-19 23:30，
@@ -103,18 +116,19 @@ func TestResolvePeriodUsesSameLengthComparison(t *testing.T) {
 			wantPrev: [2]string{"2026-10-15", "2026-10-15"},
 		},
 		{
-			// 周四：本周一(10-12)~今天(10-16) = 5 天
-			// 同期：上周一(10-05)~上周四(10-09) = 5 天 ✅
-			// 若退化成自然上期(10-05~10-11)就是 7 天 → 金额假跌 29%
-			name: "周报周四用上周同期而非自然上期", kind: PeriodWeekly, now: "2026-10-16",
-			wantCur:  [2]string{"2026-10-12", "2026-10-16"},
-			wantPrev: [2]string{"2026-10-05", "2026-10-09"},
+			// 2026-10-16 是周五 ⇒ 本周一 10-12，上周一 10-05。
+			// 本期 = 上周一(10-05)~上周日(10-11) = 完整 7 天
+			// 上期 = 上上周一(09-28)~上上周日(10-04) = 完整 7 天 ✅
+			name: "周报取上一个完整周而非本周至今", kind: PeriodWeekly, now: "2026-10-16",
+			wantCur:  [2]string{"2026-10-05", "2026-10-11"},
+			wantPrev: [2]string{"2026-09-28", "2026-10-04"},
 		},
 		{
-			name: "月报月中用上月同日而非上月整月", kind: PeriodMonthly, now: "2026-10-16",
-			wantCur:  [2]string{"2026-10-01", "2026-10-16"},
-			// 10-16 上月同日 = 09-16，不是 09-30
-			wantPrev: [2]string{"2026-09-01", "2026-09-16"},
+			// 本期 = 上月1号(09-01)~上月末(09-30)
+			// 上期 = 上上月1号(08-01)~上上月末(08-31)
+			name: "月报取上一个完整月", kind: PeriodMonthly, now: "2026-10-16",
+			wantCur:  [2]string{"2026-09-01", "2026-09-30"},
+			wantPrev: [2]string{"2026-08-01", "2026-08-31"},
 		},
 	}
 	for _, c := range cases {
@@ -129,10 +143,13 @@ func TestResolvePeriodUsesSameLengthComparison(t *testing.T) {
 				t.Errorf("本期 = %v, 期望 %v", gotCur, c.wantCur)
 			}
 			if gotPrev != c.wantPrev {
-				t.Errorf("上期 = %v, 期望 %v（自然上期会让金额假跌）", gotPrev, c.wantPrev)
+				t.Errorf("上期 = %v, 期望 %v", gotPrev, c.wantPrev)
 			}
-			// 同期口径的定义性质：两期天数必须相等
-			if p.Cur.Days() != p.Prev.Days() {
+			// 同期口径的定义性质：两期天数必须相等。
+			//
+			// ⚠️ **月报例外**：2月28天 vs 1月31天 是真实口径差异，
+			// 由 calendar.Compare 判 limited 并在卡片上说明，不在这里抹平。
+			if c.kind != PeriodMonthly && p.Cur.Days() != p.Prev.Days() {
 				t.Errorf("同期口径下两期天数应相等，实际 %d vs %d",
 					p.Cur.Days(), p.Prev.Days())
 			}
@@ -140,21 +157,67 @@ func TestResolvePeriodUsesSameLengthComparison(t *testing.T) {
 	}
 }
 
-// 上月同日不能溢出到本月。
+// 月报的本期/上期都必须是**完整月**，且不得溢出到相邻月。
 //
-// 3月31日报月报时，"上月同日"是 2月31日（不存在），
-// time 的规范化会把它变成 3月3日 —— 上期区间凭空多出两天，
-// 于是月报显示"环比上涨"，纯属算错。
-func TestMonthlyPrevDoesNotOverflowIntoNextMonth(t *testing.T) {
+// 3月31日报月报时，本期 = 2月1号~2月28日（2月短月），
+// 上期 = 1月1号~1月31日。
+//
+// ⚠️ 这条同时钉住"上月末"的取法：上上月末必须是 1月31日
+//（1月是31天），错一个月就整月错。
+func TestMonthlyPeriodsAreWholeMonths(t *testing.T) {
 	p, err := ResolvePeriod(PeriodMonthly, mustTime(t, "2026-03-31"))
 	if err != nil {
 		t.Fatalf("ResolvePeriod 失败: %v", err)
 	}
-	if got := Format(p.Prev.End); got != "2026-02-28" {
-		t.Fatalf("3月31日的上月同日应为 2026-02-28（2月最后一天），实际 %s", got)
+	if got := Format(p.Cur.Start); got != "2026-02-01" {
+		t.Errorf("本期起点 = %s, 期望 2026-02-01（上月1号）", got)
+	}
+	if got := Format(p.Cur.End); got != "2026-02-28" {
+		t.Errorf("本期终点 = %s, 期望 2026-02-28（2月最后一天）", got)
+	}
+	if got := Format(p.Prev.Start); got != "2026-01-01" {
+		t.Errorf("上期起点 = %s, 期望 2026-01-01（上上月1号）", got)
+	}
+	if got := Format(p.Prev.End); got != "2026-01-31" {
+		t.Errorf("上期终点 = %s, 期望 2026-01-31（上上月末，1月是31天）", got)
+	}
+	// 本期必须**整月落在 2 月内**，不能溢出到 3 月。
+	if p.Cur.End.After(p.Cur.Start.AddDate(0, 1, -1)) {
+		t.Fatal("本期区间越出了上个月")
 	}
 	if p.Prev.End.After(p.Prev.Start.AddDate(0, 1, -1)) {
-		t.Fatal("上期区间越出了上个月")
+		t.Fatal("上期区间越出了上上个月")
+	}
+}
+
+// 周报必须是**完整 7 天**，且落在上一个完整周里。
+//
+// 2026-10-16 是周五 ⇒ 上周一 10-05 ~ 上周日 10-11。
+//
+// ⚠️ 钉的是「上周」而不是「本周」：周报在**周一**推，
+// 若取"本周一~今天"就只有 1 天，那不是周报（2026-10-23 现场实测的 bug）。
+func TestWeeklyPeriodIsWholePreviousWeek(t *testing.T) {
+	p, err := ResolvePeriod(PeriodWeekly, mustTime(t, "2026-10-16"))
+	if err != nil {
+		t.Fatalf("ResolvePeriod 失败: %v", err)
+	}
+	if got := Format(p.Cur.Start); got != "2026-10-05" {
+		t.Errorf("本期起点 = %s, 期望 2026-10-05（上周一）", got)
+	}
+	if got := Format(p.Cur.End); got != "2026-10-11" {
+		t.Errorf("本期终点 = %s, 期望 2026-10-11（上周日）", got)
+	}
+	if n := p.Cur.Days(); n != 7 {
+		t.Errorf("周报本期必须是完整 7 天，实际 %d 天", n)
+	}
+	if n := p.Prev.Days(); n != 7 {
+		t.Errorf("周报上期必须是完整 7 天，实际 %d 天", n)
+	}
+	if wd := p.Cur.Start.Weekday(); wd != time.Monday {
+		t.Errorf("周报本期起点应是周一，实际 %v", wd)
+	}
+	if wd := p.Cur.End.Weekday(); wd != time.Sunday {
+		t.Errorf("周报本期终点应是周日，实际 %v", wd)
 	}
 }
 
