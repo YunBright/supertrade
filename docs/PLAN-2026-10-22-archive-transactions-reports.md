@@ -343,7 +343,7 @@ GET /promotion-plans/:plan_no
 ### 3.4 procurement（**新增域**，AppID `procurement`，dapr app-id `supertrade-procurement`，端口 8120）—— 采购收货（只读）
 
 ```
-GET /purchase-sheets?from=&to=&branch_id=&supplier_id=&approve_status=&order_no=&document_type=&created_by=&page=1&page_size=50
+GET /purchase-sheets?from=&to=&branch_id=&supplier_id=&approve_status=&order_no=&document_type=&created_by=&amount_gte=&page=1&page_size=50
 GET /purchase-sheets/:sheet_no
 ```
 
@@ -351,10 +351,26 @@ GET /purchase-sheets/:sheet_no
 > ⇒ 现在真的过滤(cube 侧 `purchase_sheet.operator_id` ← 思迅 `oper_id`;
 > 本域 PG 侧 `created_by`,两条路径**同一个口径**:制单人)。
 >
-> ⚠️ **`amount_gte` 仍然不支持**(前端已标注):金额是**度量**
-> (`total_net_amount_yuan`),而 cube 的过滤只作用于**维度**
-> ⇒ "金额 ≥ X"没法表达。
-> ⇒ **不要**悄悄改成按度量近似过滤(那会让 cube 路径与本域路径给出不同答案)。
+> ✅ **2026-10-23 补 `amount_gte`**(单据金额下限,元):
+> 之前"做不到"的原因**不是功能没写**,而是 cube 侧缺一个**维度** ——
+> 金额原先只有**度量**(`total_amount_yuan = SUM(amount)`),
+> 而 cube 的过滤只作用于**维度** ⇒ "金额 ≥ X"在协议层就表达不出来。
+> 现在 cube 的 `purchase_sheet` 补了 **`amount` 维度**(源列 `sheet_amt`,
+> 单据金额)⇒ 过滤成立,等价于 SQL 的 HAVING
+> (采购单是**单据头表,一行一单** ⇒ 金额就是行上的列,不是聚合值)。
+>
+> - **口径是单据金额,不是净额**:采购侧的退货单(RO)在源库里金额是**正数**
+>   (实测 ysx RO 3565 张合计 +175.2 万 / hbposv7 2081 张 +130.5 万),
+>   净额是另一列 `total_net_amount_yuan`(RO 才取负)。
+>   ⇒ cube 侧按 `purchase_sheet.amount`,本域 PG 侧按 `total_amount_yuan`,
+>   两条路径同值。
+> - **非法值返 400**,不静默忽略:把 "abc" 当成"不过滤"会返回**全量单据**,
+>   用户以为"金额 ≥ 的单据就这么几条",实际看到的是全部 ⇒ 那是**给了错答案**。
+>   (`amount_gte=0` 是**合法下限**,不是"没传"。)
+> - ⚠️ 值以**字符串**下发(cube 侧):MSSQL 按类型优先级决定把谁转成谁 ——
+>   nvarchar 优先级低于 numeric ⇒ 转成 numeric ⇒ 精确十进制比较;
+>   若下发 JSON 数字(float64),float 优先级**高于** numeric
+>   ⇒ 会把 numeric 列转成 float 再比 ⇒ 丢末位精度。
 
 列表行：
 
