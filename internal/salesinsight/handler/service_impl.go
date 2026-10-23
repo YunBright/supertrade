@@ -140,6 +140,9 @@ func (s *ServiceImpl) Generate(ctx context.Context, in GenerateInput) (insight.I
 		strings.TrimSpace(prevSummary.Summary) == "" && len(prevSummary.Highlights) == 0 {
 		prevSummary = nil
 	}
+	// ⚠ 区间是否与本期"上期"一致，由引擎判定（insight.PrevSummaryMatches）——
+	//   只有引擎同时握着事实包与最终 prompt，才能保证
+	//   "注入的摘要"与"审计里记录的摘要"是同一个东西。
 
 	ins, audit := s.engine.Analyze(ctx, insight.AnalyzeInput{
 		Fact:        *f,

@@ -93,6 +93,16 @@ type ConverseFunc func(ctx context.Context, system, user string) (raw string, pr
 
 // Analyze 执行一次推理，永远返回可用的 Insight。
 func (e *Engine) Analyze(ctx context.Context, in AnalyzeInput) (Insight, Audit) {
+	// ⚠ 上期摘要必须与事实包的"上期"区间一致，否则**整份丢弃**。
+	//
+	//	这一步在构造审计**之前**做，是为了让 audit.Context 与真正发给模型的
+	//	prompt 保持一致 —— 审计要能还原"模型当时到底看到了什么"，
+	//	若审计记着有摘要、prompt 里却没有，那份审计就是假的。
+	prev := in.PrevSummary
+	if prev != nil && !PrevSummaryMatches(in.Fact, prev) {
+		prev = nil
+	}
+
 	audit := Audit{
 		RunID:        newRunID(),
 		PeriodKind:   in.Fact.Meta.PeriodKind,
@@ -106,8 +116,8 @@ func (e *Engine) Analyze(ctx context.Context, in AnalyzeInput) (Insight, Audit) 
 
 	// 上期摘要要写进 Context —— 否则后台看到的"上下文"是不完整的，
 	// 而"模型当时到底看到了什么"正是审计要回答的问题。
-	if in.PrevSummary != nil {
-		audit.Context += "|prev_summary=" + JSONCompact(in.PrevSummary)
+	if prev != nil {
+		audit.Context += "|prev_summary=" + JSONCompact(prev)
 	}
 
 	// ---- 快速降级：根本不该调 LLM 的情况 ----
@@ -118,7 +128,7 @@ func (e *Engine) Analyze(ctx context.Context, in AnalyzeInput) (Insight, Audit) 
 		return e.degrade(in, audit, ReasonNoClient)
 	}
 
-	user := BuildUserPrompt(in.Fact, in.PrevSummary)
+	user := BuildUserPrompt(in.Fact, prev)
 	audit.Prompt = user
 
 	// ---- 自检：prompt 太长就别调了 ----
@@ -168,6 +178,10 @@ func (e *Engine) Analyze(ctx context.Context, in AnalyzeInput) (Insight, Audit) 
 	parsed.GeneratedBy = ByLLM
 	parsed.PromptVersion = PromptVersion
 	parsed.Sanitize()
+	// ⚠️ LLM 路径必须过清洗闸：prompt 里已经没有全店金额了，
+	//   但模型仍可能从别处（品类相加、上期摘要）凑出一个总额。
+	//   规则降级路径在 RuleInsightsFromFact 里已经过了同一道闸。
+	RedactStoreTotals(in.Fact, parsed)
 
 	audit.Insight = *parsed
 	audit.Degraded = false

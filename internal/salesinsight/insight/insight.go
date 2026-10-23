@@ -41,7 +41,11 @@ import (
 //   - 还是 prompt 被改过了（需要评估改动的效果）
 //
 // 每次改 prompt **必须**递增这个常量，且递增要写在同一个 commit 里。
-const PromptVersion = "v1.0.0"
+//
+// ⚠️ 2026-10-23 从 v1.0.0 升到 v1.1.0：
+//   事实包不再下发全店销售总额/总毛利的绝对金额（只给百分比），
+//   并新增硬约束 6「不要报告全店总数」。
+const PromptVersion = "v1.1.0"
 
 // GeneratedBy 标识这份结论由谁产出。
 type GeneratedBy string
@@ -364,14 +368,22 @@ func FactDigest(f fact.Fact) string {
 	}
 
 	b = append(b, "\n【本期业绩】\n"...)
-	b = append(b, "销售额 "+fmtFloat(f.Totals.NetAmount)+" 元"...)
+	// ⚠ 这里**只给百分比，不给全店销售总额与总毛利的具体金额**。
+	//
+	//	理由（2026-10-23 生产实测）：周报正文出现
+	//	「销售额108626.17元」「参考毛利16927.17元」，
+	//	而运营明确要求"不要报告这类全店总数的具体值"。
+	//
+	//	把绝对值从 prompt 里**拿掉**，比"叮嘱模型别写"可靠得多：
+	//	模型看不到的数字，它写不出来。
+	//	残留风险由 RedactStoreTotals 兜底。
 	if f.Deltas.HasPrev {
-		b = append(b, "，环比 "+fmtPct(f.Deltas.AmountPct)+"（上期 "+fmtFloat(f.Deltas.PrevNetAmount)+" 元）\n"...)
+		b = append(b, "销售额环比 "+fmtPct(f.Deltas.AmountPct)+"\n"...)
 	} else {
-		b = append(b, "（无上期数据，不做环比）\n"...)
+		b = append(b, "销售额（无上期数据，不做环比）\n"...)
 	}
 	if f.Totals.MarginAvailable {
-		b = append(b, "参考毛利 "+fmtFloat(f.Totals.RefMargin)+" 元（"+fmtPct(f.Totals.RefMarginPct*100)+"）\n"...)
+		b = append(b, "参考毛利率 "+fmtPct(f.Totals.RefMarginPct*100)+"\n"...)
 	} else {
 		// ⚠️ 必须显式告诉 LLM"毛利不可算"，否则它会自己编一个看起来合理的毛利率。
 		b = append(b, "⚠️ 参考毛利不可计算（成本数据覆盖率仅 "+fmtPct(f.Totals.CostCoverage*100)+"），请勿给出毛利率\n"...)

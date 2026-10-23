@@ -33,6 +33,9 @@ const SystemPrompt = `你是一名资深零售门店运营顾问，正在为**�
 4. **缺货就是缺货，不是卖不动。** 事实包里已标注"需要补货"的商品，它们卖不出去是因为没货，
    你必须表述为"缺货导致未销售"，绝不能说成"销量下滑"或"滞销"。这个区分对店长最重要。
 5. 若毛利被标注为不可计算，**不要给出任何毛利率数字**，也不要说"毛利表现良好"。
+6. **不要报告全店销售总额与总毛利的具体金额。** 只给**百分比**（环比、占比、毛利率）
+   与**细分项**的金额（品类、商品、供应商）。事实包不会给你全店金额，
+   你也**不要**把细分项相加去凑一个总数 —— 那是估算，不是数据。
 
 ## 输出要求
 
@@ -89,6 +92,39 @@ func BuildUserPrompt(f fact.Fact, prevSummary *PrevSummary) string {
 
 	b.WriteString("\n请按 system 要求的 JSON 格式输出。")
 	return b.String()
+}
+
+// PrevSummaryMatches 判断上期摘要描述的区间，是否就是本期的「上期」。
+//
+// # 为什么必须校验区间（而不是只校验周期类型）
+//
+// 上期摘要是**按周期类型**存的（aireport.PrevKey 含 kind），
+// 看起来"周报只会拿到周报的上一期"。但 2026-10-23 生产实测推翻了它：
+//
+//	周报正文出现「上期结论写销售额60585.35元，与本期引用的118653.51元不一致」
+//
+// 真相是：那份"上一期周报"是在**周期口径改动之前**生成的
+// （改口径前周报算的是别的区间），它与本期的"上期"根本不是同一段。
+// **类型相同 ≠ 区间相同** —— 这正是周报/月报从"未实现"变成"已实现"时
+// 才会暴露的跨期问题：类型对了，区间没对。
+//
+// # 判据
+//
+//	摘要的 from/to 必须**逐字等于**事实包的 PrevFrom/PrevTo。
+//	调用方没给区间（from/to 为空）时**不拦** —— 不猜、不误伤。
+//
+// ⚠️ 不匹配时的处置是**整份丢弃**（当作"没有上期"），
+//   而不是"照用但提醒一句"：模型拿到两份口径不同的数字，
+//   必然会自己编一个对比，而那个对比是错的。
+func PrevSummaryMatches(f fact.Fact, p *PrevSummary) bool {
+	if p == nil {
+		return true
+	}
+	from, to := strings.TrimSpace(p.From), strings.TrimSpace(p.To)
+	if from == "" || to == "" {
+		return true // 调用方没给区间 → 信任调用方
+	}
+	return from == f.Meta.PrevFrom && to == f.Meta.PrevTo
 }
 
 // MaxPrevSummaryChars 是注入的上期摘要长度上限。
@@ -188,6 +224,9 @@ func RuleInsightsFromFact(f fact.Fact, degradedReason string) Insight {
 	}
 
 	in.Sanitize()
+	// ⚠️ 规则版同样不许出现全店总额（见 RedactStoreTotals 的三道防线）。
+	//   LLM 挂掉时走的是这条路，而"降级"不该意味着口径变松。
+	RedactStoreTotals(f, &in)
 	return in
 }
 
@@ -213,10 +252,15 @@ func ruleSummary(f fact.Fact) string {
 		}
 		b.WriteString("，建议优先补货")
 	} else if f.Deltas.HasPrev {
-		b.WriteString(fmt.Sprintf("本期销售额 %s 元，环比 %s",
-			fmtFloat(f.Totals.NetAmount), fmtPct(f.Deltas.AmountPct)))
+		// ⚠ **只报百分比，不报全店销售额**（口径要求见 RedactStoreTotals）。
+		//
+		//	降级版不是"放松版"：LLM 挂掉时这张卡片照样要守同一条口径。
+		//	店长在「每日销售报表」里已经能看到全店金额，重复一遍没有增量价值，
+		//	却会让群里的汇报变成一张只有大数字的流水账。
+		b.WriteString(fmt.Sprintf("销售额环比 %s", fmtPct(f.Deltas.AmountPct)))
 	} else {
-		b.WriteString(fmt.Sprintf("本期销售额 %s 元", fmtFloat(f.Totals.NetAmount)))
+		// ⚠ 无上期数据时**不能出现"环比"二字**（它会暗示存在可比对象）。
+		b.WriteString("本期无上期数据，销售情况待对比")
 	}
 
 	// 可比性提示必须**独立追加**，不能只在"没有缺货"分支里出现。
