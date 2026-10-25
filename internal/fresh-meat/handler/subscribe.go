@@ -36,6 +36,16 @@ import (
 var SubscribeTopics = []string{
 	"auth.user.access_changed",
 	"sale.completed",
+	// ⚠️ **`sale.paid` 才是 POS 真正发的那条**
+	//   (internal/pos/service/events.go:TopicSalePaid)。
+	//
+	//   2026-10-24 生产实测:本服务此前只订阅 `sale.completed`
+	//   ⇒ **POS 的销售一条都没进来过**(journalctl 里零条真实 sale 事件)。
+	//   ⇒ 大宗「POS 自动采信」、零售猪肉的整猪归属,全都等在这条上。
+	//
+	//   两条都留着:`sale.completed` 是 EVENT-CATALOG 的老契约,
+	//   万一有别的发件方按它发,不该被我们漏掉。
+	"sale.paid",
 }
 
 // Subscription 是 /dapr/subscribe 返回结构。
@@ -111,7 +121,10 @@ func (h *Handler) dispatchSubscribe(c *gin.Context, topic string, logger *slog.L
 	switch topic {
 	case "auth.user.access_changed":
 		h.onAccessChanged(c, env.Data, body, logger)
-	case "sale.completed":
+	case "sale.completed", "sale.paid":
+		// ⚠️ 两种事件形状**同一个 handler**:payload 结构体同时认
+		// `sku_id`/`fresh_type`/`completed_at`(sale.completed)
+		// 与 `product_id`/`paid_at`(sale.paid)⇒ 见 service.SaleLine。
 		h.onSaleCompleted(c, env.Data, body, logger)
 	default:
 		logger.Warn("subscribe: unknown topic", "topic", topic)

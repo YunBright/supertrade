@@ -1,0 +1,588 @@
+// Package service / stock.go —— 库存位置(猪肉台 / 冷库)与 SKU 成本状态。
+//
+// # 位置模型(2026-10-23 与门店确认)
+//
+//	counter    —— 猪肉台:当日在售
+//	cold_store —— 冷库:过夜存放 / 分割副产(板油) / 待统收
+//
+// 「全店」是**查询口径**(= counter + cold_store),**不提供"只查冷库"**。
+//
+// # 位置流水
+//
+//	搬上台(冷库→柜台)   冷库 −T ; 柜台 +T      ← 全店不变
+//	副产入冷库          冷库 +kg                ← 全店增加
+//	酒店统收(冷库→出)   冷库 −kg                ← 全店减少(变成收入)
+//	日终过夜(柜台→冷库) 柜台 −P ; 冷库 +P       ← 全店不变
+//
+// ⇒ **全店 = 柜台 + 冷库 恒等**;毛利用全店口径,转库不影响成本
+// (成本跟着货走,移动加权单价是全店一个)。
+//
+// # 冷库余额的口径(2026-10-24 门店口径)
+//
+//	冷库余额 = 上期冷库
+//	         + 本期**结转**(日终盘点盘出来的量 —— 盘点只盘**猪肉台**)
+//	         − 本期**搬上台**
+//	         − 本期**大宗结算出库**(大宗可以直接从冷库出,不必先搬上台)
+//
+// ⇒ 「**搬上台**」是**可选动作**:门店可以只把一部分搬上台零售,剩下的压冷库
+//   (冷库里的货不参与盘点、盘点管不到它)⇒ **"没搬上台"不是异常**。
+//
+// # 为什么"搬上台"必须记录
+//
+// 门店可以**只搬一部分,甚至不上**(货在冷库压着,过几天再卖或走统收)。
+// ⇒ 冷库余额是**累加**的,只有记录了搬台量才算得准
+// ⇒ 否则冷库余额会只增不减,全店库存虚高。
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/YunBright/supertrade/internal/fresh-meat/model"
+	"github.com/shopspring/decimal"
+	"gorm.io/datatypes"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+// datatypesDate 把 time.Time 转成 datatypes.Date(只存日期部分)。
+func datatypesDate(t time.Time) datatypes.Date { return datatypes.Date(t) }
+
+// dateKey 把 datatypes.Date 格式化成 "YYYY-MM-DD"(用于 map key / 展示)。
+func dateKey(d datatypes.Date) string { return time.Time(d).Format("2006-01-02") }
+
+// BulkPositionKeyPrefix 大宗品项在**位置表**里的 key 前缀。
+//
+// ⚠️ **已废弃(2026-10-23)**:大宗库存不再用伪 key。
+//
+// 原来大宗记在 "bulk:<code>" 上(大宗没有思迅货号),但伪 key 不在部位映射里
+// ⇒ 没有入库金额 ⇒ 移动加权单价恒为 0 ⇒ **统收成本 0 ⇒ 毛利率 100%**
+// (实测:卖 10kg 板油收 60 元,成本 0、毛利 +60;真实成本 1000 元、毛利应是 −940)。
+//
+// ⇒ 大宗库存与收入现在记在**部位主 SKU** 上(见 service/bulk_carryover.go)。
+// 本常量只保留给**清理历史残留**用(位置表里可能还有旧的 bulk:* 行)。
+const BulkPositionKeyPrefix = "bulk:"
+
+// BulkPositionKey 大宗品项的**旧**位置 key(仅供清理历史行用)。
+func BulkPositionKey(productCode string) string { return BulkPositionKeyPrefix + productCode }
+
+// CounterLoadLine 搬上猪肉台的一行。
+//
+// ⚠️ 2026-10-24:可以按 **标签号**整袋搬(门店口径:「每个袋子夹上标签,
+// 方便次日搬上猪肉台继续售卖」)⇒ 填了 label 就**按袋子搬**:
+// SKU 与重量都取自袋子,不用再填。
+type CounterLoadLine struct {
+	// ID 是这一行的**行号**(可选)。
+	//
+	// ⚠️ 给了 id ⇒ **覆盖**那一行(幂等:同一份重复提交不会多搬一次);
+	//    不给 ⇒ **新增**一行 —— 门店"早上一袋,卖完了中午再加一袋"就是这么用。
+	ID            string          `json:"id,omitempty"`
+	CubeProductID string          `json:"cube_product_id"`
+	QtyKg         decimal.Decimal `json:"qty_kg"`
+	// Label 是要搬的那一袋的标签号(可选)。
+	Label string `json:"label,omitempty"`
+}
+
+// CounterLoadInput POST /stock/counter-load 入参。
+type CounterLoadInput struct {
+	Lines []CounterLoadLine `json:"lines" binding:"required"`
+	// TakenDate 是这次搬台的**归属日**(YYYY-MM-DD;空 = 今天)。
+	//
+	// ⚠️ 2026-10-24:搬台**有归属日**(与盘点一致)⇒ 补录往期的搬台记在**那一天**,
+	// 冷库也从那一天扣(不是从今天扣)⇒ 门店口径的
+	// 「冷库余额 = 上期冷库 + 本期结转 − 本期搬上台 − 本期大宗出库」才成立。
+	//
+	// ⚠️ 归属日必须 ≤ 今天(不能把货搬到未来)。
+	TakenDate string `json:"taken_date,omitempty"`
+}
+
+// CounterLoadUpdateInput PUT /stock/counter-load/:id 入参(改一行的重量)。
+//
+// ⚠️ **标签号不可改**:标签号绑着**那一袋实物**(搬上台后标签就释放了)。
+type CounterLoadUpdateInput struct {
+	QtyKg decimal.Decimal `json:"qty_kg" binding:"required"`
+}
+
+// StockLine 库存的一行(SKU 级)。
+type StockLine struct {
+	CubeProductID   string          `json:"cube_product_id"`
+	CubeProductName string          `json:"cube_product_name,omitempty"`
+	CutType         model.CutType   `json:"cut_type"`
+	CounterKg       decimal.Decimal `json:"counter_kg"`
+	ColdStoreKg     decimal.Decimal `json:"cold_store_kg"`
+	TotalKg         decimal.Decimal `json:"total_kg"`
+	// MovingAvgUnitCost 是全店移动加权单价(元/kg)。
+	MovingAvgUnitCost decimal.Decimal `json:"moving_avg_unit_cost"`
+}
+
+// StockSnapshot 某店某范围的库存快照。
+type StockSnapshot struct {
+	BranchID string       `json:"branch_id"`
+	Scope    string       `json:"scope"` // counter | all
+	Lines    []StockLine  `json:"lines"`
+	TotalKg  decimal.Decimal `json:"total_kg"`
+}
+
+// CounterLoad 把冷库的货搬上猪肉台(开市准备)。
+//
+// 校验:qty_kg > 0;**新增**的行冷库余额必须够(不够 → 400,提示还剩多少);
+// **前一个营业日必须已盘点**(否则 400,提示要补哪天,见 business_day.go);
+// 归属日(taken_date)必须 ≤ 今天。
+//
+// # 一行一个动作(2026-10-24 门店口径)
+//
+// 「一个 sku 在当天搬台里可以有多条记录,多个标签袋,早上一袋,卖完了,中午加一袋,
+//   可以随时修改,甚至过一天修改。」
+//
+// ⇒ **一行 = 一次搬台动作**:
+//   - 行里**带 id** ⇒ **覆盖**那一行(幂等:同一份重复提交不会多搬一次);
+//   - 行里**不带 id** ⇒ **新增**一行(中午加一袋)—— 序号自动接续;
+//   - 改一行重量 ⇒ PUT /stock/counter-load/:id;
+//   - 撤掉一行 ⇒ DELETE /stock/counter-load/:id;
+//   - 改/撤**过往**某天的一行也允许(过一天修改)⇒ 只影响那一天的余额链。
+//
+// ⚠️ **改/撤造成的负库存不拦**(门店口径:要在每日毛利的告警里红字显示)
+//   ⇒ 见 service/gross_margin.go 的 MarginAlert。
+//
+// ⚠️ 2026-10-24:**两种搬法都留流水**(counter_loads 表):
+// 按标签整袋搬 / 按 SKU+kg 搬 ⇒ 都有 (归属日, SKU, 重量, 操作人)。
+// ⇒ 休市判定与"按营业日推导的冷库余额"才有依据。
+func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLoadInput, operatorID string) (*StockSnapshot, error) {
+	if branchID == "" {
+		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
+	}
+	if len(in.Lines) == 0 {
+		return nil, fmt.Errorf("%w: lines 不能为空", ErrInvalidInput)
+	}
+	now := s.now()
+	// ---- 归属日(与盘点一致)----
+	takenDate, _, err := s.resolveTakenDate(in.TakenDate, now)
+	if err != nil {
+		return nil, err
+	}
+	// ---- 跨日顺序校验:前一个营业日必须已盘点 ----
+	if err := s.assertPrevBizDayStocktaken(ctx, branchID, takenDate); err != nil {
+		return nil, err
+	}
+	// ---- 冻结检查:已审计结转的期间不能再改(含补录)----
+	if err := s.assertNotAudited(ctx, branchID, takenDate, "搬台"); err != nil {
+		return nil, err
+	}
+
+	// ---- 解析每一行(整袋搬的 SKU 与重量取自袋子)----
+	//
+	// ⚠️ 每行都带**部位**(cut_type):库存/结余按部位记(门店口径),
+	//   SKU 只是那一袋实物的溯源属性。
+	cutOfSku, _, err := s.loadSkuCatalog(ctx, branchID, nil)
+	if err != nil {
+		return nil, err
+	}
+	lines := make([]counterLoadLine, 0, len(in.Lines))
+	for i, ln := range in.Lines {
+		if label := strings.TrimSpace(ln.Label); label != "" {
+			// 按**标签号**整袋搬 ⇒ SKU 与重量都取自袋子,不用填。
+			bag, err := s.findBagForCounterLoad(ctx, branchID, label, takenDate)
+			if err != nil {
+				return nil, err
+			}
+			// ⚠️ **新增**一行时:这袋今天已经搬过 ⇒ 不能再搬一次
+			//   (覆盖同一行 id 的幂等重提交不走这里)。
+			if strings.TrimSpace(ln.ID) == "" && bag.Status == BagStatusReleased {
+				return nil, fmt.Errorf("%w: 标签号 %s 今天已经搬上柜台了(要再搬请用新的标签袋)", ErrInvalidInput, label)
+			}
+			lines = append(lines, counterLoadLine{
+				id: strings.TrimSpace(ln.ID), sku: bag.CubeProductID, kg: bag.QtyKg, label: label,
+				cut: bag.CutType,
+			})
+			continue
+		}
+		sku := strings.TrimSpace(ln.CubeProductID)
+		if sku == "" {
+			return nil, fmt.Errorf("%w: lines[%d].cube_product_id 必填(或填 label 按整袋搬)", ErrInvalidInput, i)
+		}
+		if !ln.QtyKg.IsPositive() {
+			return nil, fmt.Errorf("%w: lines[%d].qty_kg 必须 > 0", ErrInvalidInput, i)
+		}
+		lines = append(lines, counterLoadLine{
+			id: strings.TrimSpace(ln.ID), sku: sku, kg: ln.QtyKg, label: "",
+			cut: cutOfSku[sku],
+		})
+	}
+
+	// ---- 覆盖已有行:取旧重量(算位置差额)+ 校验归属日一致 ----
+	for i := range lines {
+		if lines[i].id == "" {
+			continue
+		}
+		var cur model.CounterLoadRecord
+		err := s.db.WithContext(ctx).
+			Where("branch_id = ? AND id = ?", branchID, lines[i].id).
+			First(&cur).Error
+		if err == nil {
+			curDate := time.Time(cur.BizDate).In(s.bizTZOrUTC()).Format("2006-01-02")
+			reqDate := takenDate.In(s.bizTZOrUTC()).Format("2006-01-02")
+			if curDate != reqDate {
+				return nil, fmt.Errorf("%w: 搬台流水 %s 的归属日是 %s,与请求的归属日 %s 不一致",
+					ErrInvalidInput, lines[i].id, curDate, reqDate)
+			}
+			lines[i].prevKg = cur.QtyKg
+			if lines[i].label == "" {
+				lines[i].sku = cur.CubeProductID // SKU 不可改(那批货已经搬走了)
+			}
+			continue
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("query counter_load %s: %w", lines[i].id, err)
+		}
+		// 查不到 ⇒ 当成**新增**(客户端自带的幂等键:第一次提交时它还不存在)。
+	}
+
+	// ---- 冷库余额**只告警不拦截**(门店口径)----
+	//
+	// 「负库存只告警不拦截就可以」⇒ 搬超了也允许(门店可能补录/改单),
+	// 负数由每日毛利的 alert 红字显示(见 service/gross_margin.go 的 MarginAlert)。
+	_, cold, err := s.loadSkuPositions(ctx, branchID)
+	if err != nil {
+		return nil, err
+	}
+	addKg := map[string]decimal.Decimal{}
+	for _, nl := range lines {
+		if nl.id != "" {
+			continue // 覆盖已有行 ⇒ 差额在事务里算
+		}
+		addKg[nl.sku] = addKg[nl.sku].Add(nl.kg)
+	}
+	for sku, v := range addKg {
+		if v.GreaterThan(cold[sku]) {
+			s.pubLogger.Warn("CounterLoad: 搬台量超过当前冷库余额(负库存,只告警不拦截)",
+				"branch_id", branchID, "sku", sku, "cold_kg", cold[sku].String(), "move_kg", v.String())
+		}
+	}
+
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// ① 整袋搬:袋子的位置/状态(标签释放)。
+		for _, nl := range lines {
+			if nl.label == "" {
+				continue
+			}
+			if _, err := s.moveBagToCounter(ctx, tx, branchID, nl.label, takenDate); err != nil {
+				return err
+			}
+		}
+		// ② 流水:带 id 的覆盖、不带 id 的新增(序号接续)。
+		for _, nl := range lines {
+			if err := s.upsertCounterLoadLine(ctx, tx, branchID, takenDate, nl, operatorID); err != nil {
+				return err
+			}
+		}
+		// ③ 位置:按**每行的差额**调整(冷库 −、柜台 +)⇒ 幂等。
+		for _, nl := range lines {
+			delta := nl.kg.Sub(nl.prevKg)
+			if delta.IsZero() {
+				continue
+			}
+			if err := s.addPosition(ctx, tx, branchID, nl.sku, model.StockLocationColdStore, delta.Neg()); err != nil {
+				return err
+			}
+			if err := s.addPosition(ctx, tx, branchID, nl.sku, model.StockLocationCounter, delta); err != nil {
+				return err
+			}
+		}
+		// 推进营业日状态(已搬台)。
+		return s.markBusinessDayCounterLoaded(ctx, tx, branchID, takenDate)
+	})
+	if err != nil {
+		return nil, err
+	}
+	_ = now
+	_ = operatorID
+	// 按营业日推导的冷库余额变了(本期搬上台)⇒ 重算那天的结余快照。
+	if err := s.recomputeCostSnapshots(ctx, branchID, takenDate); err != nil {
+		s.pubLogger.Error("CounterLoad: 结余快照重算失败",
+			"branch_id", branchID, "taken_date", dateKey(datatypesDate(takenDate.In(s.bizTZOrUTC()))), "err", err)
+	}
+	return s.ListStock(ctx, branchID, model.StockScopeCounter)
+}
+
+// ListStock 查库存。
+//
+// scope:默认 counter(猪肉台);all = 猪肉台 + 冷库。
+// ⚠️ **不提供"只查冷库"**(门店明确:没有查冷库的说法)。
+func (s *Service) ListStock(ctx context.Context, branchID string, scope model.StockScope) (*StockSnapshot, error) {
+	if branchID == "" {
+		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
+	}
+	switch scope {
+	case "":
+		scope = model.StockScopeCounter
+	case model.StockScopeCounter, model.StockScopeAll:
+	default:
+		return nil, fmt.Errorf("%w: scope 只支持 counter | all(没有'只查冷库'这个口径)", ErrInvalidInput)
+	}
+	counter, cold, err := s.loadSkuPositions(ctx, branchID)
+	if err != nil {
+		return nil, err
+	}
+	cutOf, nameOf, err := s.loadSkuCatalog(ctx, branchID, nil)
+	if err != nil {
+		return nil, err
+	}
+	// 移动加权单价
+	unitCost := map[string]decimal.Decimal{}
+	var states []model.SkuCostState
+	if err := s.db.WithContext(ctx).Where("branch_id = ?", branchID).Find(&states).Error; err != nil {
+		return nil, fmt.Errorf("query sku_cost_states: %w", err)
+	}
+	for _, st := range states {
+		unitCost[st.CubeProductID] = st.MovingAvgUnitCost
+	}
+
+	skuSet := map[string]struct{}{}
+	for sku := range counter {
+		skuSet[sku] = struct{}{}
+	}
+	for sku := range cold {
+		skuSet[sku] = struct{}{}
+	}
+	lines := make([]StockLine, 0, len(skuSet))
+	total := decimal.Zero
+	for sku := range skuSet {
+		c := counter[sku]
+		cd := cold[sku]
+		if scope == model.StockScopeCounter {
+			cd = decimal.Zero
+		}
+		t := c.Add(cd)
+		lines = append(lines, StockLine{
+			CubeProductID:     sku,
+			CubeProductName:   nameOf[sku],
+			CutType:           cutOf[sku],
+			CounterKg:         c,
+			ColdStoreKg:       cd,
+			TotalKg:           t,
+			MovingAvgUnitCost: unitCost[sku],
+		})
+		total = total.Add(t)
+	}
+	sortStockLines(lines)
+	return &StockSnapshot{BranchID: branchID, Scope: string(scope), Lines: lines, TotalKg: total}, nil
+}
+
+// sortStockLines 按 cube_product_id 升序(输出稳定)。
+func sortStockLines(lines []StockLine) {
+	for i := 1; i < len(lines); i++ {
+		j := i
+		for j > 0 && lines[j-1].CubeProductID > lines[j].CubeProductID {
+			lines[j-1], lines[j] = lines[j], lines[j-1]
+			j--
+		}
+	}
+}
+
+// addPosition 给某位置的余额加 delta(自动 upsert)。
+//
+// # ⚠️ PG 专属坑(2026-10-23 修):upsert 的 SET 子句里**不能写不带表名的列名**
+//
+// GORM 把 `clause.Assignments` 渲染成:
+//
+//	ON CONFLICT (...) DO UPDATE SET "qty_kg" = qty_kg + $1
+//	                                                  ↑ PG 报
+//	                                                    ERROR: column reference "qty_kg" is ambiguous
+//
+// 原因:PG 的 ON CONFLICT DO UPDATE 里,**目标表与 `excluded` 都有这一列**,
+// 不带表名就分不清指的是哪个 ⇒ 必须写成 `"sku_stock_positions"."qty_kg" + $1`。
+// (SQLite 等其它方言的裸列名会解析到目标表 ⇒ 不加限定。)
+//
+// # 为什么这个坑一直没被发现
+//
+// fresh-meat 域到 2026-10-23 为止**零运营数据**(没有整猪/分割/盘点记录)
+// ⇒ 位置表从来没被写过 ⇒ 搬上台 / 日终过夜搬运 / 大宗出入库
+// **全部静默失败**(盘点那步的错误被当成 warning 吞掉,只是日志里有痕迹)。
+// ⇒ 症状是"库存查询永远是空的",而服务 200 正常、零报错。
+func (s *Service) addPosition(ctx context.Context, tx *gorm.DB, branchID, sku string, loc model.StockLocation, delta decimal.Decimal) error {
+	rec := model.SkuStockPosition{
+		ID:           StockPositionID(branchID, sku, string(loc)),
+		BranchID:     branchID,
+		CubeProductID: sku,
+		Location:     loc,
+		QtyKg:        delta,
+		UpdatedAt:    s.now(),
+	}
+	// 累加表达式:PG 要带表名限定,其它方言用裸列名。
+	expr := "qty_kg + ?"
+	if tx.Dialector.Name() == "postgres" {
+		expr = `"sku_stock_positions"."qty_kg" + ?`
+	}
+	// ⚠️ **必须把 ctx 绑到这条语句上** —— 溯源记账回调读的就是
+	// `Statement.Context` 里的 run_id。
+	//
+	// 之前这里是 `tx.Create(rec)`,而**有的调用方传的是 `s.db`**(不带 ctx)
+	// ⇒ 那条写入没有 run_id ⇒ 旁表不记账 ⇒ 收尾 sweep 清不掉 ⇒
+	// 生产库里一天天攒下"0 kg 的幽灵行",而 sweep 报的是 OK。
+	//
+	// ⇒ 统一在这里 `tx.WithContext(ctx)`,调用方传什么 tx 都不会漏。
+	stmt := tx.WithContext(ctx)
+	// upsert:冲突时 qty_kg = qty_kg + delta
+	return stmt.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "branch_id"}, {Name: "cube_product_id"}, {Name: "location"}},
+		DoUpdates: clause.Assignments(map[string]any{
+			"qty_kg":     gorm.Expr(expr, delta),
+			"updated_at": s.now(),
+		}),
+	}).Create(&rec).Error
+}
+
+// applyOvernightMove 日终盘点后执行"过夜搬运":猪肉台 → 冷库。
+//
+// counterActual 是今日盘点的**柜台实盘**(per-SKU)。
+// ⚠️ 全店余额不变(只是位置变),所以这一步**不影响毛利**,只影响位置与压货天数。
+//
+// ⚠️ 柜台是**置零**不是"减掉实盘":账面柜台可能小于实盘(盘盈)或大于实盘(盘亏),
+// 减法会留下负数余额 ⇒ 全店 = 柜台 + 冷库 就算错。
+// 正确做法:柜台绝对置零,冷库 += 今日实盘。
+func (s *Service) applyOvernightMove(ctx context.Context, branchID string, counterActual map[string]decimal.Decimal) error {
+	counter, _, err := s.loadSkuPositions(ctx, branchID)
+	if err != nil {
+		return err
+	}
+	// 要搬进冷库的量:盘到的 SKU 用实盘,没盘到的用账面。
+	toMove := map[string]decimal.Decimal{}
+	for sku, v := range counter {
+		toMove[sku] = v
+	}
+	for sku, v := range counterActual {
+		toMove[sku] = v
+	}
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for sku, cur := range counter {
+			if cur.IsZero() {
+				continue
+			}
+			// 柜台置零(可能是负数余额,一并归零)
+			if err := s.addPosition(ctx, tx, branchID, sku, model.StockLocationCounter, cur.Neg()); err != nil {
+				return err
+			}
+		}
+		for sku, qty := range toMove {
+			if !qty.IsPositive() {
+				continue
+			}
+			if err := s.addPosition(ctx, tx, branchID, sku, model.StockLocationColdStore, qty); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// PersistSkuCostDaily 落当日 SKU 成本快照(幂等 upsert),并刷新 sku_cost_states。
+//
+// 触发点:**日终盘点提交后** —— 那是"这一天算完了"的自然时点。
+// 快照同时是**次日期初的来源**(链式一致,不会因为某天漏算而断链)。
+func (s *Service) PersistSkuCostDaily(ctx context.Context, branchID string, day time.Time) (int, error) {
+	return s.persistSkuCostDaily(ctx, branchID, day, true)
+}
+
+// persistSkuCostDaily 落某营业日的 SKU 成本快照(幂等 upsert)。
+//
+// # updateState 的含义(2026-10-24)
+//
+// true  —— 同时刷新 **sku_cost_states**(「当前」成本状态)⇒ 只用于**今天**那次盘点;
+// false —— **只写 sku_cost_daily**(按营业日的成本快照)⇒ 用于**补录往日**时的重算:
+//         补录不能把"当前成本状态"改成历史某天的值(那会把今天的毛利带歪)。
+func (s *Service) persistSkuCostDaily(ctx context.Context, branchID string, day time.Time, updateState bool) (int, error) {
+	rows, _, _, err := s.computeSkuDailyCosts(ctx, branchID, day)
+	if err != nil {
+		return 0, err
+	}
+	bizDate := day.In(s.bizTZOrUTC())
+	now := s.now()
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for _, r := range rows {
+			snap := model.SkuCostDaily{
+				ID:               generateID(now, "SCD"),
+				BranchID:         r.BranchID,
+				BizDate:          datatypesDate(bizDate),
+				CubeProductID:    r.CubeProductID,
+				CutType:          r.CutType,
+				OpeningKg:        r.OpeningKg,
+				OpeningAmount:    r.OpeningAmount,
+				ProducedKg:       r.ProducedKg,
+				ProducedAmount:   r.ProducedAmount,
+				SoldKg:           r.SoldKg,
+				SoldAmount:       r.SoldAmount,
+				BulkSoldKg:       r.BulkSoldKg,
+				BulkSoldAmount:   r.BulkSoldAmount,
+				WasteKg:          r.WasteKg,
+				WasteAmount:      r.WasteAmount,
+				ClosingKg:        r.ClosingKg,
+				ClosingAmount:    r.ClosingAmount,
+				MovingAvgUnitCost: r.MovingAvgUnitCost,
+				SalesCostYuan:    r.SalesCostYuan,
+				CounterQty:        r.CounterKg,
+				ColdStoreQty:      r.ColdStoreKg,
+				DataSource:       r.DataSource,
+				CreatedAt:        now,
+			}
+			if err := tx.Clauses(clause.OnConflict{
+				Columns: []clause.Column{{Name: "branch_id"}, {Name: "biz_date"}, {Name: "cube_product_id"}},
+				DoUpdates: clause.Assignments(map[string]any{
+					"cut_type":            r.CutType,
+					"opening_kg":          r.OpeningKg,
+					"opening_amount":      r.OpeningAmount,
+					"produced_kg":         r.ProducedKg,
+					"produced_amount":     r.ProducedAmount,
+					"sold_kg":             r.SoldKg,
+					"sold_amount":         r.SoldAmount,
+					"bulk_sold_kg":        r.BulkSoldKg,
+					"bulk_sold_amount":    r.BulkSoldAmount,
+					"waste_kg":            r.WasteKg,
+					"waste_amount":        r.WasteAmount,
+					"closing_kg":          r.ClosingKg,
+					"closing_amount":      r.ClosingAmount,
+					"moving_avg_unit_cost": r.MovingAvgUnitCost,
+					"sales_cost_yuan":     r.SalesCostYuan,
+					"counter_qty":         r.CounterKg,
+					"cold_store_qty":      r.ColdStoreKg,
+					"data_source":         r.DataSource,
+				}),
+			}).Create(&snap).Error; err != nil {
+				return err
+			}
+			// 成本状态:期末 = 新的移动加权单价
+			//
+			// ⚠️ 只在"今天那次盘点"时刷新 —— 补录往日重算**不许**改当前状态。
+			if !updateState {
+				continue
+			}
+			state := model.SkuCostState{
+				ID:                SkuCostStateID(branchID, r.CubeProductID),
+				BranchID:          r.BranchID,
+				CubeProductID:     r.CubeProductID,
+				QtyKg:             r.ClosingKg,
+				AmountYuan:        r.ClosingAmount,
+				MovingAvgUnitCost: r.MovingAvgUnitCost,
+				LastBizDate:       datatypesDate(bizDate),
+			}
+			if err := tx.Clauses(clause.OnConflict{
+				Columns: []clause.Column{{Name: "branch_id"}, {Name: "cube_product_id"}},
+				DoUpdates: clause.Assignments(map[string]any{
+					"qty_kg":               r.ClosingKg,
+					"amount_yuan":          r.ClosingAmount,
+					"moving_avg_unit_cost": r.MovingAvgUnitCost,
+					"last_biz_date":        datatypesDate(bizDate),
+				}),
+			}).Create(&state).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return len(rows), nil
+}

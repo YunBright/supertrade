@@ -153,10 +153,20 @@ func DaprConversationPredictFn(daprCli dapr.Client, convName string, timeout tim
 func ptrStr(s string) *string { return &s }
 
 // buildSystemPrompt 拼 LLM system prompt(中文,固定)。
+//
+// 部位清单**由 model.CarcassCutTypes 生成**(不是手写常量)⇒ 枚举一改,prompt 自动跟着改。
+// ⚠️ 用 CarcassCutTypes 而不是 AllCutTypes:local_pork(隔山肉)是品种级商品,
+// 一头普通猪分割不出它,让 LLM 去预测它的 kg 只会产生幻觉。
 func buildSystemPrompt() string {
-	return `你是猪分割顾问。根据用户给定的整猪毛重、历史同段重量的猪拆分记录,
-输出 JSON 数组 cuts,每个元素含 cut_type(belly/tenderloin/rib/leg_front/leg_rear/trotter/liver)
-与 expected_kg(预期部位产出 kg)。只输出 JSON,不要 markdown。`
+	var sb strings.Builder
+	sb.WriteString("你是猪分割顾问。根据用户给定的整猪毛重、历史同段重量的猪拆分记录,\n")
+	sb.WriteString("输出 JSON 数组 cuts,每个元素含 cut_type 与 expected_kg(预期部位产出 kg)。\n")
+	sb.WriteString("cut_type 只能取下面这些值(英文 wire + 中文名),不要自造:\n")
+	for _, c := range model.CarcassCutTypes {
+		fmt.Fprintf(&sb, "  - %s (%s)\n", c, model.CutLabel(c))
+	}
+	sb.WriteString("只输出 JSON,不要 markdown。")
+	return sb.String()
 }
 
 // buildUserPrompt 拼 user prompt(pig metadata + 历史样本)。
@@ -182,22 +192,134 @@ func buildUserPrompt(pig *model.WholePig, history []model.WholePig) string {
 	return sb.String()
 }
 
-// normalizeCutType 把 LLM 输出的中文名映射到枚举。
-func normalizeCutType(in model.CutType) model.CutType {
-	s := strings.TrimSpace(string(in))
-	mapping := map[string]model.CutType{
-		"belly": model.CutBelly, "五花": model.CutBelly, "五花肉": model.CutBelly,
-		"tenderloin": model.CutTenderloin, "里脊": model.CutTenderloin, "里脊肉": model.CutTenderloin,
-		"rib": model.CutRib, "排骨": model.CutRib, "肋排": model.CutRib,
-		"leg_front": model.CutLegFront, "前腿": model.CutLegFront, "前腿肉": model.CutLegFront,
-		"leg_rear": model.CutLegRear, "后腿": model.CutLegRear, "后腿肉": model.CutLegRear,
-		"trotter": model.CutTrotter, "猪蹄": model.CutTrotter, "蹄": model.CutTrotter,
-		"liver": model.CutLiver, "猪肝": model.CutLiver, "肝": model.CutLiver,
+// cutTypeAliases 中文部位名 → 枚举。
+//
+// 覆盖**真源库里两个门店在售 SKU 的全部叫法**(2026-10-23 实测):
+// 佳乐 1201 / 富百家 010303 的商品名 + 行业标准名 + 广西俗称。
+//
+// 例:富百家"梅肉/腱子肉/猪面瘦肉"= shoulder_blade;佳乐"猪利"= tongue;
+// 广西"猪横利"= spleen;"水油"= fat;"沙骨"= bone_rib。
+var cutTypeAliases = map[string]model.CutType{
+	// ---- 分割肉 ----
+	"五花": model.CutBelly, "五花肉": model.CutBelly, "肋腹": model.CutBelly,
+	"三层肉": model.CutBelly, "腩肉": model.CutBelly, "腩肉(五花肉)": model.CutBelly,
+	"里脊": model.CutTenderloin, "里脊肉": model.CutTenderloin, "通脊": model.CutTenderloin,
+	"外脊": model.CutTenderloin, "小里脊": model.CutTenderloin,
+	"排骨": model.CutRib, "肋排": model.CutRib, "肋条": model.CutRib,
+	"腩排": model.CutRib, "前排": model.CutRib, "前排(硬排)": model.CutRib,
+	"硬排": model.CutRib, "猪大排": model.CutRib, "大排": model.CutRib,
+	"前腿": model.CutLegFront, "前腿肉": model.CutLegFront, "猪肩": model.CutLegFront,
+	"肩肉": model.CutLegFront, "展肉": model.CutLegFront, "猪展": model.CutLegFront,
+	"梅花肉": model.CutShoulderBlade, "梅花": model.CutShoulderBlade,
+	"夹心肉": model.CutShoulderBlade, "前夹心": model.CutShoulderBlade,
+	"梅肉": model.CutShoulderBlade, "梅肉(小里脊)": model.CutShoulderBlade,
+	"肩胛肉": model.CutShoulderBlade,
+	"瘦肉": model.CutLean, "精瘦肉": model.CutLean, "精品瘦肉": model.CutLean,
+	"新鲜瘦肉": model.CutLean, "鲜风瘦肉": model.CutLean, "中肉": model.CutLean,
+	"后腿": model.CutLegRear, "后腿肉": model.CutLegRear, "后臀": model.CutLegRear,
+	"猪蹄": model.CutTrotter, "蹄": model.CutTrotter, "蹄髈": model.CutTrotter,
+	"猪脚": model.CutTrotter, "猪手": model.CutTrotter, "猪肘": model.CutTrotter,
+	"猪肘子": model.CutTrotter, "猪脚尖": model.CutTrotter,
+	"猪尾": model.CutTail, "猪尾巴": model.CutTail, "尾骨": model.CutTail,
+	"猪尾骨": model.CutTail,
+	"猪皮": model.CutSkin, "皮": model.CutSkin,
+	"板油": model.CutFat, "猪板油": model.CutFat, "猪油": model.CutFat,
+	"肥猪油": model.CutFat, "水油": model.CutFat, "脂肪": model.CutFat,
+	"隔山肉": model.CutLocalPork, "隔山": model.CutLocalPork,
+	"土猪": model.CutLocalPork, "本地猪": model.CutLocalPork,
+
+	// ---- 头/皮/耳/舌/颈 ----
+	"猪头": model.CutHead, "头肉": model.CutHead, "猪头肉": model.CutHead,
+	"猪头皮": model.CutHeadSkin, "头皮": model.CutHeadSkin,
+	"猪耳": model.CutEar, "猪耳朵": model.CutEar, "耳朵": model.CutEar,
+	"猪舌": model.CutTongue, "猪舌头": model.CutTongue, "舌": model.CutTongue,
+	"猪利": model.CutTongue,
+	"猪颈": model.CutNeck, "猪颈肉": model.CutNeck, "血脖": model.CutNeck,
+	"颈肉": model.CutNeck,
+
+	// ---- 骨 ----
+	"筒骨": model.CutBoneShank, "筒子骨": model.CutBoneShank, "腿骨": model.CutBoneShank,
+	"精制筒骨": model.CutBoneShank,
+	"扇骨": model.CutBoneScapula, "肩胛骨": model.CutBoneScapula, "扇子骨": model.CutBoneScapula,
+	"龙骨": model.CutBoneSpine, "脊骨": model.CutBoneSpine, "脊椎骨": model.CutBoneSpine,
+	"沙骨": model.CutBoneRib, "肋骨": model.CutBoneRib,
+	"猪头骨": model.CutBoneHead, "头骨": model.CutBoneHead,
+
+	// ---- 下水 ----
+	"猪肝": model.CutLiver, "肝": model.CutLiver,
+	"猪心": model.CutHeart, "心": model.CutHeart,
+	"猪肺": model.CutLung, "肺": model.CutLung,
+	"猪腰": model.CutKidney, "腰": model.CutKidney, "肾": model.CutKidney,
+	"猪肾": model.CutKidney,
+	"猪肚": model.CutStomach, "肚": model.CutStomach, "胃": model.CutStomach,
+	"猪胃": model.CutStomach,
+	"猪小肚": model.CutStomachHoneycomb, "小肚": model.CutStomachHoneycomb,
+	"蜂巢肚": model.CutStomachHoneycomb,
+	"大肠": model.CutIntestine, "生肠": model.CutIntestine, "肥肠": model.CutIntestine,
+	"猪大肠": model.CutIntestine, "猪生肠": model.CutIntestine,
+	"大肠头": model.CutIntestineHead,
+	"粉肠": model.CutIntestineSmall, "小肠": model.CutIntestineSmall,
+	"精选粉肠": model.CutIntestineSmall,
+	"猪横利": model.CutSpleen, "横利": model.CutSpleen, "脾": model.CutSpleen,
+	"猪脾": model.CutSpleen,
+	"猪鞭": model.CutTendon, "鞭": model.CutTendon,
+}
+
+// cutAliasKeys 排序后的别名(长的在前)—— 给子串兜底匹配用。
+var cutAliasKeys = func() []string {
+	keys := make([]string, 0, len(cutTypeAliases))
+	for k := range cutTypeAliases {
+		keys = append(keys, k)
 	}
-	if v, ok := mapping[s]; ok {
+	sort.Slice(keys, func(i, j int) bool {
+		if len(keys[i]) != len(keys[j]) {
+			return len(keys[i]) > len(keys[j])
+		}
+		return keys[i] < keys[j]
+	})
+	return keys
+}()
+
+// normalizeCutType 把 LLM 输出的中文名映射到枚举。
+//
+// 三级兜底(从严到松):
+//  1. 归一化后**精确**命中别名表;
+//  2. 去掉括号补充说明再精确命中(如 "五花肉(肋腹)" → "五花肉");
+//  3. **最长子串**命中(如 "猪五花肉" → "五花肉")。
+//
+// 命中不了就**原样透传**(不猜):调用方(RecordPigCut / stocktake)会用
+// model.CutType.Valid() 拒掉未知值 —— 透传比猜错安全。
+func normalizeCutType(in model.CutType) model.CutType {
+	s := normalizeCutText(string(in))
+	if s == "" {
+		return in
+	}
+	if v, ok := cutTypeAliases[s]; ok {
 		return v
 	}
+	// 去括号补充说明("五花肉(肋腹)" → "五花肉";"梅肉(小里脊)" → "梅肉")
+	if i := strings.IndexAny(s, "(（"); i > 0 {
+		if v, ok := cutTypeAliases[strings.TrimSpace(s[:i])]; ok {
+			return v
+		}
+	}
+	// 最长子串兜底
+	for _, alias := range cutAliasKeys {
+		if strings.Contains(s, alias) {
+			return cutTypeAliases[alias]
+		}
+	}
 	return model.CutType(s) // 兜底透传
+}
+
+// normalizeCutText 归一化 LLM 可能带的空白/全角括号。
+func normalizeCutText(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "（", "(")
+	s = strings.ReplaceAll(s, "）", ")")
+	s = strings.ReplaceAll(s, " ", "")
+	s = strings.ReplaceAll(s, "　", "")
+	return s
 }
 
 // ---- Service 集成 ----

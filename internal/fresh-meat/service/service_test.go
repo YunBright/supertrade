@@ -72,6 +72,29 @@ func setupTestService(t *testing.T) (*service.Service, *recordingPublisher) {
 		&model.LineSalesByPig{},
 		&model.BranchCutMapping{},
 		&model.WasteLog{},
+		// 2026-10-23:SKU 级移动加权成本 + 两位置库存 + 特价档货号。
+		&model.SkuStockPosition{},
+		&model.SkuCostState{},
+		&model.SkuCostDaily{},
+		&model.PromoSku{},
+		// 2026-10-23:大宗台账 + 分割重量统计基线。
+		&model.StockBag{},
+		&model.BulkProduct{},
+		&model.BulkProduction{},
+		&model.BulkSettlement{},
+		&model.BulkSettlementItem{},
+		&model.BulkSettlementAllocation{},
+		&model.PigForecastBaseline{},
+		// 2026-10-24:营业日状态机 + 搬台流水 + 按营业日的结余快照 + 期初结转 + 审计结转。
+		&model.BusinessDay{},
+		&model.CounterLoadRecord{},
+		&model.CutStockDaily{},
+		&model.SkuStockOpening{},
+		&model.BizAudit{},
+		// 2026-10-24:预期毛利(预售)结转 + 预售毛利按猪分摊。
+		&model.CutPresale{},
+		&model.PigPresaleMargin{},
+		&model.CutPresaleEdit{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -147,10 +170,6 @@ func TestRecordWholePig_InvalidInput(t *testing.T) {
 		name string
 		in   model.RecordWholePigInput
 	}{
-		{"missing ear_tag", model.RecordWholePigInput{
-			GrossWeightKg: d("100"), PurchaseUnitPriceYuan: d("28"),
-			SupplierID: "SUP-1", ArrivedAt: time.Now().UTC(),
-		}},
 		{"missing supplier_id", model.RecordWholePigInput{
 			EarTag: "EB-1", GrossWeightKg: d("100"), PurchaseUnitPriceYuan: d("28"),
 			ArrivedAt: time.Now().UTC(),
@@ -175,6 +194,23 @@ func TestRecordWholePig_InvalidInput(t *testing.T) {
 				t.Errorf("应报错, got nil")
 			}
 		})
+	}
+}
+
+// TestRecordWholePig_EarTagOptional 锁「耳标号可选」(2026-10-24 门店口径)。
+//
+// 有些猪没有耳标/不扫码 ⇒ 耳标号不能是必填。
+//
+// ⚠️ 数据库侧 ear_tag 只是普通索引(不是唯一键)⇒ 多头猪都留空不冲突。
+func TestRecordWholePig_EarTagOptional(t *testing.T) {
+	svc, _ := setupTestService(t)
+	pig, err := svc.RecordWholePig(context.Background(), "S001", model.RecordWholePigInput{
+		GrossWeightKg: d("100"), PurchaseUnitPriceYuan: d("28"),
+		SupplierID: "SUP-1", ArrivedAt: time.Now().UTC(),
+	}, "u-1")
+	mustNoErr(t, err, "耳标号留空应能录入")
+	if pig.EarTag != "" {
+		t.Errorf("ear_tag 应为空, got %q", pig.EarTag)
 	}
 }
 
@@ -295,8 +331,13 @@ func TestListPigCutsByPig(t *testing.T) {
 		}, "u-1")
 	mustNoErr(t, err, "RecordWholePig")
 	for _, ct := range []model.CutType{model.CutBelly, model.CutRib, model.CutTrotter} {
+		// ⚠️ 每个部位用**自己的** cube_product_id:
+		// 2026-10-23 起 branch_cut_mappings 的唯一约束是
+		// UNIQUE(branch_id, cube_product_id) —— **一个 SKU 在一个店只对应一个部位**
+		// (resolvePigByCubeProduct 按 (branch, cube_product_id) 反查部位,必须唯一)。
+		// 同一个 SKU 挂多个部位会让"这笔销售算哪个部位"变成不确定 ⇒ 约束层直接禁掉。
 		_, err := svc.CreateBranchCutMapping(context.Background(), "S001",
-			model.CreateBranchCutMappingInput{CutType: ct, CubeProductID: "P-X"})
+			model.CreateBranchCutMappingInput{CutType: ct, CubeProductID: "P-" + string(ct)})
 		mustNoErr(t, err, "CreateBranchCutMapping "+string(ct))
 		_, err = svc.RecordPigCut(context.Background(), "S001",
 			model.RecordPigCutInput{
@@ -429,10 +470,16 @@ func TestBranchCutMapping_CRUD(t *testing.T) {
 	}
 
 	// 冲突 → ErrBranchCutMappingConflict
+	//
+	// ⚠️ 2026-10-23 起冲突的判定键变了:唯一约束是
+	// UNIQUE(branch_id, cube_product_id)(一个 SKU 在一个店只对应一个部位),
+	// 而**不是** UNIQUE(branch_id, cut_type)。
+	// ⇒ 同一个部位挂**不同** SKU 是**允许的**(见下面 TestBranchCutMapping_SameCutManySKUs);
+	// 同一个 SKU 挂**不同**部位才是冲突(会让销售归属变得不确定)。
 	_, err = svc.CreateBranchCutMapping(context.Background(), "S001",
-		model.CreateBranchCutMappingInput{CutType: model.CutBelly, CubeProductID: "P-2002"})
-	if err == nil {
-		t.Errorf("冲突应报错")
+		model.CreateBranchCutMappingInput{CutType: model.CutBelly, CubeProductID: "P-2001"})
+	if !errors.Is(err, service.ErrBranchCutMappingConflict) {
+		t.Errorf("同 SKU 重复挂载应返 ErrBranchCutMappingConflict, got %v", err)
 	}
 
 	// List
@@ -460,6 +507,75 @@ func TestBranchCutMapping_CRUD(t *testing.T) {
 	mustNoErr(t, err, "ListBranchCutMappings after delete")
 	if len(rows) != 0 {
 		t.Errorf("rows = %d, want 0", len(rows))
+	}
+}
+
+// TestBranchCutMapping_SameCutManySKUs 锁定 2026-10-23 的约束变更。
+//
+// 一个部位在一个店可以挂**多个** SKU —— 真源库实测这是常态:
+//
+//	佳乐(01)  : belly = 腩肉(五花肉) + 精品五花肉;rib = 前排(硬排) + 精品排骨
+//	富百家(00): rib  = 精选腩排 + 精选排骨;shoulder_blade = 梅花肉 + 梅肉/腱子肉;
+//	            trotter = 猪脚 + 猪手;intestine = 大肠 + 生肠
+//
+// 且日终盘点要能**按 SKU 分别**引用同一个部位下的多个 SKU ——
+// 旧约束(UNIQUE(branch_id, cut_type))下第二个 SKU 直接报
+// "(branch, cut) 映射已存在" / "未在 branch_cut_mappings 配置",
+// per-SKU 盘点形同虚设。
+func TestBranchCutMapping_SameCutManySKUs(t *testing.T) {
+	svc, _ := setupTestService(t)
+
+	// 同一部位挂两个 SKU —— 都必须成功
+	for _, sku := range []string{"P-BELLY-1", "P-BELLY-2"} {
+		_, err := svc.CreateBranchCutMapping(context.Background(), "S001",
+			model.CreateBranchCutMappingInput{CutType: model.CutBelly, CubeProductID: sku})
+		mustNoErr(t, err, "CreateBranchCutMapping "+sku)
+	}
+
+	rows, err := svc.ListBranchCutMappings(context.Background(), "S001")
+	mustNoErr(t, err, "ListBranchCutMappings")
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2(同部位应能挂多个 SKU)", len(rows))
+	}
+
+	// 日终盘点按 SKU 分别引用同一个部位下的两个 SKU —— 必须都接受
+	st, err := svc.RecordPorkCutsStocktake(context.Background(), "S001",
+		model.RecordPorkCutsStocktakeInput{
+			IsComplete: true,
+			Cuts: []model.CutInput{
+				{CutType: model.CutBelly, CubeProductID: "P-BELLY-1", ActualRemainKg: d("30")},
+				{CutType: model.CutBelly, CubeProductID: "P-BELLY-2", ActualRemainKg: d("26.5")},
+			},
+		}, "u-1")
+	mustNoErr(t, err, "RecordPorkCutsStocktake 同部位多 SKU")
+
+	var snaps []model.CutSnapshot
+	if err := json.Unmarshal(st.Cuts, &snaps); err != nil {
+		t.Fatalf("cuts JSON 解析: %v", err)
+	}
+	if len(snaps) != 2 {
+		t.Fatalf("cuts = %d, want 2", len(snaps))
+	}
+	seen := map[string]bool{}
+	for _, s := range snaps {
+		if s.CutType != model.CutBelly {
+			t.Errorf("cut_type = %s, want belly", s.CutType)
+		}
+		seen[s.CubeProductID] = true
+	}
+	if !seen["P-BELLY-1"] || !seen["P-BELLY-2"] {
+		t.Errorf("盘点行应同时含两个 SKU, got %v", seen)
+	}
+}
+
+// TestBranchCutMapping_RejectsUnknownCut 锁定 2026-10-23 补的入参校验:
+// cut_type 必须在枚举内(以前是"建了再在盘点时报映射未配置",报错点离原因很远)。
+func TestBranchCutMapping_RejectsUnknownCut(t *testing.T) {
+	svc, _ := setupTestService(t)
+	_, err := svc.CreateBranchCutMapping(context.Background(), "S001",
+		model.CreateBranchCutMappingInput{CutType: model.CutType("not_a_real_cut"), CubeProductID: "P-X"})
+	if !errors.Is(err, service.ErrInvalidInput) {
+		t.Errorf("未知 cut_type 应返 ErrInvalidInput, got %v", err)
 	}
 }
 
@@ -1004,23 +1120,35 @@ func TestComputeGrossMargin_Estimated_NoStocktake(t *testing.T) {
 	if !bellyRow.ExpectedRemainKg.Equal(d("14.8")) {
 		t.Errorf("belly expected_remain_kg = %s, want 14.8", bellyRow.ExpectedRemainKg)
 	}
-	// cost allocation:pig 总成本 400×28=11200;LLM belly=20,total LLM=20+15=35;
-	//   belly cost_for_cut = 11200 × 20/35 = 6400
-	//   consumed_ratio = min(1, 5/20) = 0.25
-	//   consumed_cost = 6400 × 0.25 = 1600
-	if !bellyRow.PurchaseCostYuan.Equal(d("1600")) {
-		t.Errorf("belly cost = %s, want 1600", bellyRow.PurchaseCostYuan)
+	// cost allocation:无盘点时按**账面期末**结转(等价于 sold × 加权单价):
+	//   pig 总成本 400×28=11200;LLM belly=20,total LLM=20+15=35
+	//   belly 入库金额 = 11200 × 20/35 = 6400
+	//   加权单价 = 6400 / 20 = 320 元/kg
+	//   账面期末 = 20 − 5(卖) − 0.2(报损) = 14.8 → 期末金额 = 14.8 × 320 = 4736
+	//   销售成本(零售那 5kg) = 6400 − 4736 − 0 − 64(报损成本) = 1600
+	if !bellyRow.SalesCostYuan.Equal(d("1600")) {
+		t.Errorf("belly sales_cost = %s, want 1600", bellyRow.SalesCostYuan)
 	}
-	// gross_margin = 170 - 1600 = -1430
-	if !bellyRow.GrossMarginYuan.Equal(d("-1430")) {
-		t.Errorf("belly gm = %s, want -1430", bellyRow.GrossMarginYuan)
+	// ⚠️ 2026-10-23 修正:**报损成本必须进损益**。
+	//
+	// 原来 gm = 收入 − 销售成本,而销售成本里**已经把报损成本减掉了**
+	// (它从"可售金额"里被扣除,不代表成本已入账)
+	// ⇒ 报损的 64 元成本**凭空消失** ⇒ 报损不体现为损失、毛利虚高 64 元。
+	//
+	// 正确:毛利 = 收入 − 销售成本 − 统收成本 − 报损成本
+	//      = 170 − 1600 − 0 − 64 = **−1494**
+	if !bellyRow.WasteCostYuan.Equal(d("64")) {
+		t.Errorf("belly waste_cost = %s, want 64(0.2kg × 320 元/kg)", bellyRow.WasteCostYuan)
+	}
+	if !bellyRow.GrossMarginYuan.Equal(d("-1494")) {
+		t.Errorf("belly gm = %s, want -1494(170 收入 − 1600 销售成本 − 64 报损成本)", bellyRow.GrossMarginYuan)
 	}
 
 	// total
 	if !report.Total.RevenueYuan.Equal(d("254")) {
 		t.Errorf("total revenue = %s, want 254(170+84)", report.Total.RevenueYuan)
 	}
-	if report.Total.PurchaseCostYuan.IsZero() {
+	if report.Total.SalesCostYuan.IsZero() {
 		t.Errorf("total cost 不应为 0")
 	}
 }

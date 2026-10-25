@@ -69,6 +69,10 @@ func newArchiveDB(t *testing.T) *gorm.DB {
 	require.NoError(t, db.AutoMigrate(
 		&model.WholePig{}, &model.PigCut{}, &model.PorkCutsStocktake{},
 		&model.LineSalesByPig{}, &model.BranchCutMapping{}, &model.WasteLog{},
+		&model.SkuStockPosition{}, &model.SkuCostState{}, &model.SkuCostDaily{},
+		&model.PromoSku{},
+		&model.BulkProduct{}, &model.BulkProduction{}, &model.BulkSettlement{},
+		&model.BulkSettlementAllocation{}, &model.PigForecastBaseline{},
 	))
 	return db
 }

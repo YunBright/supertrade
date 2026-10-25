@@ -70,6 +70,12 @@ func initApp() error {
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
 	}
+	// ⚠️ **先**跑 pre-migrate 修正:把"形状变了"的旧索引删掉
+	// (pig_cuts.idx_pig_cut 曾经是 UNIQUE(cut_type) 单列 ⇒ 每个部位只能补录一行),
+	// 让下面的 AutoMigrate 能按正确的 UNIQUE(pig_id, cut_type) 重建。
+	if err := freshmeat.ApplyPreMigrateFixups(appDB); err != nil {
+		return fmt.Errorf("apply pre-migrate fixups: %w", err)
+	}
 	if err := appDB.AutoMigrate(
 		&model.WholePig{},
 		&model.PigCut{},
@@ -77,8 +83,38 @@ func initApp() error {
 		&model.LineSalesByPig{},
 		&model.BranchCutMapping{},
 		&model.WasteLog{},
+		// 2026-10-23:SKU 级移动加权成本 + 两位置库存(猪肉台 / 冷库)。
+		&model.SkuStockPosition{},
+		&model.SkuCostState{},
+		&model.SkuCostDaily{},
+		&model.PromoSku{},
+		// 2026-10-23:大宗台账(板油等) + 分割重量统计基线。
+		&model.StockBag{},
+	&model.BulkProduct{},
+		&model.BulkProduction{},
+		&model.BulkSettlement{},
+		&model.BulkSettlementItem{},
+		&model.BulkSettlementAllocation{},
+		&model.PigForecastBaseline{},
+		// 2026-10-24:营业日状态机 + 搬台流水 + 按营业日的结余快照 + 期初结转 + 审计结转。
+		&model.BusinessDay{},
+		&model.CounterLoadRecord{},
+		&model.CutStockDaily{},
+		&model.SkuStockOpening{},
+		&model.BizAudit{},
+		// 2026-10-24:预期毛利(预售)结转 + 预售毛利按猪分摊。
+		&model.CutPresale{},
+		&model.PigPresaleMargin{},
+		&model.CutPresaleEdit{},
 	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
+	}
+	// AutoMigrate 只建索引不删索引 ⇒ 旧的 UNIQUE(branch_id, cut_type) 残留
+	// 会挡住"同一部位挂第二个 SKU"(真源库两家店都是常态)。显式删掉。
+	// 顺序:必须在 AutoMigrate **之后** —— 先让新索引建好(数据违反新约束时大声失败),
+	// 再删旧索引(不留"旧约束还在"的窗口)。见 internal/fresh-meat/migrate.go。
+	if err := freshmeat.ApplySchemaFixups(appDB); err != nil {
+		return fmt.Errorf("apply schema fixups: %w", err)
 	}
 
 	appSvc = service.New(appDB)
@@ -226,6 +262,11 @@ func registerRoutes(r *gin.Engine) {
 func registerDaprRoutes(r *gin.Engine) {
 	h := handler.New(appSvc)
 	h.RegisterSubscribeRoutes(r, slog.Default())
+	// 契约测试 sweep 的兜底清理端点(2026-10-23 新增)。
+	//
+	// ⚠️ 必须早于 claims.GinMiddleware:它要免鉴权(调用方走 dapr 内网 invoke)。
+	// 公网可达性由 nginx 挡死:`location ^~ /api/v1/fresh-meat/internal/ { return 404; }`
+	handler.RegisterPurgeRoutes(r, appDB)
 }
 
 // forwardBearerToOutgoing 把 caller 的 Authorization header 注入 ctx,供下游

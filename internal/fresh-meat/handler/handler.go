@@ -96,6 +96,73 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.PUT("/branch-cut-mappings/:id", requireBranch, h.UpdateBranchCutMapping)
 	r.DELETE("/branch-cut-mappings/:id", requireBranch, h.DeleteBranchCutMapping)
 
+	// 库存位置(2026-10-23):猪肉台 / 冷库
+	//
+	// POST /stock/counter-load —— 开市准备:把冷库的货搬上猪肉台(可部分、可不上)。
+	// GET  /stock               —— 库存查询:默认猪肉台,scope=all 为全店。
+	//                              ⚠️ **不提供"只查冷库"**(门店明确:没有查冷库的说法)。
+	r.POST("/stock/counter-load", requireBranch, h.CounterLoad)
+	// GET /stock/counter-load —— **搬台流水**(2026-10-24):当天搬了哪些货。
+	//                              前端第②步(已搬台?)与休市判定都靠它。
+	r.GET("/stock/counter-load", requireBranch, h.ListCounterLoads)
+	// PUT/DELETE /stock/counter-load/:id —— 改/撤**一行**搬台。
+	//   (门店口径:「一个 sku 当天可以有多条记录,早上一袋中午加一袋,可以随时修改,
+	//     甚至过一天修改」⇒ 改出来的负库存在每日毛利的 alert 里红字显示。)
+	r.PUT("/stock/counter-load/:id", requireBranch, h.UpdateCounterLoad)
+	r.DELETE("/stock/counter-load/:id", requireBranch, h.DeleteCounterLoad)
+	// GET/PUT /stock/openings —— **期初结转**(鲜肉-设置页):
+	//   按营业日推导的冷库余额是链式的 ⇒ 链的起点(期初)由门店在这里录(按部位)。
+	r.GET("/stock/openings", requireBranch, h.ListStockOpenings)
+	r.PUT("/stock/openings", requireBranch, h.SaveStockOpenings)
+	r.DELETE("/stock/openings", requireBranch, h.DeleteStockOpening)
+	// POST /stock/audit —— **审计结转**(指定截止日期):
+	//   截止日期及之前的每日日终盘点必须齐全 ⇒ 通过则落快照并**冻结**(不能再补录)。
+	//   审计同时做**预期毛利(预售)结转** + **重放截止日之后的动作** + 校准当前余额。
+	r.POST("/stock/audit", requireBranch, h.AuditBusinessDays)
+	// GET /stock/audit —— 审计状态(最近一次截止日 + 历次审计)。
+	r.GET("/stock/audit", requireBranch, h.GetBizAuditStatus)
+	// GET /stock/audit/precheck —— **审计前**的预检(条件 / 结余 / 预期毛利测算 / 提示文案)。
+	r.GET("/stock/audit/precheck", requireBranch, h.PrecheckBizAudit)
+	// GET /stock/presale —— **预期毛利(预售结转)**明细(按部位 / 按 SKU / 按猪)。
+	r.GET("/stock/presale", requireBranch, h.ListPresale)
+	// PUT /stock/presale —— 改**已审计**那一天的预售单价(门店审计人的人工修改;
+	// 每次改都留痕,并自动重算毛利 / 按猪分摊 / 重放截止日之后的天)。
+	r.PUT("/stock/presale", requireBranch, h.UpdatePresale)
+	// GET /stock/bags —— 袋子(标签号)清单:冷库里有哪些袋、标签号是什么。
+	r.GET("/stock/bags", requireBranch, h.ListStockBags)
+	r.GET("/stock", requireBranch, h.ListStock)
+
+	// GET /business-day —— **营业日状态机**(2026-10-24):
+	// 未进猪 → 已进猪 → 已搬台 → 已盘点(售罄|休市)。
+	// 顺带给出"前一个营业日是否已盘点"(不补录昨天就无法录今天)。
+	r.GET("/business-day", requireBranch, h.GetBusinessDay)
+
+	// 特价档货号登记(长期配置,像部位 SKU 映射一样)
+	//
+	// 登记过的货号,其 POS 销售行**不再被丢弃** ⇒ 金额与重量进得来。
+	// ⚠️ 特价档是"价格槽位",装的是当天滞销的部位 ⇒ **不静态映射到某个部位**,
+	// 未指定部位时归到 `promo` 桶,毛利报告单列"特价(未归属)"。
+	r.GET("/promo-skus", requireBranch, h.ListPromoSkus)
+	r.POST("/promo-skus", requireBranch, h.CreatePromoSku)
+	r.DELETE("/promo-skus/:id", requireBranch, h.DeletePromoSku)
+
+	// 大宗台账(板油等:分割产出 → 冷库 → 酒店统收结算)
+	r.GET("/bulk-products", requireBranch, h.ListBulkProducts)
+	r.POST("/bulk-products", requireBranch, h.CreateBulkProduct)
+	r.DELETE("/bulk-products/:id", requireBranch, h.DeleteBulkProduct)
+	r.GET("/bulk-productions", requireBranch, h.ListBulkProductions)
+	r.POST("/bulk-productions", requireBranch, h.RecordBulkProduction)
+	r.GET("/bulk-settlements", requireBranch, h.ListBulkSettlements)
+	r.POST("/bulk-settlements", requireBranch, h.CreateBulkSettlement)
+	r.GET("/bulk-balances", requireBranch, h.ListBulkBalances)
+
+	// 长期毛利(周/月/季)
+	r.GET("/gross-margin/period", requireBranch, h.ComputePeriodMargin)
+
+	// 分割重量统计基线(替掉 LLM 做数值回归)
+	r.GET("/forecast-baselines", requireBranch, h.ListForecastBaselines)
+	r.POST("/forecast-baselines/recompute", requireBranch, h.RecomputeForecastBaselines)
+
 	// dapr cron binding 触发(deployer 仓加 bindings.cron.yaml)—
 	// 走 dapr 自身 cron binding,无 JWT 无 X-Branch-ID;**不挂** requireBranch。
 	r.GET("/cron/daily-reminder", h.CronDailyReminder)
@@ -157,7 +224,8 @@ func mapErr(c *gin.Context, err error) {
 	case errors.Is(err, service.ErrWholePigNotFound),
 		errors.Is(err, service.ErrPigCutNotFound),
 		errors.Is(err, service.ErrPorkCutsStocktakeNotFound),
-		errors.Is(err, service.ErrBranchCutMappingNotFound):
+		errors.Is(err, service.ErrBranchCutMappingNotFound),
+		errors.Is(err, service.ErrPromoSkuNotFound):
 		writeError(c, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, service.ErrInvalidInput),
 		errors.Is(err, service.ErrBranchMismatch),
@@ -167,6 +235,10 @@ func mapErr(c *gin.Context, err error) {
 		writeError(c, http.StatusServiceUnavailable, "cube_unavailable", err.Error())
 	case errors.Is(err, service.ErrUserInfoUnavailable):
 		writeError(c, http.StatusServiceUnavailable, "userd_unavailable", err.Error())
+	case errors.Is(err, service.ErrBulkProductConflict):
+		// 409:资源已存在(唯一键冲突),不是"输入非法"(400)。
+		// 落 500 的后果是"操作者以为服务端坏了",而实际只是重复登记。
+		writeError(c, http.StatusConflict, "conflict", err.Error())
 	default:
 		writeError(c, http.StatusInternalServerError, "internal_error", err.Error())
 	}
@@ -457,8 +529,7 @@ func (h *Handler) ListLineSalesByPig(c *gin.Context) {
 // ---- branch_cut_mappings ----
 
 // ListBranchCutMappings GET /branch-cut-mappings
-func (h *Handler) ListBranchCutMappings(c *gin.Context) {
-	branchID := middleware.SingleBranchFromCtx(c)
+func (h *Handler) ListBranchCutMappings(c *gin.Context) {	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "freshmeat:view") {
 		return
 	}
@@ -549,3 +620,611 @@ func (h *Handler) parseDay(s string) (time.Time, error) {
 // 静默引用 decimal / service 避免 unused import 警告(若有人剥离部分代码)。
 var _ = decimal.Zero
 var _ = service.ErrInvalidInput
+
+// ---- 库存位置(猪肉台 / 冷库)---- //
+
+// CounterLoad POST /stock/counter-load
+//
+// 开市准备:把冷库的货搬上猪肉台。
+//
+// ⚠️ 门店可以**只搬一部分,甚至不上**(货在冷库压着,过几天再卖或走酒店统收)
+// ⇒ 冷库余额是累加的,只有记录了搬台量才算得准。
+func (h *Handler) CounterLoad(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	var in service.CounterLoadInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	cl, _ := claims.FromContext(c.Request.Context())
+	out, err := h.svc.CounterLoad(c.Request.Context(), branchID, in, actorIDFromClaims(cl))
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ListCounterLoads GET /stock/counter-load?date=YYYY-MM-DD
+//
+// **搬台流水**(2026-10-24):某营业日搬上台的货。
+//
+// ⇒ 前端第②步(今天搬台了吗?)与休市判定都靠它
+//   (之前只有"按标签整袋搬"留痕,"按 SKU+kg 搬"完全没有流水 ⇒ 会误判)。
+//
+// `date` 省略 = 今天(营业日界时区)。
+func (h *Handler) ListCounterLoads(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	day, err := h.parseDay(c.Query("date"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "bad_date", err.Error())
+		return
+	}
+	out, err := h.svc.ListCounterLoads(c.Request.Context(), branchID, day)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// GetBusinessDay GET /business-day?date=YYYY-MM-DD
+//
+// **营业日状态机**(2026-10-24):未进猪 → 已进猪 → 已搬台 → 已盘点(售罄|休市)。
+//
+// 顺带给出"前一个营业日是否已盘点"(门店口径:不补录昨天就无法录今天)
+// 与"现在能不能录猪 / 搬台"。
+func (h *Handler) GetBusinessDay(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	day, err := h.parseDay(c.Query("date"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "bad_date", err.Error())
+		return
+	}
+	out, err := h.svc.GetBusinessDay(c.Request.Context(), branchID, day)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// UpdateCounterLoad PUT /stock/counter-load/:id
+//
+// 改一行搬台的重量(门店口径:「可以随时修改,甚至过一天修改」)。
+//
+// ⚠️ 改出来**负库存不拦** ⇒ 在每日毛利的告警里红字显示
+//   (service.MarginAlert / code=negative_inventory)。
+func (h *Handler) UpdateCounterLoad(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		writeError(c, http.StatusBadRequest, "missing_counter_load_id", "id 必填")
+		return
+	}
+	var in service.CounterLoadUpdateInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	out, err := h.svc.UpdateCounterLoad(c.Request.Context(), branchID, id, in)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// DeleteCounterLoad DELETE /stock/counter-load/:id
+//
+// 撤掉一行搬台(货搬回冷库)。
+func (h *Handler) DeleteCounterLoad(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		writeError(c, http.StatusBadRequest, "missing_counter_load_id", "id 必填")
+		return
+	}
+	out, err := h.svc.DeleteCounterLoad(c.Request.Context(), branchID, id)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ListStockOpenings GET /stock/openings
+//
+// **期初结转**清单(鲜肉-设置页读端)。
+func (h *Handler) ListStockOpenings(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	out, err := h.svc.ListStockOpenings(c.Request.Context(), branchID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// SaveStockOpenings PUT /stock/openings
+//
+// 保存**期初结转**(鲜肉-设置页写端)⇒ 重推按营业日的余额链。
+func (h *Handler) SaveStockOpenings(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	var in struct {
+		Openings []service.StockOpeningInput `json:"openings"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	// ⚠️ **别静默吞掉**。
+	//
+	// 之前这里没校验 ⇒ 客户端传 `{"items":[...]}`(字段名写错)时
+	// ⇒ 反序列化得到空列表 ⇒ **不报错、不写入**
+	// ⇒ 症状是"保存成功了,读回来却没变"——最难查的那种。
+	//
+	// ⇒ 空列表一律 400,并说清要传 `openings`。
+	if len(in.Openings) == 0 {
+		writeError(c, http.StatusBadRequest, "bad_request",
+			"openings 不能为空(每个部位一行:{cut_type, cold_store_kg, biz_date?, note?})")
+		return
+	}
+	out, err := h.svc.SaveStockOpenings(c.Request.Context(), branchID, in.Openings)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// DeleteStockOpening DELETE /stock/openings?cut_type=xxx
+//
+// 删掉某个部位的期初结转(把该部位从链的起点里去掉)。
+func (h *Handler) DeleteStockOpening(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	cutType := model.CutType(strings.TrimSpace(c.Query("cut_type")))
+	if cutType == "" {
+		writeError(c, http.StatusBadRequest, "bad_request", "cut_type 必填")
+		return
+	}
+	out, err := h.svc.DeleteStockOpening(c.Request.Context(), branchID, cutType)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// AuditBusinessDays POST /stock/audit
+//
+// **审计结转**:指定截止日期 ⇒ 该日期及之前的每日日终盘点必须齐全,
+// 通过则落快照(=结转)并**冻结**(截止日期及之前不能再改,含补录)。
+func (h *Handler) AuditBusinessDays(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	var in service.BizAuditInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	cl, _ := claims.FromContext(c.Request.Context())
+	out, err := h.svc.AuditBusinessDays(c.Request.Context(), branchID, in, actorIDFromClaims(cl))
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// GetBizAuditStatus GET /stock/audit
+//
+// 审计状态:最近一次截止日(该日及之前已冻结)+ 历次审计。
+func (h *Handler) GetBizAuditStatus(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	out, err := h.svc.GetBizAuditStatus(c.Request.Context(), branchID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// PrecheckBizAudit GET /stock/audit/precheck?cutoff_date=YYYY-MM-DD
+//
+// 审计**前**的预检:条件是否满足(缺哪几天的日终盘点)、本次会不会产生结余、
+// 预期毛利(预售结转)的测算、审计提示文案。
+//
+// ⚠️ 审计是**不可逆**的一刀 ⇒ 门店应当在按下确认之前看到这些。
+func (h *Handler) PrecheckBizAudit(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	cutoff := strings.TrimSpace(c.Query("cutoff_date"))
+	if cutoff == "" {
+		writeError(c, http.StatusBadRequest, "bad_request", "cutoff_date 必填(YYYY-MM-DD)")
+		return
+	}
+	out, err := h.svc.PrecheckBizAudit(c.Request.Context(), branchID, cutoff)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ListPresale GET /stock/presale?date=YYYY-MM-DD
+//
+// 某个营业日的**预期毛利(预售结转)**明细:按部位 / 按 SKU / 按猪。
+func (h *Handler) ListPresale(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	day, err := h.parseDay(c.Query("date"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "bad_date", err.Error())
+		return
+	}
+	out, err := h.svc.ListPresale(c.Request.Context(), branchID, day)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// UpdatePresale PUT /stock/presale
+//
+// **改已审计那一天的预售单价**(门店审计人的人工修改)。
+//
+// ⚠️ 冻结的是**源数据**与**成本口径快照**;预售价是「审计结转」这个**产物**的
+// 一项(审计人拍板"这批货按什么价卖掉")⇒ 改它是**修正审计结论**。
+//   每次改都留痕(cut_presale_edits)⇒ 改完自动重算毛利 / 按猪分摊 /
+//   重放截止日之后的天 / 校准当前余额。
+func (h *Handler) UpdatePresale(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	var in service.UpdatePresaleInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	cl, _ := claims.FromContext(c.Request.Context())
+	out, err := h.svc.UpdatePresale(
+		c.Request.Context(),
+		branchID,
+		in,
+		actorIDFromClaims(cl),
+	)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ListStockBags GET /stock/bags?location=&label=
+//
+// 袋子(标签号)清单:冷库里有哪些袋、各多少 kg、标签号是什么。
+//
+// ⚠️ `location` 省略 = 全部;`cold_store` 只看冷库,`counter` 只看猪肉台。
+func (h *Handler) ListStockBags(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	out, err := h.svc.ListStockBags(c.Request.Context(), branchID,
+		c.Query("location"), c.Query("label"), c.Query("origin_date"))
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ListStock GET /stock
+//
+// 库存查询:默认**猪肉台**;`?scope=all` 为全店(猪肉台 + 冷库)。
+//
+// ⚠️ **不提供"只查冷库"** —— 冷库单独看没有业务含义(2026-10-23 门店明确)。
+func (h *Handler) ListStock(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	scope := model.StockScope(c.Query("scope"))
+	switch scope {
+	case "":
+		scope = model.StockScopeCounter
+	case model.StockScopeCounter, model.StockScopeAll:
+	default:
+		writeError(c, http.StatusBadRequest, "bad_request",
+			"scope 只支持 counter | all(没有'只查冷库'这个口径)")
+		return
+	}
+	out, err := h.svc.ListStock(c.Request.Context(), branchID, scope)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ListPromoSkus GET /promo-skus
+func (h *Handler) ListPromoSkus(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	out, err := h.svc.ListPromoSkus(c.Request.Context(), branchID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// CreatePromoSku POST /promo-skus
+func (h *Handler) CreatePromoSku(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	var in service.PromoSkuInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	out, err := h.svc.CreatePromoSku(c.Request.Context(), branchID, in)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// DeletePromoSku DELETE /promo-skus/:id(停用,不是物理删)
+func (h *Handler) DeletePromoSku(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		writeError(c, http.StatusBadRequest, "missing_promo_id", "id 必填")
+		return
+	}
+	if err := h.svc.DeletePromoSku(c.Request.Context(), branchID, id); err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// ---- 大宗台账 ----
+
+// ListBulkProducts GET /bulk-products
+func (h *Handler) ListBulkProducts(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	out, err := h.svc.ListBulkProducts(c.Request.Context(), branchID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// CreateBulkProduct POST /bulk-products
+func (h *Handler) CreateBulkProduct(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	var in service.BulkProductInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	out, err := h.svc.CreateBulkProduct(c.Request.Context(), branchID, in)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// DeleteBulkProduct DELETE /bulk-products/:id(停用,不是物理删)
+func (h *Handler) DeleteBulkProduct(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		writeError(c, http.StatusBadRequest, "missing_bulk_product_id", "id 必填")
+		return
+	}
+	if err := h.svc.DeleteBulkProduct(c.Request.Context(), branchID, id); err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// ListBulkProductions GET /bulk-productions
+func (h *Handler) ListBulkProductions(c *gin.Context) {	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	out, err := h.svc.ListBulkProductions(c.Request.Context(), branchID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// RecordBulkProduction POST /bulk-productions(录当日产出 → 进冷库)
+func (h *Handler) RecordBulkProduction(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	var in service.BulkProductionInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	cl, _ := claims.FromContext(c.Request.Context())
+	out, err := h.svc.RecordBulkProduction(c.Request.Context(), branchID, in, actorIDFromClaims(cl))
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ListBulkSettlements GET /bulk-settlements
+func (h *Handler) ListBulkSettlements(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	out, err := h.svc.ListBulkSettlements(c.Request.Context(), branchID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// CreateBulkSettlement POST /bulk-settlements(酒店统收结算)
+func (h *Handler) CreateBulkSettlement(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	var in service.BulkSettlementInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		return
+	}
+	cl, _ := claims.FromContext(c.Request.Context())
+	out, err := h.svc.CreateBulkSettlement(c.Request.Context(), branchID, in, actorIDFromClaims(cl))
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ListBulkBalances GET /bulk-balances(结存:产出 − 已结)
+func (h *Handler) ListBulkBalances(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	out, err := h.svc.ListBulkBalances(c.Request.Context(), branchID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ---- 长期毛利 ----
+
+// ComputePeriodMargin GET /gross-margin/period?from=&to=&group_by=day|cut|sku
+func (h *Handler) ComputePeriodMargin(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	loc := h.svc.BizTZ()
+	now := time.Now().In(loc)
+	to := c.Query("to")
+	if to == "" {
+		to = now.Format("2006-01-02")
+	}
+	from := c.Query("from")
+	if from == "" {
+		fromT, err := time.ParseInLocation("2006-01-02", to, loc)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "bad_request", "to 格式应为 YYYY-MM-DD")
+			return
+		}
+		from = fromT.AddDate(0, 0, -29).Format("2006-01-02")
+	}
+	out, err := h.svc.ComputePeriodMargin(c.Request.Context(), branchID, from, to, c.Query("group_by"))
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ---- 分割重量统计基线 ----
+
+// ListForecastBaselines GET /forecast-baselines
+func (h *Handler) ListForecastBaselines(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	out, err := h.svc.ListForecastBaselines(c.Request.Context(), branchID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// RecomputeForecastBaselines POST /forecast-baselines/recompute
+func (h *Handler) RecomputeForecastBaselines(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	n, err := h.svc.RecomputeForecastBaselines(c.Request.Context(), branchID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"baselines": n})
+}
