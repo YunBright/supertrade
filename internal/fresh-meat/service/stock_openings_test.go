@@ -29,8 +29,8 @@ func TestStockOpening_SaveListDelete(t *testing.T) {
 
 	// ① 保存两个部位
 	out, err := svc.SaveStockOpenings(ctx, "S001", []service.StockOpeningInput{
-		{CutType: model.CutBelly, ColdStoreKg: d("12.5"), Note: "上线前冷库里的五花肉"},
-		{CutType: model.CutFat, ColdStoreKg: d("8")},
+		{CutType: model.CutBelly, ColdStoreKg: d("12.5"), UnitPriceYuan: d("18"), Note: "上线前冷库里的五花肉"},
+		{CutType: model.CutFat, ColdStoreKg: d("8"), UnitPriceYuan: d("6")},
 	})
 	mustNoErr(t, err, "SaveStockOpenings")
 	if len(out.Openings) != 2 {
@@ -51,7 +51,7 @@ func TestStockOpening_SaveListDelete(t *testing.T) {
 
 	// ② 重复保存 = 覆盖(幂等),不是新增一行
 	out, err = svc.SaveStockOpenings(ctx, "S001", []service.StockOpeningInput{
-		{CutType: model.CutBelly, ColdStoreKg: d("10")},
+		{CutType: model.CutBelly, ColdStoreKg: d("10"), UnitPriceYuan: d("18")},
 	})
 	mustNoErr(t, err, "SaveStockOpenings 覆盖")
 	if len(out.Openings) != 2 {
@@ -65,7 +65,7 @@ func TestStockOpening_SaveListDelete(t *testing.T) {
 
 	// ③ 负数拒绝
 	if _, err := svc.SaveStockOpenings(ctx, "S001", []service.StockOpeningInput{
-		{CutType: model.CutBelly, ColdStoreKg: d("-1")},
+		{CutType: model.CutBelly, ColdStoreKg: d("-1"), UnitPriceYuan: d("18")},
 	}); err == nil {
 		t.Errorf("期初冷库量不能为负")
 	}

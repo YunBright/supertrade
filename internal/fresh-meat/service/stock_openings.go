@@ -59,8 +59,12 @@ type StockOpeningView struct {
 	// BizDate 是期初生效日("YYYY-MM-DD")。
 	BizDate     string          `json:"biz_date"`
 	ColdStoreKg decimal.Decimal `json:"cold_store_kg"`
-	Note        string          `json:"note,omitempty"`
-	UpdatedAt   time.Time       `json:"updated_at"`
+	// UnitPriceYuan 是**门店给的**单价(元/kg)—— 期初这批货当时的进价。
+	UnitPriceYuan decimal.Decimal `json:"unit_price_yuan"`
+	// TotalAmountYuan 是**总价**(元) = 重量 × 单价(服务端算,不可填)。
+	TotalAmountYuan decimal.Decimal `json:"total_amount_yuan"`
+	Note            string          `json:"note,omitempty"`
+	UpdatedAt       time.Time       `json:"updated_at"`
 }
 
 // StockOpeningInput PUT /stock/openings 入参的一行。
@@ -71,7 +75,12 @@ type StockOpeningInput struct {
 	BizDate string `json:"biz_date,omitempty"`
 	// ColdStoreKg 是期初的冷库余额(kg)。
 	ColdStoreKg decimal.Decimal `json:"cold_store_kg"`
-	Note        string          `json:"note,omitempty"`
+	// UnitPriceYuan 是**单价**(元/kg)—— **门店给**。
+	//
+	// ⚠️ 重量 > 0 时**必填且 > 0**:期初是已经付过钱的货,单价 0 ⇒
+	// 成本链的第一天期初金额为 0 ⇒ 那批货**零成本** ⇒ 毛利虚高。
+	UnitPriceYuan decimal.Decimal `json:"unit_price_yuan"`
+	Note           string          `json:"note,omitempty"`
 }
 
 // StockOpeningsView 某店的期初结转清单(对外 JSON)。
@@ -96,11 +105,13 @@ func (s *Service) ListStockOpenings(ctx context.Context, branchID string) (*Stoc
 	out := make([]StockOpeningView, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, StockOpeningView{
-			CutType:     r.CutType,
-			BizDate:     time.Time(r.BizDate).In(s.bizTZOrUTC()).Format("2006-01-02"),
-			ColdStoreKg: r.ColdStoreKg,
-			Note:        r.Note,
-			UpdatedAt:   r.UpdatedAt,
+			CutType:         r.CutType,
+			BizDate:         time.Time(r.BizDate).In(s.bizTZOrUTC()).Format("2006-01-02"),
+			ColdStoreKg:     r.ColdStoreKg,
+			UnitPriceYuan:   r.UnitPriceYuan,
+			TotalAmountYuan: r.TotalAmountYuan,
+			Note:            r.Note,
+			UpdatedAt:       r.UpdatedAt,
 		})
 	}
 	return &StockOpeningsView{BranchID: branchID, Openings: out}, nil
@@ -120,7 +131,9 @@ func (s *Service) ListStockOpenings(ctx context.Context, branchID string) (*Stoc
 // # 参数
 //
 //	newKg —— 期初的**绝对值**（队列那一行按绝对值写：覆盖，不是累加）；
-//	deltaKg —— 相对上次的**差额**（位置表按差额调整：链的起点是绝对值，位置表是增量）。
+//	deltaKg —— 相对上次的**差额**（位置表按差额调整：链的起点是绝对值，位置表是增量）；
+//	unitPrice —— **门店给的**单价（元/kg）⇒ 钉在队列那一行的成本快照上
+//	（这批货结掉时按这个成本进损益，不是 0）。
 //
 // # 归属
 //
@@ -128,7 +141,7 @@ func (s *Service) ListStockOpenings(ctx context.Context, branchID string) (*Stoc
 // ⇒ FIFO 领用它时收入记「**未归属**」（钱不丢，但也不硬塞给某头猪）。
 func (s *Service) applyOpeningToStock(
 	ctx context.Context, branchID string, cutType model.CutType,
-	bizDate time.Time, newKg, deltaKg decimal.Decimal,
+	bizDate time.Time, newKg, deltaKg, unitPrice decimal.Decimal,
 ) error {
 	if !deltaKg.IsZero() {
 		// 位置表：冷库 ← 差额。
@@ -169,8 +182,10 @@ func (s *Service) applyOpeningToStock(
 		Location:      string(model.StockLocationColdStore),
 		Status:        BagStatusActive,
 		Source:        BagSourceOpening,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		// 成本快照 = **门店给的**单价（不是 0,也不是倒算的移动加权单价）。
+		UnitCostYuan: unitPrice,
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
 	if err := s.upsertStockBag(ctx, bag); err != nil {
 		return err
@@ -196,9 +211,6 @@ func (s *Service) SaveStockOpenings(ctx context.Context, branchID string, items 
 		if !it.CutType.Valid() {
 			return nil, fmt.Errorf("%w: openings[%d].cut_type %q 不在 %d 类枚举", ErrInvalidInput, i, it.CutType, len(model.AllCutTypes))
 		}
-		if it.ColdStoreKg.IsNegative() {
-			return nil, fmt.Errorf("%w: openings[%d].cold_store_kg 不能为负", ErrInvalidInput, i)
-		}
 		bizDate := today
 		if key := strings.TrimSpace(it.BizDate); key != "" {
 			parsed, err := time.ParseInLocation("2006-01-02", key, loc)
@@ -211,8 +223,29 @@ func (s *Service) SaveStockOpenings(ctx context.Context, branchID string, items 
 			bizDate = parsed
 		}
 		// 冻结检查:期初生效日落在已结转的期间 ⇒ 不许改。
+		//
+		// ⚠️ **先于数值校验**:审计不可逆是硬规则 ⇒ 冻结期间的任何改动
+		//   都要先说"已冻结"(而不是"你没填单价")—— 前者才是真正的拦路虎。
 		if err := s.assertNotAudited(ctx, branchID, bizDate, "期初结转"); err != nil {
 			return nil, err
+		}
+		if it.ColdStoreKg.IsNegative() {
+			return nil, fmt.Errorf("%w: openings[%d].cold_store_kg 不能为负", ErrInvalidInput, i)
+		}
+		// ⚠️ **有货就要给单价**(2026-10-25 门店口径)。
+		//
+		// 期初是**上线前就在冷库里的货**,它的成本不在本系统流水里
+		// ⇒ 单价 0 ⇒ 成本链的第一天期初金额 0 ⇒ 那批货**零成本**
+		// ⇒ 卖出去全是利润(毛利虚高)⇒ 所以这里**必填且 > 0**。
+		//
+		// 重量 = 0 的行(明确的 0)⇒ 金额也是 0 ⇒ 单价可省。
+		if it.ColdStoreKg.IsPositive() && !it.UnitPriceYuan.IsPositive() {
+			return nil, fmt.Errorf("%w: openings[%d](%s)的 unit_price_yuan 必填且要 > 0 —— "+
+				"期初是已经付过钱的货,单价 0 会让这批货零成本、毛利虚高",
+				ErrInvalidInput, i, model.CutLabel(it.CutType))
+		}
+		if it.UnitPriceYuan.IsNegative() {
+			return nil, fmt.Errorf("%w: openings[%d].unit_price_yuan 不能为负", ErrInvalidInput, i)
 		}
 		// ⚠️ 先读**旧值**:位置表与结转记录都要按**差额**调整
 		//   (链的起点是"绝对值",位置表是"增量" ⇒ 改期初必须走差额,否则会叠两次)。
@@ -230,18 +263,23 @@ func (s *Service) SaveStockOpenings(ctx context.Context, branchID string, items 
 			BranchID:    branchID,
 			CutType:     it.CutType,
 			ColdStoreKg: it.ColdStoreKg,
-			BizDate:     datatypesDate(bizDate),
-			Note:        strings.TrimSpace(it.Note),
-			CreatedAt:   now,
-			UpdatedAt:   now,
+			// 单价 = 门店给的;总价 = 重量 × 单价(**服务端算,不可填**)。
+			UnitPriceYuan:   it.UnitPriceYuan,
+			TotalAmountYuan: it.ColdStoreKg.Mul(it.UnitPriceYuan),
+			BizDate:         datatypesDate(bizDate),
+			Note:            strings.TrimSpace(it.Note),
+			CreatedAt:       now,
+			UpdatedAt:       now,
 		}
 		if err := s.db.WithContext(ctx).Clauses(clause.OnConflict{
 			Columns: []clause.Column{{Name: "id"}},
 			DoUpdates: clause.Assignments(map[string]any{
-				"cold_store_kg": rec.ColdStoreKg,
-				"biz_date":      rec.BizDate,
-				"note":          rec.Note,
-				"updated_at":    rec.UpdatedAt,
+				"cold_store_kg":     rec.ColdStoreKg,
+				"unit_price_yuan":   rec.UnitPriceYuan,
+				"total_amount_yuan": rec.TotalAmountYuan,
+				"biz_date":          rec.BizDate,
+				"note":              rec.Note,
+				"updated_at":        rec.UpdatedAt,
 			}),
 		}).Create(&rec).Error; err != nil {
 			return nil, fmt.Errorf("upsert sku_stock_opening %s: %w", rec.ID, err)
@@ -258,7 +296,8 @@ func (s *Service) SaveStockOpenings(ctx context.Context, branchID string, items 
 		//
 		// ⇒ 这里补上：① 位置表(冷库) 按**差额**调整；② 登记一行
 		//   source='opening' 的结转记录（**没有产出猪** ⇒ 归属为空，收入记「未归属」）。
-		if err := s.applyOpeningToStock(ctx, branchID, it.CutType, bizDate, it.ColdStoreKg, it.ColdStoreKg.Sub(oldKg)); err != nil {
+		if err := s.applyOpeningToStock(ctx, branchID, it.CutType, bizDate, it.ColdStoreKg,
+			it.ColdStoreKg.Sub(oldKg), it.UnitPriceYuan); err != nil {
 			return nil, err
 		}
 	}
@@ -308,7 +347,7 @@ func (s *Service) DeleteStockOpening(ctx context.Context, branchID string, cutTy
 	// ⚠️ 删掉期初 ⇒ **位置表与队列**里的那批货也要一起撤
 	//   （否则"链里没了、账上还在"⇒ 门店看到两本账）。
 	if err := s.applyOpeningToStock(ctx, branchID, rec.CutType,
-		time.Time(rec.BizDate).In(s.bizTZOrUTC()), decimal.Zero, rec.ColdStoreKg.Neg()); err != nil {
+		time.Time(rec.BizDate).In(s.bizTZOrUTC()), decimal.Zero, rec.ColdStoreKg.Neg(), decimal.Zero); err != nil {
 		return nil, err
 	}
 	// 链的起点变了 ⇒ 各营业日的成本日快照要重算。

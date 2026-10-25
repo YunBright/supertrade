@@ -41,7 +41,8 @@ func TestOpening_SeedsTheDailyBalanceChain(t *testing.T) {
 	// 「鲜肉-设置」里录期初:冷库 100kg(上线前就在冷库里的货)。
 	// ⚠️ 期初**按部位**录(与每日毛利的部位口径一致)⇒ belly 部位。
 	view, err := svc.SaveStockOpenings(ctx, "S001", []service.StockOpeningInput{
-		{CutType: model.CutBelly, BizDate: "2026-10-01", ColdStoreKg: d("100"), Note: "上线期初"},
+		{CutType: model.CutBelly, BizDate: "2026-10-01", ColdStoreKg: d("100"),
+			UnitPriceYuan: d("18"), Note: "上线期初"},
 	})
 	mustNoErr(t, err, "SaveStockOpenings")
 	if len(view.Openings) != 1 || !view.Openings[0].ColdStoreKg.Equal(d("100")) {

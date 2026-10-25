@@ -725,6 +725,12 @@ func (s *Service) loadSkuFlows(ctx context.Context, branchID string, startOfDay,
 //
 // 优先取**上一营业日的日快照**(全店口径,链式一致);
 // 没有快照时回退到"上一日盘点(柜台实盘)+ 当前冷库余额",并把 data_source 降级。
+//
+// ⚠️ 回退分支最后会叠加**期初结转**(见 overlayStockOpenings):
+//
+//	生效日 == 当前营业日 的期初行 ⇒ 链的起点就在今天
+//	⇒ kg 与金额都取**门店给的**(重量、单价)
+//	⇒ 否则那批货零成本 ⇒ 毛利虚高(2026-10-25 门店口径)。
 func (s *Service) loadSkuOpening(ctx context.Context, branchID string, bizDate time.Time) (
 	kg, amount map[string]decimal.Decimal, err error,
 ) {
@@ -783,6 +789,18 @@ func (s *Service) loadSkuOpening(ctx context.Context, branchID string, bizDate t
 		if q, ok := kg[st.CubeProductID]; ok {
 			amount[st.CubeProductID] = q.Mul(st.MovingAvgUnitCost)
 		}
+	}
+	// ⚠️ **期初结转覆盖**(2026-10-25 门店口径)—— 必须放在最后。
+	//
+	// 生效日 == 当前营业日 的期初行 ⇒ 链的起点就在今天
+	// ⇒ 这批货的 kg 与金额都用**门店给的**(重量、单价)
+	// ⇒ 否则它**零成本**(金额 0)⇒ 卖出去全是利润(毛利虚高)。
+	//
+	// ⚠️ 覆盖"盘点实盘"与"移动加权单价"两套口径:
+	//   上面的两套都是"链外"的兜底(链还没起 ⇒ 没有上一日的快照),
+	//   而期初结转才是这条链**真正的起点** ⇒ 它说了算。
+	if err := s.overlayStockOpenings(ctx, branchID, bizDate, kg, amount); err != nil {
+		return nil, nil, err
 	}
 	// ⚠️ 这里**不补**预售重估(回退路径上期初量本身就是空的/过期的,
 	//   硬补一次重估会让"两期总毛利"算错)⇒ 断链的那一天,成本链本来就不完整,

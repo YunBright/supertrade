@@ -788,7 +788,8 @@ func (h *Handler) SaveStockOpenings(c *gin.Context) {
 	// ⇒ 空列表一律 400,并说清要传 `openings`。
 	if len(in.Openings) == 0 {
 		writeError(c, http.StatusBadRequest, "bad_request",
-			"openings 不能为空(每个部位一行:{cut_type, cold_store_kg, biz_date?, note?})")
+			"openings 不能为空(每个部位一行:{cut_type, cold_store_kg, unit_price_yuan, biz_date?, note?})"+
+				" —— 有货就要给单价(unit_price_yuan > 0):期初是已经付过钱的货,单价 0 会让这批货零成本、毛利虚高")
 		return
 	}
 	out, err := h.svc.SaveStockOpenings(c.Request.Context(), branchID, in.Openings)

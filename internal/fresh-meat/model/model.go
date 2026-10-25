@@ -1158,6 +1158,18 @@ type SkuStockOpening struct {
 	CutType CutType `gorm:"column:cut_type;type:varchar(32);not null;uniqueIndex:idx_sku_opening_branch_cut,priority:2" json:"cut_type"`
 	// ColdStoreKg 是期初的**冷库**余额(kg)。柜台期初恒为 0(开市前柜台是空的)。
 	ColdStoreKg decimal.Decimal `gorm:"column:cold_store_kg;type:decimal(14,3);not null;default:0" json:"cold_store_kg"`
+	// UnitPriceYuan 是期初的**单价**(元/kg)—— **门店给**(2026-10-25)。
+	//
+	// ⚠️ 为什么必须门店给:期初是**上线前就在冷库里的货**,它的**成本**不在本系统的
+	// 流水里(本系统 2026-10 才有进猪/搬台流水)⇒ 成本链的第一天若按"倒算的移动
+	// 加权单价"取,多半是 **0** ⇒ 那批货**零成本** ⇒ 毛利虚高(卖出去全是利润)。
+	// ⇒ 门店盘冷库时知道自己这批货当时**多少钱一斤** ⇒ 让他填。
+	UnitPriceYuan decimal.Decimal `gorm:"column:unit_price_yuan;type:decimal(14,4);not null;default:0" json:"unit_price_yuan"`
+	// TotalAmountYuan 是**总价**(元) = 重量 × 单价 ⇒ **服务端算,不可填**。
+	//
+	// ⚠️ 落库而不是每次现算:它是**审计口径的快照**(审计后不可改)，
+	// 现场算会跟着重量/单价的后续修改漂移。
+	TotalAmountYuan decimal.Decimal `gorm:"column:total_amount_yuan;type:decimal(16,2);not null;default:0" json:"total_amount_yuan"`
 	// BizDate 是期初生效日(链从这一天开始)。
 	BizDate datatypes.Date `gorm:"column:biz_date;not null" json:"biz_date"`
 	// Note 是备注(如"上线期初")。
