@@ -170,6 +170,64 @@ func TestBizDay_RecordPigRejectedWhenPrevDayNotStocktaken(t *testing.T) {
 	}
 }
 
+// ---- ①b. 期初结转的生效日 = 链的起点 ⇒ 那天不需要盘点单 ----
+
+// TestBizDay_OpeningDateNeedsNoStocktake 锁 ①的**例外②**(2026-10-25 门店反馈)。
+//
+// 门店场景：上线前冷库里的货用**期初结转**记一笔(生效日 10-01)，
+// **10-02 才开始第一期营业** ⇒ 10-01 那天没营业、哪来的盘点单？
+// 但期初就是那天的基线(链的起点) ⇒ **10-02 必须能录猪**。
+//
+// ⚠️ 只豁免"**恰好是生效日的那一天**"：10-02 之后仍然要 10-02 的盘点
+//   (链是逐日推的,漏一天后面全歪)。
+func TestBizDay_OpeningDateNeedsNoStocktake(t *testing.T) {
+	svc, ctx, _ := fmBizSetup(t)
+
+	// ⚠️ 先在 **09-30** 盘过一次(上线前最后一次盘)⇒ lastComplete = 09-30
+	//    ⇒ 没有豁免的话,录 10-02 的猪会报"10-01 未盘点"（门��的第一期就被挡住）。
+	if _, err := svc.RecordPorkCutsStocktake(ctx, "S001", model.RecordPorkCutsStocktakeInput{
+		IsComplete: true,
+		TakenDate:  "2026-09-30",
+		Cuts: []model.CutInput{
+			{CutType: model.CutBelly, CubeProductID: "P-BELLY", ActualRemainKg: d("5")},
+		},
+	}, "u-1"); err != nil {
+		t.Fatalf("09-30 盘点: %v", err)
+	}
+
+	// 期初：五花 100kg @ 18 元(生效日 10-01 = 链的起点)。
+	if _, err := svc.SaveStockOpenings(ctx, "S001", []service.StockOpeningInput{
+		{CutType: model.CutBelly, BizDate: "2026-10-01",
+			ColdStoreKg: d("100"), UnitPriceYuan: d("18")},
+	}); err != nil {
+		t.Fatalf("SaveStockOpenings: %v", err)
+	}
+
+	// 10-02 = 门店的第一期 ⇒ 录猪必须放行(10-01 是期初生效日,不是营业日)。
+	day2 := fmDay1.Add(24 * time.Hour)
+	svc.SetClock(fmClock(day2))
+	if _, err := svc.RecordWholePig(ctx, "S001", model.RecordWholePigInput{
+		EarTag: "EB-D2", GrossWeightKg: d("180"), PurchaseUnitPriceYuan: d("20"),
+		SupplierID: "SUP-1", ArrivedAt: day2,
+	}, "u-1"); err != nil {
+		t.Fatalf("★ 期初生效日(10-01)就是那天的基线 ⇒ 10-02 必须能录猪: %v", err)
+	}
+
+	// ⚠️ 但 10-03 仍然要 10-02 的盘点。
+	day3 := fmDay1.Add(48 * time.Hour)
+	svc.SetClock(fmClock(day3))
+	_, err := svc.RecordWholePig(ctx, "S001", model.RecordWholePigInput{
+		EarTag: "EB-D3", GrossWeightKg: d("180"), PurchaseUnitPriceYuan: d("20"),
+		SupplierID: "SUP-1", ArrivedAt: day3,
+	}, "u-1")
+	if err == nil {
+		t.Fatalf("★ 10-02 没盘点 ⇒ 10-03 录猪必须被拒(只有期初生效日那天被豁免)")
+	}
+	if !strings.Contains(err.Error(), "2026-10-02") {
+		t.Errorf("报错要点名要补哪天(2026-10-02), got %v", err)
+	}
+}
+
 // ---- ② 同一归属日重复盘点 ⇒ 只有一张单 ----
 
 // TestBizDay_SameBizDateStocktakeKeepsOne 锁 ②。

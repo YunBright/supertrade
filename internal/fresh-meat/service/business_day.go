@@ -203,8 +203,20 @@ func (s *Service) markBusinessDayStocktaken(ctx context.Context, tx *gorm.DB, br
 //   - lastComplete < 目标归属日 − 1 天 ⇒ **中间缺了** ⇒ 拒绝,
 //     并指出**要补的那一天**(目标归属日的前一天)。
 //
-// ⚠️ **例外**:该店**还没有任何营业日历史**(没进过猪、没搬过台、没盘过点)
+// ⚠️ **例外①:该店还没有任何营业日历史**(没进过猪、没搬过台、没盘过点)
 //   ⇒ 目标日就是它的**第一个营业日** ⇒ 允许(没有"昨天"要补)。
+//
+// ⚠️ **例外②:前一个营业日正好是**期初结转的生效日(2026-10-25 门店反馈)
+//
+//	期初结转那一行的冷库余额 = **链的起点** = 那天的基线
+//	⇒ 那天**不需要盘点单**。
+//
+//	门店的真实场景：**上线前冷库里的货**用期初结转记一笔(生效日 10-01),
+//	**10-02 才开始第一期营业** ⇒ 10-01 根本没营业、哪来的盘点单?
+//	⇒ 之前这里直接报"10-01 未盘点"⇒ 门店连第一期猪都录不进去。
+//
+//	⚠️ 只豁免"**恰好是生效日的那一天**":生效日之后的每一天仍然要盘点
+//	  (链是逐日推的,漏一天后面全歪)。
 //
 // ⚠️ **为什么用"最近一次已盘点"而不是"精确查昨天"**:
 //   补录往日时(目标日 < 最近一次盘点日)必须放行 —— 那是门店在**补时间线**。
@@ -212,6 +224,15 @@ func (s *Service) assertPrevBizDayStocktaken(ctx context.Context, branchID strin
 	target := targetDate.In(s.bizTZOrUTC())
 	prevDay := target.AddDate(0, 0, -1)
 	prevKey := prevDay.Format("2006-01-02")
+
+	// ★ **期初结转的生效日 = 链的起点** ⇒ 那天不需要盘点单(见上面的例外②)。
+	opening, err := s.hasStockOpeningOn(ctx, branchID, prevKey)
+	if err != nil {
+		return err
+	}
+	if opening {
+		return nil
+	}
 
 	lastComplete, err := s.lastCompleteStocktakeDate(ctx, branchID)
 	if err != nil {
@@ -234,6 +255,24 @@ func (s *Service) assertPrevBizDayStocktaken(ctx context.Context, branchID strin
 	}
 	return fmt.Errorf("%w: %s 未盘点，请先补录 %s 的盘点（不补录昨天，就无法录今天）",
 		ErrInvalidInput, prevKey, prevKey)
+}
+
+// hasStockOpeningOn 该店在 dateKey 那天有没有**期初结转**。
+//
+// ⚠️ 期初结转的生效日 = **链的起点**（那一行的冷库余额就是那天的基线）
+//   ⇒ 那天**不需要盘点单**（门店可能 10-01 只录期初、10-02 才开始营业）。
+//
+// ⚠️ 查询的日期必须用**营业日界时区**解析（datatypes.Date 落库保留时区表示,
+//   写读必须逐字一致,否则等值查询查不到 —— 见 mustParseDateInLoc 的注释）。
+func (s *Service) hasStockOpeningOn(ctx context.Context, branchID, dateKey string) (bool, error) {
+	var n int64
+	if err := s.db.WithContext(ctx).Model(&model.SkuStockOpening{}).
+		Where("branch_id = ? AND biz_date = ?", branchID,
+			datatypesDate(mustParseDateInLoc(dateKey, s.bizTZOrUTC()))).
+		Count(&n).Error; err != nil {
+		return false, fmt.Errorf("count sku_stock_openings: %w", err)
+	}
+	return n > 0, nil
 }
 
 // lastCompleteStocktakeDate 该店**最近一次已盘点**(is_complete=true)的归属日。
