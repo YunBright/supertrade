@@ -738,6 +738,8 @@ func (s *Service) loadSkuOpening(ctx context.Context, branchID string, bizDate t
 	amount = map[string]decimal.Decimal{}
 
 	prevStart, prevEnd := s.previousBizDayBounds(bizDate)
+	// 前一个营业日的日期键（"YYYY-MM-DD"）—— 纯基线日判定要用。
+	prevKey := prevStart.In(s.bizTZOrUTC()).Format("2006-01-02")
 	var prev []model.SkuCostDaily
 	e := s.db.WithContext(ctx).
 		Where("branch_id = ? AND biz_date >= ? AND biz_date < ?", branchID, prevStart, prevEnd).
@@ -801,6 +803,28 @@ func (s *Service) loadSkuOpening(ctx context.Context, branchID string, bizDate t
 	//   而期初结转才是这条链**真正的起点** ⇒ 它说了算。
 	if err := s.overlayStockOpenings(ctx, branchID, bizDate, kg, amount); err != nil {
 		return nil, nil, err
+	}
+	// ⚠️ **纯基线日的次日**:期初那一行就是前一天的"日终"(那天什么都没做)
+	//   ⇒ 次日的期初 = 期初的 kg / 金额。
+	//
+	//   不补这一条 ⇒ 上线第一天(10-02)的成本链里**没有**上线前那批货
+	//   ⇒ 期初那 1800 元的成本消失 ⇒ **毛利虚高**。
+	baseline, err := s.isBaselineDay(ctx, branchID, prevKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	if baseline {
+		baseKg, baseAmt, _, err := s.openingBalancesAt(
+			ctx, branchID, mustParseDateInLoc(prevKey, s.bizTZOrUTC()))
+		if err != nil {
+			return nil, nil, err
+		}
+		for sku, v := range baseKg {
+			kg[sku] = v
+		}
+		for sku, v := range baseAmt {
+			amount[sku] = v
+		}
 	}
 	// ⚠️ 这里**不补**预售重估(回退路径上期初量本身就是空的/过期的,
 	//   硬补一次重估会让"两期总毛利"算错)⇒ 断链的那一天,成本链本来就不完整,

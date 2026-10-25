@@ -215,8 +215,11 @@ func (s *Service) markBusinessDayStocktaken(ctx context.Context, tx *gorm.DB, br
 //	**10-02 才开始第一期营业** ⇒ 10-01 根本没营业、哪来的盘点单?
 //	⇒ 之前这里直接报"10-01 未盘点"⇒ 门店连第一期猪都录不进去。
 //
-//	⚠️ 只豁免"**恰好是生效日的那一天**":生效日之后的每一天仍然要盘点
-//	  (链是逐日推的,漏一天后面全歪)。
+//	⚠️ **只豁免"纯基线日"**(见 isBaselineDay)：期初生效日**且那天没有任何营业日动作**。
+//	  若门店**在那天录了猪 / 搬了台** ⇒ 那天就是**营业日**
+//	  ⇒ 那天的日终 = 期初 + 当天的进出 ⇒ **必须盘点**(链要逐日推)
+//	  ⇒ 次日才放行
+//	  ⇒ 否则那天没有日终快照 ⇒ 期初那批货的成本在次日**消失** ⇒ 毛利虚高。
 //
 // ⚠️ **为什么用"最近一次已盘点"而不是"精确查昨天"**:
 //   补录往日时(目标日 < 最近一次盘点日)必须放行 —— 那是门店在**补时间线**。
@@ -225,12 +228,12 @@ func (s *Service) assertPrevBizDayStocktaken(ctx context.Context, branchID strin
 	prevDay := target.AddDate(0, 0, -1)
 	prevKey := prevDay.Format("2006-01-02")
 
-	// ★ **期初结转的生效日 = 链的起点** ⇒ 那天不需要盘点单(见上面的例外②)。
-	opening, err := s.hasStockOpeningOn(ctx, branchID, prevKey)
+	// ★ **纯基线日**（期初生效日 + 那天什么都没做）⇒ 不需要盘点单（见上面的例外②）。
+	baseline, err := s.isBaselineDay(ctx, branchID, prevKey)
 	if err != nil {
 		return err
 	}
-	if opening {
+	if baseline {
 		return nil
 	}
 
@@ -308,6 +311,69 @@ func (s *Service) assertOnOrAfterChainStart(ctx context.Context, branchID string
 			ErrInvalidInput, what, key, start, start)
 	}
 	return nil
+}
+
+// isBaselineDay 判断某天是不是一个**纯基线日**。
+//
+// # 纯基线日 = 期初结转的生效日 **且** 那天**没有任何营业日动作**
+//
+//	（没录猪、没搬台、没盘点）⇒ 那天的"日终"就等于**期初本身**
+//	⇒ 次日的期初 = 期初的 kg / 金额 ⇒ **链从那里开始** ⇒ 不需要盘点单。
+//
+// # 为什么必须区分"纯基线日"和"期初生效日但那天有动作"
+//
+//	门店在 10-01 录了猪 ⇒ 10-01 就是**营业日**
+//	⇒ 那天的日终 = 期初 + 当天的进出 ⇒ **必须盘点**（链要逐日推）
+//	⇒ 否则那天没有日终快照 ⇒ 期初那批货的成本在次日**消失** ⇒ **毛利虚高**。
+//
+// ⚠️ 只认**最早**那个生效日（链的起点）⇒ 起点之前的日子链还不存在。
+func (s *Service) isBaselineDay(ctx context.Context, branchID, dayKey string) (bool, error) {
+	start, err := s.chainStartDate(ctx, branchID)
+	if err != nil {
+		return false, err
+	}
+	if start == "" || dayKey != start {
+		return false, nil
+	}
+	hasActions, err := s.hasBizDayActions(ctx, branchID, dayKey)
+	if err != nil {
+		return false, err
+	}
+	return !hasActions, nil
+}
+
+// hasBizDayActions 该店在 dayKey 那天有没有**营业日动作**（录猪 / 搬台 / 盘点）。
+//
+// ⚠️ 用来判断"那天是不是纯基线日"：期初生效日 + **没有任何动作**
+//   ⇒ 那天只是把链的起点摆好 ⇒ 之后的第一期不用补它的盘点单。
+func (s *Service) hasBizDayActions(ctx context.Context, branchID, dayKey string) (bool, error) {
+	start, end := s.businessDayBounds(mustParseDateInLoc(dayKey, s.bizTZOrUTC()))
+	var n int64
+	// ① 录猪（按到店时间落在那天）。
+	if err := s.db.WithContext(ctx).Model(&model.WholePig{}).
+		Where("branch_id = ? AND arrived_at >= ? AND arrived_at < ?", branchID, start, end).
+		Count(&n).Error; err != nil {
+		return false, fmt.Errorf("count whole_pigs(actions): %w", err)
+	}
+	if n > 0 {
+		return true, nil
+	}
+	// ② 搬台（按归属营业日）。
+	if err := s.db.WithContext(ctx).Model(&model.CounterLoadRecord{}).
+		Where("branch_id = ? AND biz_date = ?", branchID, datatypesDate(start)).
+		Count(&n).Error; err != nil {
+		return false, fmt.Errorf("count counter_loads(actions): %w", err)
+	}
+	if n > 0 {
+		return true, nil
+	}
+	// ③ 盘点（按盘点时刻落在那天）。
+	if err := s.db.WithContext(ctx).Model(&model.PorkCutsStocktake{}).
+		Where("branch_id = ? AND taken_at >= ? AND taken_at < ?", branchID, start, end).
+		Count(&n).Error; err != nil {
+		return false, fmt.Errorf("count stocktakes(actions): %w", err)
+	}
+	return n > 0, nil
 }
 
 // hasStockOpeningOn 该店在 dateKey 那天有没有**期初结转**。
