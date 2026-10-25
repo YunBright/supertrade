@@ -154,6 +154,44 @@ type ApprovalAttachment struct {
 
 func (ApprovalAttachment) TableName() string { return "approval_attachments" }
 
+// ApprovalItem 付款审批里的**手工收付款明细行**（2026-10-25 用户需求）。
+//
+// # 业务形态
+//
+// 「付款审批」不再只有"付供应商货款"这一种：门店还会有
+// 付款项（水电费 / 租金 / 物业费 / 垃圾处理费 / 软件服务费 / 其它）与
+// 收款项（陈列费 / 堆头费 / 补差价 / 兑换 / 纸皮回收 / 其它）。
+// 收款项**冲减**付款金额 ⇒ 应付金额 = 货款 + 付款项 − 收款项（不为负）。
+//
+// # 为什么只存"手工行"，货款不存
+//
+// 货款来自 ERP 结算单（cube），事实源是 approval_settlements 快照 ——
+// 再抄一份进明细表就会出现**两个金额口径**，迟早对不上。
+// ⇒ 明细表只存人填的行；货款行在读取/审核时**派生**（类型固定「货款」）。
+//
+// # 为什么类型/备注是文本而不是枚举
+//
+// 用户口径：「收款类型」「备注」**皆保存为文本**。而且「其它」允许用户
+// 把"其它"两字改成自定义文字（如"临期处理费"）⇒ 用枚举/字典表就得先建
+// 码表才能存一个字。文本列 ⇒ 新增类型不改表、不迁移。
+type ApprovalItem struct {
+	ID              string `gorm:"primaryKey;size:36" json:"id"`
+	ApprovalID      string `gorm:"size:32;index" json:"approval_id"`
+	BranchID        string `gorm:"size:32;index" json:"branch_id"`
+	ApplicantUserID string `gorm:"size:64;index" json:"applicant_user_id"`
+	// Direction 是方向：payment=付款项 / receipt=收款项。
+	Direction string `gorm:"size:16;index" json:"direction"`
+	// ItemType 是**类型文本**（"陈列费"/"水电费"/自定义文字…）。
+	ItemType string `gorm:"size:64" json:"item_type"`
+	// Remark 是备注（提示用户填写所属日期等补充信息）。
+	Remark string `gorm:"size:256" json:"remark"`
+	// AmountYuan 是金额（元）。恒 > 0（校验在 service 层）。
+	AmountYuan decimal.Decimal `gorm:"type:numeric(14,2)" json:"amount_yuan"`
+	CreatedAt  time.Time       `json:"created_at"`
+}
+
+func (ApprovalItem) TableName() string { return "approval_items" }
+
 // AuditSignal 一条核对信号(证据快照存 Evidence JSON)。
 type AuditSignal struct {
 	ID           string         `gorm:"primaryKey;size:36" json:"id"`

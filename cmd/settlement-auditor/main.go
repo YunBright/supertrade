@@ -86,6 +86,8 @@ func initApp() error {
 		&model.ApprovalSettlement{},
 		// 发起人上传的附件(图片/文件)——机器审核是异步的,字节要活到 pass 那一刻。
 		&model.ApprovalAttachment{},
+		// 手工收付款明细(陈列费/水电费/…)—— 收款项冲减付款金额。
+		&model.ApprovalItem{},
 		&model.AuditSignal{},
 		&model.AuditLog{},
 		&model.LLMVerdict{},

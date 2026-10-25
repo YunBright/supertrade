@@ -26,7 +26,7 @@ func TestBuildSettlementDetailCSV(t *testing.T) {
 		{ID: "CP002", SupplierID: "425", DocumentType: "CP",
 			PeriodStart: "09  1 2026 12:00AM", PeriodEnd: "09 30 2026 12:00AM", TotalGoodsYuan: dec("1252.5")},
 	}
-	out := buildSettlementDetailCSV(rows)
+	out := buildSettlementDetailCSV(rows, nil)
 
 	if !strings.HasPrefix(string(out), "\xEF\xBB\xBF") {
 		t.Fatal("缺 UTF-8 BOM:Excel 会按 GBK 猜,整张表乱码")
@@ -70,7 +70,7 @@ func TestBuildSettlementDetailCSV(t *testing.T) {
 }
 
 func TestBuildSettlementDetailCSV_Empty(t *testing.T) {
-	out := buildSettlementDetailCSV(nil)
+	out := buildSettlementDetailCSV(nil, nil)
 	recs, err := csv.NewReader(strings.NewReader(string(out[3:]))).ReadAll()
 	if err != nil {
 		t.Fatalf("CSV 解析失败: %v", err)
@@ -161,7 +161,7 @@ func TestStoreAndLoadApprovalAttachments(t *testing.T) {
 	svc.cfg.AttachmentControlID = "item-1494251220825"
 	got := svc.loadApprovalAttachments(context.Background(), ap, []SettlementRow{
 		{ID: "CP001", SupplierID: "142", TotalGoodsYuan: dec("10")},
-	})
+	}, nil)
 	if len(got) != 2 {
 		t.Fatalf("附件数 = %d, want 2(明细清单 + 上传)", len(got))
 	}
@@ -185,7 +185,7 @@ func TestLoadApprovalAttachments_NoControlID(t *testing.T) {
 		t.Fatalf("create ap: %v", err)
 	}
 	svc.cfg.AttachmentControlID = ""
-	got := svc.loadApprovalAttachments(context.Background(), ap, []SettlementRow{{ID: "CP001", TotalGoodsYuan: dec("10")}})
+	got := svc.loadApprovalAttachments(context.Background(), ap, []SettlementRow{{ID: "CP001", TotalGoodsYuan: dec("10")}}, nil)
 	if len(got) != 0 {
 		t.Fatalf("没配控件 id 却带了附件: %+v", got)
 	}

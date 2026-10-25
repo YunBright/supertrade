@@ -238,6 +238,7 @@ func newTestService(t *testing.T) (*Service, *gorm.DB, *fakeCube, *fakePublisher
 		&model.ApprovalInstance{}, &model.ApprovalSettlement{}, &model.ApprovalAttachment{}, &model.AuditSignal{},
 		&model.AuditLog{}, &model.LLMVerdict{}, &model.ApprovalStocktakeLink{},
 		&model.SettlementPayState{}, &model.StocktakeNotifyGroup{},
+		&model.ApprovalItem{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -570,7 +571,7 @@ func TestStepFinish_RejectNotifiesApplicant(t *testing.T) {
 	svc.stepFinish(context.Background(), ap, &VerdictResult{
 		Conclusion: ConclusionReject,
 		Reason:     "商品 16.8升琅悦泉水桶装水-02000116 自 2026-08-25 采购入库后无销售记录,本次进货 18",
-	}, nil, nil)
+	}, nil, nil, nil)
 
 	cmds := pub.commands(CmdNotifyText)
 	if len(cmds) != 1 {
@@ -1242,7 +1243,7 @@ func TestBuildApplyData(t *testing.T) {
 		Confidence: dec("0.95"),
 		Source:     model.VerdictSourceLLM,
 	}
-	applyData, summary := svc.buildApplyData(context.Background(), &ap, verdict, []signalDraft{{Level: model.SignalWarn}})
+	applyData, summary := svc.buildApplyData(context.Background(), &ap, verdict, []signalDraft{{Level: model.SignalWarn}}, nil, nil)
 	ad := string(applyData)
 	if !strings.Contains(ad, "S1") || !strings.Contains(ad, "S2") {
 		t.Errorf("apply_data 应含全部结算单号: %s", ad)
@@ -1282,7 +1283,7 @@ func TestBuildApplyData_AIConclusion(t *testing.T) {
 		Confidence: dec("0.95"),
 		Source:     model.VerdictSourceLLM,
 	}
-	applyData, _ := svc.buildApplyData(context.Background(), &ap, verdict, nil)
+	applyData, _ := svc.buildApplyData(context.Background(), &ap, verdict, nil, nil, nil)
 	ad := string(applyData)
 	if !strings.Contains(ad, `"Textarea-1791692081606"`) {
 		t.Errorf("apply_data 应含 AI 结论控件 id: %s", ad)
@@ -1292,7 +1293,7 @@ func TestBuildApplyData_AIConclusion(t *testing.T) {
 	}
 
 	// verdict 缺失 → 跳过控件(不写 AI 结论,也不报错)。
-	applyData, _ = svc.buildApplyData(context.Background(), &ap, nil, nil)
+	applyData, _ = svc.buildApplyData(context.Background(), &ap, nil, nil, nil, nil)
 	if strings.Contains(string(applyData), `"Textarea-1791692081606"`) {
 		t.Errorf("verdict 缺失时应跳过 AI 结论控件: %s", applyData)
 	}
@@ -1317,7 +1318,7 @@ func TestBuildApplyData_AIConclusion_RejectBlock(t *testing.T) {
 		{Level: model.SignalWarn, Message: "警告信号"},
 		{Level: model.SignalBlock, Message: longBlock},
 	}
-	applyData, _ := svc.buildApplyData(context.Background(), &ap, verdict, signals)
+	applyData, _ := svc.buildApplyData(context.Background(), &ap, verdict, signals, nil, nil)
 	ad := string(applyData)
 	got := truncateRunes(longBlock, 40)
 	if !strings.Contains(ad, `"text":"`+got+`"`) {

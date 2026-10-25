@@ -58,11 +58,21 @@ type AttachmentInput struct {
 // 明细清单的表头(审批人第一眼就要看懂)。
 var settlementDetailHeader = []string{"结算单号", "供应商", "单据类型", "账期", "货款金额(元)"}
 
+// 收付款明细段的表头(2026-10-25:付款审批不再只有货款)。
+//
+// ⚠️ 列数与第一段**一致**(5 列)⇒ 整份 CSV 每行字段数相同,
+//   Excel/严格解析器都不会因为"某行少一列"而报错或错位。
+var itemDetailHeader = []string{"方向", "类型", "备注", "金额(元)", "关联单据"}
+
 // buildSettlementDetailCSV 生成结算单明细清单(CSV,UTF-8 BOM)。
 //
 // rows 来自 cube(带供应商名与**当前**货款金额)⇒ 清单里的金额与审批单上的
 // 付款金额是同一份数据,不会自相矛盾。
-func buildSettlementDetailCSV(rows []SettlementRow) []byte {
+//
+// items 是手工收付款明细 ⇒ 清单第二段把它们全列出来
+// (用户口径 2026-10-25:「所有收付款项都列给机器审核」;附件同理,
+// 审批人在企微上不用回门店问"这单除了货款还有什么")。
+func buildSettlementDetailCSV(rows []SettlementRow, items []model.ApprovalItem) []byte {
 	var buf bytes.Buffer
 	// Excel 认 BOM 才不会把 UTF-8 当 GBK 猜。
 	buf.Write([]byte{0xEF, 0xBB, 0xBF})
@@ -80,6 +90,43 @@ func buildSettlementDetailCSV(rows []SettlementRow) []byte {
 		total = total.Add(r.TotalGoodsYuan)
 	}
 	_ = w.Write([]string{"合计", fmt.Sprintf("%d 张", len(rows)), "", "", total.StringFixed(2)})
+
+	// 第二段:收付款明细(货款行 + 手工行 + 合计应付)。
+	if len(items) > 0 {
+		_ = w.Write([]string{"", "", "", "", ""})
+		_ = w.Write([]string{"收付款明细", "", "", "", ""})
+		_ = w.Write(itemDetailHeader)
+		totals := totalsOf(rows, items)
+		// 货款行(来自结算单)也算一条明细 ⇒ 审批人看到的是"全部收付款项"。
+		for _, r := range rows {
+			_ = w.Write([]string{
+				directionLabel(ItemDirectionPayment),
+				ItemTypeGoods,
+				detailSupplierLabel(r.SupplierID, r.SupplierName),
+				r.TotalGoodsYuan.StringFixed(2),
+				r.ID,
+			})
+		}
+		for _, it := range items {
+			_ = w.Write([]string{
+				directionLabel(it.Direction),
+				it.ItemType,
+				it.Remark,
+				it.AmountYuan.StringFixed(2),
+				"",
+			})
+		}
+		_ = w.Write([]string{
+			"合计",
+			fmt.Sprintf("货款 %s + 付款项 %s - 收款项 %s",
+				totals.GoodsTotalYuan.StringFixed(2),
+				totals.PaymentTotalYuan.StringFixed(2),
+				totals.ReceiptTotalYuan.StringFixed(2)),
+			"应付",
+			totals.PayableYuan.StringFixed(2),
+			"",
+		})
+	}
 	w.Flush()
 	return buf.Bytes()
 }
@@ -207,13 +254,13 @@ func (s *Service) storeAttachments(ctx context.Context, ap *model.ApprovalInstan
 // loadApprovalAttachments 读出这次审批要附的全部文件(明细清单 + 发起人上传的)。
 //
 // 顺序：**明细清单在前**，发起人上传的在后(审批人先看单据明细，再看凭证)。
-func (s *Service) loadApprovalAttachments(ctx context.Context, ap *model.ApprovalInstance, settlements []SettlementRow) []ApprovalAttachment {
+func (s *Service) loadApprovalAttachments(ctx context.Context, ap *model.ApprovalInstance, settlements []SettlementRow, items []model.ApprovalItem) []ApprovalAttachment {
 	out := make([]ApprovalAttachment, 0, maxAttachmentsPerApproval+1)
 	// ① 自动生成的结算单明细清单(用 cube 当前金额 ⇒ 与审批单上的付款金额同源)。
 	if strings.TrimSpace(s.cfg.AttachmentControlID) != "" && len(settlements) > 0 {
 		out = append(out, ApprovalAttachment{
 			FileName:      detailFileName(settlements),
-			ContentBase64: base64.StdEncoding.EncodeToString(buildSettlementDetailCSV(settlements)),
+			ContentBase64: base64.StdEncoding.EncodeToString(buildSettlementDetailCSV(settlements, items)),
 		})
 	}
 	// ② 发起人自己上传的(落库的那批)。

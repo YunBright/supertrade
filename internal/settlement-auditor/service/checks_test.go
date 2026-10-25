@@ -94,7 +94,7 @@ func TestCheckAmounts_LineMismatch(t *testing.T) {
 		"S1": {{SettlementID: "S1", TotalGoodsYuan: dec("100")}},
 		"S2": {{SettlementID: "S2", TotalGoodsYuan: dec("40")}}, // 差 10
 	}
-	sigs, _ := checkAmounts(settlements, lines, dec("150"), dec("0.01"), dec("1"))
+	sigs, _ := checkAmounts(settlements, lines, dec("150"), dec("0.01"), dec("1"), decimal.Zero, decimal.Zero)
 	if len(sigs) != 1 {
 		t.Fatalf("信号数 = %d, want 1(仅 S2 行勾稽)", len(sigs))
 	}
@@ -111,7 +111,7 @@ func TestCheckAmounts_ManualMismatch(t *testing.T) {
 	lines := map[string][]SettlementLineRow{
 		"S1": {{SettlementID: "S1", TotalGoodsYuan: dec("100")}},
 	}
-	sigs, summary := checkAmounts(settlements, lines, dec("95"), dec("0.01"), dec("1"))
+	sigs, summary := checkAmounts(settlements, lines, dec("95"), dec("0.01"), dec("1"), decimal.Zero, decimal.Zero)
 	if len(sigs) != 1 {
 		t.Fatalf("信号数 = %d, want 1(手工金额勾稽)", len(sigs))
 	}
@@ -128,7 +128,7 @@ func TestCheckAmounts_WithinTolerance(t *testing.T) {
 	lines := map[string][]SettlementLineRow{
 		"S1": {{SettlementID: "S1", TotalGoodsYuan: dec("100.005")}}, // 差 0.005 < 0.01
 	}
-	if sigs, _ := checkAmounts(settlements, lines, dec("100"), dec("0.01"), dec("1")); len(sigs) != 0 {
+	if sigs, _ := checkAmounts(settlements, lines, dec("100"), dec("0.01"), dec("1"), decimal.Zero, decimal.Zero); len(sigs) != 0 {
 		t.Errorf("容差内应无信号, got %d", len(sigs))
 	}
 }
@@ -150,7 +150,7 @@ func TestCheckAmounts_PaymentRoundingIsNotAnError(t *testing.T) {
 		"CP002609014321": {{SettlementID: "CP002609014321", TotalGoodsYuan: dec("7765.1946")}},
 		"CP002609014322": {{SettlementID: "CP002609014322", TotalGoodsYuan: dec("441.0000")}},
 	}
-	sigs, summary := checkAmounts(settlements, lines, dec("8206.20"), dec("0.01"), dec("1"))
+	sigs, summary := checkAmounts(settlements, lines, dec("8206.20"), dec("0.01"), dec("1"), decimal.Zero, decimal.Zero)
 	if len(sigs) != 0 {
 		t.Fatalf("0.0054 元的取整差异不应产生信号, got %d: %+v", len(sigs), sigs)
 	}
@@ -176,7 +176,7 @@ func TestCheckAmounts_FenAndJiaoDiffNeverBlocks(t *testing.T) {
 			lines := map[string][]SettlementLineRow{
 				"S1": {{SettlementID: "S1", TotalGoodsYuan: dec("8206.1946")}},
 			}
-			sigs, summary := checkAmounts(settlements, lines, dec(manual), dec("0.01"), dec("1"))
+			sigs, summary := checkAmounts(settlements, lines, dec(manual), dec("0.01"), dec("1"), decimal.Zero, decimal.Zero)
 			if len(sigs) != 0 {
 				t.Fatalf("差额 %s 元应不阻断, got %d 条信号", manual, len(sigs))
 			}
@@ -193,7 +193,7 @@ func TestCheckAmounts_YuanLevelDiffBlocks(t *testing.T) {
 	lines := map[string][]SettlementLineRow{
 		"S1": {{SettlementID: "S1", TotalGoodsYuan: dec("8206.1946")}},
 	}
-	sigs, summary := checkAmounts(settlements, lines, dec("8207.20"), dec("0.01"), dec("1"))
+	sigs, summary := checkAmounts(settlements, lines, dec("8207.20"), dec("0.01"), dec("1"), decimal.Zero, decimal.Zero)
 	if len(sigs) != 1 {
 		t.Fatalf("差 1.0054 元应产生 1 条信号, got %d", len(sigs))
 	}
@@ -214,7 +214,7 @@ func TestCheckAmounts_LineCheckKeepsStrictNumericTolerance(t *testing.T) {
 	lines := map[string][]SettlementLineRow{
 		"S1": {{SettlementID: "S1", TotalGoodsYuan: dec("100.5")}}, // 差 0.5 > 数值容差 0.01
 	}
-	sigs, _ := checkAmounts(settlements, lines, dec("100"), dec("0.01"), dec("1"))
+	sigs, _ := checkAmounts(settlements, lines, dec("100"), dec("0.01"), dec("1"), decimal.Zero, decimal.Zero)
 	if len(sigs) != 1 {
 		t.Fatalf("单头 vs 明细差 0.5 元应产生 1 条信号, got %d", len(sigs))
 	}

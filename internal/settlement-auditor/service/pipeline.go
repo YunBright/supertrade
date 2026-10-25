@@ -71,6 +71,14 @@ type SubmitInput struct {
 	// 随审批一路活到企微审批单的「附件」控件上(审批人直接看得到发票照片)。
 	// ⚠️ 上限:最多 3 个,单个解码后 ≤2MB(见 maxAttachmentsPerApproval)。
 	Attachments []AttachmentInput
+	// ReceiptItems / PaymentItems 是**手工收付款明细行**(2026-10-25 用户需求)。
+	//
+	// 供应商结算单不在这里 —— 它是「付款类型-货款」,由勾选结果派生
+	// (事实源是 cube 快照,见 service/items.go)。
+	//
+	// 收款项冲减付款金额 ⇒ 应付金额 = 货款 + 付款项 − 收款项(不为负)。
+	ReceiptItems []ItemInput
+	PaymentItems []ItemInput
 }
 
 // maxSettlementsPerApproval 单次审批勾选上限(防 LLM prompt 爆炸)。
@@ -102,12 +110,20 @@ func (s *Service) SubmitApproval(ctx context.Context, branchID string, in Submit
 	if in.ApplicantBearer == "" {
 		return nil, fmt.Errorf("%w: 缺少 Authorization 头(机器审核需以申请人身份调 cube)", ErrInvalidInput)
 	}
-	if !in.ManualAmountYuan.GreaterThan(decimal.Zero) {
-		return nil, fmt.Errorf("%w: manual_amount_yuan 必须 > 0", ErrInvalidInput)
+	// ⚠️ 手工金额允许为 **0**:纯收款项(只有"纸皮回收"这类)应付金额就是 0
+	//   (用户口径 2026-10-25:「付款审批可以只有'纸皮回收'」)。
+	//   真的填错了(应付 > 0 却填 0)由金额勾稽(check_amounts)拦,不在这层拦。
+	if in.ManualAmountYuan.IsNegative() {
+		return nil, fmt.Errorf("%w: manual_amount_yuan 不能为负", ErrInvalidInput)
 	}
 	ids := dedupeStrings(in.SettlementIDs)
-	if len(ids) == 0 {
-		return nil, fmt.Errorf("%w: settlement_ids 至少 1 张", ErrInvalidInput)
+	// ⚠️ 结算单可以**一张都不勾** —— 前提是填了收/付款明细。
+	//
+	// 用户口径（2026-10-25）：「付款审批可以只有'货款'，只有'纸皮回收'」——
+	// 纯收款项（只有纸皮回收这类）没有货款，也就没有结算单。
+	// 没有明细也没有结算单 ⇒ 是一张空单，必须拒。
+	if len(ids) == 0 && len(in.ReceiptItems) == 0 && len(in.PaymentItems) == 0 {
+		return nil, fmt.Errorf("%w: settlement_ids 至少 1 张,或填收/付款明细", ErrInvalidInput)
 	}
 	if len(ids) > maxSettlementsPerApproval {
 		return nil, fmt.Errorf("%w: 单次审批最多 %d 张结算单", ErrInvalidInput, maxSettlementsPerApproval)
@@ -123,6 +139,15 @@ func (s *Service) SubmitApproval(ctx context.Context, branchID string, in Submit
 			return nil, err
 		}
 		attachments = append(attachments, va)
+	}
+	// 收付款明细:类型/备注/金额/行数校验(见 service/items.go)。
+	receiptItems, err := validateItems(ItemDirectionReceipt, in.ReceiptItems)
+	if err != nil {
+		return nil, err
+	}
+	paymentItems, err := validateItems(ItemDirectionPayment, in.PaymentItems)
+	if err != nil {
+		return nil, err
 	}
 	// 审批流人员:按**节点类型**分桶(键 approver/handler/cc)。
 	//
@@ -170,6 +195,10 @@ func (s *Service) SubmitApproval(ctx context.Context, branchID string, in Submit
 	}
 	// 落发起人上传的附件(机器审核是异步的 ⇒ 字节必须活到 pass 那一刻)。
 	if err := s.storeAttachments(ctx, ap, attachments); err != nil {
+		return nil, err
+	}
+	// 落手工收付款明细(机器审核异步 ⇒ 审核时要读得到它们)。
+	if err := s.storeItems(ctx, ap, receiptItems, paymentItems); err != nil {
 		return nil, err
 	}
 
@@ -239,6 +268,10 @@ func (s *Service) runAudit(ctx context.Context, approvalID string) {
 
 	var signals []signalDraft
 
+	// 手工收付款明细(读库)—— 审核要用它算应付金额与放宽额度。
+	items := s.loadApprovalItems(ctx, ap.ID)
+	allowance := buildAllowance(receiptItemsOf(items))
+
 	// step 1: 拉结算单 + 存在性/审核状态核对
 	settlements, err := s.stepFetchSettlements(ctx, ap, &signals)
 	if err != nil {
@@ -262,14 +295,20 @@ func (s *Service) runAudit(ctx context.Context, approvalID string) {
 		return
 	}
 
-	// step 4: 金额勾稽
-	amountCheck := s.stepCheckAmounts(ctx, ap, settlements, linesBySettlement, &signals)
+	// step 4: 金额勾稽(比的是**应付金额** = 货款 + 付款项 − 收款项)
+	amountCheck := s.stepCheckAmounts(ctx, ap, settlements, linesBySettlement, &signals, items)
 
-	// step 5: 数量信号(采购量 vs 销售)
-	if err := s.stepCheckQuantity(ctx, ap, linesBySettlement, sheets, &signals); err != nil {
+	// step 5: 数量信号(采购量 vs 销售) + 毛利额度信号(补差价)
+	if err := s.stepCheckQuantity(ctx, ap, linesBySettlement, sheets, &signals, allowance); err != nil {
 		s.markFailed(ctx, ap, err.Error())
 		return
 	}
+
+	// step 5.5: 收款项放宽(有陈列费/堆头费 ⇒ 进货可以多些)
+	//
+	// 放在数量信号之后、落库之前 ⇒ 落库的信号级别就是放宽后的级别,
+	// LLM 与规则降级路径看到的也是同一份。
+	signals = applyReceiptAllowance(signals, allowance)
 
 	// 信号统一落库
 	if err := s.saveSignals(ctx, ap.ID, signals); err != nil {
@@ -278,7 +317,7 @@ func (s *Service) runAudit(ctx context.Context, approvalID string) {
 	}
 
 	// step 6: LLM 综合研判(失败降级规则)
-	verdict, err := s.stepLLMVerdict(ctx, ap, settlements, linesBySettlement, sheets, signals, &amountCheck)
+	verdict, err := s.stepLLMVerdict(ctx, ap, settlements, linesBySettlement, sheets, signals, &amountCheck, items, allowance)
 	if err != nil {
 		s.markFailed(ctx, ap, err.Error())
 		return
@@ -288,7 +327,7 @@ func (s *Service) runAudit(ctx context.Context, approvalID string) {
 	s.stepStocktake(ctx, ap, verdict)
 
 	// finish: pass → apply_event;reject → notify_text
-	s.stepFinish(ctx, ap, verdict, signals, settlements)
+	s.stepFinish(ctx, ap, verdict, signals, settlements, items)
 }
 
 // loadApproval 按 id 读实例(不分 branch:内部流水线用)。
@@ -484,22 +523,27 @@ func (s *Service) stepCheckSheets(ctx context.Context, ap *model.ApprovalInstanc
 // 返回 AmountCheck 是给 LLM 用的:金额结论必须由引擎算好后原样传递,
 // 不能让 LLM 拿着 user prompt 里的**显示值**自己相加 ——
 // 2026-10-22 生产实踩,它把"差 0.0054 元"算成了"差 0.01 元"并当成 block 理由拒单。
-func (s *Service) stepCheckAmounts(ctx context.Context, ap *model.ApprovalInstance, settlements []SettlementRow, linesBySettlement map[string][]SettlementLineRow, signals *[]signalDraft) AmountCheck {
+func (s *Service) stepCheckAmounts(ctx context.Context, ap *model.ApprovalInstance, settlements []SettlementRow, linesBySettlement map[string][]SettlementLineRow, signals *[]signalDraft, items []model.ApprovalItem) AmountCheck {
 	start := time.Now()
 	before := len(*signals)
 	tol := decimal.NewFromFloat(s.cfg.AmountToleranceYuan)
 	payTol := decimal.NewFromFloat(s.cfg.PaymentToleranceYuan)
-	sigs, summary := checkAmounts(settlements, linesBySettlement, ap.ManualAmountYuan, tol, payTol)
+	// 手工付款项/收款项合计(货款来自 cube 结算单,不在这里)。
+	paymentTotal := sumItemsByDirection(items, ItemDirectionPayment)
+	receiptTotal := sumItemsByDirection(items, ItemDirectionReceipt)
+	sigs, summary := checkAmounts(settlements, linesBySettlement, ap.ManualAmountYuan, tol, payTol, paymentTotal, receiptTotal)
 	*signals = append(*signals, sigs...)
 	verdict := "不一致"
 	if summary.Consistent {
 		verdict = "一致(差额在付款取整容差内,属正常取整)"
 	}
 	s.logStep(ctx, ap, StepCheckAmounts,
-		fmt.Sprintf("手工金额 %s,数值容差 %s,付款取整容差 %s",
-			yuanText(ap.ManualAmountYuan), yuanText(tol), yuanText(payTol)),
-		fmt.Sprintf("新增 %d 条金额信号;结算单货款合计 %s,差额 %s,结论:%s",
-			len(*signals)-before, yuanText(summary.SettledTotalYuan), yuanText(summary.DiffYuan), verdict),
+		fmt.Sprintf("手工金额 %s,付款项 %s,收款项 %s,数值容差 %s,付款取整容差 %s",
+			yuanText(ap.ManualAmountYuan), yuanText(summary.PaymentTotalYuan), yuanText(summary.ReceiptTotalYuan),
+			yuanText(tol), yuanText(payTol)),
+		fmt.Sprintf("新增 %d 条金额信号;货款合计 %s,应付 %s,差额 %s,结论:%s",
+			len(*signals)-before, yuanText(summary.SettledTotalYuan), yuanText(summary.PayableYuan),
+			yuanText(summary.DiffYuan), verdict),
 		"", time.Since(start).Milliseconds())
 	return summary
 }
@@ -515,7 +559,7 @@ func (s *Service) stepCheckAmounts(ctx context.Context, ap *model.ApprovalInstan
 //
 // 信号里写「<商品名称>-<商品货号>」(ProductLabel)⇒ 这里要先把名字查出来。
 // 名字查不到只 warn 不失败:回退成纯货号,不影响主结论。
-func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInstance, linesBySettlement map[string][]SettlementLineRow, sheets []PurchaseSheetRow, signals *[]signalDraft) error {
+func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInstance, linesBySettlement map[string][]SettlementLineRow, sheets []PurchaseSheetRow, signals *[]signalDraft, allowance Allowance) error {
 	start := time.Now()
 	// 仅 PI(进货)单做收货量聚合;RO 退货本期不建信号(见 checks.go 注释)。
 	piSheetSet := make(map[string]struct{})
@@ -600,11 +644,47 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 		Names:      names,
 		WindowFrom: windowFromByProduct(groups),
 	})...)
+	// 毛利额度信号(有补差价收款时才产生;见 service/allowance.go)。
+	//
+	// 成本用**本次进货均价**估算(进货金额 ÷ 收货量)—— 引擎手上没有该商品的
+	// 历史成本,这是最接近的口径;只做"毛利是否为负/缺口多大"的相对判断。
+	unitCost := unitCostByProduct(lines)
+	gm := estimateGrossMargin(unitCost, salesByProduct)
+	gmSignals := checkGrossMarginWithAllowance(gm, allowance)
+	*signals = append(*signals, gmSignals...)
 	s.logStep(ctx, ap, StepCheckQuantity,
 		fmt.Sprintf("PI 单 %d 张,商品 %d 种,窗口 %s~%s(按各商品最后一次采购入库日起算,取不到则回退 %s)",
 			len(piSheets), len(products), groups[0].From, toDate, fallbackFrom),
-		fmt.Sprintf("新增 %d 条数量信号", len(*signals)-before), "", time.Since(start).Milliseconds())
+		fmt.Sprintf("新增 %d 条数量信号;窗口毛利估算 %s 元,补差价额度 %s 元",
+			len(*signals)-before, yuanText(gm.AmountYuan), yuanText(allowance.PriceDiffYuan)),
+		"", time.Since(start).Milliseconds())
 	return nil
+}
+
+// unitCostByProduct 按货号算本次进货均价(元/件)。
+//
+// 口径:Σ(该商品各行进货金额) ÷ Σ(该商品各行收货量)。
+//
+// ⚠️ 只用于**毛利估算**(相对判断),不是财务成本口径 —— 引擎没有历史成本。
+func unitCostByProduct(lines []SheetLineRow) map[string]decimal.Decimal {
+	amount := make(map[string]decimal.Decimal)
+	qty := make(map[string]decimal.Decimal)
+	for _, ln := range lines {
+		if ln.ProductID == "" {
+			continue
+		}
+		amount[ln.ProductID] = amount[ln.ProductID].Add(ln.TotalAmountYuan)
+		qty[ln.ProductID] = qty[ln.ProductID].Add(ln.ReceivedQuantity)
+	}
+	out := make(map[string]decimal.Decimal, len(amount))
+	for pid, a := range amount {
+		q := qty[pid]
+		if !q.GreaterThan(decimal.Zero) {
+			continue
+		}
+		out[pid] = a.Div(q)
+	}
+	return out
 }
 
 // containsString 判断字符串切片里是否已有该值(小规模,线性扫足够)。
@@ -638,7 +718,7 @@ func (s *Service) saveSignals(ctx context.Context, approvalID string, drafts []s
 }
 
 // stepLLMVerdict 调 verdictFn;失败降级 defaultVerdictFn;落 llm_verdicts。
-func (s *Service) stepLLMVerdict(ctx context.Context, ap *model.ApprovalInstance, settlements []SettlementRow, linesBySettlement map[string][]SettlementLineRow, sheets []PurchaseSheetRow, signals []signalDraft, amount *AmountCheck) (*VerdictResult, error) {
+func (s *Service) stepLLMVerdict(ctx context.Context, ap *model.ApprovalInstance, settlements []SettlementRow, linesBySettlement map[string][]SettlementLineRow, sheets []PurchaseSheetRow, signals []signalDraft, amount *AmountCheck, items []model.ApprovalItem, allowance Allowance) (*VerdictResult, error) {
 	start := time.Now()
 	in := &AuditInput{
 		Approval:    ap,
@@ -647,6 +727,9 @@ func (s *Service) stepLLMVerdict(ctx context.Context, ap *model.ApprovalInstance
 		Sheets:      sheets,
 		Signals:     signals,
 		Amount:      amount,
+		Items:       buildItemRows(settlements, items),
+		Totals:      totalsOf(settlements, items),
+		Allowance:   allowance,
 	}
 	verdict, err := s.verdictFn(ctx, in)
 	trace := ""
@@ -811,9 +894,9 @@ func notifyTargetText(group *model.StocktakeNotifyGroup, users []string) string 
 
 // stepFinish 按结论收尾:pass → apply_event;reject → notify_text。
 //
-// settlements 是本次勾选的结算单(cube 行,带供应商名与金额)⇒
-// pass 分支用它生成「附件」控件的**结算单明细清单**。
-func (s *Service) stepFinish(ctx context.Context, ap *model.ApprovalInstance, verdict *VerdictResult, signals []signalDraft, settlements []SettlementRow) {
+// settlements 是本次勾选的结算单(cube 行,带供应商名与金额),
+// items 是手工收付款明细 ⇒ 二者一起生成「附件」控件的**结算单明细清单**。
+func (s *Service) stepFinish(ctx context.Context, ap *model.ApprovalInstance, verdict *VerdictResult, signals []signalDraft, settlements []SettlementRow, items []model.ApprovalItem) {
 	start := time.Now()
 	if verdict.Conclusion == ConclusionReject {
 		reason := truncate(verdict.Reason, 1024)
@@ -844,7 +927,7 @@ func (s *Service) stepFinish(ctx context.Context, ap *model.ApprovalInstance, ve
 	}
 
 	// pass → 代提交企微审批
-	applyData, summaryList := s.buildApplyData(ctx, ap, verdict, signals)
+	applyData, summaryList := s.buildApplyData(ctx, ap, verdict, signals, settlements, items)
 	// 按**模板的流程配置**组装 process.node_list(审批人 / 办理人 / 抄送人)。
 	//
 	// ⚠️ 必须是 mode=0(自带 process):这个模板的三个节点全是「申请人自选」,
@@ -871,7 +954,7 @@ func (s *Service) stepFinish(ctx context.Context, ap *model.ApprovalInstance, ve
 		// (素材上传与控件组装在 wechat-bot 侧 —— 它持有 OA token。)
 		AttachmentControlID:   s.cfg.AttachmentControlID,
 		AttachmentControlType: s.cfg.AttachmentControlType,
-		Attachments:           s.loadApprovalAttachments(ctx, ap, settlements),
+		Attachments:           s.loadApprovalAttachments(ctx, ap, settlements, items),
 	}
 	cmdID, err := s.publishCommand(ctx, CmdApplyEvent, payload)
 	if err != nil {
@@ -932,7 +1015,7 @@ func (s *Service) snapshotFlowSelections(ap *model.ApprovalInstance) (FlowSelect
 //
 // 另可选追加「AI审核结论」多行文本控件(cfg.AIConclusionControlID 非空时):
 // 写入 LLM 研判结论精简文案(aiConclusionText);模板未配/结论为空则跳过。
-func (s *Service) buildApplyData(ctx context.Context, ap *model.ApprovalInstance, verdict *VerdictResult, signals []signalDraft) (applyData, summaryList json.RawMessage) {
+func (s *Service) buildApplyData(ctx context.Context, ap *model.ApprovalInstance, verdict *VerdictResult, signals []signalDraft, settlements []SettlementRow, items []model.ApprovalItem) (applyData, summaryList json.RawMessage) {
 	ids := s.settlementIDsOf(ctx, ap.ID)
 	type textValue struct {
 		Text string `json:"text"`
@@ -949,8 +1032,20 @@ func (s *Service) buildApplyData(ctx context.Context, ap *model.ApprovalInstance
 		}
 	}
 	remark := ap.Remark
+	// 备注控件里带上**收付款摘要**(2026-10-25 用户需求:审批人要在企微单上
+	// 看得见"这单除了货款还有什么、冲减了多少")。
+	//
+	// ⚠️ 摘要只用引擎口径(cube 货款 + 明细行)⇒ 与附件清单同源,不会自相矛盾。
+	if len(items) > 0 {
+		parts := []string{}
+		if strings.TrimSpace(ap.Remark) != "" {
+			parts = append(parts, strings.TrimSpace(ap.Remark))
+		}
+		parts = append(parts, "收付:"+itemsSummaryText(totalsOf(settlements, items)))
+		remark = strings.Join(parts, ";")
+	}
 	if warnCount > 0 {
-		remark = fmt.Sprintf("%s(机器一审通过,%d 条警告请关注)", ap.Remark, warnCount)
+		remark = fmt.Sprintf("%s(机器一审通过,%d 条警告请关注)", remark, warnCount)
 	}
 	texts := []string{strings.Join(ids, ","), ap.ManualAmountYuan.StringFixed(2), remark}
 	contents := make([]content, 0, 4)
@@ -969,9 +1064,18 @@ func (s *Service) buildApplyData(ctx context.Context, ap *model.ApprovalInstance
 		}
 	}
 	applyData, _ = json.Marshal(map[string]any{"contents": contents})
+	// 摘要行:没有收付款明细时保持原样(纯货款审批的摘要不变),
+	// 有明细时把三笔账都写上 ⇒ 企微列表页一眼看清冲减关系。
+	summaryText := fmt.Sprintf("结算单 %d 张 / 付款 %s 元", len(ids), ap.ManualAmountYuan.StringFixed(2))
+	if len(items) > 0 {
+		t := totalsOf(settlements, items)
+		summaryText = fmt.Sprintf("结算单 %d 张 / 付款 %s 元(货款 %s + 付款项 %s - 收款项 %s)",
+			len(ids), ap.ManualAmountYuan.StringFixed(2),
+			yuanText(t.GoodsTotalYuan), yuanText(t.PaymentTotalYuan), yuanText(t.ReceiptTotalYuan))
+	}
 	summaryList, _ = json.Marshal(map[string]any{
 		"summary_info": []map[string]string{
-			{"text": fmt.Sprintf("结算单 %d 张 / 付款 %s 元", len(ids), ap.ManualAmountYuan.StringFixed(2)), "lang": "zh_CN"},
+			{"text": summaryText, "lang": "zh_CN"},
 		},
 	})
 	return applyData, summaryList
@@ -1064,9 +1168,11 @@ func (s *Service) RescanStuck(ctx context.Context) (int, error) {
 type ApprovalDetail struct {
 	Approval    *model.ApprovalInstance       `json:"approval"`
 	Settlements []model.ApprovalSettlement    `json:"settlements"`
-	Signals     []model.AuditSignal           `json:"signals"`
-	Verdict     *model.LLMVerdict             `json:"verdict,omitempty"`
-	Links       []model.ApprovalStocktakeLink `json:"stocktake_links"`
+	// Items 是手工收付款明细(2026-10-25):重新发起时用它预填两张明细表。
+	Items   []model.ApprovalItem          `json:"items"`
+	Signals []model.AuditSignal           `json:"signals"`
+	Verdict *model.LLMVerdict             `json:"verdict,omitempty"`
+	Links   []model.ApprovalStocktakeLink `json:"stocktake_links"`
 }
 
 // ListApprovals 按 branch + 条件分页(created_at 降序)。
@@ -1119,6 +1225,8 @@ func (s *Service) GetApprovalDetail(ctx context.Context, branchID, id string) (*
 	// 得用字典现查。字典查询失败只告警不报错 —— 详情页的主体是审批快照,
 	// 为了一个显示字段让整页 503 不划算。
 	s.fillApprovalSettlementNames(ctx, branchID, d.Settlements)
+	// 手工收付款明细(重新发起时用来预填两张明细表)。
+	s.db.WithContext(ctx).Where("approval_id = ?", id).Order("created_at ASC").Find(&d.Items)
 	s.db.WithContext(ctx).Where("approval_id = ?", id).Order("created_at ASC").Find(&d.Signals)
 	var verdict model.LLMVerdict
 	if err := s.db.WithContext(ctx).First(&verdict, "approval_id = ?", id).Error; err == nil {

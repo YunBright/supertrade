@@ -53,6 +53,14 @@ type AuditInput struct {
 	// 把 0.0054 元的差额算成"差 0.01"并当成 block 理由拒了单。
 	// 金额结论只有一个口径:引擎算完给 LLM。
 	Amount *AmountCheck
+	// Items 是本次审批的**全部**收付款明细行(货款行在前,手工行在后)。
+	//
+	// 用户口径(2026-10-25):「所有收付款项都列给机器审核」。
+	Items []ItemRow
+	// Totals 是金额汇总(货款/付款项/收款项/应付)。
+	Totals ItemTotals
+	// Allowance 是收款项给审核的放宽额度(陈列费/堆头费/补差价)。
+	Allowance Allowance
 }
 
 // VerdictResult 是 VerdictFn 的返回值。
@@ -321,6 +329,19 @@ func buildAuditSystemPrompt() string {
   并在 reason 里写明依据是申请人的备注(例如「申请人备注:该商品为换购品,不产生销量,本次无销售记录可接受」)。
 - 备注与信号无关时,按常规判断;备注只是解释,**不能推翻**单据缺失/未审核/金额勾稽这类硬异常。
 
+收付款明细与放宽口径(2026-10-25 用户口径,**必须遵守**):
+- 本次付款审批可能包含**货款**(供应商结算单)之外的收付款项:
+  付款项(水电费/租金/物业费/垃圾处理费/软件服务费/其它)与
+  收款项(陈列费/堆头费/补差价/兑换/纸皮回收/其它);
+  收款项**冲减**付款金额 ⇒ 应付金额 = 货款 + 付款项 − 收款项(不为负)。
+- 数据里的「金额勾稽结论」已经算好了应付金额,**直接采信,不要自己重算**。
+- 有**陈列费/堆头费**收款时:供应商为陈列/堆头付了费用,本次进货量大于销量属正常铺货,
+  ⇒ **进货可以多些**;「数量偏离」(进货量是销量若干倍)与「自入库后无销售记录」类信号
+  **不作为拒绝理由**,应当 pass;
+- 有**补差价**收款时:允许因进货偏多导致的**毛利降低**,降低幅度小于补差价总额即可,
+  ⇒ 毛利相关的疑虑不作为拒绝理由;
+- 本单所有收付款项都会列在数据里,金额结论以引擎口径为准,不要自行推断或改写金额。
+
 只输出 JSON,不要 markdown,不要解释:
 {"conclusion":"pass|reject","reason":"中文,200字内","confidence":0.0~1.0,
 "suggest_stocktake":{"scope":"category|supplier|product","ids":["..."]}}`
@@ -355,9 +376,31 @@ func buildAuditUserPrompt(in *AuditInput) string {
 		if in.Amount.Consistent {
 			verdict = "一致(差额在付款取整容差内,属正常取整)"
 		}
-		fmt.Fprintf(&sb, "金额勾稽结论:%s —— 手工付款额 %s 元,结算单货款合计 %s 元,差额 %s 元,付款取整容差 %s 元。\n",
-			verdict, yuanText(in.Amount.ManualAmountYuan), yuanText(in.Amount.SettledTotalYuan),
+		fmt.Fprintf(&sb, "金额勾稽结论:%s —— 手工付款额 %s 元,应付金额 %s 元(货款 %s + 付款项 %s - 收款项 %s),差额 %s 元,付款取整容差 %s 元。\n",
+			verdict, yuanText(in.Amount.ManualAmountYuan), yuanText(in.Amount.PayableYuan),
+			yuanText(in.Amount.SettledTotalYuan), yuanText(in.Amount.PaymentTotalYuan),
+			yuanText(in.Amount.ReceiptTotalYuan),
 			yuanText(in.Amount.DiffYuan), yuanText(in.Amount.ToleranceYuan))
+	}
+
+	// 收付款明细(用户口径 2026-10-25:「所有收付款项都列给机器审核」)。
+	if len(in.Items) > 0 {
+		fmt.Fprintf(&sb, "本次收付款明细 %d 项(货款 %s + 付款项 %s - 收款项 %s = 应付 %s 元):\n",
+			len(in.Items), yuanText(in.Totals.GoodsTotalYuan), yuanText(in.Totals.PaymentTotalYuan),
+			yuanText(in.Totals.ReceiptTotalYuan), yuanText(in.Totals.PayableYuan))
+		for _, r := range in.Items {
+			remark := ""
+			if r.Remark != "" {
+				remark = "(" + r.Remark + ")"
+			}
+			fmt.Fprintf(&sb, "  - %s %s %s 元%s\n", directionLabel(r.Direction), r.Type, yuanText(r.AmountYuan), remark)
+		}
+	}
+	// 放宽额度(有陈列费/堆头费 ⇒ 进货可以多些;有补差价 ⇒ 允许毛利降低)。
+	if in.Allowance.HasDisplayOrPromotion() || in.Allowance.PriceDiffYuan.GreaterThan(decimal.Zero) {
+		fmt.Fprintf(&sb, "放宽额度:陈列费 %s 元,堆头费 %s 元(有则进货可以多些,数量偏离不作为拒绝理由);补差价 %s 元(有则允许毛利降低,幅度小于该总额)。\n",
+			yuanText(in.Allowance.DisplayYuan), yuanText(in.Allowance.PromotionYuan),
+			yuanText(in.Allowance.PriceDiffYuan))
 	}
 
 	fmt.Fprintf(&sb, "勾选结算单 %d 张:\n", len(in.Settlements))

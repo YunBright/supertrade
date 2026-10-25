@@ -156,7 +156,19 @@ type AmountCheck struct {
 	ManualAmountYuan decimal.Decimal
 	// SettledTotalYuan 是勾选结算单的货款合计(引擎口径)。
 	SettledTotalYuan decimal.Decimal
-	// DiffYuan 是 |手工 - 合计|。
+	// PaymentTotalYuan 是手工付款项合计（水电费/租金/…）。
+	PaymentTotalYuan decimal.Decimal
+	// ReceiptTotalYuan 是手工收款项合计（陈列费/堆头费/…）。
+	ReceiptTotalYuan decimal.Decimal
+	// NetPayableYuan 是净额 = 货款 + 付款项 − 收款项（**可能为负**）。
+	NetPayableYuan decimal.Decimal
+	// PayableYuan 是**真正要付的钱** = max(0, 净额)。
+	//
+	// ⚠️ 手工金额要跟这个比、不是跟货款合计比：收款项**冲减**付款金额
+	//   （用户口径 2026-10-25：「收款项冲减付款金额」）⇒ 跟货款合计比会
+	//   把"填了净额"的人判成不一致。
+	PayableYuan decimal.Decimal
+	// DiffYuan 是 |手工 - 应付|。
 	DiffYuan decimal.Decimal
 	// ToleranceYuan 是付款取整容差(元)。
 	ToleranceYuan decimal.Decimal
@@ -181,7 +193,7 @@ func yuanText(d decimal.Decimal) string {
 //	a) 每张结算单:Σ(PI/RO 行 total_goods_yuan) vs settlement.total_goods_yuan
 //	   —— **同一套源数据的自洽性**,容差用数值容差(默认 0.01 元),不放宽:
 //	   单头与明细都来自思迅同一张单,差一分钱都要看;
-//	b) 全部结算单货款合计 vs 申请人手工累加金额
+//	b) 手工累加金额 vs **应付金额**(= 货款 + 付款项 − 收款项,不为负)
 //	   —— **付款口径**,容差用付款取整容差(默认 1 元):
 //	   实际付款按元付,分位一般不实际支付、角位也可能被舍去,
 //	   分位/角位差异是正常取整,不是账实不符(2026-10-22 生产实踩,见 AmountCheck 注释)。
@@ -189,8 +201,11 @@ func yuanText(d decimal.Decimal) string {
 // 两层容差**刻意不同**:把付款的取整口径套到"单头 vs 明细"上,
 // 会把源数据自身的不自洽也一并放过。
 //
+// ⚠️ b) 比的是**应付金额**而不是货款合计:收款项冲减付款金额
+//   (用户口径 2026-10-25),填了净额的人不该被判成"与货款合计不符"。
+//
 // 返回信号 + 金额结论摘要(给 LLM 用,见 AmountCheck)。
-func checkAmounts(settlements []SettlementRow, linesBySettlement map[string][]SettlementLineRow, manualAmount, tolerance, paymentTolerance decimal.Decimal) ([]signalDraft, AmountCheck) {
+func checkAmounts(settlements []SettlementRow, linesBySettlement map[string][]SettlementLineRow, manualAmount, tolerance, paymentTolerance, paymentTotal, receiptTotal decimal.Decimal) ([]signalDraft, AmountCheck) {
 	var out []signalDraft
 	grandTotal := decimal.Zero
 	for _, st := range settlements {
@@ -212,22 +227,32 @@ func checkAmounts(settlements []SettlementRow, linesBySettlement map[string][]Se
 				}))
 		}
 	}
-	diff := grandTotal.Sub(manualAmount).Abs()
+	totals := computeTotals(grandTotal, paymentTotal, receiptTotal)
+	diff := totals.PayableYuan.Sub(manualAmount).Abs()
 	// 付款取整口径:差额 **小于** 1 元 = 同一笔付款(分位不实际支付、角位可能被舍去)。
 	summary := AmountCheck{
 		ManualAmountYuan: manualAmount,
 		SettledTotalYuan: grandTotal,
+		PaymentTotalYuan: paymentTotal,
+		ReceiptTotalYuan: receiptTotal,
+		NetPayableYuan:   totals.NetYuan,
+		PayableYuan:      totals.PayableYuan,
 		DiffYuan:         diff,
 		ToleranceYuan:    paymentTolerance,
 		Consistent:       diff.LessThan(paymentTolerance),
 	}
 	if !summary.Consistent {
 		out = append(out, newSignal(model.SignalBlock, SigManualAmountMismatch, "", "",
-			fmt.Sprintf("手工累加付款金额 %s 元 与结算单货款合计 %s 元 不符(差 %s 元,已达付款取整容差 %s 元)",
-				yuanText(manualAmount), yuanText(grandTotal), yuanText(diff), yuanText(paymentTolerance)),
+			fmt.Sprintf("手工累加付款金额 %s 元 与应付金额 %s 元(货款 %s + 付款项 %s - 收款项 %s)不符(差 %s 元,已达付款取整容差 %s 元)",
+				yuanText(manualAmount), yuanText(totals.PayableYuan), yuanText(grandTotal),
+				yuanText(paymentTotal), yuanText(receiptTotal),
+				yuanText(diff), yuanText(paymentTolerance)),
 			map[string]any{
 				"manual_amount": manualAmount.String(),
 				"settled_total": grandTotal.String(),
+				"payment_total": paymentTotal.String(),
+				"receipt_total": receiptTotal.String(),
+				"payable":       totals.PayableYuan.String(),
 				"diff":          diff.String(),
 				"tolerance":     paymentTolerance.String(),
 			}))

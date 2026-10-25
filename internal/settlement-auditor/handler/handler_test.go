@@ -201,7 +201,7 @@ func buildTestHandler(t *testing.T, withCube bool) (*gin.Engine, *gorm.DB, *fake
 	if err := db.AutoMigrate(
 		&model.ApprovalInstance{}, &model.ApprovalSettlement{}, &model.ApprovalAttachment{}, &model.AuditSignal{},
 		&model.AuditLog{}, &model.LLMVerdict{}, &model.ApprovalStocktakeLink{},
-		&model.SettlementPayState{},
+		&model.SettlementPayState{}, &model.ApprovalItem{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -317,6 +317,89 @@ func TestHandler_Submit_202(t *testing.T) {
 	}
 	if !found {
 		t.Error("应发布 wecom.approval.command(apply_event)")
+	}
+}
+
+// 收付款明细的**端到端契约**（2026-10-25 用户需求）。
+//
+// 货款 100 + 付款项 50(水电费) − 收款项 30(陈列费) = 应付 120
+// ⇒ 手工金额填 120 才能过金额勾稽；明细要落库、详情要能读回来。
+func TestHandler_Submit_202_WithReceiptPaymentItems(t *testing.T) {
+	r, db, _ := buildTestHandler(t, true)
+	body := `{"applicant_wecom_id":"wecom-u1","settlement_ids":["S1"],"manual_amount_yuan":"120",
+		"remark":"9月货款+陈列费",
+		"receipt_items":[{"type":"陈列费","remark":"2026-09","amount_yuan":"30"}],
+		"payment_items":[{"type":"水电费","remark":"2026-08","amount_yuan":"50"}],
+		"approver_userids":["apr1"],"handler_userids":["h1"],"cc_userids":["cc1"]}`
+	req := httptest.NewRequest(http.MethodPost, "/settlement-approvals", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	adminReq(req)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202, body=%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// 金额勾稽按**应付金额**(100 + 50 − 30 = 120)⇒ 应当通过。
+	ap := waitTerminal(t, db, resp.ID)
+	if ap.Status != model.StatusApproved {
+		t.Fatalf("流水线终态 = %s, want approved(err=%s)", ap.Status, ap.Error)
+	}
+	// 明细落库(类型/备注按文本存)。
+	var items []model.ApprovalItem
+	if err := db.Where("approval_id = ?", resp.ID).Find(&items).Error; err != nil {
+		t.Fatalf("查明细: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("明细行数 = %d, want 2", len(items))
+	}
+	byDir := map[string]model.ApprovalItem{}
+	for _, it := range items {
+		byDir[it.Direction] = it
+	}
+	if got := byDir["receipt"]; got.ItemType != "陈列费" || got.Remark != "2026-09" || got.AmountYuan.String() != "30" {
+		t.Fatalf("收款明细 = %+v", got)
+	}
+	if got := byDir["payment"]; got.ItemType != "水电费" || got.AmountYuan.String() != "50" {
+		t.Fatalf("付款明细 = %+v", got)
+	}
+	// 详情接口要把明细返回(重新发起要靠它预填)。
+	greq := httptest.NewRequest(http.MethodGet, "/settlement-approvals/"+resp.ID, nil)
+	adminReq(greq)
+	gw := httptest.NewRecorder()
+	r.ServeHTTP(gw, greq)
+	if gw.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200, body=%s", gw.Code, gw.Body.String())
+	}
+	var detail struct {
+		Items []model.ApprovalItem `json:"items"`
+	}
+	if err := json.Unmarshal(gw.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if len(detail.Items) != 2 {
+		t.Fatalf("详情里的明细行数 = %d, want 2", len(detail.Items))
+	}
+}
+
+// 明细金额不是十进制数字 ⇒ 当场 400(别留到流水线里炸)。
+func TestHandler_Submit_400_BadItemAmount(t *testing.T) {
+	r, _, _ := buildTestHandler(t, true)
+	body := `{"applicant_wecom_id":"wecom-u1","settlement_ids":["S1"],"manual_amount_yuan":"100",
+		"receipt_items":[{"type":"陈列费","remark":"x","amount_yuan":"abc"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/settlement-approvals", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	adminReq(req)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400, body=%s", w.Code, w.Body.String())
 	}
 }
 

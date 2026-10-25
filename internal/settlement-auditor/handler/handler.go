@@ -392,6 +392,25 @@ type submitReq struct {
 	// 随审批一路活到企微审批单的「附件」控件上 ⇒ 审批人直接看得到发票照片。
 	// ⚠️ base64 会让体积涨约 1/3;上限由 service 层校验(最多 3 个,单个 ≤2MB)。
 	Attachments []attachmentReq `json:"attachments"`
+	// ReceiptItems / PaymentItems 是**手工收付款明细行**(2026-10-25 用户需求)。
+	//
+	// 供应商结算单不在这里 —— 它是「付款类型-货款」,由 settlement_ids 派生。
+	// 收款项冲减付款金额 ⇒ 应付金额 = 货款 + 付款项 − 收款项(不为负)。
+	ReceiptItems []itemReq `json:"receipt_items"`
+	PaymentItems []itemReq `json:"payment_items"`
+}
+
+// itemReq 是提交请求里的一行收付款明细。
+//
+// ⚠️ 金额用**十进制字符串**(与 manual_amount_yuan 同款):JSON number 走
+// float64 会有精度损失,金额一律用字符串传。
+type itemReq struct {
+	// Type 是类型文本("陈列费"/"水电费"/…;「其它」可被改成自定义文字)。
+	Type string `json:"type"`
+	// Remark 是备注(所属日期等补充信息)。
+	Remark string `json:"remark"`
+	// AmountYuan 是金额(元)。
+	AmountYuan string `json:"amount_yuan"`
 }
 
 // attachmentReq 是提交请求里"发起人上传的一个附件"。
@@ -428,6 +447,32 @@ func (h *Handler) Submit(c *gin.Context) {
 			Size:          a.Size,
 		})
 	}
+	// 收付款明细:金额是十进制字符串,解析失败当场 400(别留到流水线里炸)。
+	parseItems := func(raw []itemReq, label string) ([]service.ItemInput, error) {
+		out := make([]service.ItemInput, 0, len(raw))
+		for i, it := range raw {
+			amt, err := decimal.NewFromString(strings.TrimSpace(it.AmountYuan))
+			if err != nil {
+				return nil, fmt.Errorf("%s 第 %d 行金额不是十进制数字(%q)", label, i+1, it.AmountYuan)
+			}
+			out = append(out, service.ItemInput{
+				Type:       it.Type,
+				Remark:     it.Remark,
+				AmountYuan: amt,
+			})
+		}
+		return out, nil
+	}
+	receiptItems, err := parseItems(req.ReceiptItems, "收款明细")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
+	paymentItems, err := parseItems(req.PaymentItems, "付款明细")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "bad_request", err.Error())
+		return
+	}
 	ap, err := h.svc.SubmitApproval(c.Request.Context(), branchID, service.SubmitInput{
 		ApplicantUserID:  cl.Sub,
 		ApplicantWecomID: req.ApplicantWecomID,
@@ -440,6 +485,8 @@ func (h *Handler) Submit(c *gin.Context) {
 		HandlerUserIDs:   req.HandlerUserIDs,
 		CcUserIDs:        req.CcUserIDs,
 		Attachments:      attachments,
+		ReceiptItems:     receiptItems,
+		PaymentItems:     paymentItems,
 	})
 	if err != nil {
 		mapErr(c, err)
