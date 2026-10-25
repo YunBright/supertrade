@@ -214,6 +214,13 @@ func (s *Service) RecordWholePig(ctx context.Context, branchID string, in model.
 		return nil, fmt.Errorf("%w: arrived_at 必填", ErrInvalidInput)
 	}
 
+	// ---- 链的起点:归属日不得早于期初结转的生效日(2026-10-25 门店反馈)----
+	//
+	// ⚠️ 起点之前**链还没开始** ⇒ 那几天的账算不出来 ⇒ 录了也是孤儿数据。
+	//   起点**当天**可以营业(期初的余额就是那天的基线)⇒ 见 assertOnOrAfterChainStart。
+	if err := s.assertOnOrAfterChainStart(ctx, branchID, in.ArrivedAt, "进猪"); err != nil {
+		return nil, err
+	}
 	// ---- 跨日顺序校验(2026-10-24)----
 	//
 	// 门店口径:「不补录昨天,就无法录今天」⇒ 录猪之前,

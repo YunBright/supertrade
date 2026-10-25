@@ -296,7 +296,7 @@ func (h *Handler) RecordWholePig(c *gin.Context) {
 	}
 	var in model.RecordWholePigInput
 	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
 		return
 	}
 	cl, _ := claims.FromContext(c.Request.Context())
@@ -362,7 +362,7 @@ func (h *Handler) RecordPigCut(c *gin.Context) {
 	}
 	var in model.RecordPigCutInput
 	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
 		return
 	}
 	cl, _ := claims.FromContext(c.Request.Context())
@@ -406,7 +406,7 @@ func (h *Handler) RecordPorkCutsStocktake(c *gin.Context) {
 	}
 	var in model.RecordPorkCutsStocktakeInput
 	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
 		return
 	}
 	cl, _ := claims.FromContext(c.Request.Context())
@@ -488,7 +488,7 @@ func (h *Handler) RecordWasteLog(c *gin.Context) {
 	}
 	var in model.RecordWasteLogInput
 	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
 		return
 	}
 	cl, _ := claims.FromContext(c.Request.Context())
@@ -549,7 +549,7 @@ func (h *Handler) CreateBranchCutMapping(c *gin.Context) {
 	}
 	var in model.CreateBranchCutMappingInput
 	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
 		return
 	}
 	out, err := h.svc.CreateBranchCutMapping(c.Request.Context(), branchID, in)
@@ -573,7 +573,7 @@ func (h *Handler) UpdateBranchCutMapping(c *gin.Context) {
 	}
 	var in model.UpdateBranchCutMappingInput
 	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
 		return
 	}
 	out, err := h.svc.UpdateBranchCutMapping(c.Request.Context(), branchID, id, in)
@@ -636,7 +636,7 @@ func (h *Handler) CounterLoad(c *gin.Context) {
 	}
 	var in service.CounterLoadInput
 	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
 		return
 	}
 	cl, _ := claims.FromContext(c.Request.Context())
@@ -716,7 +716,7 @@ func (h *Handler) UpdateCounterLoad(c *gin.Context) {
 	}
 	var in service.CounterLoadUpdateInput
 	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
 		return
 	}
 	out, err := h.svc.UpdateCounterLoad(c.Request.Context(), branchID, id, in)
@@ -776,7 +776,7 @@ func (h *Handler) SaveStockOpenings(c *gin.Context) {
 		Openings []service.StockOpeningInput `json:"openings"`
 	}
 	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
 		return
 	}
 	// ⚠️ **别静默吞掉**。
@@ -832,7 +832,7 @@ func (h *Handler) AuditBusinessDays(c *gin.Context) {
 	}
 	var in service.BizAuditInput
 	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
 		return
 	}
 	cl, _ := claims.FromContext(c.Request.Context())
@@ -920,7 +920,7 @@ func (h *Handler) UpdatePresale(c *gin.Context) {
 	}
 	var in service.UpdatePresaleInput
 	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
 		return
 	}
 	cl, _ := claims.FromContext(c.Request.Context())
@@ -1006,7 +1006,7 @@ func (h *Handler) CreatePromoSku(c *gin.Context) {
 	}
 	var in service.PromoSkuInput
 	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
 		return
 	}
 	out, err := h.svc.CreatePromoSku(c.Request.Context(), branchID, in)
@@ -1059,7 +1059,7 @@ func (h *Handler) CreateBulkProduct(c *gin.Context) {
 	}
 	var in service.BulkProductInput
 	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
 		return
 	}
 	out, err := h.svc.CreateBulkProduct(c.Request.Context(), branchID, in)
@@ -1109,7 +1109,7 @@ func (h *Handler) RecordBulkProduction(c *gin.Context) {
 	}
 	var in service.BulkProductionInput
 	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
 		return
 	}
 	cl, _ := claims.FromContext(c.Request.Context())
@@ -1143,7 +1143,7 @@ func (h *Handler) CreateBulkSettlement(c *gin.Context) {
 	}
 	var in service.BulkSettlementInput
 	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", err.Error())
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
 		return
 	}
 	cl, _ := claims.FromContext(c.Request.Context())

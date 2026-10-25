@@ -228,6 +228,50 @@ func TestBizDay_OpeningDateNeedsNoStocktake(t *testing.T) {
 	}
 }
 
+// ---- ①c. 链的起点之前的日子不许录业务 ----
+
+// TestBizDay_BeforeChainStartRejected 锁"链起点之前不许录业务"(2026-10-25 门店反馈)。
+//
+// 门店场景：期初结转的生效日 = 2026-10-01（链的起点）⇒ **09-30 之前链还没开始**
+// ⇒ 那几天的冷库余额与毛利**算不出来** ⇒ 在那里录猪 = 录了链外的孤儿数据。
+//
+// ⚠️ **起点当天是可以营业的**（期初的余额就是那天的基线）⇒ 只拦**更早**的日子。
+func TestBizDay_BeforeChainStartRejected(t *testing.T) {
+	svc, ctx, _ := fmBizSetup(t)
+
+	// 期初：五花 100kg @ 18 元（生效日 2026-10-01 = 链的起点）。
+	if _, err := svc.SaveStockOpenings(ctx, "S001", []service.StockOpeningInput{
+		{CutType: model.CutBelly, BizDate: "2026-10-01",
+			ColdStoreKg: d("100"), UnitPriceYuan: d("18")},
+	}); err != nil {
+		t.Fatalf("SaveStockOpenings: %v", err)
+	}
+
+	// 09-30（在链起点之前）录猪 ⇒ 必须被拒，且说清为什么。
+	before := fmDay1.Add(-24 * time.Hour)
+	svc.SetClock(fmClock(fmDay1))
+	_, err := svc.RecordWholePig(ctx, "S001", model.RecordWholePigInput{
+		EarTag: "EB-BEFORE", GrossWeightKg: d("180"), PurchaseUnitPriceYuan: d("20"),
+		SupplierID: "SUP-1", ArrivedAt: before,
+	}, "u-1")
+	if err == nil {
+		t.Fatalf("★ 链起点(2026-10-01)之前的日子录猪必须被拒(那几天的账算不出来)")
+	}
+	if !strings.Contains(err.Error(), "2026-10-01") {
+		t.Errorf("★ 报错要点名期初的生效日(2026-10-01), got %v", err)
+	}
+
+	// ⚠️ 起点**当天**（10-01）可以营业：期初的余额就是那天的基线。
+	onStart := fmDay1
+	svc.SetClock(fmClock(fmDay1))
+	if _, err := svc.RecordWholePig(ctx, "S001", model.RecordWholePigInput{
+		EarTag: "EB-ON-START", GrossWeightKg: d("180"), PurchaseUnitPriceYuan: d("20"),
+		SupplierID: "SUP-1", ArrivedAt: onStart,
+	}, "u-1"); err != nil {
+		t.Fatalf("★ 链起点当天应该可以营业(期初的余额就是那天的基线): %v", err)
+	}
+}
+
 // ---- ② 同一归属日重复盘点 ⇒ 只有一张单 ----
 
 // TestBizDay_SameBizDateStocktakeKeepsOne 锁 ②。

@@ -1382,7 +1382,14 @@ func (CutPresaleEdit) TableName() string { return "cut_presale_edits" }
 //   - 1 头整猪:      half_pig=false,offal_included=false (默认)
 //   - 2 头整猪同批:  两次调用,purchase_group_id 同值
 type RecordWholePigInput struct {
-	EarTag                string          `json:"ear_tag" binding:"required"`
+	// EarTag 是猪场耳标 / 批次号。
+	//
+	// ⚠️ **可空**(2026-10-24 门店口径:有些猪没有耳标/不扫码)
+	//   ⇒ 之前这里写着 `binding:"required"`,与前端提示"可留空"、
+	//     与 service 的"耳标号可选"注释**自相矛盾**
+	//   ⇒ 门店按前端的提示留空 ⇒ 后端 400 + 一串 Go 的 key 路径天书。
+	//   ⇒ 数据库侧 ear_tag 只是普通索引(不是唯一键)⇒ 多头猪都留空不冲突。
+	EarTag                string          `json:"ear_tag"`
 	GrossWeightKg         decimal.Decimal `json:"gross_weight_kg" binding:"required"`
 	PurchaseUnitPriceYuan decimal.Decimal `json:"purchase_unit_price_yuan" binding:"required"`
 	SupplierID            string          `json:"supplier_id" binding:"required"`

@@ -257,6 +257,59 @@ func (s *Service) assertPrevBizDayStocktaken(ctx context.Context, branchID strin
 		ErrInvalidInput, prevKey, prevKey)
 }
 
+// chainStartDate 该店**链的起点**（期初结转里最早的那个生效日）；空 = 没有期初。
+//
+// ⚠️ 链的起点 = 冷库余额链的**第一天**（见 deriveColdChain：在生效日那天，
+//   余额被重置为期初的 kg）⇒ 更早的日子**链还没开始**
+//   ⇒ 那几天的余额/毛利算不出来（账算在链外 ⇒ 毛利对不上）。
+//
+// ⚠️ 没有期初 ⇒ 空串 ⇒ **不限制**（链从门店的第一期营业日起算）。
+func (s *Service) chainStartDate(ctx context.Context, branchID string) (string, error) {
+	var rows []model.SkuStockOpening
+	if err := s.db.WithContext(ctx).Model(&model.SkuStockOpening{}).
+		Where("branch_id = ?", branchID).
+		Find(&rows).Error; err != nil {
+		return "", fmt.Errorf("query sku_stock_openings(chain start): %w", err)
+	}
+	best := ""
+	for _, r := range rows {
+		key := time.Time(r.BizDate).In(s.bizTZOrUTC()).Format("2006-01-02")
+		if best == "" || key < best {
+			best = key
+		}
+	}
+	return best, nil
+}
+
+// assertOnOrAfterChainStart 校验归属日**不早于链的起点**。
+//
+// # 为什么
+//
+// 链的起点（期初结转的生效日）之前**链还没开始** ⇒ 那几天的冷库余额与毛利
+// **算不出来** ⇒ 在那里录猪/搬台 = 录了链外的孤儿数据（报表对不上，门店更看不懂）。
+//
+// ⚠️ **起点当天是可以营业的**：期初的余额就是**那天的期初**（基线），
+//   当天的产出/搬台照样往上累 ⇒ 与链完全自洽。
+//   （"第一天不营业"是门店的**用法**，不是系统的**硬规则**——
+//   想从次日开始，把期初生效日设成前一天即可。）
+//
+// ⚠️ 没有期初 ⇒ 不限制（链从门店的第一期营业日起算）。
+func (s *Service) assertOnOrAfterChainStart(ctx context.Context, branchID string, day time.Time, what string) error {
+	start, err := s.chainStartDate(ctx, branchID)
+	if err != nil {
+		return err
+	}
+	if start == "" {
+		return nil
+	}
+	key := day.In(s.bizTZOrUTC()).Format("2006-01-02")
+	if key < start {
+		return fmt.Errorf("%w: 不能录%s：%s 在期初结转的生效日(%s)之前 —— 冷库余额链从 %s 才开始，那天的账算不出来",
+			ErrInvalidInput, what, key, start, start)
+	}
+	return nil
+}
+
 // hasStockOpeningOn 该店在 dateKey 那天有没有**期初结转**。
 //
 // ⚠️ 期初结转的生效日 = **链的起点**（那一行的冷库余额就是那天的基线）
