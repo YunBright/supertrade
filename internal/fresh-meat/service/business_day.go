@@ -284,20 +284,23 @@ func (s *Service) chainStartDate(ctx context.Context, branchID string) (string, 
 	return best, nil
 }
 
-// assertOnOrAfterChainStart 校验归属日**不早于链的起点**。
+// assertAfterChainStart 校验归属日**严格晚于链的起点**。
 //
-// # 为什么
+// # 口径（2026-10-25 门店反馈）
 //
-// 链的起点（期初结转的生效日）之前**链还没开始** ⇒ 那几天的冷库余额与毛利
-// **算不出来** ⇒ 在那里录猪/搬台 = 录了链外的孤儿数据（报表对不上，门店更看不懂）。
+//	**期初结转的生效日 = 链的起点 = "基线日" ⇒ 它不是营业日。**
 //
-// ⚠️ **起点当天是可以营业的**：期初的余额就是**那天的期初**（基线），
-//   当天的产出/搬台照样往上累 ⇒ 与链完全自洽。
-//   （"第一天不营业"是门店的**用法**，不是系统的**硬规则**——
-//   想从次日开始，把期初生效日设成前一天即可。）
+//	门店的用法：上线前冷库里的货用期初记一笔（基线日 = 上线**前一天**），
+//	**从次日开始第一期营业** ⇒ 基线日本身**不能录猪/搬台**。
+//
+// # 为什么不能是"基线日当天也营业"
+//
+//	基线日的日终 = 期初 + 当天的进出 ⇒ 那天的快照（成本链的接续点）就不等于期初
+//	⇒ 成本链的第一天不再是那批期初货 ⇒ **毛利算不准**。
+//	⇒ 门店想"上线当天就营业"⇒ 把期初生效日设成**上线前一天**（默认就是昨天）。
 //
 // ⚠️ 没有期初 ⇒ 不限制（链从门店的第一期营业日起算）。
-func (s *Service) assertOnOrAfterChainStart(ctx context.Context, branchID string, day time.Time, what string) error {
+func (s *Service) assertAfterChainStart(ctx context.Context, branchID string, day time.Time, what string) error {
 	start, err := s.chainStartDate(ctx, branchID)
 	if err != nil {
 		return err
@@ -306,11 +309,20 @@ func (s *Service) assertOnOrAfterChainStart(ctx context.Context, branchID string
 		return nil
 	}
 	key := day.In(s.bizTZOrUTC()).Format("2006-01-02")
-	if key < start {
-		return fmt.Errorf("%w: 不能录%s：%s 在期初结转的生效日(%s)之前 —— 冷库余额链从 %s 才开始，那天的账算不出来",
-			ErrInvalidInput, what, key, start, start)
+	if key <= start {
+		return fmt.Errorf("%w: 不能录%s：%s 不是营业日 —— 期初结转的生效日(%s)是链的起点（基线日），请从 %s 开始录",
+			ErrInvalidInput, what, key, start, startDatePlusOne(start))
 	}
 	return nil
+}
+
+// startDatePlusOne 日期键 + 1 天（"YYYY-MM-DD"）。
+func startDatePlusOne(key string) string {
+	t, err := time.ParseInLocation("2006-01-02", key, time.UTC)
+	if err != nil {
+		return key
+	}
+	return t.AddDate(0, 0, 1).Format("2006-01-02")
 }
 
 // isBaselineDay 判断某天是不是一个**纯基线日**。

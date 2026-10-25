@@ -218,7 +218,7 @@ func (s *Service) RecordWholePig(ctx context.Context, branchID string, in model.
 	//
 	// ⚠️ 起点之前**链还没开始** ⇒ 那几天的账算不出来 ⇒ 录了也是孤儿数据。
 	//   起点**当天**可以营业(期初的余额就是那天的基线)⇒ 见 assertOnOrAfterChainStart。
-	if err := s.assertOnOrAfterChainStart(ctx, branchID, in.ArrivedAt, "进猪"); err != nil {
+	if err := s.assertAfterChainStart(ctx, branchID, in.ArrivedAt, "进猪"); err != nil {
 		return nil, err
 	}
 	// ---- 跨日顺序校验(2026-10-24)----

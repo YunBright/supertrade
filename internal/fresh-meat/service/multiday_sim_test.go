@@ -201,13 +201,14 @@ func simSnapshot(t *testing.T) map[string]map[string]float64 {
 func TestMultiDaySim_OneWeekBusiness(t *testing.T) {
 	svc, ctx := simSetup(t)
 
-	// 期初（10-01 生效）：五花 100kg @ 18 元、板油 40kg @ 6 元。
+	// 期初（**基线日 = 第一期的前一天**：期初生效日是链的起点，它不是营业日）：
+	// 五花 100kg @ 18 元、板油 40kg @ 6 元（生效日 2026-09-30）。
 	//
 	// ⚠️ 单价是**门店给的**：期初是上线前就在冷库里的货，
 	//   它的成本不在本系统流水里 ⇒ 不给单价 ⇒ 那批货零成本 ⇒ 毛利虚高。
 	if _, err := svc.SaveStockOpenings(ctx, simBranch, []service.StockOpeningInput{
-		{CutType: model.CutBelly, BizDate: simKey(0), ColdStoreKg: d("100"), UnitPriceYuan: d("18")},
-		{CutType: model.CutFat, BizDate: simKey(0), ColdStoreKg: d("40"), UnitPriceYuan: d("6")},
+		{CutType: model.CutBelly, BizDate: simKey(-1), ColdStoreKg: d("100"), UnitPriceYuan: d("18")},
+		{CutType: model.CutFat, BizDate: simKey(-1), ColdStoreKg: d("40"), UnitPriceYuan: d("6")},
 	}); err != nil {
 		t.Fatalf("SaveStockOpenings: %v", err)
 	}

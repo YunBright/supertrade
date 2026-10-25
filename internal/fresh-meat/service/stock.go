@@ -164,7 +164,7 @@ func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLo
 		return nil, err
 	}
 	// ---- 链的起点:归属日不得早于期初结转的生效日(见 service.go 同名调用)----
-	if err := s.assertOnOrAfterChainStart(ctx, branchID, takenDate, "搬台"); err != nil {
+	if err := s.assertAfterChainStart(ctx, branchID, takenDate, "搬台"); err != nil {
 		return nil, err
 	}
 	// ---- 跨日顺序校验:前一个营业日必须已盘点 ----
