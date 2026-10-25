@@ -74,6 +74,9 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.POST("/whole-pigs", requireBranch, h.RecordWholePig)
 	r.GET("/whole-pigs", requireBranch, h.ListWholePigsByDay)
 	r.GET("/whole-pigs/:pig_id", requireBranch, h.GetWholePig)
+	// ★ 删掉**录错了**的猪（2026-10-25 门店反馈："多录了一头，只能将错就错"）。
+	//   只允许删**干净**的猪：没有分割补录、没有销售归属、且不在已审计期间。
+	r.DELETE("/whole-pigs/:pig_id", requireBranch, h.DeleteWholePig)
 
 	// 单品补录
 	r.POST("/pig-cuts", requireBranch, h.RecordPigCut)
@@ -327,6 +330,31 @@ func (h *Handler) GetWholePig(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+// DeleteWholePig DELETE /whole-pigs/:pig_id
+//
+// 删掉**录错了**的猪（早盘多录一头 / 毛重打错）。
+//
+// 权限：freshmeat:write。
+//
+// ⚠️ 只允许删**干净**的猪：没有分割补录、没有销售归属、不在已审计期间
+//   （理由见 service/pig_delete.go）⇒ 否则 400 + 说清为什么不能删。
+func (h *Handler) DeleteWholePig(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	pigID := strings.TrimSpace(c.Param("pig_id"))
+	if pigID == "" {
+		writeError(c, http.StatusBadRequest, "missing_pig_id", "pig_id 必填")
+		return
+	}
+	if err := h.svc.DeleteWholePig(c.Request.Context(), branchID, pigID); err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "pig_id": pigID})
 }
 
 // ListWholePigsByDay GET /whole-pigs?date=YYYY-MM-DD
