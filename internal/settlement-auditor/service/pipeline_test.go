@@ -570,7 +570,7 @@ func TestStepFinish_RejectNotifiesApplicant(t *testing.T) {
 	svc.stepFinish(context.Background(), ap, &VerdictResult{
 		Conclusion: ConclusionReject,
 		Reason:     "商品 16.8升琅悦泉水桶装水-02000116 自 2026-08-25 采购入库后无销售记录,本次进货 18",
-	}, nil)
+	}, nil, nil)
 
 	cmds := pub.commands(CmdNotifyText)
 	if len(cmds) != 1 {

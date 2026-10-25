@@ -113,6 +113,12 @@ func initApp() error {
 		cfg.ApplyControlTypes = [3]string{ts[0], ts[1], ts[2]}
 	}
 	cfg.AIConclusionControlID = os.Getenv("SETTLEMENT_AUDITOR_AI_CONCLUSION_CONTROL_ID")
+	// 「附件」控件(企微「结算付款」模板里的 File 型控件)。
+	//
+	// ⚠️ id **不设默认值**:它是模板里的那一个控件,随模板走 ⇒ 猜错 id
+	//    只会让企微报"控件不存在"。空 ⇒ 不带附件(退回旧行为:只写四个文本控件)。
+	cfg.AttachmentControlID = os.Getenv("SETTLEMENT_AUDITOR_ATTACHMENT_CONTROL_ID")
+	cfg.AttachmentControlType = os.Getenv("SETTLEMENT_AUDITOR_ATTACHMENT_CONTROL_TYPE")
 	// 审批流程节点声明(与企微管理后台里「付款审批」模板的流程设置对应)。
 	//
 	// ⚠️ 企微的公开 API 读不到流程配置(gettemplatedetail 只给表单控件),

@@ -78,6 +78,26 @@ type ApplyEventPayload struct {
 	NotifyType  int             `json:"notify_type,omitempty"`
 	ApplyData   json.RawMessage `json:"apply_data"`
 	SummaryList json.RawMessage `json:"summary_list"`
+	// Attachment 是「附件」型控件的待上传内容(可选)。
+	//
+	// 企微的 File 型控件要的是 media_id,而 media_id 只能用**持有 OA token 的
+	// 一侧**(wechat-bot)上传素材才能拿到 ⇒ 这里只带**内容**,
+	// 上传与控件组装在 wechat-bot 侧完成(镜像 wechat-bot
+	// wapproval.ApprovalAttachment,wire 字段必须逐字对齐)。
+	Attachment *ApprovalAttachment `json:"attachment,omitempty"`
+}
+
+// ApprovalAttachment 是「附件」控件的待上传内容(业务侧只负责生成内容)。
+type ApprovalAttachment struct {
+	// ControlID 是企微模板里该控件的 id(实测 2026-10-25:「结算付款」模板
+	// controls 里 control=File / id=item-1494251220825)。
+	ControlID string `json:"control_id"`
+	// ControlType 是控件类型(默认 File)。
+	ControlType string `json:"control_type,omitempty"`
+	// FileName 是附件名(审批单上显示的名字)。
+	FileName string `json:"file_name"`
+	// ContentBase64 是文件内容(base64 标准编码)。
+	ContentBase64 string `json:"content_base64"`
 }
 
 // ProcessConfig 是企微 applyevent 的新版流程列表。

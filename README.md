@@ -580,6 +580,7 @@ daprCli.InvokeMethodWithContent(ctx,
 | [`docs/FIELD_SPEC.md`](docs/FIELD_SPEC.md) | 字段契约(数据库字段 ↔ cube 字段) |
 | [`docs/EVENT-CATALOG.md`](docs/EVENT-CATALOG.md) | Dapr pub/sub 事件 payload 契约 |
 | [`docs/DEPLOY-FRONTEND-2026-09-24.md`](docs/DEPLOY-FRONTEND-2026-09-24.md) | 前端对接 + 部署步骤(branch 重构后) |
+| [`docs/settlement-approval-attachment.md`](docs/settlement-approval-attachment.md) | 结算付款审批:附件(结算单明细清单)链路 + 企微控件表 |
 | [`.claude/rules/00-app-catalog.md`](.claude/rules/00-app-catalog.md) | App ↔ URL 快查表 |
 | [`.claude/rules/01-cmd-bootstrap.md`](.claude/rules/01-cmd-bootstrap.md) | `cmd/<svc>/main.go` 入口规范 |
 | [`.claude/rules/02-handler-routes.md`](.claude/rules/02-handler-routes.md) | Handler 路由注册 + X-Branch-ID 规范 |

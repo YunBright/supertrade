@@ -267,7 +267,7 @@ func (s *Service) runAudit(ctx context.Context, approvalID string) {
 	s.stepStocktake(ctx, ap, verdict)
 
 	// finish: pass → apply_event;reject → notify_text
-	s.stepFinish(ctx, ap, verdict, signals)
+	s.stepFinish(ctx, ap, verdict, signals, settlements)
 }
 
 // loadApproval 按 id 读实例(不分 branch:内部流水线用)。
@@ -789,7 +789,10 @@ func notifyTargetText(group *model.StocktakeNotifyGroup, users []string) string 
 }
 
 // stepFinish 按结论收尾:pass → apply_event;reject → notify_text。
-func (s *Service) stepFinish(ctx context.Context, ap *model.ApprovalInstance, verdict *VerdictResult, signals []signalDraft) {
+//
+// settlements 是本次勾选的结算单(cube 行,带供应商名与金额)⇒
+// pass 分支用它生成「附件」控件的**结算单明细清单**。
+func (s *Service) stepFinish(ctx context.Context, ap *model.ApprovalInstance, verdict *VerdictResult, signals []signalDraft, settlements []SettlementRow) {
 	start := time.Now()
 	if verdict.Conclusion == ConclusionReject {
 		reason := truncate(verdict.Reason, 1024)
@@ -843,6 +846,8 @@ func (s *Service) stepFinish(ctx context.Context, ap *model.ApprovalInstance, ve
 		NotifyType:          1,
 		ApplyData:           applyData,
 		SummaryList:         summaryList,
+		// 「附件」:本次付款的结算单明细清单(企微侧负责上传素材并组装控件)。
+		Attachment: s.buildSettlementDetailAttachment(settlements),
 	}
 	cmdID, err := s.publishCommand(ctx, CmdApplyEvent, payload)
 	if err != nil {

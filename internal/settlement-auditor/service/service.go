@@ -86,6 +86,13 @@ type Config struct {
 	// 非空时 apply_data 追加该控件,写入 LLM 审核结论精简文案;
 	// 空(模板未配该控件)或结论为空时跳过,不阻塞提交。
 	AIConclusionControlID string
+	// AttachmentControlID 是模板「附件」控件的 id(可选,实测 2026-10-25:
+	// 企微「结算付款」模板 controls 里 control=File / id=item-1494251220825)。
+	// 非空时把本次付款的**结算单明细清单**作为附件带上去(审批人不用再去
+	// sixun 查"这十几万付给了哪些供应商");空 ⇒ 不带附件。
+	AttachmentControlID string
+	// AttachmentControlType 是该附件控件的类型(默认 File)。
+	AttachmentControlType string
 }
 
 func (c *Config) withDefaults() {
@@ -109,6 +116,14 @@ func (c *Config) withDefaults() {
 	}
 	if c.ApplyControlTypes[0] == "" {
 		c.ApplyControlTypes = [3]string{"Text", "Text", "Text"}
+	}
+	// 附件控件类型默认 File(企微只有 File/Image 这类控件能带素材)。
+	//
+	// ⚠️ 附件控件 id **不给默认值**:模板是企微后台里的那一张,
+	//    控件 id 随模板走 ⇒ 猜一个错 id 只会让企微报"控件不存在"。
+	//    真值由 deploy 注入(实测值见 Config 注释)。
+	if c.AttachmentControlType == "" {
+		c.AttachmentControlType = "File"
 	}
 }
 
