@@ -125,6 +125,10 @@
 
 ### 2.3 sale.completed
 
+> ⚠️ **2026-10-24:POS 实际发的是 `sale.paid`,不是这条。**
+> 鲜肉服务**两条都订阅**;下面这条是 EVENT-CATALOG 的老契约,
+> 行里有 `sku_id` + `fresh_type`(见 §2.3a 的对照表)。
+
 ```jsonc
 // data:
 {
@@ -140,13 +144,54 @@
       "amount_yuan": 36.0,
       "fresh_type": "none" | "produce" | "meat",  // 决定是否要落 fresh-* 表
       "pig_id": "uuid",                            // 仅 fresh_type=meat 时填,关联整猪
-      "cut_type": "belly" | "tenderloin" | ...     // 仅 fresh_type=meat 时填
+      "cut_type": "belly" | "tenderloin" | ...     // 仅 fresh_type=meat 时填;34 类封闭集合,见 REQUIREMENTS §4.6
     }
   ],
   "completed_at": "2026-09-17T10:23:45Z",
   "order_status": "S" | "R"                        // S=销售 / R=退货
 }
 ```
+
+### 2.3a sale.paid —— **POS 真正发的那条**(2026-10-24 对齐)
+
+发件方:`internal/pos/service/events.go`(`TopicSalePaid = "sale.paid"`),
+下游:`inventory`(扣库存) / `member`(加积分) / **`fresh-meat`(归属到猪 + 大宗采信)**。
+
+```jsonc
+// data:
+{
+  "op_id":      "uuid",                 // 幂等键(订阅方按它去重)
+  "sale_id":    "SO20260917001",
+  "branch_id":  "S001",
+  "member_id":  "M0001",                // 空 ⇒ 不计积分
+  "operator_id": "user-uuid",
+  "total_amount_yuan": "86.50",         // ⚠️ 金额/qty 一律**字符串**
+  "paid_at":    "2026-09-17T10:23:45+08:00",
+  "order_status": "S" | "R",            // 退货也走这条 topic,qty/金额取负
+  "lines": [
+    {
+      "line_id":  "SO20260917001-L1",
+      "product_id": "00000297",         // = catalog.products.id = **思迅货号**
+      "qty": "2",
+      "unit_price_yuan": "18.00",
+      "amount_yuan": "36.00"
+    }
+  ]
+}
+```
+
+#### ⚠️ 与 `sale.completed` 的差别(订阅方必须同时认两种)
+
+| 字段 | sale.completed | sale.paid | 后果 |
+|---|---|---|---|
+| 行里的货号 | `sku_id` | `product_id` | 取 `sku_id ?? product_id` |
+| 行里的品类 | `fresh_type`("meat"…) | **没有** | ⇒ "这是不是猪肉行"只能靠**订阅方自己的表**判定(部位映射/特价档/大宗品项) |
+| 成交时刻 | `completed_at` | `paid_at` | 取 `completed_at ?? paid_at` |
+| 金额类型 | JSON number | **字符串** | decimal 两边都吃得下 ✔ |
+
+⇒ **2026-10-24 生产实测**:鲜肉服务此前只订阅 `sale.completed`
+⇒ **POS 的销售一条都没进来过**(journalctl 零条真实 sale 事件)。
+⇒ 现改为**两条都订阅**(`SubscribeTopics`),并在 `service.SaleLine` 里同时认两种形状。
 
 ### 2.4 stocktake.completed
 
@@ -242,11 +287,12 @@
   "cuts": [
     {
       "cut_type":             "belly",
-      "actual_remain_kg":     8.2,
+      "cube_product_id":      "01409",    // per-SKU(一个部位可挂多个 SKU)
+      "actual_remain_kg":     8.2,       // ⚠️ **全店**实盘(柜台实盘 + 冷库余额)
       "expected_remain_kg":   7.5,
       "variance_kg":          0.7
     },
-    { "cut_type": "tenderloin", "actual_remain_kg": 2.1, "expected_remain_kg": 2.0, "variance_kg": 0.1 }
+    { "cut_type": "tenderloin", "cube_product_id": "01405", "actual_remain_kg": 2.1, "expected_remain_kg": 2.0, "variance_kg": 0.1 }
   ],
   "llm_reviewed": true,                // 是否完成 LLM 反推(可选)
   "completed_at": "2026-09-17T22:10:00Z",
@@ -256,6 +302,11 @@
 
 > 当日**未**录入盘点 → sales-agg 用 llm 推演 / 历史均值估算 fresh-meat 毛利,
 > BI 在鲜猪毛利卡片显示"⚠ 未盘点,数据为推演"。
+
+> ⚠️ **2026-10-23 起 `actual_remain_kg` 是**全店**实盘**(猪肉台 + 冷库)。
+> 仓管录入的仍是**柜台实盘**(他不开冷库),服务层在保存盘点单时
+> 按流水余额补上冷库那一半 ⇒ 仓管工作量不变,而毛利/库存口径是全店。
+> 详见 REQUIREMENTS §4.7.3。
 
 ### 2.9 外部 LLM 网关(原 pig.analysis.completed)
 

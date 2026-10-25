@@ -374,8 +374,8 @@ func TestResolveRange(t *testing.T) {
 	}{
 		{PresetToday, "2026-10-14", "2026-10-14"},
 		{PresetYesterday, "2026-10-13", "2026-10-13"},
-		// 周三往前推 2 天 = 周一 2026-10-12
-		{PresetWeek, "2026-10-12", "2026-10-14"},
+		// 周三往前推 3 天 = 周日 2026-10-11（周日为一周之始）
+		{PresetWeek, "2026-10-11", "2026-10-14"},
 		{PresetMonth, "2026-10-01", "2026-10-14"},
 	}
 	for _, c := range cases {
@@ -396,17 +396,25 @@ func TestResolveRangeUnknownPresetFallsBackToToday(t *testing.T) {
 	}
 }
 
-// TestResolveRangeWeekStartsMonday 周一是一周之始（Go 里 Sunday=0，要换算）。
-func TestResolveRangeWeekStartsMonday(t *testing.T) {
-	monday := time.Date(2026, 10, 12, 8, 0, 0, 0, time.Local) // 周一
-	from, _ := ResolveRange(PresetWeek, monday)
-	if from != "2026-10-12" {
-		t.Errorf("周一 from = %q, want 2026-10-12", from)
-	}
+// TestResolveRangeWeekStartsSunday 周日是一周之始（Go 里 Sunday=0，直接就是距周日的天数）。
+//
+// ⚠️ 口径来自思迅老系统（2026-10-23 实测）：
+// 思迅「上周」= 10-11(周日)~10-17(周六)、「本周」= 10-18(周日)~10-24(周六)。
+func TestResolveRangeWeekStartsSunday(t *testing.T) {
 	sunday := time.Date(2026, 10, 18, 8, 0, 0, 0, time.Local) // 周日
-	from2, _ := ResolveRange(PresetWeek, sunday)
-	if from2 != "2026-10-12" {
-		t.Errorf("周日 from = %q, want 2026-10-12（周日应归属上一个周一）", from2)
+	from, _ := ResolveRange(PresetWeek, sunday)
+	if from != "2026-10-18" {
+		t.Errorf("周日 from = %q, want 2026-10-18（周日归属本周）", from)
+	}
+	monday := time.Date(2026, 10, 19, 8, 0, 0, 0, time.Local) // 周一
+	from2, _ := ResolveRange(PresetWeek, monday)
+	if from2 != "2026-10-18" {
+		t.Errorf("周一 from = %q, want 2026-10-18（周一回溯到上一个周日）", from2)
+	}
+	saturday := time.Date(2026, 10, 24, 8, 0, 0, 0, time.Local) // 周六
+	from3, _ := ResolveRange(PresetWeek, saturday)
+	if from3 != "2026-10-18" {
+		t.Errorf("周六 from = %q, want 2026-10-18", from3)
 	}
 }
 

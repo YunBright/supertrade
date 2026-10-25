@@ -3,8 +3,14 @@
 // 路由(nginx 已剥过 /api/v1/pricing/):
 //
 //	GET /promotion-plans?from=&to=&plan_no=&plan_name=&approve_status=
-//	                  &created_by=&exclude_expired=true&page=&page_size=
+//	                  &created_by=&member_level=&exclude_expired=true
+//	                  &sort=&order=&page=&page_size=
 //	    促销方案列表(pricing:view,per branch)
+//
+//	    sort / order 是**排序**:sort 取白名单字段
+//	    (created_at / plan_no / plan_name / begin_date / end_date /
+//	    created_by / approved_at / stopped_at),order 取 asc / desc。
+//	    不传 ⇒ 默认「制单日期倒序」。非法取值 ⇒ **400**(不静默回落)。
 //	GET /promotion-plans/:plan_no
 //	    促销方案详情(pricing:view,per branch)
 //
@@ -47,6 +53,13 @@ func (h *Handler) listPromotionPlans(c *gin.Context) {
 		ApproveStatus:  strings.TrimSpace(c.Query("approve_status")),
 		CreatedBy:      strings.TrimSpace(c.Query("created_by")),
 		MemberLevel:    strings.TrimSpace(c.Query("member_level")),
+		// ⚠️ 排序:空 = 后端默认「制单日期倒序」;非法字段/方向 ⇒ **400**
+		// (静默回落 = 用户点了排序、列表没变、零提示)。
+		Sort:  strings.TrimSpace(c.Query("sort")),
+		Order: strings.TrimSpace(c.Query("order")),
+		// ⚠️ exclude_expired 默认 **true**:促销方案是时效数据,
+		// 2021 年的方案和今天的方案混在一张列表里没法用。
+		// 显式传 false 才放开。
 		ExcludeExpired: true,
 		Page:           1,
 		PageSize:       50,

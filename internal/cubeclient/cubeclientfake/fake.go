@@ -403,6 +403,44 @@ func (c *Client) GetActivePromotion(_ context.Context, itemNo, onDate string) (*
 	return best, nil
 }
 
+// BatchCurrentPrices 与真实实现同语义:
+// 零售价取 product 的 PriceYuan(**没维护价 = nil**),促销价取当前生效促销的**最低**那条。
+func (c *Client) BatchCurrentPrices(_ context.Context, productIDs []string, onDate string) (map[string]cubeclient.ProductPriceQuote, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	day := onDate
+	if day == "" {
+		day = c.clock().Format("2006-01-02")
+	}
+	out := map[string]cubeclient.ProductPriceQuote{}
+	for _, id := range productIDs {
+		p, ok := c.products[id]
+		if !ok || p.PriceYuan == nil {
+			continue // 没维护售价 ⇒ 不进结果
+		}
+		out[id] = cubeclient.ProductPriceQuote{ProductID: id, PriceYuan: p.PriceYuan}
+	}
+	for _, pr := range c.promotions {
+		if _, ok := out[pr.ItemNo]; !ok {
+			continue // 没有零售价的商品不进结果(与真实实现一致:先有商品再谈价)
+		}
+		if pr.BeginDay > day || pr.EndDay < day {
+			continue
+		}
+		if pr.Price.LessThanOrEqual(decimal.Zero) {
+			continue
+		}
+		q := out[pr.ItemNo]
+		if q.PromoPriceYuan == nil || pr.Price.LessThan(*q.PromoPriceYuan) {
+			p := pr.Price
+			q.PromoPriceYuan = &p
+			out[pr.ItemNo] = q
+		}
+	}
+	return out, nil
+}
+
 // ---- 商品选择控件(ProductPicker)用的只读查询 ----
 //
 // 语义与真实实现(cubeclient/catalog.go)对齐:

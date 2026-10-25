@@ -44,6 +44,7 @@ func newLedgerService(t *testing.T) (*service.Service, *gorm.DB, *cubeclientfake
 		&model.StocktakeLineOperation{},
 		&model.StocktakePlanItem{},
 		&model.StocktakeBranchDefault{},
+		&model.StocktakeExcludedScope{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

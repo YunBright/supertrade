@@ -34,9 +34,9 @@ import (
 
 // fakeCube 实现 service.CubeQuerier,灌 S1 全通过数据(货款 100)。
 type fakeCube struct {
-	settlements []service.SettlementRow
-	suppliers   map[string]string // 供应商字典(id → 名称)
-	supplierErr error             // 非 nil ⇒ 字典查询失败(测降级)
+	settlements  []service.SettlementRow
+	suppliers    map[string]string // 供应商字典(id → 名称)
+	supplierErr  error             // 非 nil ⇒ 字典查询失败(测降级)
 	productNames map[string]string // 货号 → 商品名(信号里写「<名称>-<货号>」)
 }
 
@@ -283,7 +283,7 @@ func waitTerminal(t *testing.T, db *gorm.DB, id string) model.ApprovalInstance {
 
 func TestHandler_Submit_202(t *testing.T) {
 	r, db, pub := buildTestHandler(t, true)
-	body := `{"applicant_wecom_id":"wecom-u1","settlement_ids":["S1"],"manual_amount_yuan":"100","remark":"9月货款","approver_userids":["apr1"],"cc_userids":["cc1"]}`
+	body := `{"applicant_wecom_id":"wecom-u1","settlement_ids":["S1"],"manual_amount_yuan":"100","remark":"9月货款","approver_userids":["apr1"],"handler_userids":["h1"],"cc_userids":["cc1"]}`
 	req := httptest.NewRequest(http.MethodPost, "/settlement-approvals", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	adminReq(req)

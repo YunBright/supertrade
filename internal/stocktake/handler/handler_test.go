@@ -141,6 +141,7 @@ func buildTestHandler(t *testing.T) *gin.Engine {
 		&model.StocktakeLineOperation{},
 		&model.StocktakePlanItem{},
 		&model.StocktakeBranchDefault{},
+		&model.StocktakeExcludedScope{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

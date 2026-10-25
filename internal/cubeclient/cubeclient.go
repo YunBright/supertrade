@@ -44,6 +44,18 @@ type Client interface {
 	// 调用方因此不能靠 err != nil 判断"有没有促销"。
 	GetActivePromotion(ctx context.Context, itemNo, onDate string) (*PromotionDTO, error)
 
+	// BatchCurrentPrices **批量**查一批商品的当前售价(零售价 + 促销价)。
+	//
+	// 一次给一批(几十个 SKU)而不是逐个查 ⇒ 两次 cube 查询(product + promotion)
+	// 就够,不会把审计拖成几十秒。
+	//
+	// 返回 map[product_id]ProductPriceQuote:
+	//   - **没维护售价**的商品不在返回里(调用方要能区分"没维护价"与"0 元");
+	//   - 没有生效促销 ⇒ PromoPriceYuan = nil。
+	//
+	// onDate 是判定基准日("yyyy-mm-dd");留空 = 今天。
+	BatchCurrentPrices(ctx context.Context, productIDs []string, onDate string) (map[string]ProductPriceQuote, error)
+
 	// ---- 商品选择控件(ProductPicker)用的只读查询 ----
 	//
 	// 这几个方法是一组:每个方法发**固定条数**的 cube 查询,分类名 / 供应商名

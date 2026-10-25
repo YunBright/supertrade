@@ -219,10 +219,18 @@ func ResolveRange(p Preset, now time.Time) (from, to string) {
 		y := now.AddDate(0, 0, -1).Format("2006-01-02")
 		return y, y
 	case PresetWeek:
-		// 周一为一周之始（Go 的 Weekday: Sunday=0）
-		offset := (int(now.Weekday()) + 6) % 7
-		monday := now.AddDate(0, 0, -offset)
-		return monday.Format("2006-01-02"), d
+		// ⚠️ **周日为一周之始**(对齐思迅老系统)。
+		//
+		// ✅ 实测 2026-10-23(周五):思迅前端对货号 02000118 的销售数量
+		// 上周 = 7 / 本周 = 16 / 上月 = 33;直连源库逐日核对:
+		//   思迅「上周」= 10-11(周日)~10-17(周六) = 7 ✅
+		//   思迅「本周」= 10-18(周日)~10-24(周六) = 16 ✅
+		//   按周一始算则是 13 / 9 ⇒ **差的不是公式,是某一天被划进哪一周**。
+		//
+		// Go 的 Weekday: Sunday=0 ⇒ 距周日的天数 = int(now.Weekday())。
+		offset := int(now.Weekday())
+		sunday := now.AddDate(0, 0, -offset)
+		return sunday.Format("2006-01-02"), d
 	case PresetMonth:
 		first := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
 		return first.Format("2006-01-02"), d

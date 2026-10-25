@@ -270,11 +270,11 @@ func TestBuildAuditUserPrompt_Truncates(t *testing.T) {
 func TestBuildAuditSystemPrompt_AmountRoundingRule(t *testing.T) {
 	p := buildAuditSystemPrompt()
 	must := []string{
-		"按元取整",                    // 取整口径
-		"分位一般不实际支付",              // 取整口径
-		"不得作为拒绝理由",                // 分/角级差异不阻断
+		"按元取整",            // 取整口径
+		"分位一般不实际支付",       // 取整口径
+		"不得作为拒绝理由",        // 分/角级差异不阻断
 		"不要**再自己把结算单金额相加", // 禁止自行重算
-		"只能引用信号列表里的信号",        // 不许凭空造事实
+		"只能引用信号列表里的信号",    // 不许凭空造事实
 	}
 	for _, m := range must {
 		if !strings.Contains(p, m) {

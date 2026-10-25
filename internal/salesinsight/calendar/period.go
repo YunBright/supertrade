@@ -116,18 +116,24 @@ func ResolvePeriod(kind PeriodKind, now time.Time) (Period, error) {
 		return Period{Kind: kind, Cur: cur, Prev: prev}, nil
 
 	case PeriodWeekly:
-		// 上周一~上周日（**完整周**），而不是"本周一到今天"。
+		// 上周日~上周六（**完整周**），而不是"本周日到今天"。
 		//
-		// ⚠️ 周报在**周一**推：若取"本周一~今天"就是 1 天，
+		// ⚠️ 周报在**周一**推：若取"本周一到今天"就是 1 天，
 		// 一份只覆盖 1 天的周报没有任何内容。
-		offset := (int(d.Weekday()) + 6) % 7
-		thisMonday := d.AddDate(0, 0, -offset)
-		lastMonday := thisMonday.AddDate(0, 0, -7)
-		cur := Range{Start: lastMonday, End: lastMonday.AddDate(0, 0, 6)}
-		// 同期：再往前 7 天，得到"上上周一 ~ 上上周日"
+		//
+		// ⚠️ **周日为一周之始**（对齐思迅老系统，2026-10-23 实测：
+		// 思迅「上周」= 10-11(周日)~10-17(周六)、「本周」= 10-18~10-24）。
+		// ⇒ 同一份 App 里"上周"必须只有一个含义：
+		//   报表页 / 流水页（app/core/utils/date_range_preset.dart）
+		//   与这里的周报期次必须是同一套周边界。
+		offset := int(d.Weekday()) // Go 的 Weekday: Sunday=0 ⇒ 距周日的天数
+		thisSunday := d.AddDate(0, 0, -offset)
+		lastSunday := thisSunday.AddDate(0, 0, -7)
+		cur := Range{Start: lastSunday, End: lastSunday.AddDate(0, 0, 6)}
+		// 同期：再往前 7 天，得到"上上周日 ~ 上上周六"
 		prev := Range{
-			Start: lastMonday.AddDate(0, 0, -7),
-			End:   lastMonday.AddDate(0, 0, -1),
+			Start: lastSunday.AddDate(0, 0, -7),
+			End:   lastSunday.AddDate(0, 0, -1),
 		}
 		return Period{Kind: kind, Cur: cur, Prev: prev}, nil
 

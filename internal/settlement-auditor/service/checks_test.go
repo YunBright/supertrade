@@ -316,9 +316,9 @@ func TestBuildSaleWindowGroups_UsesLastPurchaseDate(t *testing.T) {
 		"PI-B": "2026-08-26",
 	}
 	productSheets := map[string][]string{
-		"PR1": {"PI-A"},          // 只在 08-23 进过货
-		"PR2": {"PI-A", "PI-B"},  // 两次都进 ⇒ 起点取**最晚**的 08-26
-		"PR3": {"PI-MISSING"},    // 取不到日期 ⇒ 回退固定窗口
+		"PR1": {"PI-A"},         // 只在 08-23 进过货
+		"PR2": {"PI-A", "PI-B"}, // 两次都进 ⇒ 起点取**最晚**的 08-26
+		"PR3": {"PI-MISSING"},   // 取不到日期 ⇒ 回退固定窗口
 	}
 	groups := buildSaleWindowGroups(sheetDates, productSheets, "2026-10-22", "2026-09-22", 0)
 	got := map[string]string{}

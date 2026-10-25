@@ -54,10 +54,18 @@ type SubmitInput struct {
 	SettlementIDs    []string
 	ManualAmountYuan decimal.Decimal
 	Remark           string
-	// ApproverUserIDs 申请人在 H5 用企微原生选人器选定的审批人(至少 1 人)。
+	// FlowSelections 是按**节点类型**分桶的人员选择(键:approver/handler/cc)。
+	//
+	// 节点集合由 Config.ApprovalFlow 决定(与企微模板的流程设置对应)——
+	// 模板加一个节点,协议不用改。
+	FlowSelections FlowSelections
+	// ApproverUserIDs / HandlerUserIDs / CcUserIDs 是**按固定字段**给的兼容入参。
+	//
+	// ⚠️ 只给这些字段 ⇒ 拿不到"办理人"节点(旧客户端/旧契约测试不知道这回事)。
+	// 新客户端一律用 FlowSelections。
 	ApproverUserIDs []string
-	// CcUserIDs 抄送人(可空)。
-	CcUserIDs []string
+	HandlerUserIDs  []string
+	CcUserIDs       []string
 }
 
 // maxSettlementsPerApproval 单次审批勾选上限(防 LLM prompt 爆炸)。
@@ -99,19 +107,20 @@ func (s *Service) SubmitApproval(ctx context.Context, branchID string, in Submit
 	if len(ids) > maxSettlementsPerApproval {
 		return nil, fmt.Errorf("%w: 单次审批最多 %d 张结算单", ErrInvalidInput, maxSettlementsPerApproval)
 	}
-	approvers := dedupeStrings(in.ApproverUserIDs)
-	if len(approvers) == 0 {
-		return nil, fmt.Errorf("%w: approver_userids 至少选择 1 名审批人", ErrInvalidInput)
+	// 审批流人员:按**节点类型**分桶(键 approver/handler/cc)。
+	//
+	// 节点集合与校验规则都来自 Config.ApprovalFlow —— 那份声明对应企微
+	// 管理后台里「付款审批」模板的流程设置(节点类型/顺序/选人方式)。
+	// ⚠️ 旧客户端只发 approver_userids/cc_userids ⇒ 合并进来,仍能走通
+	// (只是"办理人"节点拿不到人 ⇒ 按 required 判定给出可读报错)。
+	selections := in.FlowSelections.Merge(in.ApproverUserIDs, in.HandlerUserIDs, in.CcUserIDs)
+	flow, err := s.resolveFlowSelections(selections)
+	if err != nil {
+		return nil, err
 	}
-	if len(approvers) > maxApproversPerApproval {
-		return nil, fmt.Errorf("%w: 审批人最多 %d 人", ErrInvalidInput, maxApproversPerApproval)
-	}
-	ccUsers := dedupeStrings(in.CcUserIDs)
-	if len(ccUsers) > maxApproversPerApproval {
-		return nil, fmt.Errorf("%w: 抄送人最多 %d 人", ErrInvalidInput, maxApproversPerApproval)
-	}
-	approversJSON, _ := json.Marshal(approvers)
-	ccJSON, _ := json.Marshal(ccUsers)
+	approversJSON, _ := json.Marshal(flow[FlowNodeApprover])
+	handlersJSON, _ := json.Marshal(flow[FlowNodeHandler])
+	ccJSON, _ := json.Marshal(flow[FlowNodeCC])
 
 	ap := &model.ApprovalInstance{
 		ID:               newApprovalID(),
@@ -123,6 +132,7 @@ func (s *Service) SubmitApproval(ctx context.Context, branchID string, in Submit
 		ManualAmountYuan: in.ManualAmountYuan,
 		Remark:           in.Remark,
 		ApproverUserIDs:  approversJSON,
+		HandlerUserIDs:   handlersJSON,
 		CcUserIDs:        ccJSON,
 		Status:           model.StatusReceived,
 	}
@@ -146,9 +156,14 @@ func (s *Service) SubmitApproval(ctx context.Context, branchID string, in Submit
 	go s.runAudit(context.Background(), ap.ID)
 
 	// 记住本次审批流人员(下次发起默认带出,对齐官方审批体验);失败不阻断提交。
-	if err := s.upsertApproverPreference(ctx, branchID, in.ApplicantUserID, approvers, ccUsers); err != nil {
-		s.logger.Warn("upsert approver preference failed",
-			"approval_id", ap.ID, "user_id", in.ApplicantUserID, "err", err)
+	//
+	// ⚠️ 三个节点都要记:模板里审批人/办理人/抄送人都是「申请人自选」,
+	// 下次发起时把上次选的**都**带出来,店长只改要改的那个。
+	if len(flow) > 0 {
+		if err := s.upsertApproverPreference(ctx, branchID, in.ApplicantUserID, flow); err != nil {
+			s.logger.Warn("upsert approver preference failed",
+				"approval_id", ap.ID, "user_id", in.ApplicantUserID, "err", err)
+		}
 	}
 
 	s.publishStatusEvent(ctx, &AuditStatusEvent{
@@ -806,7 +821,16 @@ func (s *Service) stepFinish(ctx context.Context, ap *model.ApprovalInstance, ve
 
 	// pass → 代提交企微审批
 	applyData, summaryList := s.buildApplyData(ctx, ap, verdict, signals)
-	process, err := buildProcess(ap)
+	// 按**模板的流程配置**组装 process.node_list(审批人 / 办理人 / 抄送人)。
+	//
+	// ⚠️ 必须是 mode=0(自带 process):这个模板的三个节点全是「申请人自选」,
+	// 成员由发起人在 H5 选。mode=1 时企微会忽略 app 给的成员 ⇒ 节点空 ⇒ 没人办。
+	selections, err := s.snapshotFlowSelections(ap)
+	if err != nil {
+		s.markFailed(ctx, ap, "build process: "+err.Error())
+		return
+	}
+	process, err := s.buildProcess(selections)
 	if err != nil {
 		s.markFailed(ctx, ap, "build process: "+err.Error())
 		return
@@ -814,7 +838,7 @@ func (s *Service) stepFinish(ctx context.Context, ap *model.ApprovalInstance, ve
 	payload := ApplyEventPayload{
 		CreatorUserID:       ap.ApplicantWecomID,
 		TemplateID:          s.cfg.TemplateID,
-		UseTemplateApprover: 0, // 始终用申请人在 H5 选定的审批流(模板内无需配审批人)
+		UseTemplateApprover: 0,
 		Process:             process,
 		NotifyType:          1,
 		ApplyData:           applyData,
@@ -843,27 +867,30 @@ func (s *Service) stepFinish(ctx context.Context, ap *model.ApprovalInstance, ve
 		"", time.Since(start).Milliseconds())
 }
 
-// buildProcess 把审批单快照上的审批人/抄送人映射为企微 applyevent 的
-// process.node_list:审批人节点(type=1,或签 apv_rel=2)+ 抄送人节点(type=2)。
-// 审批人提交时已校验非空,这里若读不出视为数据损坏。
-func buildProcess(ap *model.ApprovalInstance) (*ProcessConfig, error) {
-	var approvers, cc []string
-	if len(ap.ApproverUserIDs) > 0 {
-		if err := json.Unmarshal(ap.ApproverUserIDs, &approvers); err != nil {
-			return nil, fmt.Errorf("解析审批人列表: %w", err)
+// snapshotFlowSelections 从审批单快照里读回各节点成员。
+//
+// 快照是**提交时**选的人(随单存档);机器审核是异步的,到 applyevent 那一步
+// 早就不是同一个请求上下文了 ⇒ 只能从快照读。
+func (s *Service) snapshotFlowSelections(ap *model.ApprovalInstance) (FlowSelections, error) {
+	out := FlowSelections{}
+	for _, nd := range []struct {
+		nodeType string
+		raw      []byte
+	}{
+		{FlowNodeApprover, ap.ApproverUserIDs},
+		{FlowNodeHandler, ap.HandlerUserIDs},
+		{FlowNodeCC, ap.CcUserIDs},
+	} {
+		if len(nd.raw) == 0 {
+			continue
 		}
+		var ids []string
+		if err := json.Unmarshal(nd.raw, &ids); err != nil {
+			return nil, fmt.Errorf("解析 %s 列表: %w", nd.nodeType, err)
+		}
+		out[nd.nodeType] = ids
 	}
-	if len(ap.CcUserIDs) > 0 {
-		_ = json.Unmarshal(ap.CcUserIDs, &cc)
-	}
-	if len(approvers) == 0 {
-		return nil, fmt.Errorf("审批单未记录审批人(数据异常)")
-	}
-	nodes := []ProcessNode{{Type: 1, ApvRel: 2, UserID: approvers}}
-	if len(cc) > 0 {
-		nodes = append(nodes, ProcessNode{Type: 2, UserID: cc})
-	}
-	return &ProcessConfig{NodeList: nodes}, nil
+	return out, nil
 }
 
 // buildApplyData 组企微 apply_event 的 apply_data / summary_list。

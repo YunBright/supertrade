@@ -223,3 +223,58 @@ func TestPromotionPlans_SourceDisabledIs503(t *testing.T) {
 	require.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
 	assert.Equal(t, "cube_source_disabled", decodePlan(t, w)["code"])
 }
+
+// TestPromotionPlans_InvalidSortIs400 锁"非法排序字段 ⇒ 400"。
+//
+// ⚠️ 不能静默回落成默认排序:用户点了"按方案名称排"、列表还是按日期排,
+// 而且**没有任何提示**——与"参数被忽略"无法区分。
+func TestPromotionPlans_InvalidSortIs400(t *testing.T) {
+	r, _ := newPlanRouter(t, &planSource{src: cubesource.Source{BranchID: "10"}})
+
+	w := doPlan(r, "/promotion-plans?sort=created_at%3B+drop+table", "10")
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Equal(t, "bad_request", decodePlan(t, w)["code"])
+}
+
+// TestPromotionPlans_InvalidOrderIs400 锁"非法排序方向 ⇒ 400"。
+func TestPromotionPlans_InvalidOrderIs400(t *testing.T) {
+	r, _ := newPlanRouter(t, &planSource{src: cubesource.Source{BranchID: "10"}})
+
+	w := doPlan(r, "/promotion-plans?sort=created_at&order=sideways", "10")
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Equal(t, "bad_request", decodePlan(t, w)["code"])
+}
+
+// TestPromotionPlans_SortOrdersRows 锁"排序真的改变了行的顺序(HTTP 层)"。
+func TestPromotionPlans_SortOrdersRows(t *testing.T) {
+	r, db := newPlanRouter(t, &planSource{src: cubesource.Source{BranchID: "10"}})
+	begin := time.Date(2021, 9, 17, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2021, 9, 18, 0, 0, 0, 0, time.UTC)
+	early := time.Date(2021, 9, 17, 9, 0, 0, 0, time.UTC)
+	late := time.Date(2021, 9, 17, 21, 30, 0, 0, time.UTC)
+	rows := []any{
+		&model.PromotionPlan{PlanNo: "PS002109160001", BranchID: "10", PlanName: "早",
+			BeginDate: &begin, EndDate: &end, CreatedAt: &early, CreatedBy: "2001",
+			ApproveFlag: "1", ApproveStatus: "draft", MemberLevel: "无"},
+		&model.PromotionPlan{PlanNo: "PS002109160002", BranchID: "10", PlanName: "晚",
+			BeginDate: &begin, EndDate: &end, CreatedAt: &late, CreatedBy: "2001",
+			ApproveFlag: "1", ApproveStatus: "draft", MemberLevel: "无"},
+	}
+	for _, row := range rows {
+		require.NoError(t, db.Create(row).Error, "seed")
+	}
+
+	desc := decodePlan(t, doPlan(r,
+		"/promotion-plans?exclude_expired=false&sort=created_at&order=desc", "10"))
+	items := desc["items"].([]any)
+	require.Len(t, items, 2)
+	assert.Equal(t, "PS002109160002", items[0].(map[string]any)["plan_no"],
+		"倒序 ⇒ 制单晚的在前")
+
+	asc := decodePlan(t, doPlan(r,
+		"/promotion-plans?exclude_expired=false&sort=created_at&order=asc", "10"))
+	ascItems := asc["items"].([]any)
+	require.Len(t, ascItems, 2)
+	assert.Equal(t, "PS002109160001", ascItems[0].(map[string]any)["plan_no"],
+		"升序 ⇒ 制单早的在前")
+}

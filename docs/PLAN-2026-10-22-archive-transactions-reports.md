@@ -664,6 +664,67 @@ cube-router 收不到 `X-Branch-ID` ⇒ 返 400 `branch_required` ⇒
 （单号含日期，字典序≈时间序；`flow_id desc` 原本等于**乱序**）。
 ⇒ ⇒ 前端把 `id` 当**不透明串**回传即可 ⇒ 对前端无感。
 
+### 7.9 「周」的边界：**思迅以周日为一周之始**（2026-10-23 用户报障）
+
+**现象**（货号 `02000118` 的「商品销售条码分组统计」）：
+
+| 期间 | 思迅前端 | 本系统 |
+|---|---|---|
+| 上周销售数量 | 7 | **13** |
+| 本周销售数量 | 16 | **9** |
+| 上月销售数量 | 33 | 33 ✅ |
+
+**定位过程**（不是靠猜，是逐日核对）：
+
+1. 直连源库 ysx `t_rm_daysum`，按 `oper_date` 逐日汇总 `SUM(sale_qty - ret_qty)`
+   （货号 02000118，2026-09-01 ~ 10-23）；
+2. 逐日数据与逐笔流水 `t_rm_saleflow` **完全一致** ⇒ 排除「日结未结算」；
+3. `t_rm_daysum` 的 `MAX(oper_date) = 2026-10-23` ⇒ 排除「今天还没进表」；
+4. 逐日数据**反解**出唯一自洽解：
+
+| 口径 | 区间 | 合计 | 对不对得上思迅 |
+|---|---|---|---|
+| 思迅 | 10-11(**周日**) ~ 10-17(周六) | 1+2+1+0+1+2+0 = **7** | ✅ |
+| 思迅 | 10-18(**周日**) ~ 10-24(周六) | 7+4+3+2+0+0+0 = **16** | ✅ |
+| 旧实现（周一始） | 10-12(周一) ~ 10-18(周日) | **13** | ❌ |
+| 旧实现（周一始） | 10-19(周一) ~ 10-23 | **9** | ❌ |
+| 自然月 | 09-01 ~ 09-30 | **33** | ✅ 两边一致 |
+
+⇒ **结论：公式没错，错的是"某一天被划进哪一周"** ——
+**思迅的一周是「周日 ~ 周六」**，本系统当时按「周一 ~ 周日」。
+（"上月两边都是 33"正是这个结论的关键佐证：月是自然月、公式一致，
+唯独"周"的归属不同。）
+
+**改法（全应用统一，不留两套"周"）**：
+
+| 位置 | 改动 |
+|---|---|
+| `tradewind_app/lib/core/utils/date_range_preset.dart` | `thisWeek`/`lastWeek` 改成**周日 ~ 周六**（流水页 + 销售报表页共用这一处） |
+| `supertrade/internal/salesagg/service/service.go` `ResolveRange(PresetWeek)` | 同步改成周日始（旧 `/reports/sales` 与 compare 端点） |
+| `supertrade/internal/salesinsight/calendar/period.go` `ResolvePeriod(PeriodWeekly)` | AI 周报的期次同步改成周日始（否则 App 内"上周"会有两个含义） |
+
+⚠️ **只改了一处前端是不够的**：`date_range_preset.dart` 是 core（流水页与报表页共用），
+但服务端 `preset=week` 是**另一套**实现 —— 只改前端会导致"旧销售报表页"与"图7 报表页"
+对"本周"给出不同区间，比原来的错更难查。
+
+⚠️ Dart 的 `DateTime.weekday` 是 **Mon=1 … Sun=7** ⇒ "距周日的天数 = `weekday % 7`"；
+Go 的 `time.Weekday` 是 **Sun=0 … Sat=6** ⇒ "距周日的天数 = `int(Weekday())`"。
+两边换算**不同**，抄错一个就是差一天。
+
+**回归锁**：
+
+- `tradewind_app/test/core/date_range_preset_test.dart`：钉 2026-10-23(周五) 的
+  上周 = 10-11~10-17、本周 = 10-18~10-23、上月 = 09-01~09-30；
+- `supertrade/internal/salesagg/service/service_test.go`：`TestResolveRangeWeekStartsSunday`；
+- `supertrade/internal/salesinsight/calendar/calendar_test.go`：周报期次起点周日、终点周六；
+- `deployer/tests/contract/sales_reports_test.go`：
+  `TestSalesReports_ByCode_WeekBoundaryMatchesSixun` —— **生产级对账**：
+  打真实端点断言「周日~周六 = 7 / 周一~周日 = 13 / 自然月 = 33」，
+  且两种周口径必须给出**不同**结果（否则那条用例没有判别力）。
+
+⚠️ 契约用例钉的是**已关闭的历史周**，不钉"本周"——
+"本周"那个窗口还在滚动（当天还在补单），钉它必然偶发红。
+
 
 
 ---
@@ -682,6 +743,21 @@ cube-router 收不到 `X-Branch-ID` ⇒ 返 400 `branch_required` ⇒
 | tradewind_app | `flutter test` | **+2011 ~10: All other tests passed!** |
 | 生产 | 5 个功能域端点实调 | 全部 200 + 真实数据 |
 | 生产 | 销售报表 11 个菜单项 | 11/11 = 200 |
+
+**2026-10-23 周边界修复后（§7.9）追加的验证**：
+
+| 仓 | 验证 | 结果 |
+|---|---|---|
+| supertrade | `go test ./internal/salesagg/... ./internal/salesinsight/...` | 全绿（12 个包 ok） |
+| tradewind_app | `flutter analyze` | **No issues found!** |
+| tradewind_app | `flutter test` | **+2051 ~10: All tests passed!** |
+| deployer | 5 个功能域契约（`TestSalesReports\|TestSalesCompare\|TestSalesAgg\|TestProductArchive\|TestTransaction\|TestPromotionPlans\|TestPurchaseSheets`） | **ok 81.4s** |
+| deployer | `TestSalesReports_ByCode_WeekBoundaryMatchesSixun` | **PASS**（真打生产，未 skip） |
+| deployer | `go test ./...`（**全量**，含修好的 catalog 大小写用例） | **ok 408.4s，EXIT=0** |
+| 生产 | `preset=week` 服务端解析 | `from=2026-10-18`（周日始，已生效） |
+| 生产 | by-code 11 个 code × 思迅周边界 | 11/11 = 200，02000118 = **7.00**（= 思迅的 7） |
+| 生产 | 5 个功能域端点冒烟 | 全部 200 |
+| 生产 | 重启后服务日志 | 无 err 级别条目；两服务 active |
 
 ### 8.2 生产实测（门店 00 富百家 / cube-sixun-ysx-fb）
 
@@ -709,6 +785,7 @@ cube-router 收不到 `X-Branch-ID` ⇒ 返 400 `branch_required` ⇒
 | `deployer/dapr/gyy/shared-components/authkey.yaml` | scopes 加 2 个 app-id（已同步生产） |
 | gyy `~/.config/systemd/user/` | 装 2 个新 unit + `daemon-reload` + `enable` |
 | 部署 | cube ×2；supertrade（catalog / pricing / sales-agg / transaction / procurement / cube-router） |
+| 部署 | **2026-10-23 周边界修复**：supertrade 重新部署 `sales-agg` + `sales-insight`（两者 healthz 200 / auth_ok=true） |
 
 ### 8.4 已知遗留（不影响本次交付，但前端能看出来）
 
@@ -727,3 +804,15 @@ cube-router 收不到 `X-Branch-ID` ⇒ 返 400 `branch_required` ⇒
 9. **另一条工作流在同时改 cube**（会话 "Remove DuckDB layer from cube repo"）——
    本次交付把 DuckDB 路径**按 HEAD 恢复**并保持 `duck` 模型可用。
    **那条工作流若继续推进，cube 仓会再次漂移**，需与它协调后再合并。
+10. **顺手修掉的一条"数据漂移型"假红契约**（2026-10-23，与周边界无关）：
+    `deployer/tests/contract/catalog_product_picker_test.go`
+    `TestCatalogProductSearchByNameIsCaseInsensitive` 原来从**最后 3 页**里随便挑一个
+    "名字含 ASCII 片段"的商品，用它名字里那段片段做小写搜索。
+    ⇒ 两个毛病：① 片段可能是**纯数字**（"020"）——数字没有大小写之分，
+    **根本没测到大小写**；② 纯数字片段极常见（实测命中 **11490** 个商品），
+    而用例只扫 20 页 ⇒ 目标商品被挤出窗口。
+    ⇒ 门店新增商品后目标漂移成"泡泡泥020"，用例红了 —— 但**实现是对的**
+    （实测 `金灶l` 与 `金灶L` 都搜得到 `020220金灶L-310A`）。
+    ⇒ 已改为：目标必须是**名字含 ASCII 字母**的商品，且用**整个名字的小写**去搜
+    （命中近乎唯一 ⇒ 一页够，从 29.95s 降到 2.76s），
+    并补一句"搜索命中数 < 全店商品数"以保证这条用例**有判别力**。

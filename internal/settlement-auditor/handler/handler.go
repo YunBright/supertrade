@@ -61,6 +61,8 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/settlement-approvals/export", requireBranch, h.Export)
 	r.GET("/settlement-approvals/cube/settlements", requireBranch, h.ListCubeSettlements)
 	r.GET("/settlement-approvals/approver-preference", requireBranch, h.GetApproverPreference)
+	// ⚠️ 必须注册在 /:id 之前(见 GetApprovalFlow 的注释)。
+	r.GET("/settlement-approvals/approval-flow", requireBranch, h.GetApprovalFlow)
 	r.GET("/settlement-approvals/:id", requireBranch, h.Get)
 	r.GET("/settlement-approvals/:id/logs", requireBranch, h.GetLogs)
 	r.POST("/settlement-approvals/:id/retry", requireBranch, h.Retry)
@@ -91,12 +93,12 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 
 // stocktakeNotifyGroupResp 是推送群配置的响应体。
 type stocktakeNotifyGroupResp struct {
-	BranchID string `json:"branch_id"`
-	ChatID   string `json:"chat_id"`
-	ChatName string `json:"chat_name"`
-	AppID    string `json:"app_id"`
-	AppName  string `json:"app_name"`
-	UpdatedBy string `json:"updated_by,omitempty"`
+	BranchID  string     `json:"branch_id"`
+	ChatID    string     `json:"chat_id"`
+	ChatName  string     `json:"chat_name"`
+	AppID     string     `json:"app_id"`
+	AppName   string     `json:"app_name"`
+	UpdatedBy string     `json:"updated_by,omitempty"`
 	UpdatedAt *time.Time `json:"updated_at,omitempty"`
 }
 
@@ -372,10 +374,19 @@ type submitReq struct {
 	SettlementIDs    []string `json:"settlement_ids" binding:"required"`
 	ManualAmountYuan string   `json:"manual_amount_yuan" binding:"required"`
 	Remark           string   `json:"remark"`
-	// ApproverUserIDs 审批人企微 userid(原生选人器选定,至少 1 人)。
-	ApproverUserIDs []string `json:"approver_userids" binding:"required"`
-	// CcUserIDs 抄送人(可空)。
-	CcUserIDs []string `json:"cc_userids"`
+	// FlowSelections 是按**节点类型**分桶的人员选择
+	// (键 approver/handler/cc,值 企微 userid 列表)。
+	//
+	// 节点集合由后端的审批流程配置决定(= 企微管理后台里那个模板的流程设置),
+	// 所以模板加一个节点(比如办理人)协议不用改。
+	//
+	// ⚠️ 不能加 binding:"required" —— 键是动态的,required 只对固定字段有意义。
+	FlowSelections map[string][]string `json:"flow_selections"`
+	// ApproverUserIDs / HandlerUserIDs / CcUserIDs 是按固定字段给的兼容入参
+	// (旧客户端只发 approver/cc;服务端会并进 flow_selections)。
+	ApproverUserIDs []string `json:"approver_userids"`
+	HandlerUserIDs  []string `json:"handler_userids"`
+	CcUserIDs       []string `json:"cc_userids"`
 }
 
 // Submit POST /settlement-approvals → 202 {id,status}
@@ -402,7 +413,9 @@ func (h *Handler) Submit(c *gin.Context) {
 		SettlementIDs:    req.SettlementIDs,
 		ManualAmountYuan: amount,
 		Remark:           req.Remark,
+		FlowSelections:   service.FlowSelections(req.FlowSelections),
 		ApproverUserIDs:  req.ApproverUserIDs,
+		HandlerUserIDs:   req.HandlerUserIDs,
 		CcUserIDs:        req.CcUserIDs,
 	})
 	if err != nil {
@@ -414,7 +427,7 @@ func (h *Handler) Submit(c *gin.Context) {
 
 // GetApproverPreference GET /settlement-approvals/approver-preference
 //
-// 发起页带出该用户上次使用的审批人/抄送人(对齐官方审批"记住上次"体验)。
+// 发起页带出该用户上次使用的审批人/办理人/抄送人(对齐官方审批"记住上次"体验)。
 func (h *Handler) GetApproverPreference(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "settlement:view") {
@@ -427,6 +440,32 @@ func (h *Handler) GetApproverPreference(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, pref)
+}
+
+// GetApprovalFlow GET /settlement-approvals/approval-flow
+//
+// 返回本次审批的**流程节点声明**(节点类型/标题/选人方式/多人办理方式/是否必填),
+// 发起页按它渲染「审批流程」组件(几行、每行单选还是多选、哪些必填)。
+//
+// # 为什么 UI 要读这个而不是写死三行
+//
+// 企微模板「付款审批」的流程是**可以随时改**的(2026-10-23 就加了「办理人」节点)。
+// UI 写死三行 ⇒ 模板加了第四个节点,发起页不知道要问谁,那个节点就**静默没有成员**
+// (企微按 app 给的 node_list 走,模板里多出来的节点没有对应的人)。
+//
+// ⚠️ 企微的**公开 API 读不到流程配置**:`oa/gettemplatedetail` 的响应只有
+// `template_content.controls`(表单控件),没有流程节点字段;`getapprovaldetail`
+// 的 `sp_record` 也没有节点类型。⇒ 这份声明由 app 侧持有
+// (Config.ApprovalFlow,deploy 用 SETTLEMENT_AUDITOR_APPROVAL_FLOW 配置),
+// 必须与企微后台的模板保持一致 —— 两边对不上 = 少一个节点。
+//
+// ⚠️ 路由必须注册在 `/:id` 之前,否则会被当成 id="approval-flow" 走 Get → 404。
+func (h *Handler) GetApprovalFlow(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "settlement:view") {
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"nodes": h.svc.ApprovalFlowNodes()})
 }
 
 // ---- 查询 ----

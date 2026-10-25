@@ -356,7 +356,7 @@
 |---|---|---|---|
 | `id` | string | - | |
 | `pig_id` | string | - | 关联 whole_pig.id |
-| `cut_type` | enum | - | `belly` / `tenderloin` / `rib` / `leg_front` / `leg_rear` / `trotter` / `liver` |
+| `cut_type` | enum | - | 鲜肉部位,34 类封闭集合(见 [REQUIREMENTS §4.6](./REQUIREMENTS.md#46-部位枚举cut_type2026-10-23-扩到-34-类));取值:`whole_pig` / `head` / `head_skin` / `ear` / `tongue` / `neck` / `leg_front` / `shoulder_blade` / `belly` / `rib` / `tenderloin` / `lean` / `leg_rear` / `trotter` / `tail` / `skin` / `fat` / `local_pork` / `bone_shank` / `bone_scapula` / `bone_spine` / `bone_rib` / `bone_head` / `liver` / `heart` / `lung` / `kidney` / `stomach` / `stomach_honeycomb` / `intestine` / `intestine_head` / `intestine_small` / `spleen` / `tendon` |
 | `barcode` | string | - | 单品条码 |
 | `weight_kg` | decimal | kg | 单品重量 |
 | `expires_at` | datetime | - | 保质期 |
@@ -377,6 +377,58 @@
 
 > **粒度**:门店 + cut_type(五花 / 里脊 / 排骨 / 前后腿 / 猪蹄 / 猪肝)。
 > **不盘点不阻断**:当日未录入盘点,作为"次日开盘库存"继续销售,当日 fresh-meat 毛利按 llm 推演 / 历史均值估算,sales-agg 在 BI 标注推演来源。
+
+#### 1.6.1 库存位置与 SKU 成本(2026-10-23 新增)
+
+门店只有**两个存放位置**;「全店」是查询口径,不是第三个真实位置。
+
+`sku_stock_positions`:
+
+| 字段 | 类型 | 单位 | 说明 |
+|---|---|---|---|
+| `branch_id` | string | - | |
+| `cube_product_id` | string | - | 复合主键之一 |
+| `location` | enum | - | 复合主键之一;`counter`(猪肉台)/ `cold_store`(冷库) |
+| `qty_kg` | decimal | kg | 该位置的库存量 |
+| `updated_at` | datetime | - | |
+
+`sku_cost_states`(全店移动加权成本状态,当日有效):
+
+| 字段 | 类型 | 单位 | 说明 |
+|---|---|---|---|
+| `branch_id` / `cube_product_id` | string | - | 复合主键 |
+| `qty_kg` | decimal | kg | 期末全店量 |
+| `amount_yuan` | decimal | 元 | 期末全店金额 |
+| `moving_avg_unit_cost` | decimal | 元/kg | 全店移动加权单价 |
+| `last_biz_date` | date | - | 最后核算的营业日 |
+
+`sku_cost_daily`(日快照;可审计 + 长期毛利按它累计):
+
+| 字段 | 类型 | 单位 | 说明 |
+|---|---|---|---|
+| `branch_id` / `biz_date` / `cube_product_id` | string/date/string | - | 唯一键 |
+| `cut_type` | enum | - | 部位 |
+| `opening_kg` / `opening_amount` | decimal | kg / 元 | 期初 |
+| `produced_kg` / `produced_amount` | decimal | kg / 元 | 本期入库(分割产出) |
+| `sold_kg` / `sold_amount` | decimal | kg / 元 | 零售卖出 |
+| `bulk_sold_kg` / `bulk_sold_amount` | decimal | kg / 元 | 统收(酒店)卖出 |
+| `waste_kg` / `waste_amount` | decimal | kg / 元 | 报损 |
+| `closing_kg` / `closing_amount` | decimal | kg / 元 | 期末(全店) |
+| `moving_avg_unit_cost` | decimal | 元/kg | 本期移动加权单价 |
+| `sales_cost_yuan` | decimal | 元 | 本期销售成本 |
+| `counter_qty` / `cold_store_qty` | decimal | kg | 期末两位置分布 |
+| `data_source` | enum | - | `actual` / `partial` / `estimated` |
+
+**新端点**:
+
+| 端点 | scope | 说明 |
+|---|---|---|
+| `POST /stock/counter-load` | `freshmeat:write` | 开市准备:冷库 → 猪肉台(可部分、可不上);搬超冷库余额返 400 |
+| `GET /stock?scope=counter\|all` | `freshmeat:view` | 库存查询;**默认 `counter`**;**不提供"只查冷库"** |
+
+**毛利报告新增字段**(`GET /gross-margin`):
+`per_sku[]`(SKU 级明细)/ `reconciliation`(成本对账行)/ `losses`(切分损耗 + 隔夜失重·盘亏);
+部位行的 `purchase_cost_yuan` **改名** `sales_cost_yuan`(语义从"摊销采购成本"变为"本期销售成本")。
 
 ### 1.7 stocktake(盘点,dapr app `stocktake`,本期重点)
 

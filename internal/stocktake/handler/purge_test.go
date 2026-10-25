@@ -34,6 +34,7 @@ func newPurgeDB(t *testing.T) *gorm.DB {
 		&model.StocktakeLineOperation{},
 		&model.StocktakePlanItem{},
 		&model.StocktakeBranchDefault{},
+		&model.StocktakeExcludedScope{},
 	))
 	require.NoError(t, testrun.RegisterGorm(db))
 	return db

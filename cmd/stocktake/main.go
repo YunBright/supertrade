@@ -30,6 +30,7 @@ import (
 	"github.com/YunBright/supertrade/internal/stocktake"
 	"github.com/YunBright/supertrade/internal/stocktake/handler"
 	"github.com/YunBright/supertrade/internal/stocktake/model"
+	"github.com/YunBright/supertrade/internal/stocktake/seed"
 	"github.com/YunBright/supertrade/internal/stocktake/service"
 	"github.com/YunBright/supertrade/pkg/cmdbootstrap"
 	"github.com/YunBright/supertrade/pkg/middleware"
@@ -77,9 +78,23 @@ func initApp() error {
 		&model.StocktakeLineOperation{},
 		&model.StocktakePlanItem{},
 		&model.StocktakeBranchDefault{},
+		&model.StocktakeExcludedScope{},
 	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
 	}
+
+	// 排除域配置(默认:两家生产门店的猪肉分类)幂等装配一次。
+	//
+	// ⚠️ 为什么不放在"运维手工跑一次"的脚本里:这张表是**守卫**,
+	// 漏装 ⇒ 猪肉被两条流程各盘一次 ⇒ 两个数、没人说得清哪个对,
+	// 而失败是**静默**的。启动时装配 ⇒ 守卫永远在。
+	// 装配失败 ⇒ 启动失败(宁可起不来,也不要静默地少一道守卫)。
+	created, updated, skipped, err := seed.Apply(appDB, time.Now())
+	if err != nil {
+		return fmt.Errorf("seed excluded scopes: %w", err)
+	}
+	slog.Info("排除域配置已装配",
+		"created", created, "updated", updated, "skipped", skipped)
 
 	appCube, err = initCubeClient()
 	if err != nil {

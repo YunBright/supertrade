@@ -22,7 +22,7 @@ import (
 	"github.com/YunBright/supertrade/internal/stocktake/model"
 )
 
-// PurgeRegistry 是 stocktake 的可清理实体清单（5 张表都要列，原因见文件头）。
+// PurgeRegistry 是 stocktake 的可清理实体清单（6 张表都要列，原因见文件头）。
 //
 // # 顺序：不是正确性要求，是报告准确性要求
 //
@@ -45,6 +45,14 @@ func PurgeRegistry() *purge.Registry {
 		purge.Model{Table: "stocktake_plan_items", Model: &model.StocktakePlanItem{}},
 		purge.Model{Table: "stocktake_branch_defaults", Model: &model.StocktakeBranchDefault{}},
 		purge.Model{Table: "stocktake_headers", Model: &model.StocktakeHeader{}},
+		// 排除域配置（2026-10-23 新增）。
+		//
+		// 登记它只是为了**兜底**：清理按“本次运行记过账的行”定位，
+		// 而 seed 装配的配置行是在**没有 run_id 的上下文**里写的
+		// ⇒ 不会被记账 ⇒ 本次运行删不到它们 ⇒ 不会被误删。
+		// 反过来，若哪天有人加了“运行期改排除域”的端点，漏登记就会留下
+		// 永远清不掉的行（且不报错）—— 先登记上，这条隐患就不存在了。
+		purge.Model{Table: "stocktake_excluded_scopes", Model: &model.StocktakeExcludedScope{}},
 	)
 }
 

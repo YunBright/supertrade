@@ -113,6 +113,17 @@ func initApp() error {
 		cfg.ApplyControlTypes = [3]string{ts[0], ts[1], ts[2]}
 	}
 	cfg.AIConclusionControlID = os.Getenv("SETTLEMENT_AUDITOR_AI_CONCLUSION_CONTROL_ID")
+	// 审批流程节点声明(与企微管理后台里「付款审批」模板的流程设置对应)。
+	//
+	// ⚠️ 企微的公开 API 读不到流程配置(gettemplatedetail 只给表单控件),
+	//    所以这份声明只能由 app 侧持有 —— **改模板流程时这里要一起改**。
+	//    解析失败直接退出:配置错了要让进程起不来,而不是等到店长发起时才发现。
+	flow, err := service.ParseApprovalFlow(os.Getenv("SETTLEMENT_AUDITOR_APPROVAL_FLOW"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "SETTLEMENT_AUDITOR_APPROVAL_FLOW 非法: %v\n", err)
+		os.Exit(1)
+	}
+	cfg.ApprovalFlow = flow
 	appSvc = service.New(appDB, cfg)
 
 	// dapr client(pub/sub + conversation + invoke 共用)。

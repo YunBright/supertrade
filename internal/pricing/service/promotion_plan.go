@@ -77,6 +77,13 @@ type PromotionPlanQuery struct {
 	// ⚠️ 默认 true:图4 的默认视图是"当前有效的方案",
 	// 而促销方案是时效数据 —— 2021 年的方案和今天的方案混在一张列表里没法用。
 	ExcludeExpired bool
+	// Sort 是排序字段(白名单,见 promotionPlanSortColumns)。空 = 默认制单日期。
+	//
+	// ⚠️ 非法字段 ⇒ **400**(不是静默回落):静默回落 = 用户点了排序、
+	// 列表没变、零提示,与"参数被忽略"无法区分。
+	Sort string
+	// Order 是排序方向(asc / desc)。空 = 默认 desc(倒序)。
+	Order string
 	// Page 从 1 开始;PageSize 是每页条数。
 	Page     int
 	PageSize int
@@ -230,21 +237,33 @@ func (s *PromotionPlanService) List(ctx context.Context, branchID string, q Prom
 		return nil, err
 	}
 	q = q.normalized()
-	if useCube {
-		return s.cubeList(ctx, q)
+	// ⚠️ 排序参数**先校验后使用**:非法字段静默回落成默认排序 =
+	// "用户点了按方案名称排、列表还是按日期排",零提示。
+	sortCol, err := promotionPlanSortColumnOf(q.Sort)
+	if err != nil {
+		return nil, err
 	}
-	return s.localList(ctx, branchID, q)
+	dir, err := promotionPlanSortDirection(q.Order)
+	if err != nil {
+		return nil, err
+	}
+	if useCube {
+		return s.cubeList(ctx, q, sortCol, dir)
+	}
+	return s.localList(ctx, branchID, q, sortCol, dir)
 }
 
 // cubeList 走 cube 的促销方案列表。
-func (s *PromotionPlanService) cubeList(ctx context.Context, q PromotionPlanQuery) (*PromotionPlanPage, error) {
+func (s *PromotionPlanService) cubeList(ctx context.Context, q PromotionPlanQuery, sortCol promotionPlanSortColumn, dir string) (*PromotionPlanPage, error) {
 	cq := cubeclient.CubeQuery{
 		Measures:   []string{"promotion_plan.count"},
 		Dimensions: promotionPlanDims(),
-		Order:      []cubeclient.CubeOrder{{ID: "promotion_plan.plan_no", Order: "asc"}},
-		Limit:      q.PageSize,
-		Offset:     (q.Page - 1) * q.PageSize,
-		Total:      true,
+		// ⚠️ 排序成员必须**同时在 SELECT 里**(cube 的硬约束)——
+		// sortCol.CubeDim 一定在 promotionPlanDims() 里,否则 cube 返 400。
+		Order:  promotionPlanCubeOrder(sortCol, dir),
+		Limit:  q.PageSize,
+		Offset: (q.Page - 1) * q.PageSize,
+		Total:  true,
 	}
 	cq.Filters = append(cq.Filters, promotionPlanFilters(q)...)
 	rows, total, err := s.reader.LoadCubeQueryPage(ctx, "promotion_plan", cq)
@@ -310,7 +329,7 @@ func promotionPlanFilters(q PromotionPlanQuery) []cubeclient.CubeFilter {
 }
 
 // localList 走本域 PG 的促销方案列表。
-func (s *PromotionPlanService) localList(ctx context.Context, branchID string, q PromotionPlanQuery) (*PromotionPlanPage, error) {
+func (s *PromotionPlanService) localList(ctx context.Context, branchID string, q PromotionPlanQuery, sortCol promotionPlanSortColumn, dir string) (*PromotionPlanPage, error) {
 	if s.db == nil {
 		return nil, model.ErrLocalStoreNotReady
 	}
@@ -344,7 +363,8 @@ func (s *PromotionPlanService) localList(ctx context.Context, branchID string, q
 		return nil, err
 	}
 	var rows []model.PromotionPlan
-	if err := tx.Order("plan_no").
+	// ⚠️ 排序走白名单表达式(列名来自 promotionPlanSortColumns,不接受用户原文)。
+	if err := tx.Order(promotionPlanLocalOrderExpr(sortCol.LocalColumn, dir)).
 		Offset((q.Page - 1) * q.PageSize).
 		Limit(q.PageSize).
 		Find(&rows).Error; err != nil {

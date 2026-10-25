@@ -56,10 +56,16 @@ type ApprovalInstance struct {
 	Status           string          `gorm:"size:24;index" json:"status"`
 	// SpNo 是企微审批单号(apply_event command_result 回填)。
 	SpNo string `gorm:"size:64;index" json:"sp_no"`
-	// ApproverUserIDs / CcUserIDs 是本次发起时申请人选定的审批人/抄送人
-	// 企微 userid 列表(JSON 数组),随单快照;提交企微时映射为
-	// process.node_list(type=1 审批人 / type=2 抄送人)。
+	// ApproverUserIDs / HandlerUserIDs / CcUserIDs 是本次发起时申请人在
+	// H5 用企微原生选人器选定的**各节点成员**(企微 userid 列表,JSON 数组),
+	// 随单快照;提交企微时映射为 process.node_list
+	// (type=1 审批人 / type=3 办理人 / type=2 抄送人)。
+	//
+	// ⚠️ 三个节点都存在是因为企微模板的流程里三个节点都是「申请人自选」——
+	// 成员由发起人在提交时选,不是模板写死。缺一个节点 = 企微那边少一个人
+	// (办理人就是这样丢的)。
 	ApproverUserIDs datatypes.JSON `gorm:"type:jsonb" json:"approver_userids"`
+	HandlerUserIDs  datatypes.JSON `gorm:"type:jsonb" json:"handler_userids"`
 	CcUserIDs       datatypes.JSON `gorm:"type:jsonb" json:"cc_userids"`
 	// SpStatus 是企微审批状态:1审批中 2通过 3驳回 4撤销 6通过后撤销 10已支付。
 	SpStatus int `gorm:"default:0" json:"sp_status"`
@@ -180,6 +186,7 @@ type ApprovalApproverPreference struct {
 	BranchID        string         `gorm:"size:32;index" json:"branch_id"`
 	ApplicantUserID string         `gorm:"size:64;index" json:"applicant_user_id"`
 	ApproverUserIDs datatypes.JSON `gorm:"type:jsonb" json:"approver_userids"`
+	HandlerUserIDs  datatypes.JSON `gorm:"type:jsonb" json:"handler_userids"`
 	CcUserIDs       datatypes.JSON `gorm:"type:jsonb" json:"cc_userids"`
 	UpdatedAt       time.Time      `gorm:"index" json:"updated_at"`
 }
@@ -210,9 +217,9 @@ type StocktakeNotifyGroup struct {
 	// AppID 是这个群所属的**自建应用** handle(不是 agentid)。
 	AppID string `gorm:"column:app_id;type:varchar(64)"`
 	// AppName 是自建应用名称(只用于回显)。
-	AppName    string    `gorm:"column:app_name;type:varchar(128)"`
-	UpdatedBy  string    `gorm:"column:updated_by;type:varchar(64)"`
-	UpdatedAt  time.Time `gorm:"column:updated_at"`
+	AppName   string    `gorm:"column:app_name;type:varchar(128)"`
+	UpdatedBy string    `gorm:"column:updated_by;type:varchar(64)"`
+	UpdatedAt time.Time `gorm:"column:updated_at"`
 }
 
 func (StocktakeNotifyGroup) TableName() string { return "stocktake_notify_groups" }

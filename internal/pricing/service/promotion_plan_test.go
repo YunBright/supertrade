@@ -271,6 +271,142 @@ func TestPromotionPlan_Get_NotFound(t *testing.T) {
 	assert.ErrorIs(t, err, ErrPromotionPlanNotFound)
 }
 
+// ---- 排序 ----
+
+// TestPromotionPlans_CubeQueryCarriesSortOrder 锁"排序真的进了 cube 查询"。
+//
+// ⚠️ 只断言"返回了 200"是**抓不到**一个被静默忽略的排序参数:
+// 用户点了"按方案名称排",列表还是按日期排,零提示。
+func TestPromotionPlans_CubeQueryCarriesSortOrder(t *testing.T) {
+	src := &fakeSource{src: externalSource()}
+	svc, _, reader := newPlanSvc(t, src)
+
+	_, err := svc.List(context.Background(), "00", PromotionPlanQuery{
+		Sort: "plan_name", Order: "asc", Page: 1, PageSize: 50,
+	})
+	require.NoError(t, err)
+
+	q, ok := reader.LastQuery("promotion_plan")
+	require.True(t, ok)
+	require.Len(t, q.Query.Order, 2, "排序项 = 排序列 + 兜底键")
+	assert.Equal(t, "promotion_plan.plan_name", q.Query.Order[0].ID)
+	assert.Equal(t, "asc", q.Query.Order[0].Order)
+	// ⚠️ 兜底键:排序列会并列 ⇒ 没有兜底键就不是全序 ⇒ 翻页会重复 / 漏行。
+	assert.Equal(t, "promotion_plan.plan_no", q.Query.Order[1].ID)
+	assert.Equal(t, "asc", q.Query.Order[1].Order)
+}
+
+// TestPromotionPlans_SortByPlanNoHasNoDuplicateTieBreaker 锁"按方案编号排时**不重复**给兜底键"。
+//
+// ⚠️ MSSQL 的 ORDER BY 里同一列出现两次直接报
+// "在排序依据列表中多次指定了某一列"(错误 169)⇒ 整条查询 503 `cube_unavailable`。
+//
+// 症状:按"方案编号"排序时列表**整个打不开**,按其它列排一切正常
+// ⇒ 看起来像"编号列坏了",真实原因是兜底键撞了排序列。
+func TestPromotionPlans_SortByPlanNoHasNoDuplicateTieBreaker(t *testing.T) {
+	src := &fakeSource{src: externalSource()}
+	svc, _, reader := newPlanSvc(t, src)
+
+	_, err := svc.List(context.Background(), "00", PromotionPlanQuery{
+		Sort: "plan_no", Order: "asc", Page: 1, PageSize: 50,
+	})
+	require.NoError(t, err)
+
+	q, ok := reader.LastQuery("promotion_plan")
+	require.True(t, ok)
+	require.Len(t, q.Query.Order, 1, "排序列本身就是 plan_no ⇒ 兜底键必须跳过(否则 MSSQL 169)")
+	assert.Equal(t, "promotion_plan.plan_no", q.Query.Order[0].ID)
+	assert.Equal(t, "asc", q.Query.Order[0].Order)
+}
+
+// TestPromotionPlanLocalOrderExpr_SkipsDuplicateTieBreaker 锁本域 PG 侧的同一件事。
+//
+// PG 侧重复列不报错,但纯属多余 ⇒ 两边行为必须一致(否则两条路径的分页顺序会分叉)。
+func TestPromotionPlanLocalOrderExpr_SkipsDuplicateTieBreaker(t *testing.T) {
+	assert.NotContains(t, promotionPlanLocalOrderExpr("plan_no", "asc"), "plan_no ASC,",
+		"排序列是 plan_no 时不能重复给兜底键")
+	assert.Contains(t, promotionPlanLocalOrderExpr("created_at", "asc"), "plan_no ASC",
+		"其它排序列仍要带兜底键(否则并列 ⇒ 不是全序 ⇒ 翻页重复/漏行)")
+	assert.Contains(t, promotionPlanLocalOrderExpr("created_at", "desc"), "plan_no ASC")
+}
+
+// TestPromotionPlans_DefaultSortIsCreatedAtDesc 锁"默认按制单日期倒序"。
+func TestPromotionPlans_DefaultSortIsCreatedAtDesc(t *testing.T) {
+	src := &fakeSource{src: externalSource()}
+	svc, _, reader := newPlanSvc(t, src)
+
+	_, err := svc.List(context.Background(), "00", PromotionPlanQuery{Page: 1, PageSize: 50})
+	require.NoError(t, err)
+
+	q, ok := reader.LastQuery("promotion_plan")
+	require.True(t, ok)
+	require.NotEmpty(t, q.Query.Order)
+	assert.Equal(t, "promotion_plan.created_at", q.Query.Order[0].ID)
+	assert.Equal(t, "desc", q.Query.Order[0].Order)
+}
+
+// TestPromotionPlans_InvalidSortIsRejected 锁"非法排序字段 ⇒ 400(不是静默回落)"。
+//
+// 静默回落的后果:用户点了排序、列表没变、**没有任何提示**。
+func TestPromotionPlans_InvalidSortIsRejected(t *testing.T) {
+	src := &fakeSource{src: externalSource()}
+	svc, _, _ := newPlanSvc(t, src)
+
+	_, err := svc.List(context.Background(), "00", PromotionPlanQuery{
+		Sort: "plan_no; drop table promotion_plans", Page: 1, PageSize: 50,
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, model.ErrInvalidInput)
+}
+
+// TestPromotionPlans_InvalidOrderIsRejected 锁"非法方向 ⇒ 400"。
+func TestPromotionPlans_InvalidOrderIsRejected(t *testing.T) {
+	src := &fakeSource{src: externalSource()}
+	svc, _, _ := newPlanSvc(t, src)
+
+	_, err := svc.List(context.Background(), "00", PromotionPlanQuery{
+		Sort: "created_at", Order: "sideways", Page: 1, PageSize: 50,
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, model.ErrInvalidInput)
+}
+
+// TestPromotionPlans_LocalSortOrdersRows 锁"本域 PG 路径真的按排序列排"。
+func TestPromotionPlans_LocalSortOrdersRows(t *testing.T) {
+	src := &fakeSource{src: localSource()}
+	svc, db, _ := newPlanSvc(t, src)
+
+	begin := time.Date(2021, 9, 17, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2021, 9, 18, 0, 0, 0, 0, time.UTC)
+	early := time.Date(2021, 9, 17, 9, 0, 0, 0, time.UTC)
+	late := time.Date(2021, 9, 17, 21, 30, 0, 0, time.UTC)
+	rows := []any{
+		&model.PromotionPlan{PlanNo: "PS002109160001", BranchID: "10", PlanName: "早",
+			BeginDate: &begin, EndDate: &end, CreatedAt: &early, CreatedBy: "2001",
+			ApproveFlag: "1", ApproveStatus: "draft", MemberLevel: "无"},
+		&model.PromotionPlan{PlanNo: "PS002109160002", BranchID: "10", PlanName: "晚",
+			BeginDate: &begin, EndDate: &end, CreatedAt: &late, CreatedBy: "2001",
+			ApproveFlag: "1", ApproveStatus: "draft", MemberLevel: "无"},
+	}
+	for _, r := range rows {
+		require.NoError(t, db.Create(r).Error, "seed")
+	}
+
+	desc, err := svc.List(context.Background(), "10", PromotionPlanQuery{
+		Sort: "created_at", Order: "desc", ExcludeExpired: false, Page: 1, PageSize: 50,
+	})
+	require.NoError(t, err)
+	require.Len(t, desc.Items, 2)
+	assert.Equal(t, "PS002109160002", desc.Items[0].PlanNo, "倒序 ⇒ 新的在前")
+
+	asc, err := svc.List(context.Background(), "10", PromotionPlanQuery{
+		Sort: "created_at", Order: "asc", ExcludeExpired: false, Page: 1, PageSize: 50,
+	})
+	require.NoError(t, err)
+	require.Len(t, asc.Items, 2)
+	assert.Equal(t, "PS002109160001", asc.Items[0].PlanNo, "升序 ⇒ 旧的前")
+}
+
 // ---- 两条路径的响应结构必须逐字相同 ----
 
 func TestPromotionPlans_LocalAndCubeHaveSameShape(t *testing.T) {

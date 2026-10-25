@@ -158,6 +158,14 @@ var (
 	// ErrCubeForbidden cube 侧 per-branch 守门拒绝(最常见:缺 cube:read scope)。
 	// handler 映射 403 —— cube 本身是健康的,拒绝的是**这个账号**。
 	ErrCubeForbidden = errors.New("service: 当前账号缺少该门店的 cube 读权限")
+	// ErrProductScopeExcluded 商品落在本门店的「排除域」里(例:猪肉由 fresh-meat 域盘)。
+	//
+	// handler 映射 400 —— 这是**选错了盘点流程**,不是服务端故障:
+	// 通用盘点与鲜肉盘点对同一批猪肉各盘一次 ⇒ 两个数、没人说得清哪个对。
+	// 消息里带一句可操作的话(来自配置行 note),告诉操作员该去哪个流程盘。
+	//
+	// 判定口径与 fail open 规则见 service/scope.go。
+	ErrProductScopeExcluded = errors.New("service: 该商品不属于本盘点域")
 )
 
 // authRejectedErr 判断 err 是否表示"userd 拒绝了调用者的 token"。
@@ -603,6 +611,22 @@ func (s *Service) AddLine(ctx context.Context, headerID string, in AddLineInput)
 	if product.ID == "" {
 		return nil, fmt.Errorf("%w: product_id=%q (cube 返空记录)",
 			ErrProductNotFound, in.ProductID)
+	}
+
+	// 1.5 排除域判定(猪肉等由别的域盘,通用盘点不许再盘一次)
+	//
+	// 放在 GetProduct 之后、GetStock 之前:判定只需要 category_id,
+	// 而 GetStock 是**第二次跨主机往返** —— 先判掉能省一次。
+	//
+	// fail open:分类取不到(product.CategoryID 为空)⇒ 放行。
+	// cube 不可达不该让通用盘点整个不能用。
+	if err := s.checkProductExcluded(ctx, h.BranchID, product.CategoryID, in.ProductID); err != nil {
+		if errors.Is(err, ErrProductScopeExcluded) {
+			return nil, err
+		}
+		// 读配置失败 ⇒ fail open(记日志后放行),别把守卫的故障说成业务拒绝。
+		s.pubLogger.Warn("排除域判定失败,按 fail open 放行",
+			"branch_id", h.BranchID, "product_id", in.ProductID, "err", err)
 	}
 
 	// 2. 拉 cube stock 快照(跨店阻断)
@@ -1549,6 +1573,18 @@ type AddPlanItemsInput struct {
 //
 // 任一重复 (header_id, product_id) 立即整体回滚 → ErrPlanItemDuplicated;
 // product_name / unit / barcode 若客户端未传,服务端从 cube 现拉(便于 UI 直接展示)。
+//
+// # 排除域(猪肉等):整批拒绝,不是"跳过那一条"
+//
+// 任一条商品落在本门店的排除域里 ⇒ **整批回滚**,返回 ErrProductScopeExcluded。
+//
+// 为什么整批拒绝而不是跳过那一条:
+//   - 本端点已经在事务里,重复商品也是整批回滚(既有语义);
+//   - "半批入库"比"整批失败"更难查 —— 前端拿到 201 与部分商品,
+//     却不知道哪些被丢了;后者是一句明确的 400,调用方原样重试即可。
+//
+// ⚠️ 计划清单是**人工圈品**的(仓管预选),所以排除域命中多半是"圈错了",
+// 让人改完再提交,比"系统悄悄替你删几条"更符合直觉。
 func (s *Service) AddPlanItems(ctx context.Context, headerID string, in AddPlanItemsInput) ([]model.StocktakePlanItem, error) {
 	if len(in.Items) == 0 {
 		return nil, nil
@@ -1556,6 +1592,16 @@ func (s *Service) AddPlanItems(ctx context.Context, headerID string, in AddPlanI
 	h, err := s.GetHeader(ctx, headerID)
 	if err != nil {
 		return nil, err
+	}
+
+	// 排除域配置:整批只读一次(逐条读会重复打同一张表)。
+	// 读失败 ⇒ fail open(记日志后按"没有排除域"继续),别把守卫的故障
+	// 翻译成业务拒绝。
+	scopes, scopeErr := s.loadExcludedScopes(ctx, h.BranchID)
+	if scopeErr != nil {
+		s.pubLogger.Warn("排除域配置读取失败,按 fail open 放行",
+			"branch_id", h.BranchID, "err", scopeErr)
+		scopes = &excludedScopeSet{categories: map[string]string{}}
 	}
 
 	now := s.now()
@@ -1567,27 +1613,52 @@ func (s *Service) AddPlanItems(ctx context.Context, headerID string, in AddPlanI
 				return fmt.Errorf("%w: product_id 必填", ErrInvalidStatus)
 			}
 
-			// product_name / unit / barcode 缺省时从 cube 拉
+			// product_name / unit / barcode 缺省时从 cube 拉;
+			// **而且每次都要问一次 cube** —— 排除域判定要用 product.category_id,
+			// 客户端传来的 name/barcode 里没有它。
+			//
+			// cube 问不到时的语义(fail open):
+			//   - 商品不存在 / cube 故障 ⇒ 分类未知 ⇒ **不排除**;
+			//   - 但 name/barcode 也缺着 ⇒ 沿用既有语义:直接报错
+			//     (这次调用本来就拿不到商品档案,不是"排除域"问题)。
 			name := it.ProductName
 			unit := it.Unit
 			barcode := it.Barcode
-			if s.cube != nil && (name == "" || barcode == "") {
-				product, err := s.cube.GetProduct(ctx, it.ProductID)
-				if err != nil && !errors.Is(err, cubeclient.ErrProductNotFound) {
-					return fmt.Errorf("cube get product: %w", err)
-				}
-				if product != nil {
-					if name == "" {
-						name = product.Name
+			categoryID := ""
+			if s.cube != nil {
+				product, perr := s.cube.GetProduct(ctx, it.ProductID)
+				switch {
+				case perr != nil && !errors.Is(perr, cubeclient.ErrProductNotFound):
+					if name == "" || barcode == "" {
+						return fmt.Errorf("cube get product: %w", perr)
 					}
-					if unit == "" {
-						unit = product.Unit
-					}
-					if barcode == "" {
-						barcode = product.Barcode
+					s.pubLogger.Warn("计划盘点:取商品失败,分类未知按 fail open 处理",
+						"product_id", it.ProductID, "err", perr)
+				case perr != nil:
+					// 商品在 cube 里不存在 ⇒ 分类未知 ⇒ 不排除。
+					s.pubLogger.Warn("计划盘点:商品在 cube 中不存在,分类未知按 fail open 处理",
+						"product_id", it.ProductID, "err", perr)
+				default:
+					if product != nil {
+						categoryID = product.CategoryID
+						if name == "" {
+							name = product.Name
+						}
+						if unit == "" {
+							unit = product.Unit
+						}
+						if barcode == "" {
+							barcode = product.Barcode
+						}
 					}
 				}
 			}
+
+			// 排除域判定:命中 ⇒ 整批回滚(事务返回错误,已插入的行一并撤掉)。
+			if err := scopes.excludeError(h.BranchID, categoryID, it.ProductID); err != nil {
+				return err
+			}
+
 			if name == "" {
 				name = it.ProductID // 兜底
 			}

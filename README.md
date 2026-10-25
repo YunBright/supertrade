@@ -543,7 +543,7 @@ daprCli.InvokeMethodWithContent(ctx,
 
 | 服务 | Schema | 关键表 |
 |---|---|---|
-| `stocktake` | `stocktake` | `stocktake_headers` / `stocktake_lines` / `stocktake_line_operations` / `stocktake_plan_items` / `stocktake_branch_defaults` |
+| `stocktake` | `stocktake` | `stocktake_headers` / `stocktake_lines` / `stocktake_line_operations` / `stocktake_plan_items` / `stocktake_branch_defaults` / `stocktake_excluded_scopes` |
 | `catalog` | `catalog` | `suppliers`(复合主键 `(id, branch_id)`)/ `products`(复合主键) |
 | `cube-router` | `cube_router` | `branch_cube_sources`(主键 `branch_id`) |
 

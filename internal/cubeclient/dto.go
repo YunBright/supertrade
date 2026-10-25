@@ -303,3 +303,21 @@ type PromotionDTO struct {
 	BeginDay  string           `json:"begin_day"`            // 活动起始日 ISO yyyy-mm-dd
 	EndDay    string           `json:"end_day"`              // 活动截止日 ISO yyyy-mm-dd
 }
+
+// ProductPriceQuote 是某个商品**当前售价**的一条结论(零售价 + 促销价)。
+//
+// # 为什么单独一个 DTO(而不是复用 ProductDTO)
+//
+// `ProductDTO.PriceYuan` 是"这个商品卖多少钱"(可能为 nil = 没维护价),
+// 而**促销价**是**时效数据**:同一时刻有的商品有促销、有的没有。
+// 预售结转要的是"**有促销价按促销价**"这条结论 ⇒ 必须把两者放在一起给。
+type ProductPriceQuote struct {
+	// ProductID 是商品 id(= 思迅 item_no = 商品条码)。
+	ProductID string `json:"product_id"`
+	// PriceYuan 是**零售价**;nil = 该商品**没维护售价**(与"售价 0 元"是两件事)。
+	PriceYuan *decimal.Decimal `json:"price_yuan,omitempty"`
+	// PromoPriceYuan 是**当前生效促销价**;nil = 没有生效促销(绝大多数商品的常态)。
+	//
+	// ⚠️ 同一商品多张促销单生效时取**最低**那条(与 GetActivePromotion 同口径)。
+	PromoPriceYuan *decimal.Decimal `json:"promo_price_yuan,omitempty"`
+}

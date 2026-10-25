@@ -258,6 +258,9 @@ func newTestService(t *testing.T) (*Service, *gorm.DB, *fakeCube, *fakePublisher
 }
 
 // submitOK 提交一笔合法审批(S1,金额 amount)。
+//
+// ⚠️ 必须带上**办理人**:模板的流程里审批人/办理人/抄送人三个节点全是
+// 「申请人自选」⇒ 三个节点都要有人(办理人单选,出纳)。少一个 ⇒ 400。
 func submitOK(t *testing.T, svc *Service, amount string) *model.ApprovalInstance {
 	t.Helper()
 	ap, err := svc.SubmitApproval(context.Background(), "B1", SubmitInput{
@@ -267,8 +270,13 @@ func submitOK(t *testing.T, svc *Service, amount string) *model.ApprovalInstance
 		SettlementIDs:    []string{"S1"},
 		ManualAmountYuan: dec(amount),
 		Remark:           "9月货款",
-		ApproverUserIDs:  []string{"apr1"},
-		CcUserIDs:        []string{"cc1"},
+		FlowSelections: FlowSelections{
+			FlowNodeApprover: []string{"apr1"},
+			FlowNodeHandler:  []string{"handler1"},
+			FlowNodeCC:       []string{"cc1"},
+		},
+		ApproverUserIDs: []string{"apr1"},
+		CcUserIDs:       []string{"cc1"},
 	})
 	if err != nil {
 		t.Fatalf("SubmitApproval: %v", err)
@@ -328,9 +336,12 @@ func TestSubmitApproval_Validation(t *testing.T) {
 		{"金额为负", "B1", func(in *SubmitInput) { in.ManualAmountYuan = dec("-1") }},
 		{"结算单为空", "B1", func(in *SubmitInput) { in.SettlementIDs = nil }},
 		{"结算单超上限", "B1", func(in *SubmitInput) { in.SettlementIDs = tooMany }},
-		{"缺审批人", "B1", func(in *SubmitInput) { in.ApproverUserIDs = nil }},
 		{"审批人超上限", "B1", func(in *SubmitInput) { in.ApproverUserIDs = tooManyApprovers }},
 	}
+	// ⚠️ **"缺审批人"不再是校验错误**（2026-10-23）:
+	// 审批人为空 = 走企业微信审批模板在管理后台配的流程(含办理人)。
+	// 见 SubmitApproval 里 use_template_approver 的说明。
+	// ⇒ 它的行为由 TestSubmitApproval_NoApproverUsesTemplateFlow 单独锁。
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			in := valid
@@ -381,16 +392,22 @@ func TestRunAudit_PassLLM(t *testing.T) {
 	if p.CreatorUserID != "wecom-u1" || p.TemplateID != "tpl-1" || p.UseTemplateApprover != 0 {
 		t.Errorf("payload = %+v", p)
 	}
-	if p.Process == nil || len(p.Process.NodeList) != 2 {
-		t.Fatalf("process 应有审批+抄送 2 节点: %+v", p.Process)
+	// 节点顺序/类型与企微模板的流程设置一致:
+	// 审批人(type=1, 依次审批=3) → 办理人(type=3, 或签=2) → 抄送人(type=2)。
+	if p.Process == nil || len(p.Process.NodeList) != 3 {
+		t.Fatalf("process 应有 审批+办理+抄送 3 节点: %+v", p.Process)
 	}
 	n0 := p.Process.NodeList[0]
-	if n0.Type != 1 || n0.ApvRel != 2 || len(n0.UserID) != 1 || n0.UserID[0] != "apr1" {
-		t.Errorf("审批节点 = %+v, want type=1 apv_rel=2 [apr1]", n0)
+	if n0.Type != 1 || n0.ApvRel != ApvRelSerial || len(n0.UserID) != 1 || n0.UserID[0] != "apr1" {
+		t.Errorf("审批节点 = %+v, want type=1 apv_rel=3 [apr1]", n0)
 	}
 	n1 := p.Process.NodeList[1]
-	if n1.Type != 2 || n1.UserID[0] != "cc1" {
-		t.Errorf("抄送节点 = %+v, want type=2 [cc1]", n1)
+	if n1.Type != 3 || n1.ApvRel != ApvRelAny || len(n1.UserID) != 1 || n1.UserID[0] != "handler1" {
+		t.Errorf("办理节点 = %+v, want type=3 apv_rel=2 [handler1]", n1)
+	}
+	n2 := p.Process.NodeList[2]
+	if n2.Type != 2 || n2.UserID[0] != "cc1" {
+		t.Errorf("抄送节点 = %+v, want type=2 [cc1]", n2)
 	}
 	if !strings.Contains(string(p.ApplyData), "S1") || !strings.Contains(string(p.ApplyData), "100.00") {
 		t.Errorf("apply_data 应含结算单号与金额: %s", p.ApplyData)
@@ -498,6 +515,7 @@ func TestRunAudit_ProductionCase_20261022(t *testing.T) {
 		ManualAmountYuan: dec("8206.20"),
 		Remark:           "9月货款",
 		ApproverUserIDs:  []string{"apr1"},
+		HandlerUserIDs:   []string{"handler1"},
 		CcUserIDs:        []string{"cc1"},
 	})
 	if err != nil {
@@ -544,7 +562,7 @@ func TestStepFinish_RejectNotifiesApplicant(t *testing.T) {
 		ID: "ap-rej-applicant", CorpID: "wcorp-test", BranchID: "B1",
 		ApplicantUserID: "u-1", ApplicantWecomID: "wecom-u1",
 		ApproverUserIDs: datatypes.JSON([]byte(`["wecom-apr1","wecom-apr2"]`)),
-		Status:           model.StatusAuditing,
+		Status:          model.StatusAuditing,
 	}
 	if err := db.Create(ap).Error; err != nil {
 		t.Fatalf("create ap: %v", err)
@@ -887,6 +905,7 @@ func TestRunAudit_CPInventoryAnomaly_FullChain(t *testing.T) {
 		ManualAmountYuan: dec("100"),
 		Remark:           "CP 异常模拟",
 		ApproverUserIDs:  []string{"apr1"},
+		HandlerUserIDs:   []string{"handler1"},
 	})
 	if err != nil {
 		t.Fatalf("SubmitApproval: %v", err)
@@ -1351,6 +1370,7 @@ func TestSubmitApproval_DedupeIDs(t *testing.T) {
 		SettlementIDs:    []string{"S1", "S1", " S2 "},
 		ManualAmountYuan: dec("150"),
 		ApproverUserIDs:  []string{"apr1"},
+		HandlerUserIDs:   []string{"handler1"},
 	})
 	if err != nil {
 		t.Fatalf("SubmitApproval: %v", err)

@@ -319,3 +319,57 @@ type StocktakeBranchDefault struct {
 
 // TableName 显式表名。
 func (StocktakeBranchDefault) TableName() string { return "stocktake_branch_defaults" }
+
+// ---- 排除域配置 (StocktakeExcludedScope) ----
+
+// ScopeKindCategory = 排除域按「商品分类(cube product.category_id)」判定。
+const ScopeKindCategory = "category"
+
+// ScopeKindProduct = 排除域按「**商品货号**(cube product.id = 思迅 item_no)」判定。
+//
+// ⚠️ 2026-10-23 新增。猪肉必须用**货号**口径,不能用类目:
+//
+//	佳乐(01) 的猪肉类目 `1201`「佳乐超市猪肉部」里**混着**羊肉/牛肉/鸡/预制菜
+//	(实测 03415 羊肉、03005 特价牛肉30Y、03455 新鲜鸡肾、03527 五花肉串 …)
+//	⇒ 按类目一刀切会把这些**非猪肉**商品也一起挡掉
+//	⇒ 通用盘点就**盘不了**门店的真实库存 ⇒ 过度排除,同样是错的。
+//
+// 货号口径的权威来源 = **fresh-meat 的部位映射表**(那里就是"这些货号是猪肉部位"的
+// 唯一事实源)⇒ 排除清单按 SKU 从那里派生,并由 fresh-meat 在映射变化时推送。
+const ScopeKindProduct = "product"
+
+// StocktakeExcludedScope 是「本服务**不盘**的商品域」的**按门店**配置。
+//
+// # 为什么需要它
+//
+// 猪肉由 fresh-meat 域盘(按部位切分),通用盘点**不许**再盘一次:
+// 同一批猪肉被两条流程各盘一次 ⇒ 两个数、没人说得清哪个对,而失败是**静默**的。
+// 所以必须在**写路径**上拒绝,而不是前端过滤(前端过滤能被绕过)。
+//
+// # 为什么按门店存
+//
+// cube 的 category_id 是思迅 `item_clsno`,**每个门店各编各的**:
+// 佳乐(branch 01)的猪肉类是 1201,富百家(branch 00)的是 010303。
+// ⇒ 写死一个全局列表 = 另一个门店的同类商品被误伤(或者反过来,漏防)。
+//
+// # scope_kind / scope_value
+//
+// 目前只有 scope_kind='category'(按分类排除),scope_value = cube category_id。
+// 留出 kind 是为了以后能按「供应商 / 标签」排除,而不必改表结构。
+//
+// # note
+//
+// note 是**给操作员看的一句话**(例:"猪肉请用鲜肉盘点(生鲜肉盘点)"),
+// 拒绝时原样带进错误消息 ⇒ 改文案不用发版。
+type StocktakeExcludedScope struct {
+	ID         string    `gorm:"primaryKey;column:id;type:varchar(64)"`
+	BranchID   string    `gorm:"column:branch_id;type:varchar(64);not null;uniqueIndex:idx_excluded_scope,priority:1"`
+	ScopeKind  string    `gorm:"column:scope_kind;type:varchar(32);not null;uniqueIndex:idx_excluded_scope,priority:2"`
+	ScopeValue string    `gorm:"column:scope_value;type:varchar(64);not null;uniqueIndex:idx_excluded_scope,priority:3"`
+	Note       string    `gorm:"column:note;type:varchar(255)"`
+	CreatedAt  time.Time `gorm:"column:created_at;not null"`
+	UpdatedAt  time.Time `gorm:"column:updated_at;not null"`
+}
+
+// TableName 显式表名。
+func (StocktakeExcludedScope) TableName() string { return "stocktake_excluded_scopes" }

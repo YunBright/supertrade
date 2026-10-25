@@ -88,8 +88,8 @@ type PurchaseSheetRow struct {
 	//
 	// 源列 oper_date(思迅 t_pm_sheet_master)是**真 datetime**,
 	// cube 返回形如 "08 23 2026  4:19PM" ⇒ 用 normalizeCubeDate 规范化。
-	CreatedAt         string
-	TotalAmountYuan   decimal.Decimal
+	CreatedAt          string
+	TotalAmountYuan    decimal.Decimal
 	TotalNetAmountYuan decimal.Decimal
 }
 

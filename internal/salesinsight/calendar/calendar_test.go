@@ -116,12 +116,12 @@ func TestResolvePeriodUsesSameLengthComparison(t *testing.T) {
 			wantPrev: [2]string{"2026-10-15", "2026-10-15"},
 		},
 		{
-			// 2026-10-16 是周五 ⇒ 本周一 10-12，上周一 10-05。
-			// 本期 = 上周一(10-05)~上周日(10-11) = 完整 7 天
-			// 上期 = 上上周一(09-28)~上上周日(10-04) = 完整 7 天 ✅
+			// 2026-10-16 是周五 ⇒ 本周日 10-11，上周日 10-04。
+			// 本期 = 上周日(10-04)~上周六(10-10) = 完整 7 天
+			// 上期 = 上上周日(09-27)~上上周六(10-03) = 完整 7 天 ✅
 			name: "周报取上一个完整周而非本周至今", kind: PeriodWeekly, now: "2026-10-16",
-			wantCur:  [2]string{"2026-10-05", "2026-10-11"},
-			wantPrev: [2]string{"2026-09-28", "2026-10-04"},
+			wantCur:  [2]string{"2026-10-04", "2026-10-10"},
+			wantPrev: [2]string{"2026-09-27", "2026-10-03"},
 		},
 		{
 			// 本期 = 上月1号(09-01)~上月末(09-30)
@@ -192,20 +192,21 @@ func TestMonthlyPeriodsAreWholeMonths(t *testing.T) {
 
 // 周报必须是**完整 7 天**，且落在上一个完整周里。
 //
-// 2026-10-16 是周五 ⇒ 上周一 10-05 ~ 上周日 10-11。
+// 2026-10-16 是周五 ⇒ 上周日 10-04 ~ 上周六 10-10（周日为一周之始，
+// 与思迅老系统及 App 端的 date_range_preset 同一口径）。
 //
 // ⚠️ 钉的是「上周」而不是「本周」：周报在**周一**推，
-// 若取"本周一~今天"就只有 1 天，那不是周报（2026-10-23 现场实测的 bug）。
+// 若取"本周一到今天"就只有 1 天，那不是周报（2026-10-23 现场实测的 bug）。
 func TestWeeklyPeriodIsWholePreviousWeek(t *testing.T) {
 	p, err := ResolvePeriod(PeriodWeekly, mustTime(t, "2026-10-16"))
 	if err != nil {
 		t.Fatalf("ResolvePeriod 失败: %v", err)
 	}
-	if got := Format(p.Cur.Start); got != "2026-10-05" {
-		t.Errorf("本期起点 = %s, 期望 2026-10-05（上周一）", got)
+	if got := Format(p.Cur.Start); got != "2026-10-04" {
+		t.Errorf("本期起点 = %s, 期望 2026-10-04（上周日）", got)
 	}
-	if got := Format(p.Cur.End); got != "2026-10-11" {
-		t.Errorf("本期终点 = %s, 期望 2026-10-11（上周日）", got)
+	if got := Format(p.Cur.End); got != "2026-10-10" {
+		t.Errorf("本期终点 = %s, 期望 2026-10-10（上周六）", got)
 	}
 	if n := p.Cur.Days(); n != 7 {
 		t.Errorf("周报本期必须是完整 7 天，实际 %d 天", n)
@@ -213,11 +214,11 @@ func TestWeeklyPeriodIsWholePreviousWeek(t *testing.T) {
 	if n := p.Prev.Days(); n != 7 {
 		t.Errorf("周报上期必须是完整 7 天，实际 %d 天", n)
 	}
-	if wd := p.Cur.Start.Weekday(); wd != time.Monday {
-		t.Errorf("周报本期起点应是周一，实际 %v", wd)
+	if wd := p.Cur.Start.Weekday(); wd != time.Sunday {
+		t.Errorf("周报本期起点应是周日，实际 %v", wd)
 	}
-	if wd := p.Cur.End.Weekday(); wd != time.Sunday {
-		t.Errorf("周报本期终点应是周日，实际 %v", wd)
+	if wd := p.Cur.End.Weekday(); wd != time.Saturday {
+		t.Errorf("周报本期终点应是周六，实际 %v", wd)
 	}
 }
 

@@ -516,35 +516,73 @@ func (c *DaprCubeClient) SearchProductsByBarcode(ctx context.Context, barcode, b
 	return out, nil
 }
 
-// SearchSuppliers 按 ID 精确 或 name 模糊查供应商。
+// SearchSuppliers 按 ID 精确 **或** name 模糊查供应商。
 //
-// query 以 "SUP-" 开头 → 走 id equals;
-// 否则走 name contains。
+// # ⚠️ 2026-10-23 修正:原来只在 query 以 `"SUP-"` 开头时才走 id equals。
+//
+// 思迅的供应商编码是**数字**(`1001` / `1002` / `0` / `0001` …),
+// **不带 "SUP-" 前缀** ⇒ 按真实编码查时落到 `name contains` 分支
+// ⇒ 在供应商**名字**里搜 "1001" 搜不到 ⇒ 返回空
+// ⇒ 门店用真实供应商编码进猪时被拒:
+// 「service: 输入校验失败: supplier_id 1001 在 cube 中不存在」(实测 2026-10-23)。
+//
+// ⇒ 改成:**先按 id 精确查,查不到再按 name 模糊查**。
+//
+//	id equals  → 命中(编码查)        ⇒ 返回
+//	           → 没命中(人输的是名字) ⇒ 回落 name contains
+//
+// 代价:名字类查询多一次往返(可接受 —— 供应商下拉是低频操作)。
 func (c *DaprCubeClient) SearchSuppliers(ctx context.Context, query string, limit int) ([]SupplierDTO, error) {
 	cq := CubeQuery{
 		Measures: []string{"supplier.count"},
 		Dimensions: []string{"supplier.id", "supplier.name", "supplier.type",
 			"supplier.contact", "supplier.phone"},
 	}
-	if query != "" {
-		if strings.HasPrefix(query, "SUP-") {
-			cq.Filters = []CubeFilter{
-				{Member: "supplier.id", Operator: "equals", Values: []any{query}},
-			}
-			cq.Limit = 1
-		} else {
-			cq.Filters = []CubeFilter{
-				{Member: "supplier.name", Operator: "contains", Values: []any{query}},
-			}
-			if limit > 0 {
-				cq.Limit = limit
-			}
+	byID := func(q string) CubeQuery {
+		c := cq
+		c.Filters = []CubeFilter{
+			{Member: "supplier.id", Operator: "equals", Values: []any{q}},
 		}
+		c.Limit = 1
+		return c
 	}
-	data, err := c.LoadCubeQuery(ctx, "supplier", cq)
+	byName := func(q string) CubeQuery {
+		c := cq
+		c.Filters = []CubeFilter{
+			{Member: "supplier.name", Operator: "contains", Values: []any{q}},
+		}
+		if limit > 0 {
+			c.Limit = limit
+		}
+		return c
+	}
+
+	// 空 query ⇒ 全部(不筛)
+	if query == "" {
+		data, err := c.LoadCubeQuery(ctx, "supplier", cq)
+		if err != nil {
+			return nil, err
+		}
+		return supplierDTOs(data), nil
+	}
+	// 1) 先按 id 精确
+	data, err := c.LoadCubeQuery(ctx, "supplier", byID(query))
 	if err != nil {
 		return nil, err
 	}
+	if len(data) > 0 {
+		return supplierDTOs(data), nil
+	}
+	// 2) 没命中 ⇒ 按 name 模糊(人输的是供应商名字)
+	data, err = c.LoadCubeQuery(ctx, "supplier", byName(query))
+	if err != nil {
+		return nil, err
+	}
+	return supplierDTOs(data), nil
+}
+
+// supplierDTOs 把 cube 返回的行转成 DTO。
+func supplierDTOs(data []map[string]any) []SupplierDTO {
 	out := make([]SupplierDTO, 0, len(data))
 	for _, row := range data {
 		out = append(out, SupplierDTO{
@@ -555,7 +593,7 @@ func (c *DaprCubeClient) SearchSuppliers(ctx context.Context, query string, limi
 			Phone:   asStr(row["supplier.phone"]),
 		})
 	}
-	return out, nil
+	return out
 }
 
 // GetActivePromotion 查 itemNo 在 onDate 当天(或今天)生效的促销,返回**最低价**那一条。

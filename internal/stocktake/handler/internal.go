@@ -116,6 +116,10 @@ func (h *Handler) mapInternalErr(c *gin.Context, err error) {
 		errors.Is(err, service.ErrPlanItemDuplicated),
 		errors.Is(err, service.ErrRecheckRequiresParent):
 		writeError(c, http.StatusBadRequest, "bad_request", err.Error())
+	case errors.Is(err, service.ErrProductScopeExcluded):
+		// 400:计划清单里圈了别的域的商品(例:猪肉)。
+		// 语义同对外端点 —— 是"圈错了",不是服务端故障。
+		writeError(c, http.StatusBadRequest, "excluded_scope", err.Error())
 	default:
 		writeError(c, http.StatusInternalServerError, "internal_error", err.Error())
 	}

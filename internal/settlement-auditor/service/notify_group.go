@@ -70,11 +70,11 @@ func (s *Service) SetStocktakeNotifyGroup(ctx context.Context, branchID string, 
 		return nil, fmt.Errorf("%w: chat_id 与 app_id 必填(群必须指明所属自建应用)", ErrInvalidInput)
 	}
 	row := &model.StocktakeNotifyGroup{
-		BranchID: branchID,
-		ChatID:   chatID,
-		ChatName: strings.TrimSpace(in.ChatName),
-		AppID:    appID,
-		AppName:  strings.TrimSpace(in.AppName),
+		BranchID:  branchID,
+		ChatID:    chatID,
+		ChatName:  strings.TrimSpace(in.ChatName),
+		AppID:     appID,
+		AppName:   strings.TrimSpace(in.AppName),
 		UpdatedBy: strings.TrimSpace(operatorID),
 		UpdatedAt: s.now(),
 	}

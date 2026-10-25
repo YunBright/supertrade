@@ -36,6 +36,19 @@ type Config struct {
 	CorpID string
 	// TemplateID 是企微"结算付款审批"模板 id(apply_event 用)。
 	TemplateID string
+	// ApprovalFlow 是本次审批的**流程节点声明**,与企微管理后台里那个模板的
+	// 「规则设置 → 审批流程设置」一一对应(节点类型/顺序/选人方式/多人办理方式)。
+	//
+	// ⚠️ 为什么必须由 app 侧持有这份声明:
+	// 企微的**公开 API 读不到流程配置** —— `oa/gettemplatedetail` 的响应
+	// schema 只有 `template_content.controls`(表单控件),没有流程节点字段;
+	// `getapprovaldetail` 的 `sp_record` 也没有节点类型。
+	// ⇒ 模板里配的节点只能"声明在 app 侧",UI 按它渲染、提交按它组装
+	// process.node_list。两边对不上 = 企微里少一个节点(办��人就是这样丢的)。
+	//
+	// 默认值见 DefaultApprovalFlow(对齐 2026-10-23 模板实际配置:
+	// 审批人=申请人自选/依次审批,办理人=申请人自选/单选,抄送人=申请人自选)。
+	ApprovalFlow []ApprovalFlowNode
 	// AmountToleranceYuan 是**数值容差**(默认 0.01 元):同一套源数据内部的勾稽
 	// (结算单明细合计 vs 单头货款)允许的误差,只挡源数据的精度噪声。
 	AmountToleranceYuan float64
@@ -280,12 +293,16 @@ func (s *Service) InvalidateScopeCache(userID, branchID string) {
 // ApproverPreference 是某申请人在某 branch 下最近一次使用的审批流人员。
 type ApproverPreference struct {
 	ApproverUserIDs []string `json:"approver_userids"`
-	CcUserIDs       []string `json:"cc_userids"`
+	// HandlerUserIDs 是上次选的**办理人**(企微办理人节点,type=3)。
+	HandlerUserIDs []string `json:"handler_userids"`
+	CcUserIDs      []string `json:"cc_userids"`
 }
 
 // GetApproverPreference 读取偏好;从未提交过时返回空切片(不报错)。
 func (s *Service) GetApproverPreference(ctx context.Context, branchID, userID string) (*ApproverPreference, error) {
-	pref := &ApproverPreference{ApproverUserIDs: []string{}, CcUserIDs: []string{}}
+	pref := &ApproverPreference{
+		ApproverUserIDs: []string{}, HandlerUserIDs: []string{}, CcUserIDs: []string{},
+	}
 	if branchID == "" || userID == "" {
 		return pref, fmt.Errorf("%w: branch_id/user_id 必填", ErrInvalidInput)
 	}
@@ -301,11 +318,17 @@ func (s *Service) GetApproverPreference(ctx context.Context, branchID, userID st
 	if len(row.ApproverUserIDs) > 0 {
 		_ = json.Unmarshal(row.ApproverUserIDs, &pref.ApproverUserIDs)
 	}
+	if len(row.HandlerUserIDs) > 0 {
+		_ = json.Unmarshal(row.HandlerUserIDs, &pref.HandlerUserIDs)
+	}
 	if len(row.CcUserIDs) > 0 {
 		_ = json.Unmarshal(row.CcUserIDs, &pref.CcUserIDs)
 	}
 	if pref.ApproverUserIDs == nil {
 		pref.ApproverUserIDs = []string{}
+	}
+	if pref.HandlerUserIDs == nil {
+		pref.HandlerUserIDs = []string{}
 	}
 	if pref.CcUserIDs == nil {
 		pref.CcUserIDs = []string{}
@@ -314,14 +337,18 @@ func (s *Service) GetApproverPreference(ctx context.Context, branchID, userID st
 }
 
 // upsertApproverPreference 用本次提交的选择覆盖偏好(提交成功即记住)。
-func (s *Service) upsertApproverPreference(ctx context.Context, branchID, userID string, approvers, cc []string) error {
-	ab, _ := json.Marshal(dedupeStrings(approvers))
-	cb, _ := json.Marshal(dedupeStrings(cc))
+//
+// 三个节点都记(审批人/办理人/抄送人)—— 模板里它们全是「申请人自选」。
+func (s *Service) upsertApproverPreference(ctx context.Context, branchID, userID string, flow FlowSelections) error {
+	ab, _ := json.Marshal(dedupeStrings(flow[FlowNodeApprover]))
+	hb, _ := json.Marshal(dedupeStrings(flow[FlowNodeHandler]))
+	cb, _ := json.Marshal(dedupeStrings(flow[FlowNodeCC]))
 	row := model.ApprovalApproverPreference{
 		ID:              branchID + ":" + userID,
 		BranchID:        branchID,
 		ApplicantUserID: userID,
 		ApproverUserIDs: ab,
+		HandlerUserIDs:  hb,
 		CcUserIDs:       cb,
 		UpdatedAt:       s.now(),
 	}

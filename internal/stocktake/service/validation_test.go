@@ -40,6 +40,7 @@ func setupWithCube(t *testing.T, cube cubeclient.Client) *service.Service {
 		&model.StocktakeLineOperation{},
 		&model.StocktakePlanItem{},
 		&model.StocktakeBranchDefault{},
+		&model.StocktakeExcludedScope{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

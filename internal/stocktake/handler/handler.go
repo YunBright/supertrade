@@ -20,6 +20,7 @@
 //	ErrCubeUnavailable → 503
 //	ErrUserInfoUnavailable → 503(userd 不可用,影响 effective scopes 校验)
 //	ErrProductNotFound / ErrStockNotFound → 400(数据问题)
+//	ErrProductScopeExcluded → 400(商品属于别的盘点域,例:猪肉走鲜肉盘点)
 //	其它 → 500
 package handler
 
@@ -258,6 +259,11 @@ func mapErr(c *gin.Context, err error) {
 		errors.Is(err, service.ErrInvalidDiffReason),
 		errors.Is(err, service.ErrInvalidOpMethod):
 		writeError(c, http.StatusBadRequest, "bad_request", err.Error())
+	case errors.Is(err, service.ErrProductScopeExcluded):
+		// 400 而不是 500:这是**选错了盘点流程**(例:猪肉该走鲜肉盘点),
+		// 不是服务端故障。单独的 code 让前端能识别"换个流程再来",
+		// 而不是弹一句笼统的"请求有误"。
+		writeError(c, http.StatusBadRequest, "excluded_scope", err.Error())
 	case errors.Is(err, service.ErrCubeUnavailable):
 		writeError(c, http.StatusServiceUnavailable, "cube_unavailable", err.Error())
 	// 2026-10-08:调用者 token 被 userd 拒(401)。必须排在 ErrUserInfoUnavailable
