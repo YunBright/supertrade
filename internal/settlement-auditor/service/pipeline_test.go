@@ -235,7 +235,7 @@ func newTestService(t *testing.T) (*Service, *gorm.DB, *fakeCube, *fakePublisher
 		t.Fatalf("open sqlite: %v", err)
 	}
 	if err := db.AutoMigrate(
-		&model.ApprovalInstance{}, &model.ApprovalSettlement{}, &model.AuditSignal{},
+		&model.ApprovalInstance{}, &model.ApprovalSettlement{}, &model.ApprovalAttachment{}, &model.AuditSignal{},
 		&model.AuditLog{}, &model.LLMVerdict{}, &model.ApprovalStocktakeLink{},
 		&model.SettlementPayState{}, &model.StocktakeNotifyGroup{},
 	); err != nil {

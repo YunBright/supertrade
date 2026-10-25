@@ -66,7 +66,7 @@ func newArchiveDB(t *testing.T) *gorm.DB {
 	db, err := testdb.OpenSQLite(":memory:?_pragma=foreign_keys(1)")
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(
-		&model.ApprovalInstance{}, &model.ApprovalSettlement{}, &model.AuditSignal{},
+		&model.ApprovalInstance{}, &model.ApprovalSettlement{}, &model.ApprovalAttachment{}, &model.AuditSignal{},
 		&model.AuditLog{},
 	))
 	return db

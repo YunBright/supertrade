@@ -78,23 +78,24 @@ type ApplyEventPayload struct {
 	NotifyType  int             `json:"notify_type,omitempty"`
 	ApplyData   json.RawMessage `json:"apply_data"`
 	SummaryList json.RawMessage `json:"summary_list"`
-	// Attachment 是「附件」型控件的待上传内容(可选)。
+	// AttachmentControlID / AttachmentControlType 是模板里**附件(File)控件**的
+	// id 与类型(实测 2026-10-25:control=File / id=item-1494251220825)。
 	//
-	// 企微的 File 型控件要的是 media_id,而 media_id 只能用**持有 OA token 的
-	// 一侧**(wechat-bot)上传素材才能拿到 ⇒ 这里只带**内容**,
-	// 上传与控件组装在 wechat-bot 侧完成(镜像 wechat-bot
-	// wapproval.ApprovalAttachment,wire 字段必须逐字对齐)。
-	Attachment *ApprovalAttachment `json:"attachment,omitempty"`
+	// 模板知识属于本服务(settlement-auditor),wechat-bot 只负责把文件变成
+	// media_id 并塞进这个控件 ⇒ 控件 id 由这里给。
+	AttachmentControlID   string `json:"attachment_control_id,omitempty"`
+	AttachmentControlType string `json:"attachment_control_type,omitempty"`
+	// Attachments 是要附到该控件上的文件(明细清单 + 发起人自己上传的)。
+	// 企微的 File 控件值形状是 files[] 数组 ⇒ 一次可附多个。
+	Attachments []ApprovalAttachment `json:"attachments,omitempty"`
 }
 
-// ApprovalAttachment 是「附件」控件的待上传内容(业务侧只负责生成内容)。
+// ApprovalAttachment 是要随审批附上的一个文件。
+//
+// ⚠️ 字段必须与 wechat-bot internal/wapproval.ApprovalAttachment 逐字对齐
+// (两个 module 不能互相 import,字段名错位 ⇒ 附件静默丢失)。
 type ApprovalAttachment struct {
-	// ControlID 是企微模板里该控件的 id(实测 2026-10-25:「结算付款」模板
-	// controls 里 control=File / id=item-1494251220825)。
-	ControlID string `json:"control_id"`
-	// ControlType 是控件类型(默认 File)。
-	ControlType string `json:"control_type,omitempty"`
-	// FileName 是附件名(审批单上显示的名字)。
+	// FileName 是文件名(审批单上显示的名字)。
 	FileName string `json:"file_name"`
 	// ContentBase64 是文件内容(base64 标准编码)。
 	ContentBase64 string `json:"content_base64"`

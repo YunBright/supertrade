@@ -84,6 +84,8 @@ func initApp() error {
 	if err := appDB.AutoMigrate(
 		&model.ApprovalInstance{},
 		&model.ApprovalSettlement{},
+		// 发起人上传的附件(图片/文件)——机器审核是异步的,字节要活到 pass 那一刻。
+		&model.ApprovalAttachment{},
 		&model.AuditSignal{},
 		&model.AuditLog{},
 		&model.LLMVerdict{},

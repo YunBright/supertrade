@@ -45,24 +45,66 @@ curl -X POST "https://qyapi.weixin.qq.com/cgi-bin/oa/gettemplatedetail?access_to
 
 ---
 
-## 3. 为什么跨两个仓
+## 3. 两条附件来源
+
+| 来源 | 什么时候产生 | 落在哪 |
+|---|---|---|
+| **发起人自己上传**（拍照/相册，像企微官方审批的附件控件） | 提交那一刻（前端 `ww.chooseImage` → base64 随 body 过来） | 落库 `approval_attachments`（字节） |
+| **结算单明细清单**（CSV） | 机器审核**通过**那一刻（用 cube 当前金额现算） | 不入库，直接进命令载荷 |
+
+### 3.1 发起人上传的为什么要落库
+
+机器审核是**异步**的（`go s.runAudit`），而企微 File 控件的 media_id 必须由
+wechat-bot 用 **OA token** 上传（media_id 绑定上传它的应用，别的应用用不了）
+⇒ 字节必须从"提交那一刻"活到"机器审核通过、准备提交企微"那一刻。
+提交请求返回后前端就走了 ⇒ **只能落库**。
+
+`approval_attachments`（AutoMigrate 建表）：
+
+| 列 | 说明 |
+|---|---|
+| `approval_id` / `branch_id` / `applicant_user_id` | 归属（删审批时按 approval_id 级联删） |
+| `file_name` | 文件名（**已去路径分隔符**并限长 —— 前端给的名字可能带 `../`） |
+| `content_type` / `size` | MIME 与字节数 |
+| `data` | `bytea`，**`json:"-"` ⇒ 不出现在任何 API 响应里** |
+
+### 3.2 上限（两边都要挡）
+
+- 最多 **3** 个（`maxAttachmentsPerApproval`），单个解码后 **≤2MB**（`maxAttachmentBytes`）。
+- base64 让体积涨约 1/3 ⇒ 单个上限按**解码后**的字节数算。
+- 非法 base64 / 空文件 / 超限 ⇒ **提交时就拒**（`validateAttachment`），别留到流水线里炸。
+
+### 3.3 提交协议
+
+```json
+POST /settlement-approvals
+{ "...其它字段...": "...",
+  "attachments": [
+    {"file_name":"发票.jpg","content_type":"image/jpeg","content_base64":"QUJD...","size":20480}
+  ]}
+```
+
+---
+
+## 4. 为什么跨两个仓 + wire 契约
 
 企微的 File 型控件要的不是内容，而是 **media_id**：
 
 ```json
 {"control":"File","id":"item-1494251220825",
- "value":{"files":[{"file_id":"<media_id>","file_name":"结算单明细-CP001.csv"}]}}
+ "value":{"files":[{"file_id":"<media_id>","file_name":"发票.jpg"},
+                  {"file_id":"<media_id2>","file_name":"结算单明细-CP001.csv"}]}}
 ```
 
 media_id **只能用持 OA token 的一侧上传素材才能拿到**（`media/upload?type=file`，multipart），
 而 **OA secret 只有 wechat-bot 持有**（Dapr state `wechat-bot-manager||wecom-approval/config/00`）。
 
-而"附件里放什么"是**业务知识**（结算单明细）⇒ 职责切分：
+而"附件里放什么"是**业务知识** ⇒ 职责切分：
 
 ```
 settlement-auditor（业务）                 wechat-bot（企微唯一出口）
-  生成明细 CSV（附件内容）      ──wire──▶   base64 解码 → media/upload → 拿 media_id
-  只带内容，不碰素材/控件                       → 往 apply_data.contents 追加 File 控件
+  给内容（明细 CSV + 上传的文件）  ──wire──▶  base64 解码 → media/upload → 拿 media_id
+  只带内容，不碰素材/控件                          → 往 apply_data.contents 追加 File 控件
 ```
 
 ### wire 契约（两边字段必须逐字对齐）
@@ -70,19 +112,33 @@ settlement-auditor（业务）                 wechat-bot（企微唯一出口�
 ```go
 // supertrade: internal/settlement-auditor/service/publisher.go
 // wechat-bot: internal/wapproval/model.go
+type ApplyEventPayload struct {
+    ...
+    AttachmentControlID   string `json:"attachment_control_id,omitempty"`   // 模板里 File 控件的 id
+    AttachmentControlType string `json:"attachment_control_type,omitempty"` // 默认 File
+    Attachments           []ApprovalAttachment `json:"attachments,omitempty"` // 明细清单 + 发起人上传的
+}
+
 type ApprovalAttachment struct {
-    ControlID    string `json:"control_id"`     // 企微模板控件 id
-    ControlType  string `json:"control_type"`   // 默认 File
-    FileName     string `json:"file_name"`      // 审批单上显示的名字
-    ContentBase64 string `json:"content_base64"` // 文件内容
+    FileName      string `json:"file_name"`       // 审批单上显示的名字
+    ContentBase64 string `json:"content_base64"`  // 文件内容
 }
 ```
 
-挂在 `ApplyEventPayload.attachment`（可选，缺省 = 不带附件）。
+⚠️ 两个 module 不能互相 import ⇒ **字段名对不上时编译期看不出来**，
+运行时表现为"附件静默丢失"（企微单上就是没有附件，没有任何报错）。
+⇒ 两边各有一份**黄金 JSON 契约测试**
+（supertrade: `TestApplyEventPayloadAttachmentWire`；wechat-bot: `TestApplyEventPayloadWireFromSupertrace`… 即
+`TestApplyEventPayloadWireFromSupertrade`）。
+
+### 4.1 部署顺序：**先 wechat-bot**
+
+旧的 wechat-bot 会忽略未知的字段（Go 的 json.Unmarshal 行为）
+⇒ 先发业务侧的话，附件会**静默丢失**（不报错、就是没有附件）。
 
 ---
 
-## 4. 业务侧实现（supertrade）
+## 5. 业务侧实现（supertrade）
 
 `internal/settlement-auditor/service/attachment.go`：
 
@@ -91,11 +147,14 @@ type ApprovalAttachment struct {
   - ⚠️ **带 UTF-8 BOM**（`EF BB BF`）：审批人拿 Excel 打开，不带 BOM 会被按 GBK 猜 ⇒ 整张表乱码。
   - 金额取 **cube 当前值**（与审批单上的付款金额同源，不会自相矛盾）。
   - 账期走 `normalizeCubeDate`（cube 有 ISO 与 MSSQL 美式两种串）。
-- `buildSettlementDetailAttachment(rows)` → `*ApprovalAttachment`
-  - 控件 id 为空 / 没有结算单 ⇒ 返回 nil（**不带附件**，不猜 id）。
+- `storeAttachments(ctx, ap, ins)` —— 落库发起人上传的附件。
+- `loadApprovalAttachments(ctx, ap, settlements)` → `[]ApprovalAttachment`
+  - **明细清单在前、发起人上传的在后**（审批人先看单据明细，再看凭证）。
+  - 控件 id 没配 ⇒ 只给上传的文件也不给（整个附件区关掉）。
 
-`pipeline.go` 的 `stepFinish`（pass 分支）把它挂进 `ApplyEventPayload.Attachment`。
-`stepFinish` 现在多一个参数 `settlements []SettlementRow`（流水线 step 1 已经拿到 cube 行，
+`pipeline.go` 的 `stepFinish`（pass 分支）把它们挂进
+`ApplyEventPayload.AttachmentControlID / AttachmentControlType / Attachments`。
+`stepFinish` 多一个参数 `settlements []SettlementRow`（流水线 step 1 已经拿到 cube 行，
 直接复用 ⇒ **不为附件多打一次 cube**）。
 
 ### 配置
@@ -114,14 +173,16 @@ SETTLEMENT_AUDITOR_ATTACHMENT_CONTROL_TYPE=File
 
 ---
 
-## 5. 企微侧实现（wechat-bot）
+## 6. 企微侧实现（wechat-bot）
 
 `internal/wapproval/service.go`：
 
-- `attachFileControl(...)`：`base64` 解码 → `client.UploadFile(...)` → `injectFileControl(...)`。
+- `attachFileControl(...)`：逐个附件 `base64` 解码 → `client.UploadFile(...)`
+  → 收集 `{file_id, file_name}` → `injectFileControl(...)`。
 - ⚠️ **附件失败不阻断整单**：附件控件是**选填**的，而审批人判断要不要付钱靠的是
-  单号/金额/备注 ⇒ 上传失败只记 warn，**继续提交**（控件留空），不把付款审批卡死。
+  单号/金额/备注 ⇒ **单个**附件上传失败只记 warn 并跳过，其它附件照常。
   （base64 非法是上游的 bug，不是网络问题 ⇒ 直接报错，让上游发现。）
+- 一个 File 控件的 `files[]` 里可以放多个文件（明细清单 + 发起人上传的）。
 
 `internal/wapproval/service.go::injectFileControl`：
 
@@ -138,9 +199,11 @@ SETTLEMENT_AUDITOR_ATTACHMENT_CONTROL_TYPE=File
 
 | 仓 | 测试 | 锁什么 |
 |---|---|---|
-| supertrade | `service/attachment_test.go` | BOM 在、表头/列/合计、MSSQL 账期规整、无名称的供应商、控件 id 为空 ⇒ 不带附件 |
+| supertrade | `service/attachment_test.go` | BOM 在、表头/列/合计、MSSQL 账期规整、无名称的供应商、**文件名去路径**、base64/空/超限被拒、落库↔读回、控件 id 为空 ⇒ 不带附件 |
+| supertrade | `service/attachment_test.go::TestApplyEventPayloadAttachmentWire` | **跨仓黄金 JSON**（字段名逐字对齐） |
 | wechat-bot | `internal/wechat/wecom/oa_test.go` | 上传成功拿 media_id、业务错误要报错、空文件名本地失败（不发请求） |
 | wechat-bot | `internal/wapproval/attachment_test.go` | 注入是**追加**（不弄丢上游控件）、类型默认 File、files 形状、坏 apply_data 要报错 |
+| wechat-bot | `internal/wapproval/attachment_test.go::TestApplyEventPayloadWireFromSupertrade` | **跨仓黄金 JSON**（另一侧的反序列化） |
 | wechat-bot | `internal/wapproval/attachment_test.go`（组合用例） | 命令带附件 → 上传 → 注入 → 提交 applyevent（用仓库自带的假企微，不碰生产） |
 
 **线上自查**（不产生审批单）：
@@ -163,11 +226,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File F:\go\src\github.com\YunBrig
 powershell -NoProfile -ExecutionPolicy Bypass -File F:\go\src\github.com\YunBright\deployer\deploy-supertrade.ps1 -Service settlement-auditor
 ```
 
-顺序：**先 wechat-bot**。老的 wechat-bot 会忽略未知的 `attachment` 字段（Go 的 json.Unmarshal 行为），
+顺序：**先 wechat-bot**。老的 wechat-bot 会忽略未知的字段（Go 的 json.Unmarshal 行为），
 ⇒ 先发业务侧的话，附件会**静默丢失**（不报错、就是没有附件）。
 
 改过 unit env 的话，部署后记得 `systemctl --user daemon-reload` + 重启，
 并核对**进程**里的 env（`tr '\0' '\n' < /proc/<pid>/environ | grep ATTACHMENT`），别只看 unit 文件。
+
+新表 `approval_attachments` 由 **AutoMigrate** 在启动时建（`cmd/settlement-auditor/main.go`）
+⇒ 不用手工迁移；部署后可用 `select count(*) from approval_attachments` 确认表已存在。
 
 ---
 
@@ -175,4 +241,5 @@ powershell -NoProfile -ExecutionPolicy Bypass -File F:\go\src\github.com\YunBrig
 
 **真实审批单上看到附件**，需要一笔**能过机器审核**的付款审批。
 近两天提交都被机器驳回了 ⇒ applyevent 这条路没被验证过。
-验证方式：发一笔小额付款审批 → 企微审批单上应出现「结算单明细-<首单号>.csv」。
+验证方式：发一笔小额付款审批（可带一张附件图）→ 企微审批单上应出现
+「结算单明细-<首单号>.csv」与发起人上传的图片。

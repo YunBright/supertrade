@@ -1,11 +1,14 @@
 package service
 
 import (
-	"bytes"
+	"context"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/csv"
 	"strings"
 	"testing"
+
+	"github.com/YunBright/supertrade/internal/settlement-auditor/model"
 )
 
 // 明细清单的形状回归锁。
@@ -25,10 +28,10 @@ func TestBuildSettlementDetailCSV(t *testing.T) {
 	}
 	out := buildSettlementDetailCSV(rows)
 
-	if !bytes.HasPrefix(out, []byte{0xEF, 0xBB, 0xBF}) {
+	if !strings.HasPrefix(string(out), "\xEF\xBB\xBF") {
 		t.Fatal("缺 UTF-8 BOM:Excel 会按 GBK 猜,整张表乱码")
 	}
-	recs, err := csv.NewReader(bytes.NewReader(out[3:])).ReadAll()
+	recs, err := csv.NewReader(strings.NewReader(string(out[3:]))).ReadAll()
 	if err != nil {
 		t.Fatalf("CSV 解析失败: %v", err)
 	}
@@ -68,7 +71,7 @@ func TestBuildSettlementDetailCSV(t *testing.T) {
 
 func TestBuildSettlementDetailCSV_Empty(t *testing.T) {
 	out := buildSettlementDetailCSV(nil)
-	recs, err := csv.NewReader(bytes.NewReader(out[3:])).ReadAll()
+	recs, err := csv.NewReader(strings.NewReader(string(out[3:]))).ReadAll()
 	if err != nil {
 		t.Fatalf("CSV 解析失败: %v", err)
 	}
@@ -92,45 +95,140 @@ func TestDetailSupplierLabel(t *testing.T) {
 	}
 }
 
-func TestBuildSettlementDetailAttachment(t *testing.T) {
-	svc, _, _, _, _ := newTestService(t)
-	svc.cfg.AttachmentControlID = "item-1494251220825"
-
-	rows := []SettlementRow{{ID: "CP001", SupplierID: "142", TotalGoodsYuan: dec("10")}}
-	att := svc.buildSettlementDetailAttachment(rows)
-	if att == nil {
-		t.Fatal("配了控件 id 却没生成附件")
+// 附件文件名:前端给的名字可能带路径/超长/是空的 ⇒ 落库前必须收敛。
+func TestSanitizeAttachmentName(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"发票.jpg", "发票.jpg"},
+		{"../../etc/passwd", "passwd"},
+		{`C:\temp\photo.png`, "photo.png"},
+		{"", "附件"},
+		{"..", "附件"},
+		{"  ", "附件"},
 	}
-	if att.ControlID != "item-1494251220825" {
-		t.Fatalf("control id = %q", att.ControlID)
+	for _, c := range cases {
+		if got := sanitizeAttachmentName(c.in); got != c.want {
+			t.Errorf("sanitizeAttachmentName(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
-	if att.ControlType != "File" {
-		t.Fatalf("control type = %q, want File", att.ControlType)
-	}
-	if !strings.HasSuffix(att.FileName, ".csv") || !strings.Contains(att.FileName, "CP001") {
-		t.Fatalf("文件名 = %q(应含首单号)", att.FileName)
-	}
-	raw, err := base64.StdEncoding.DecodeString(att.ContentBase64)
-	if err != nil {
-		t.Fatalf("内容不是合法 base64: %v", err)
-	}
-	if !bytes.Contains(raw, []byte("CP001")) {
-		t.Fatalf("清单内容不含单号: %q", raw)
+	long := strings.Repeat("长", 200)
+	if got := sanitizeAttachmentName(long); len([]rune(got)) != 120 {
+		t.Errorf("超长名未截断: %d rune", len([]rune(got)))
 	}
 }
 
-func TestBuildSettlementDetailAttachment_Nil(t *testing.T) {
-	svc, _, _, _, _ := newTestService(t)
-	rows := []SettlementRow{{ID: "CP001", TotalGoodsYuan: dec("10")}}
-
-	// 没配控件 id ⇒ 不带附件(退回旧行为,不猜 id)
-	svc.cfg.AttachmentControlID = ""
-	if att := svc.buildSettlementDetailAttachment(rows); att != nil {
-		t.Fatalf("没配控件 id 却生成了附件: %+v", att)
+// 附件校验:base64 坏 / 空文件 / 超大 ⇒ 当场拒(别留到流水线里炸)。
+func TestValidateAttachment(t *testing.T) {
+	ok, err := validateAttachment(AttachmentInput{
+		FileName:      "发票.jpg",
+		ContentBase64: base64.StdEncoding.EncodeToString([]byte("JPEGBYTES")),
+	})
+	if err != nil {
+		t.Fatalf("正常附件被拒: %v", err)
 	}
-	// 没有结算单 ⇒ 也不带附件
-	svc.cfg.AttachmentControlID = "item-1"
-	if att := svc.buildSettlementDetailAttachment(nil); att != nil {
-		t.Fatalf("没有结算单却生成了附件: %+v", att)
+	if ok.Size != len("JPEGBYTES") {
+		t.Fatalf("size = %d, want %d", ok.Size, len("JPEGBYTES"))
+	}
+
+	if _, err := validateAttachment(AttachmentInput{FileName: "a.jpg", ContentBase64: "!!!not-base64!!!"}); err == nil {
+		t.Error("非法 base64 必须被拒")
+	}
+	if _, err := validateAttachment(AttachmentInput{FileName: "a.jpg", ContentBase64: ""}); err == nil {
+		t.Error("空内容必须被拒")
+	}
+	big := base64.StdEncoding.EncodeToString(make([]byte, maxAttachmentBytes+1))
+	if _, err := validateAttachment(AttachmentInput{FileName: "a.bin", ContentBase64: big}); err == nil {
+		t.Error("超限附件必须被拒")
+	}
+}
+
+// 发起人上传的附件要活到"机器审核通过"那一刻 ⇒ 落库 + 能读回来。
+func TestStoreAndLoadApprovalAttachments(t *testing.T) {
+	svc, db, _, _, _ := newTestService(t)
+	ap := &model.ApprovalInstance{
+		ID: "ap-att", BranchID: "B1", ApplicantUserID: "u1",
+	}
+	if err := db.Create(ap).Error; err != nil {
+		t.Fatalf("create ap: %v", err)
+	}
+	ins := []AttachmentInput{
+		{FileName: "发票.jpg", ContentBase64: base64.StdEncoding.EncodeToString([]byte("JPEGBYTES"))},
+	}
+	if err := svc.storeAttachments(context.Background(), ap, ins); err != nil {
+		t.Fatalf("storeAttachments: %v", err)
+	}
+
+	// 读回来:第一份是自动生成的明细清单,后面是发起人上传的。
+	svc.cfg.AttachmentControlID = "item-1494251220825"
+	got := svc.loadApprovalAttachments(context.Background(), ap, []SettlementRow{
+		{ID: "CP001", SupplierID: "142", TotalGoodsYuan: dec("10")},
+	})
+	if len(got) != 2 {
+		t.Fatalf("附件数 = %d, want 2(明细清单 + 上传)", len(got))
+	}
+	if !strings.HasPrefix(got[0].FileName, "结算单明细-") {
+		t.Fatalf("第 1 个应是明细清单: %q", got[0].FileName)
+	}
+	if got[1].FileName != "发票.jpg" {
+		t.Fatalf("第 2 个应是上传的文件: %q", got[1].FileName)
+	}
+	raw, err := base64.StdEncoding.DecodeString(got[1].ContentBase64)
+	if err != nil || string(raw) != "JPEGBYTES" {
+		t.Fatalf("读回的内容不对: %q err=%v", raw, err)
+	}
+}
+
+// 没配附件控件 id ⇒ 不带附件(不猜 id;猜错只会让企微报"控件不存在")。
+func TestLoadApprovalAttachments_NoControlID(t *testing.T) {
+	svc, db, _, _, _ := newTestService(t)
+	ap := &model.ApprovalInstance{ID: "ap-no", BranchID: "B1"}
+	if err := db.Create(ap).Error; err != nil {
+		t.Fatalf("create ap: %v", err)
+	}
+	svc.cfg.AttachmentControlID = ""
+	got := svc.loadApprovalAttachments(context.Background(), ap, []SettlementRow{{ID: "CP001", TotalGoodsYuan: dec("10")}})
+	if len(got) != 0 {
+		t.Fatalf("没配控件 id 却带了附件: %+v", got)
+	}
+}
+
+// 跨仓 wire 契约(supertrade ↔ wechat-bot)。
+//
+// 两个 module 不能互相 import ⇒ 字段名对不上时**编译期看不出来**,
+// 运行时表现为"附件静默丢失"(企微单上就是没有附件,没有任何报错)。
+// ⇒ 这里把 JSON 形状钉死;wechat-bot 侧有对应的反序列化测试。
+func TestApplyEventPayloadAttachmentWire(t *testing.T) {
+	p := ApplyEventPayload{
+		TemplateID:            "tpl",
+		AttachmentControlID:   "item-1494251220825",
+		AttachmentControlType: "File",
+		Attachments: []ApprovalAttachment{
+			{FileName: "发票.jpg", ContentBase64: "QUJD"},
+		},
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if m["attachment_control_id"] != "item-1494251220825" {
+		t.Fatalf("attachment_control_id 不对: %s", b)
+	}
+	if m["attachment_control_type"] != "File" {
+		t.Fatalf("attachment_control_type 不对: %s", b)
+	}
+	atts, _ := m["attachments"].([]any)
+	if len(atts) != 1 {
+		t.Fatalf("attachments 数量 = %d: %s", len(atts), b)
+	}
+	a, _ := atts[0].(map[string]any)
+	if a["file_name"] != "发票.jpg" || a["content_base64"] != "QUJD" {
+		t.Fatalf("attachments 元素形状不对: %s", b)
+	}
+	// ⚠️ 附件内容**不能**出现在任何别的字段里(重复=体积翻倍)。
+	if len(a) != 2 {
+		t.Fatalf("attachments 元素字段数 = %d, want 2: %s", len(a), b)
 	}
 }

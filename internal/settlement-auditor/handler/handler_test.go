@@ -199,7 +199,7 @@ func buildTestHandler(t *testing.T, withCube bool) (*gin.Engine, *gorm.DB, *fake
 		t.Fatalf("open sqlite: %v", err)
 	}
 	if err := db.AutoMigrate(
-		&model.ApprovalInstance{}, &model.ApprovalSettlement{}, &model.AuditSignal{},
+		&model.ApprovalInstance{}, &model.ApprovalSettlement{}, &model.ApprovalAttachment{}, &model.AuditSignal{},
 		&model.AuditLog{}, &model.LLMVerdict{}, &model.ApprovalStocktakeLink{},
 		&model.SettlementPayState{},
 	); err != nil {

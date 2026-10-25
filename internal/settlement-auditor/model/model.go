@@ -121,6 +121,39 @@ type ApprovalSettlement struct {
 
 func (ApprovalSettlement) TableName() string { return "approval_settlements" }
 
+// ApprovalAttachment 审批附件（**发起人自己上传**的图片/文件）。
+//
+// # 为什么落库
+//
+// 机器审核是**异步**的（go s.runAudit），而企微「附件」控件的素材必须由
+// wechat-bot 用 **OA token** 上传（media_id 绑定上传它的应用，别的应用用不了）
+// ⇒ 字节必须从"提交那一刻"一路活到"机器审核通过、准备提交企微"那一刻。
+// 提交请求返回后前端就走了 ⇒ 只能落库。
+//
+// # 只存发起人上传的
+//
+// 自动生成的「结算单明细清单」是机器审核通过那一刻才生成的（用 cube 的当前金额），
+// 不入库，直接在 pass 分支现算现传。
+type ApprovalAttachment struct {
+	ID             string `gorm:"primaryKey;size:36" json:"id"`
+	ApprovalID     string `gorm:"size:32;index" json:"approval_id"`
+	BranchID       string `gorm:"size:32;index" json:"branch_id"`
+	ApplicantUserID string `gorm:"size:64;index" json:"applicant_user_id"`
+	// FileName 是文件名（审批单上显示的名字）；已去掉路径分隔符。
+	FileName string `gorm:"size:256" json:"file_name"`
+	// ContentType 是 MIME（image/jpeg 等），给下游判断用。
+	ContentType string `gorm:"size:128" json:"content_type"`
+	// Size 是字节数（校验过上限）。
+	Size int `json:"size"`
+	// Data 是文件内容。
+	//
+	// ⚠️ json:"-" ⇒ **不出现在任何 API 响应里**（几百 KB 的图片不该进审批详情 JSON）。
+	Data      []byte    `gorm:"type:bytea" json:"-"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func (ApprovalAttachment) TableName() string { return "approval_attachments" }
+
 // AuditSignal 一条核对信号(证据快照存 Evidence JSON)。
 type AuditSignal struct {
 	ID           string         `gorm:"primaryKey;size:36" json:"id"`

@@ -66,6 +66,11 @@ type SubmitInput struct {
 	ApproverUserIDs []string
 	HandlerUserIDs  []string
 	CcUserIDs       []string
+	// Attachments 是**发起人自己上传**的附件(拍照/相册选的图片、文件)。
+	//
+	// 随审批一路活到企微审批单的「附件」控件上(审批人直接看得到发票照片)。
+	// ⚠️ 上限:最多 3 个,单个解码后 ≤2MB(见 maxAttachmentsPerApproval)。
+	Attachments []AttachmentInput
 }
 
 // maxSettlementsPerApproval 单次审批勾选上限(防 LLM prompt 爆炸)。
@@ -106,6 +111,18 @@ func (s *Service) SubmitApproval(ctx context.Context, branchID string, in Submit
 	}
 	if len(ids) > maxSettlementsPerApproval {
 		return nil, fmt.Errorf("%w: 单次审批最多 %d 张结算单", ErrInvalidInput, maxSettlementsPerApproval)
+	}
+	// 附件:个数上限 + 逐个解码校验(base64 坏/超大 ⇒ 当场拒,别留到流水线里炸)。
+	if len(in.Attachments) > maxAttachmentsPerApproval {
+		return nil, fmt.Errorf("%w: 附件最多 %d 个", ErrInvalidInput, maxAttachmentsPerApproval)
+	}
+	attachments := make([]AttachmentInput, 0, len(in.Attachments))
+	for _, a := range in.Attachments {
+		va, err := validateAttachment(a)
+		if err != nil {
+			return nil, err
+		}
+		attachments = append(attachments, va)
 	}
 	// 审批流人员:按**节点类型**分桶(键 approver/handler/cc)。
 	//
@@ -150,6 +167,10 @@ func (s *Service) SubmitApproval(ctx context.Context, branchID string, in Submit
 		if err := s.db.WithContext(ctx).Create(row).Error; err != nil {
 			return nil, fmt.Errorf("create approval_settlement %s: %w", sid, err)
 		}
+	}
+	// 落发起人上传的附件(机器审核是异步的 ⇒ 字节必须活到 pass 那一刻)。
+	if err := s.storeAttachments(ctx, ap, attachments); err != nil {
+		return nil, err
 	}
 
 	// 后台异步审核(detach ctx:请求返回后流水线继续)。
@@ -846,8 +867,11 @@ func (s *Service) stepFinish(ctx context.Context, ap *model.ApprovalInstance, ve
 		NotifyType:          1,
 		ApplyData:           applyData,
 		SummaryList:         summaryList,
-		// 「附件」:本次付款的结算单明细清单(企微侧负责上传素材并组装控件)。
-		Attachment: s.buildSettlementDetailAttachment(settlements),
+		// 「附件」:自动生成的结算单明细清单 + 发起人自己上传的文件。
+		// (素材上传与控件组装在 wechat-bot 侧 —— 它持有 OA token。)
+		AttachmentControlID:   s.cfg.AttachmentControlID,
+		AttachmentControlType: s.cfg.AttachmentControlType,
+		Attachments:           s.loadApprovalAttachments(ctx, ap, settlements),
 	}
 	cmdID, err := s.publishCommand(ctx, CmdApplyEvent, payload)
 	if err != nil {

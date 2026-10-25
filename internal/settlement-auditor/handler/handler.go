@@ -387,6 +387,19 @@ type submitReq struct {
 	ApproverUserIDs []string `json:"approver_userids"`
 	HandlerUserIDs  []string `json:"handler_userids"`
 	CcUserIDs       []string `json:"cc_userids"`
+	// Attachments 是**发起人自己上传**的附件(拍照/相册选的图片、文件)。
+	//
+	// 随审批一路活到企微审批单的「附件」控件上 ⇒ 审批人直接看得到发票照片。
+	// ⚠️ base64 会让体积涨约 1/3;上限由 service 层校验(最多 3 个,单个 ≤2MB)。
+	Attachments []attachmentReq `json:"attachments"`
+}
+
+// attachmentReq 是提交请求里"发起人上传的一个附件"。
+type attachmentReq struct {
+	FileName      string `json:"file_name"`
+	ContentType   string `json:"content_type"`
+	ContentBase64 string `json:"content_base64"`
+	Size          int    `json:"size"`
 }
 
 // Submit POST /settlement-approvals → 202 {id,status}
@@ -406,6 +419,15 @@ func (h *Handler) Submit(c *gin.Context) {
 		return
 	}
 	cl, _ := claims.FromContext(c.Request.Context())
+	attachments := make([]service.AttachmentInput, 0, len(req.Attachments))
+	for _, a := range req.Attachments {
+		attachments = append(attachments, service.AttachmentInput{
+			FileName:      a.FileName,
+			ContentType:   a.ContentType,
+			ContentBase64: a.ContentBase64,
+			Size:          a.Size,
+		})
+	}
 	ap, err := h.svc.SubmitApproval(c.Request.Context(), branchID, service.SubmitInput{
 		ApplicantUserID:  cl.Sub,
 		ApplicantWecomID: req.ApplicantWecomID,
@@ -417,6 +439,7 @@ func (h *Handler) Submit(c *gin.Context) {
 		ApproverUserIDs:  req.ApproverUserIDs,
 		HandlerUserIDs:   req.HandlerUserIDs,
 		CcUserIDs:        req.CcUserIDs,
+		Attachments:      attachments,
 	})
 	if err != nil {
 		mapErr(c, err)
