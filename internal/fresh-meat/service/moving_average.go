@@ -1027,14 +1027,39 @@ func (s *Service) loadStocktakeClosing(ctx context.Context, branchID string, sta
 	return out, nil
 }
 
-// loadSkuCounterAndCold 取**两位置**余额(账面)+ 今日是否有盘点。
+// loadSkuCounterAndCold 取**两位置**余额(账面)+ 今日盘点口径。
 //
 // ⚠️ **counter 就是账面余额,不用盘点值覆盖**。
 // 原因:日终盘点后会把柜台的货"搬进冷库过夜"(counter := 0,cold += 柜台实盘),
 // 此时冷库里**已经包含**了柜台那份 ⇒ 若再拿盘点值加一次就是**重复计算**
 // (曾导致全店期末翻倍:柜台 10 + 冷库 10 = 20,而真实是 10)。
 //
-// hasStocktake / dataSource 只用于**标注可信度**,不参与数量计算。
+// # 两个口径必须**分开**(2026-10-26 修正)
+//
+// ⚠️ hasStocktake 与 dataSource **不是一回事**,别用同一个判据:
+//
+//	hasStocktake —— **成本链**用:当天有没有**任何**盘点单
+//	               ⇒ 有 ⇒ 期末取"按营业日推导的日终结余"(closingForDay)
+//	                 而不是"今天的余额"(补录往日时,今天的余额是错的)
+//	               ⇒ **与 is_complete 无关**(半盘那天也有日终搬台链)
+//
+//	dataSource   —— **报表标注**用(只影响可信度,不影响任何金额):
+//	               actual / partial / estimated 三态(见下)
+//
+// 之前这里只查"当天有没有**任何**盘点单" ⇒ 返回的 dataSource 只有
+// actual / estimated 两个值 ⇒ gross_margin.go 里的 "partial" 分支是**死代码**。
+//
+// ⚠️ 更要紧的是:is_complete=false 的盘点单(is_complete 的语义见 model.go:
+// 「决定 BI 标注 ✓已盘点 / ⚠未盘点数据为推演」)被当成了**完整实盘** ⇒
+// 报表标注"已盘点"、而数据其实是推演 ⇒ 门店按"盘过了"看数,却拿到推演值。
+//
+// ⇒ dataSource 现在按 is_complete 分三态:
+//   - 有 is_complete=true 的单 ⇒ actual(真实实盘)
+//   - 有单但没有 is_complete=true 的 ⇒ partial(部分实盘)
+//   - 没有任何单 ⇒ estimated(纯账面推演)
+//
+// ⚠️ **成本/期末口径一个字没改**(hasStocktake 仍是"有没有任何盘点单")
+// ⇒ 本次修复只动**报表展示层**,不动成本链。
 func (s *Service) loadSkuCounterAndCold(ctx context.Context, branchID string, startOfDay, endOfDay time.Time) (
 	counter, cold map[string]decimal.Decimal, hasStocktake bool, dataSource string, err error,
 ) {
@@ -1042,17 +1067,32 @@ func (s *Service) loadSkuCounterAndCold(ctx context.Context, branchID string, st
 	if err != nil {
 		return nil, nil, false, "", err
 	}
-	var n int64
+	// 只打索引列(branch_id + taken_at),不扫全表。
+	var nAll, nComplete int64
 	if err := s.db.WithContext(ctx).
 		Model(&model.PorkCutsStocktake{}).
 		Where("branch_id = ? AND taken_at >= ? AND taken_at < ?", branchID, startOfDay, endOfDay).
-		Count(&n).Error; err != nil {
+		Count(&nAll).Error; err != nil {
 		return nil, nil, false, "", fmt.Errorf("count stocktake: %w", err)
 	}
-	if n == 0 {
-		return counter, cold, false, "estimated", nil
+	if nAll == 0 {
+		return counter, cold, false, dataSourceEstimated, nil
 	}
-	return counter, cold, true, "actual", nil
+	if err := s.db.WithContext(ctx).
+		Model(&model.PorkCutsStocktake{}).
+		Where("branch_id = ? AND taken_at >= ? AND taken_at < ? AND is_complete = ?",
+			branchID, startOfDay, endOfDay, true).
+		Count(&nComplete).Error; err != nil {
+		return nil, nil, false, "", fmt.Errorf("count complete stocktake: %w", err)
+	}
+	if nComplete == 0 {
+		// ⚠️ 有盘点单但**没有一张是完整的** ⇒ 口径标 partial(**不是实盘**)。
+		//
+		// ⚠️ hasStocktake 仍是 **true**:那天有日终动作(搬台链),
+		// 期末照样取"按营业日推导的结余" —— 跟修复前完全一致(不动成本链)。
+		return counter, cold, true, dataSourcePartial, nil
+	}
+	return counter, cold, true, dataSourceActual, nil
 }
 
 // loadSkuPositions 读当前两位置余额。

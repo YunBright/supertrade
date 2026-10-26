@@ -1190,15 +1190,22 @@ func TestComputeGrossMargin_Actual_WithStocktake(t *testing.T) {
 	if belly == nil {
 		t.Fatalf("belly 不在 per_cut")
 	}
+	// 实盘/差异是**指针**:nil = 没有实盘(2026-10-26 起)。
+	if belly.ActualRemainKg == nil {
+		t.Fatalf("belly actual_remain_kg 不该为空(完整盘点必须有实盘)")
+	}
 	if !belly.ActualRemainKg.Equal(d("10")) {
-		t.Errorf("belly actual_remain_kg = %s, want 10", belly.ActualRemainKg)
+		t.Errorf("belly actual_remain_kg = %s, want 10", *belly.ActualRemainKg)
 	}
 	// expected = 0 + 0 - 0 - 0 = 0;variance = 10 - 0 = 10
 	if !belly.ExpectedRemainKg.Equal(decimal.Zero) {
 		t.Errorf("belly expected_remain_kg = %s, want 0", belly.ExpectedRemainKg)
 	}
+	if belly.VarianceKg == nil {
+		t.Fatalf("belly variance_kg 不该为空(完整盘点必须有差异)")
+	}
 	if !belly.VarianceKg.Equal(d("10")) {
-		t.Errorf("belly variance_kg = %s, want 10", belly.VarianceKg)
+		t.Errorf("belly variance_kg = %s, want 10", *belly.VarianceKg)
 	}
 }
 

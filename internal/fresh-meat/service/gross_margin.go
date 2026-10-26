@@ -52,6 +52,17 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// 盘点口径三态(2026-10-26 收敛成常量 —— 之前是散落的字面量,
+// 很容易在新增分支时写错/漏判,导致"推演值"被当成"实盘")。
+const (
+	// dataSourceActual = 当日有**完整**盘点单(is_complete=true)⇒ 期末量是实盘。
+	dataSourceActual = "actual"
+	// dataSourcePartial = 有盘点单但 is_complete=false ⇒ 期末量是**部分实盘**。
+	dataSourcePartial = "partial"
+	// dataSourceEstimated = 当日无盘点单 ⇒ 期末量是**账面推演**。
+	dataSourceEstimated = "estimated"
+)
+
 // GrossMarginReport 单店单日毛利总览。
 type GrossMarginReport struct {
 	BranchID            string              `json:"branch_id"`
@@ -213,9 +224,17 @@ type PerCutGrossMargin struct {
 	SoldKg            decimal.Decimal `json:"sold_kg"`
 	BulkSoldKg        decimal.Decimal `json:"bulk_sold_kg"`
 	WasteKg           decimal.Decimal `json:"waste_kg"`
-	ActualRemainKg    decimal.Decimal `json:"actual_remain_kg,omitempty"`
-	ExpectedRemainKg  decimal.Decimal `json:"expected_remain_kg"`
-	VarianceKg        decimal.Decimal `json:"variance_kg,omitempty"`
+	// ActualRemainKg 是**实盘**剩余(kg);**nil = 当天没有实盘**。
+	//
+	// ⚠️ 必须用**指针**:decimal.Decimal 是 struct,encoding/json 的 omitempty
+	// 对 struct **无效** ⇒ 用值类型时零值也会序列化出 "actual_remain_kg":"0"
+	// ⇒ 前端拿到 0 就会显示"实盘剩余 0"(门店会误读成"我盘出来是 0 kg")。
+	// 指针 nil ⇒ 整个键缺失 ⇒ 前端显示「—」。
+	ActualRemainKg *decimal.Decimal `json:"actual_remain_kg,omitempty"`
+	// ExpectedRemainKg 是**账面应有**剩余(kg)—— 任何口径下都有值。
+	ExpectedRemainKg decimal.Decimal `json:"expected_remain_kg"`
+	// VarianceKg = 实盘 − 应有;**nil = 当天没有实盘**(恒 0 是**假的**"对上了")。
+	VarianceKg *decimal.Decimal `json:"variance_kg,omitempty"`
 	RevenueYuan       decimal.Decimal `json:"revenue_yuan"`
 	// ⚠️ 改名(2026-10-23):旧字段 `purchase_cost_yuan` 是"按消耗比例摊销的猪采购成本";
 	// 新字段是**本期销售成本**(移动加权结转)—— 两者语义不同,不是同一个数。
@@ -274,16 +293,16 @@ func (s *Service) ComputeGrossMargin(ctx context.Context, branchID string, day t
 
 	perCut, total := rollUpPerCut(rows, promoAlloc)
 
-	dataSource := "estimated"
+	dataSource := dataSourceEstimated
 	isComplete := false
 	for _, r := range rows {
-		if r.DataSource == "actual" {
-			dataSource = "actual"
+		if r.DataSource == dataSourceActual {
+			dataSource = dataSourceActual
 			isComplete = true
 			break
 		}
-		if r.DataSource == "partial" && dataSource != "actual" {
-			dataSource = "partial"
+		if r.DataSource == dataSourcePartial && dataSource != dataSourceActual {
+			dataSource = dataSourcePartial
 		}
 	}
 
@@ -408,6 +427,17 @@ func rollUpPerCut(rows []SkuDailyCost, promoAlloc *PromoAllocation) ([]PerCutGro
 		bulkCost, wasteCost                            decimal.Decimal
 		availAmount, availKg                           decimal.Decimal
 		presaleMargin, presaleRevenue                  decimal.Decimal
+		// hasActualStocktake = 该部位**有真实盘点**。
+		//
+		// ⚠️ 没有它就不能把 ClosingKg 当"实盘剩余"展示(2026-10-26 门店反馈):
+		//   引擎在**无盘点日**把 ClosingKg 设成 expectedCloseKg(账面推演值,
+		//   见 moving_average.go 的 closeKg 分支)—— 那是**成本计算**需要的
+		//   (期末存货金额要进恒等式),但它**不是实盘**。
+		//   ⇒ 无盘点日若照样填进"实盘剩余"列,门店会看到:
+		//     · "实盘剩余"有值(其实是账面推演)
+		//     · "差异"恒为 0(推演值 − 推演值 = 0)⇒ 看起来"盘点全对"
+		//   ⇒ 门店说"我没录日终实盘,怎么有实盘剩余"——**就是这么来的**。
+		hasActualStocktake bool
 	}
 	byCut := map[model.CutType]*agg{}
 	get := func(c model.CutType) *agg {
@@ -429,7 +459,12 @@ func rollUpPerCut(rows []SkuDailyCost, promoAlloc *PromoAllocation) ([]PerCutGro
 		a.bulkKg = a.bulkKg.Add(r.BulkSoldKg)
 		a.wasteKg = a.wasteKg.Add(r.WasteKg)
 		a.expectedKg = a.expectedKg.Add(r.ExpectedClosingKg)
-		a.actualKg = a.actualKg.Add(r.ClosingKg)
+		// ⚠️ **只有真实盘点**的 ClosingKg 才是"实盘剩余"。
+		// 无盘点日 ClosingKg = 账面推演值(引擎用来算成本)⇒ 不能进这一列。
+		if r.DataSource == dataSourceActual {
+			a.actualKg = a.actualKg.Add(r.ClosingKg)
+			a.hasActualStocktake = true
+		}
 		a.revenue = a.revenue.Add(r.RevenueYuan)
 		a.salesCost = a.salesCost.Add(r.SalesCostYuan)
 		// ⚠️ 统收成本 / 报损成本必须一起汇总 —— 少了它们,
@@ -493,9 +528,16 @@ func rollUpPerCut(rows []SkuDailyCost, promoAlloc *PromoAllocation) ([]PerCutGro
 			PresaleExpectedRevenueYuan: a.presaleRevenue,
 			MovingAvgUnitCost: movingAvg,
 		}
-		if !a.actualKg.IsZero() {
-			row.ActualRemainKg = a.actualKg
-			row.VarianceKg = a.actualKg.Sub(a.expectedKg)
+		// ⚠️ 「实盘剩余」**只在有真实盘点时才有值**。
+		// 无盘点 ⇒ 留空(指针 nil ⇒ JSON 里**没有这个键**)⇒ 前端显示「—」,
+		// 而不是把账面推演值冒充成实盘(2026-10-26 门店反馈)。
+		//
+		// 「差异」= 实盘 − 应有 ⇒ 没有实盘就没有差异(恒 0 是**假的**"对上了")。
+		if a.hasActualStocktake {
+			actual := a.actualKg
+			variance := a.actualKg.Sub(a.expectedKg)
+			row.ActualRemainKg = &actual
+			row.VarianceKg = &variance
 		}
 		perCut = append(perCut, row)
 
