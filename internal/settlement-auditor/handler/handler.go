@@ -338,7 +338,11 @@ func mapErr(c *gin.Context, err error) {
 	case errors.Is(err, service.ErrCubeUnavailable):
 		writeError(c, http.StatusServiceUnavailable, "cube_unavailable", err.Error())
 	case errors.Is(err, service.ErrUserInfoUnavailable):
-		writeError(c, http.StatusServiceUnavailable, "userd_unavailable", err.Error())
+		// ⚠️ **不透出 err.Error()**(2026-10-26)。
+		// 生产原文含 gRPC 错误码 + 内部 app-id,对门店是噪音,还会让人
+		// 以为"账号被拒了"(其实只是链路抖了一下)。⇒ 对外只说人话。
+		writeError(c, http.StatusServiceUnavailable, "userd_unavailable",
+			"权限服务暂时不可用，请稍后重试")
 	default:
 		writeError(c, http.StatusInternalServerError, "internal_error", err.Error())
 	}

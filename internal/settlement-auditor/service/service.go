@@ -239,13 +239,13 @@ func (s *Service) GetEffectiveScopes(ctx context.Context, userID, branchID strin
 	entry, ok := s.scopeCache[ck]
 	ttl := s.scopeTTL
 	s.scopeMu.RUnlock()
-	if ok && time.Since(entry.at) < ttl {
+	if ok && s.now().Sub(entry.at) < ttl {
 		return entry.scopes, nil
 	}
 
 	s.scopeMu.Lock()
 	defer s.scopeMu.Unlock()
-	if entry, ok := s.scopeCache[ck]; ok && time.Since(entry.at) < ttl {
+	if entry, ok := s.scopeCache[ck]; ok && s.now().Sub(entry.at) < ttl {
 		return entry.scopes, nil
 	}
 

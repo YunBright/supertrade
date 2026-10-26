@@ -1852,7 +1852,7 @@ func (s *Service) GetEffectiveScopes(ctx context.Context, userID, branchID strin
 	entry, ok := s.scopeCache[key]
 	ttl := s.scopeTTL
 	s.scopeMu.RUnlock()
-	if ok && time.Since(entry.at) < ttl {
+	if ok && s.now().Sub(entry.at) < ttl {
 		return entry.scopes, nil
 	}
 
@@ -1860,7 +1860,7 @@ func (s *Service) GetEffectiveScopes(ctx context.Context, userID, branchID strin
 	s.scopeMu.Lock()
 	defer s.scopeMu.Unlock()
 	// double-check(同一 key 可能在锁等待期间已被别的请求填好)
-	if entry, ok := s.scopeCache[key]; ok && time.Since(entry.at) < ttl {
+	if entry, ok := s.scopeCache[key]; ok && s.now().Sub(entry.at) < ttl {
 		return entry.scopes, nil
 	}
 
@@ -1964,13 +1964,13 @@ func (s *Service) GetEffectiveScopesMulti(ctx context.Context, userID string, br
 	entry, ok := s.scopeCache[key]
 	ttl := s.scopeTTL
 	s.scopeMu.RUnlock()
-	if ok && time.Since(entry.at) < ttl {
+	if ok && s.now().Sub(entry.at) < ttl {
 		return entry.scopes, nil
 	}
 
 	s.scopeMu.Lock()
 	defer s.scopeMu.Unlock()
-	if entry, ok := s.scopeCache[key]; ok && time.Since(entry.at) < ttl {
+	if entry, ok := s.scopeCache[key]; ok && s.now().Sub(entry.at) < ttl {
 		return entry.scopes, nil
 	}
 
