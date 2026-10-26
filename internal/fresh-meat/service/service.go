@@ -59,7 +59,7 @@ type Service struct {
 	// ⇒ 毛利看板永远是 0 销售。详见 service/cube_sales.go 的文件头。
 	sources    cubesource.Resolver
 	publisher  Publisher // nil = 禁用 pub/sub 广播
-	userInfo   *userinfo.Client
+	userInfo   BranchPermissionsReader
 	pubLogger  *slog.Logger
 	now        func() time.Time
 	predictFn  PredictFn      // SetPredictFn 覆盖
@@ -68,6 +68,11 @@ type Service struct {
 	scopeMu    sync.RWMutex
 	scopeCache map[string]scopeCacheEntry
 	scopeTTL   time.Duration
+	// scopeStaleTTL 是过期缓存仍可兜底的时间窗(stale-while-error)。
+	//
+	// ⚠️ 0 = 关闭兜底(过期即失效,userd 失败直接 503)。
+	// 默认 5 分钟,见 defaultScopeStaleTTL 的理由。
+	scopeStaleTTL time.Duration
 }
 
 // CubeClient 是 cube-gateway 客户端的最小抽象(便于单测注入 mock)。
@@ -91,6 +96,34 @@ type scopeCacheEntry struct {
 // defaultScopeTTL 是 effective scopes 缓存的默认 TTL。
 const defaultScopeTTL = 60 * time.Second
 
+// defaultScopeStaleTTL 是**过期缓存仍可兜底**的时间窗(stale-while-error)。
+//
+// # 为什么需要它(2026-10-26 生产现场)
+//
+// 门店打开「每日作业」页会**并发**打十几个请求
+// (business-day / whole-pigs / stock/bags / counter-load / openings …),
+// 每个请求都要过一次 requireScope → GetEffectiveScopes。
+//
+// 平时命中 60s 缓存,没问题。但**缓存恰好过期 + userd 那一瞬抖了**
+// (机器 token 换取被 context canceled / 跨主机 invoke 失败)⇒
+// 全部并发请求**一起**拿到 ErrUserInfoUnavailable ⇒ 整页 503。
+//
+// 生产实测(16:49:01)就是这个形状:
+//	userinfo.GetBranchPermissions failed … 机器身份被拒: … context canceled
+//	⇒ GET /whole-pigs → 503
+//
+// ⇒ 一个**外部依赖的瞬时抖动**,被放大成「门店整页打不开」。
+//
+// # 口径:兜底的是**已经授权过**的 scopes,不是新授权
+//
+//   - 缓存里存的是上次**成功**从 userd 取到的 scopes;
+//   - 过期 ≤ staleTTL 时,userd 失败 ⇒ 继续用这份**旧** scopes;
+//   - 超出 staleTTL ⇒ 宁可 503 也不放行(权限可能早已被收回)。
+//
+// ⇒ 风险窗口 = staleTTL(默认 5 分钟):这期间权限变更不生效。
+// 对"某个店员被撤销某个 scope"的场景,可接受(与 60s 缓存本身的延迟同量级)。
+const defaultScopeStaleTTL = 5 * time.Minute
+
 // New 构造 Service。
 //
 // db 是 PG 连接(GORM);cube / predictFn 通过 SetCubeClient / SetPredictFn 注入。
@@ -102,6 +135,7 @@ func New(db *gorm.DB) *Service {
 		now:        func() time.Time { return time.Now() },
 		scopeCache: make(map[string]scopeCacheEntry),
 		scopeTTL:   defaultScopeTTL,
+		scopeStaleTTL: defaultScopeStaleTTL,
 		predictFn:  defaultPredictFn, // 默认 history_avg 降级路径
 		bizTZ:      time.FixedZone("Asia/Shanghai", 8*3600),
 	}
@@ -159,9 +193,33 @@ func (s *Service) SetClock(fn func() time.Time) {
 	s.now = fn
 }
 
+// BranchPermissionsReader 是读 per-branch 有效权限矩阵的最小抽象。
+//
+// # 为什么抽接口(2026-10-26)
+//
+// stale-while-error(缓存过期 + userd 抖动 ⇒ 用过期缓存兜底)必须**能测**:
+// userd 抖了 ⇒ 拿不到权限 ⇒ 走兜底分支。
+// 而 *userinfo.Client 是**具体类型**(内部持 dapr.Client),没法注入一个
+// "必然失败"的替身。
+//
+// ⇒ 抽这个窄接口,生产实现仍是 *userinfo.Client(见 SetUserInfo),
+// 测试注入 fake 即可。
+type BranchPermissionsReader interface {
+	GetBranchPermissions(ctx context.Context, userID, branchID string) (*userinfo.BranchPermissions, error)
+}
+
 // SetUserInfo 注入 userinfo 客户端。
 func (s *Service) SetUserInfo(c *userinfo.Client) {
+	if c == nil {
+		s.userInfo = nil
+		return
+	}
 	s.userInfo = c
+}
+
+// SetBranchPermissionsReader 注入权限读取器(测试用;生产用 SetUserInfo)。
+func (s *Service) SetBranchPermissionsReader(r BranchPermissionsReader) {
+	s.userInfo = r
 }
 
 // SetScopeTTL 注入 effective scopes 缓存 TTL。
@@ -171,6 +229,19 @@ func (s *Service) SetScopeTTL(ttl time.Duration) {
 	}
 	s.scopeMu.Lock()
 	s.scopeTTL = ttl
+	s.scopeMu.Unlock()
+}
+
+// SetScopeStaleTTL 注入过期缓存的兜底窗口(stale-while-error)。
+//
+// 0 = 关闭兜底(过期即失效,userd 失败直接 503)。
+// 负数 = 同样按 0 处理。
+func (s *Service) SetScopeStaleTTL(ttl time.Duration) {
+	if ttl < 0 {
+		ttl = 0
+	}
+	s.scopeMu.Lock()
+	s.scopeStaleTTL = ttl
 	s.scopeMu.Unlock()
 }
 
@@ -1255,18 +1326,40 @@ func (s *Service) GetEffectiveScopes(ctx context.Context, userID, branchID strin
 	entry, ok := s.scopeCache[ck]
 	ttl := s.scopeTTL
 	s.scopeMu.RUnlock()
-	if ok && time.Since(entry.at) < ttl {
+	// ⚠️ 年龄必须用 **s.now()** 算，不能用 time.Since。
+	//
+	// 原因:entry.at 是用 s.now() 打的戳(可注入时钟),而 time.Since 用的是
+	// 真实墙钟 ⇒ 两者不同源时,差值可能是**负数**(注入的"现在"比真实时间靠后),
+	// 负数 < ttl 恒成立 ⇒ **缓存永远不过期**。
+	// ⇒ 表现为:改 TTL / 注入时钟后缓存行为完全失真(测试里查出来是这个)。
+	//
+	// ⇒ 统一用 s.now().Sub(entry.at),打戳与判龄同源。
+	if ok && s.now().Sub(entry.at) < ttl {
 		return entry.scopes, nil
 	}
 
 	s.scopeMu.Lock()
 	defer s.scopeMu.Unlock()
-	if entry, ok := s.scopeCache[ck]; ok && time.Since(entry.at) < ttl {
+	if entry, ok := s.scopeCache[ck]; ok && s.now().Sub(entry.at) < ttl {
 		return entry.scopes, nil
 	}
 
 	p, err := s.userInfo.GetBranchPermissions(ctx, userID, branchID)
 	if err != nil {
+		// ⚠️ stale-while-error:userd 抖了 ≠ 门店没权限。
+		//
+		// 生产现场(2026-10-26 16:49:01):缓存恰好过期 + userd 机器 token
+		// 交换被 context canceled ⇒ 十几个并发请求**一起** 503 ⇒ 整页打不开。
+		//
+		// ⇒ 这里回落到**过期但仍在 staleTTL 内**的缓存(那份 scopes 曾经
+		// 成功从 userd 取到,说明当时是有权限的)。
+		// 超出 staleTTL ⇒ 宁可 503,也不放行可能早已收回的权限。
+		if scopes, staleOK := s.staleScopesLocked(ck); staleOK {
+			s.pubLogger.Warn("userinfo.GetBranchPermissions failed; 用过期缓存兜底",
+				"user_id", userID, "branch_id", branchID,
+				"stale_ttl", s.scopeStaleTTL.String(), "err", err)
+			return scopes, nil
+		}
 		s.pubLogger.Warn("userinfo.GetBranchPermissions failed",
 			"user_id", userID, "branch_id", branchID, "err", err)
 		return nil, ErrUserInfoUnavailable
@@ -1275,6 +1368,24 @@ func (s *Service) GetEffectiveScopes(ctx context.Context, userID, branchID strin
 	scopes = append([]string(nil), scopes...)
 	s.scopeCache[ck] = scopeCacheEntry{scopes: scopes, at: s.now()}
 	return scopes, nil
+}
+
+// staleScopesLocked 取过期但在 staleTTL 内的缓存。**调用方必须已持有 scopeMu 写锁。**
+//
+// 返回 (scopes, true) 表示可以用过期缓存兜底;(nil, false) 表示没有可用兜底。
+func (s *Service) staleScopesLocked(ck string) ([]string, bool) {
+	if s.scopeStaleTTL <= 0 {
+		return nil, false
+	}
+	entry, ok := s.scopeCache[ck]
+	if !ok {
+		return nil, false
+	}
+	age := s.now().Sub(entry.at)
+	if age < 0 || age >= s.scopeStaleTTL {
+		return nil, false
+	}
+	return append([]string(nil), entry.scopes...), true
 }
 
 // HasEffectiveScope 判断用户在该 branch 下是否拥有某 scope。

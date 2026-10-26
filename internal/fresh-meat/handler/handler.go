@@ -237,7 +237,16 @@ func mapErr(c *gin.Context, err error) {
 	case errors.Is(err, service.ErrCubeUnavailable):
 		writeError(c, http.StatusServiceUnavailable, "cube_unavailable", err.Error())
 	case errors.Is(err, service.ErrUserInfoUnavailable):
-		writeError(c, http.StatusServiceUnavailable, "userd_unavailable", err.Error())
+		// ⚠️ **不透出 err.Error()**。
+		//
+		// 生产现场(2026-10-26 16:49:01)的原文是:
+		//   「userinfo: 机器身份被拒: 用服务账号换机器 token 失败(app-id=userd):
+		//     rpc error: code = Canceled desc = context canceled」
+		// ——含 gRPC 错误码 + 内部 app-id,对门店毫无意义,还会让人以为
+		// "账号被拒了"(其实只是链路抖了一下)。
+		// ⇒ 对外只说人话;细节留在服务端日志里。
+		writeError(c, http.StatusServiceUnavailable, "userd_unavailable",
+			"权限服务暂时不可用，请稍后重试")
 	case errors.Is(err, service.ErrBulkProductConflict):
 		// 409:资源已存在(唯一键冲突),不是"输入非法"(400)。
 		// 落 500 的后果是"操作者以为服务端坏了",而实际只是重复登记。
