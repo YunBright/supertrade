@@ -172,6 +172,23 @@ func initApp() error {
 	appSvc.SetCubeClient(cube)
 	slog.Info("cube client enabled")
 
+	// ---- 有源门店的**销售读取**(2026-10-26 门店反馈)----
+	//
+	// ⚠️ 为什么必须装配:
+	//   有源门店(店 00 / 店 01)的销售在**它自己的 cube 源**里,
+	//   而本域的 line_sales_by_pigs 只收**本地 POS 的 sale.paid 事件**
+	//   ⇒ 对有源门店它永远是空的 ⇒ 毛利看板恒 0 销售。
+	//
+	// ⚠️ 用同一个 cubeCli:它是 *cubeclient.DaprCubeClient,
+	//   本身就实现了 cuberead.Reader(LoadCubeQueryPage)
+	//   ⇒ 不需要再包一层适配器,也不需要第二次 dapr 往返。
+	appSvc.SetCubeReader(cubeCli)
+	// ⚠️ 解析器带 60s 缓存 + stale-on-error:毛利看板每次都要判"这个店配了源吗",
+	//   不缓存的话每次请求都多一次 dapr 往返(而它是 10s 超时的链路)。
+	appSvc.SetSourceResolver(cubesource.NewCachedResolver(cubeCli, cubesource.DefaultTTL, slog.Default()))
+	slog.Info("fresh-meat: 有源门店销售读取已启用",
+		"app_id", cubeclient.DefaultCubeAppID())
+
 	// 注入 Dapr Conversation API predict fn(同步调 LLM)。
 	daprCli, err := dapr.NewClient()
 	if err != nil {

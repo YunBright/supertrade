@@ -100,11 +100,14 @@ func (s *Service) computeExpectedRemainKgByCut(ctx context.Context, branchID str
 	}
 
 	// 3) line_sales_by_pig.qty_kg 按 cut_type 聚合(扣减;R 行 qty 为负自动抵销)
+	//
+	// ⚠️ **sale_date 是 DATE 列** ⇒ **按等值查那一天**,不用范围比较
+	// (理由见 moving_average.go 的 loadSkuFlows 同样的注释)。
 	soldAgg := make(map[model.CutType]decimal.Decimal)
 	var sales []model.LineSalesByPig
+	dayKey := startOfDay.In(s.bizTZOrUTC()).Format("2006-01-02")
 	if err := s.db.WithContext(ctx).
-		Where("branch_id = ? AND sale_date >= ? AND sale_date < ?",
-			branchID, startOfDay, endOfDay).
+		Where("branch_id = ? AND "+s.fmSaleDateExpr(), branchID, dayKey).
 		Find(&sales).Error; err != nil {
 		return nil, fmt.Errorf("query line_sales_by_pig: %w", err)
 	}

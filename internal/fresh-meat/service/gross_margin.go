@@ -57,7 +57,21 @@ type GrossMarginReport struct {
 	BranchID            string              `json:"branch_id"`
 	Date                string              `json:"date"` // YYYY-MM-DD(bizTZ)
 	IsStocktakeComplete bool                `json:"is_stocktake_complete"`
-	DataSource          string              `json:"data_source"` // actual | partial | estimated
+	// DataSource 是**盘点**口径(actual | partial | estimated)——
+	// 它说的是"期末剩余量是实盘还是推演",**与销售来源无关**。
+	DataSource string `json:"data_source"`
+	// SalesSource 是**销售**口径 —— 这次的收入/销量是从哪读出来的。
+	//
+	// ⚠️ 为什么必须显式给出(2026-10-26 门店反馈):
+	//   有源门店(店 00/01)的销售在**它自己的 cube 源**里;
+	//   无源门店(店 10)的销售在本地 PG(本地 POS 的 sale.paid 事件)。
+	//   ⇒ 门店看到"没有销售数据"时,第一反应是"今天真没卖"——
+	//   而真相可能是"数据源没读到" ⇒ **必须让门店看见来源**。
+	//
+	// 取值:cube(有源,读 cube sales_report)| local(无源,读本地 line_sales_by_pigs)。
+	SalesSource string `json:"sales_source"`
+	// SalesSourceNote 是给门店看的**人话**说明(前端直接显示)。
+	SalesSourceNote string `json:"sales_source_note,omitempty"`
 	PerCut              []PerCutGrossMargin `json:"per_cut"`
 	// PerSku 是 SKU 级明细 —— **这才是实际的计算单元**
 	// (一个部位挂多个 SKU 时,部位行是它们的汇总)。
@@ -290,11 +304,19 @@ func (s *Service) ComputeGrossMargin(ctx context.Context, branchID string, day t
 		}
 	}
 
+	// 销售来源(2026-10-26):让门店看得见"收入是从哪读出来的"。
+	salesSource, salesSourceNote, err := s.salesSourceOf(ctx, branchID)
+	if err != nil {
+		return nil, err
+	}
+
 	return &GrossMarginReport{
 		BranchID:            branchID,
 		Date:                day.In(s.bizTZOrUTC()).Format("2006-01-02"),
 		IsStocktakeComplete: isComplete,
 		DataSource:          dataSource,
+		SalesSource:         salesSource,
+		SalesSourceNote:     salesSourceNote,
 		PerCut:              perCut,
 		PerSku:              rows,
 		Total:               total,

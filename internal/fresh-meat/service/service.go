@@ -26,6 +26,8 @@ import (
 
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/cuberead"
+	"github.com/YunBright/supertrade/internal/cubesource"
 	"github.com/YunBright/supertrade/internal/fresh-meat/model"
 	"github.com/shopspring/decimal"
 	"gorm.io/datatypes"
@@ -40,19 +42,28 @@ import (
 // 字段:
 //   - db:PG 连接(GORM)
 //   - cube:cube-gateway 客户端(可 nil,RecordWholePig 跳过 supplier 校验)
+//   - cubeReader:cube 通用查询读端(可 nil;**有源门店读销售**用)
+//   - sources:门店→数据源解析器(可 nil;nil ⇒ 全部按"无源"处理)
 //   - publisher:pub/sub 广播(可 nil,启用 = DaprPublisher)
 //   - userInfo:per-branch effective scopes 校验客户端(可 nil,HasEffectiveScope 返 ErrUserInfoUnavailable)
 //   - scopeCache + scopeMu + scopeTTL:effective scopes 60s 缓存
 //   - predictFn:LLM 预测函数(默认 history_avg 降级;SetPredictFn 注入 Dapr Conversation API)
 type Service struct {
-	db        *gorm.DB
-	cube      CubeClient // 可 nil
-	publisher Publisher  // nil = 禁用 pub/sub 广播
-	userInfo  *userinfo.Client
-	pubLogger *slog.Logger
-	now       func() time.Time
-	predictFn PredictFn      // SetPredictFn 覆盖
-	bizTZ     *time.Location // 营业日界时区(默认 Asia/Shanghai UTC+8)
+	db         *gorm.DB
+	cube       CubeClient // 可 nil
+	cubeReader cuberead.Reader
+	// sources 解析"这个门店配了哪个数据源"。
+	//
+	// ⚠️ **有源查 cube 源,无源查本地 PG**(2026-10-26 门店反馈):
+	// 有源门店的销售在它自己的 cube 源里 ⇒ 本地 line_sales_by_pigs 对它永远是空的
+	// ⇒ 毛利看板永远是 0 销售。详见 service/cube_sales.go 的文件头。
+	sources    cubesource.Resolver
+	publisher  Publisher // nil = 禁用 pub/sub 广播
+	userInfo   *userinfo.Client
+	pubLogger  *slog.Logger
+	now        func() time.Time
+	predictFn  PredictFn      // SetPredictFn 覆盖
+	bizTZ      *time.Location // 营业日界时区(默认 Asia/Shanghai UTC+8)
 
 	scopeMu    sync.RWMutex
 	scopeCache map[string]scopeCacheEntry

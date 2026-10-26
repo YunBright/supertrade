@@ -50,6 +50,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/cubesource"
 	"github.com/YunBright/supertrade/internal/fresh-meat/model"
 	"github.com/shopspring/decimal"
 	"gorm.io/gorm"
@@ -668,6 +670,23 @@ func (s *Service) totalProducedKg(byPig map[string]map[string]decimal.Decimal) d
 // cutFromSales 是"从销售行反推的部位":**没有部位映射的 SKU**(如特价档)
 // 在 branch_cut_mappings 里查不到部位,但销售行自带 cut_type ⇒ 用它兜底,
 // 否则这类销售会落进一个**空 cut_type 的桶**(报表上"无名桶")。
+//
+// # ⚠️ 销售来源按门店的数据源分流(2026-10-26 门店反馈)
+//
+//	**有源门店** ⇒ 读**它自己的 cube 源**(sales_report 日汇总)
+//	**无源门店** ⇒ 读本地 PG 的 line_sales_by_pigs(由 sale.paid 事件写入)
+//
+// 为什么不统一读本地:line_sales_by_pigs **只收本地 POS 的 sale.paid 事件**
+// ⇒ 对有源门店它永远是空的 ⇒ 毛利看板永远是 revenue=0(2026-10-26 实测:
+// 店 00 的 cube 源 10-02 有 172.04kg / 3480.30 元的鲜肉销售,看板显示 0)。
+//
+// ⇒ **店与店之间没有映射关系**:不因为"都在一个系统里"就把店 10 的事件算到店 00 头上。
+//
+// ⚠️ 判据用 cubesource.Decide 的**三态**:问不到路由 / 数据源被停用 ⇒ **上抛**
+// (不回落本地 —— 回落 = 把一次链路故障显示成「这家店没卖东西」)。
+//
+// ⚠️ **统收(bulk)在有源门店拿不到**:cube 的 sales_report 只有零售货号维度,
+//   没有"大宗/统收"标记 ⇒ 有源门店的统收仍走本地手工登记(统收结算)。
 func (s *Service) loadSkuFlows(ctx context.Context, branchID string, startOfDay, endOfDay time.Time) (
 	soldKg, soldAmount, bulkKg, bulkAmount, wasteKg map[string]decimal.Decimal,
 	cutFromSales map[string]model.CutType, err error,
@@ -679,9 +698,47 @@ func (s *Service) loadSkuFlows(ctx context.Context, branchID string, startOfDay,
 	wasteKg = map[string]decimal.Decimal{}
 	cutFromSales = map[string]model.CutType{}
 
+	// ---- 销售:按数据源分流 ----
+	//
+	// ⚠️ **零售与统收是两条路,不能一起分流**(2026-10-26 契约实测抓到):
+	//
+	//	**零售**(POS 收银)⇒ 有源门店读 cube,无源门店读本地 sale.paid 事件;
+	//	**统收**(大宗/酒店批量)⇒ **永远读本地** line_sales_by_pigs(source='bulk')
+	//	  —— 因为统收是**在本域手工登记**的(统收结算单),
+	//	     cube 侧根本没有这个概念(它只有零售货号维度)。
+	//
+	// ⇒ 之前"有源 ⇒ 全走 cube"会把统收**整段丢掉**
+	//   ⇒ 统收成本 = 0 ⇒ 卖板油毛利率 100%(2026-10-25 修过的老 bug 又回来了)。
+	//
+	// ⚠️ 而且"有源"是**门店级**属性,不是**数据类别**属性:
+	//   契约测试的一次性门店会**借用**一个已启用的 cube 实例(为了校验 supplier_id),
+	//   但它的统收/报损仍是**本地数据** ⇒ 统一走 cube 必然读不到。
+	useCube, err := s.salesReadPath(ctx, branchID)
+	if err != nil {
+		return nil, nil, nil, nil, nil, nil, err
+	}
+	// ---- 零售 ----
+	if useCube {
+		if err := s.loadCubeSalesInto(ctx, branchID, startOfDay, soldKg, soldAmount, cutFromSales); err != nil {
+			return nil, nil, nil, nil, nil, nil, err
+		}
+	}
+	// ---- 本地销售行(零售事件 + 统收)----
+	//
+	// ⚠️ **sale_date 是 DATE 列** ⇒ 比较要用**字符串日期** `'YYYY-MM-DD'`。
+	//
+	// 为什么不能直接传 datatypes.Date / time.Time:
+	//   datatypes.Date.Value() 返回带**自身时区**的 time.Time
+	//   ⇒ PG 会把它当 timestamptz 转成**会话时区**(UTC)的日期
+	//   ⇒ 业务日"上海 10-02 00:00"落成 **10-01** ⇒ 查错一天(生产实测确认);
+	//   SQLite 下则序列化成 ISO 串 "2026-10-02T00:00:00Z" ⇒ 与参数形态不一致
+	//   ⇒ 当天那行永远匹配不上(2026-10-26 单测抓到:销售恒为 0)。
+	//
+	// ⇒ 一律传**字符串日期** + 跨驱动的归一表达式(见 fmSaleDateExpr)。
+	dayKey := startOfDay.In(s.bizTZOrUTC()).Format("2006-01-02")
 	var sales []model.LineSalesByPig
 	if err := s.db.WithContext(ctx).
-		Where("branch_id = ? AND sale_date >= ? AND sale_date < ?", branchID, startOfDay, endOfDay).
+		Where("branch_id = ? AND "+s.fmSaleDateExpr(), branchID, dayKey).
 		Find(&sales).Error; err != nil {
 		return nil, nil, nil, nil, nil, nil, fmt.Errorf("query line_sales_by_pig: %w", err)
 	}
@@ -697,8 +754,15 @@ func (s *Service) loadSkuFlows(ctx context.Context, branchID string, startOfDay,
 			cutFromSales[sku] = sa.CutType
 		}
 		if sa.Source == "bulk" {
+			// 统收:**永远走本地**(见上面的分流说明)。
 			bulkKg[sku] = bulkKg[sku].Add(sa.QtyKg)
 			bulkAmount[sku] = bulkAmount[sku].Add(sa.AmountYuan)
+			continue
+		}
+		if useCube {
+			// 零售已从 cube 读过了 ⇒ 本地的零售事件**跳过**
+			// (有源门店的本地事件表要么是空的,要么是历史残留;
+			//  两边都算 ⇒ 收入翻倍)。
 			continue
 		}
 		soldKg[sku] = soldKg[sku].Add(sa.QtyKg)
@@ -719,6 +783,104 @@ func (s *Service) loadSkuFlows(ctx context.Context, branchID string, startOfDay,
 		wasteKg[sku] = wasteKg[sku].Add(w.QtyKg)
 	}
 	return soldKg, soldAmount, bulkKg, bulkAmount, wasteKg, cutFromSales, nil
+}
+
+// salesReadPath 判定该门店的销售该走哪条路。
+//
+// ⚠️ 与 cubesource.Decide 的三态**完全一致**,不自己另判:
+//
+//	没配数据源(自营店) ⇒ 本地 PG
+//	配了且启用        ⇒ cube 源
+//	配了但被停用      ⇒ 503(ErrCubeUnavailable),**不回落本地**
+//	问不到路由        ⇒ 503,**不回落本地**
+//
+// 回落本地 = 把一次链路故障显示成「这家店没卖东西」——
+// 那正是 2026-10-26 门店看到"毛利看板没有销售"的形状。
+func (s *Service) salesReadPath(ctx context.Context, branchID string) (bool, error) {
+	useCube, err := cubesource.Decide(ctx, s.sources, branchID)
+	if err != nil {
+		// ⚠️ 权限类错误(403/401)原样上抛;其它(问不到/停用)一律 503。
+		if errors.Is(err, cubeclient.ErrCubeForbidden) || errors.Is(err, cubeclient.ErrCubeAuthRejected) {
+			return false, err
+		}
+		return false, fmt.Errorf("%w: %v", ErrCubeUnavailable, err)
+	}
+	if useCube && s.cubeReader == nil {
+		return false, fmt.Errorf("%w: 有源门店需要 cube 读端才能读销售", ErrCubeUnavailable)
+	}
+	return useCube, nil
+}
+
+// loadCubeSalesInto 读有源门店的 cube 销售,归集到 soldKg / soldAmount。
+//
+// operDate 用**源系统的营业日**:cube 的 oper_date 是思迅的日汇总营业日,
+// 与鲜肉域的 bizTZ 窗口不强制相等 ⇒ 直接等值匹配,不做二次时区换算。
+//
+// ⚠️ 部位(cut_type)从 **branch_cut_mappings** 反查 ——
+// cube 侧没有 cut_type 维度 ⇒ 拿不到就落进"无名桶"。
+// 这里只填 cutFromSales 里**已经有**的部位(映射表查到的),没查到的留空
+// ⇒ 主循环里的 cutOfSku 兜底会生效。
+func (s *Service) loadCubeSalesInto(
+	ctx context.Context, branchID string, day time.Time,
+	soldKg, soldAmount map[string]decimal.Decimal,
+	cutFromSales map[string]model.CutType,
+) error {
+	// 只关心**映射表里登记过的货号** ⇒ 非猪肉(蔬菜等)不会混进毛利。
+	skus, cutOf, err := s.mappedSkus(ctx, branchID)
+	if err != nil {
+		return err
+	}
+	if len(skus) == 0 {
+		// 该店一个货号都没登记 ⇒ 没有猪肉销售可言(不是错误)。
+		s.pubLogger.Warn("loadCubeSalesInto: 该店没有登记任何部位↔货号映射,销售按 0 计",
+			"branch_id", branchID)
+		return nil
+	}
+	operDate := day.In(s.bizTZOrUTC()).Format("2006-01-02")
+	rows, err := s.loadCubeSales(ctx, branchID, operDate, skus)
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		if r.QtyKg.IsZero() && r.AmountYuan.IsZero() {
+			continue
+		}
+		// ⚠️ **Go 侧再过滤一次**:cube 的 `in` 过滤是"请求什么给什么",
+		//   但**不能只靠它** —— 若过滤条件被 cube 侧忽略(实测过 502/行为漂移),
+		//   未登记的货号(蔬菜等)会混进鲜肉毛利。
+		//   ⇒ 这里只接受**映射表登记过**的货号。
+		cut, ok := cutOf[r.SKU]
+		if !ok {
+			continue
+		}
+		soldKg[r.SKU] = soldKg[r.SKU].Add(r.QtyKg)
+		soldAmount[r.SKU] = soldAmount[r.SKU].Add(r.AmountYuan)
+		if cut != "" {
+			cutFromSales[r.SKU] = cut
+		}
+	}
+	return nil
+}
+
+// mappedSkus 取该店登记过的货号集合 + 货号→部位。
+func (s *Service) mappedSkus(ctx context.Context, branchID string) ([]string, map[string]model.CutType, error) {
+	var mappings []model.BranchCutMapping
+	if err := s.db.WithContext(ctx).
+		Where("branch_id = ?", branchID).
+		Find(&mappings).Error; err != nil {
+		return nil, nil, fmt.Errorf("query branch_cut_mappings: %w", err)
+	}
+	skus := make([]string, 0, len(mappings))
+	cutOf := map[string]model.CutType{}
+	for _, m := range mappings {
+		sku := strings.TrimSpace(m.CubeProductID)
+		if sku == "" {
+			continue
+		}
+		skus = append(skus, sku)
+		cutOf[sku] = m.CutType
+	}
+	return skus, cutOf, nil
 }
 
 // loadSkuOpening 取期初(全店)数量与金额。
@@ -1011,6 +1173,44 @@ func (s *Service) bizTZOrUTC() *time.Location {
 		return s.bizTZ
 	}
 	return time.UTC
+}
+
+// fmSaleDateExpr 返回"把 sale_date 列归一成 'YYYY-MM-DD' 字符串"的 SQL 表达式。
+//
+// # 为什么需要它(2026-10-26)
+//
+// sale_date 是 datatypes.Date,**存储形态随驱动而变**(实测):
+//
+//	PG     → date 列
+//	SQLite → ISO 串 "2026-10-01T00:00:00+08:00"(连时区偏移都带)
+//
+// ⇒ 与"字符串日期参数"比较时,两边必须归一成同一种形态。
+//
+// # 两个驱动各自的写法(必须分开!)
+//
+//	PG     → substr(sale_date::text, 1, 10)
+//	         ⚠️ **不能写 substr(sale_date,1,10)** —— PG 里没有 substr(date,int,int)
+//	           这个函数(实测:`function substr(date, integer, integer) does not exist`)
+//	           ⇒ 查询直接报错 ⇒ **当天所有销售都查不出来**(统收台账直接挂)。
+//	SQLite → substr(sale_date, 1, 10)
+//	         ⚠️ SQLite 的 date() **不认带时区的 ISO 串**(实测 0 命中)
+//	           ⇒ 只能用 substr 取前 10 位。
+//
+// # 为什么**不传** datatypes.Date / time.Time 当参数
+//
+// datatypes.Date.Value() 返回带**自身时区**的 time.Time
+// ⇒ PG 把它当 timestamptz,按**会话时区**(UTC)折算日期
+// ⇒ 业务日"上海 10-02 00:00"落成 **10-01** ⇒ **查错一天**(生产实测确认:
+//	'select ('2026-10-02 00:00:00+08'::timestamptz)::date' = 2026-10-01)。
+//
+// ⇒ 一律传**字符串日期** + 归一后的列表达式 ⇒ 两个驱动都得到"营业日那一天"。
+//
+// 同类写法见 subscribe.go 的 findPigByCutInAdvice(PG/SQLite 两套 SQL)。
+func (s *Service) fmSaleDateExpr() string {
+	if s.db != nil && s.db.Dialector.Name() == "postgres" {
+		return "substr(sale_date::text, 1, 10) = ?"
+	}
+	return "substr(sale_date, 1, 10) = ?"
 }
 
 // computeOvernightShrink 估"隔夜失重·盘亏"。

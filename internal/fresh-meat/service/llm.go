@@ -22,6 +22,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/YunBright/supertrade/internal/cuberead"
+	"github.com/YunBright/supertrade/internal/cubesource"
 	"github.com/YunBright/supertrade/internal/fresh-meat/model"
 	dapr "github.com/dapr/go-sdk/client"
 	"github.com/shopspring/decimal"
@@ -338,6 +340,33 @@ func (s *Service) SetCubeClient(c CubeClient) {
 		return
 	}
 	s.cube = c
+}
+
+// SetCubeReader 注入 cube 通用查询读端(读 cube model 的低层能力)。
+//
+// ⚠️ **只用于"有源门店读销售"**(见 service/cube_sales.go):
+// 供应商校验、预售取价走的是上面那个窄接口 CubeClient,不需要它。
+//
+// 未注入 ⇒ 有源门店读销售会返 ErrCubeUnavailable(而不是静默回落本地,
+// 那会把"有源"显示成"这家店没卖东西")。
+func (s *Service) SetCubeReader(r cuberead.Reader) {
+	if r == nil {
+		return
+	}
+	s.cubeReader = r
+}
+
+// SetSourceResolver 注入「这个门店配了哪个数据源」的解析器。
+//
+// ⚠️ **未注入 ⇒ 全部按"无源"处理**(resolver == nil 时 cubesource.Decide 返 useCube=false)
+// ⇒ 读本地 PG。这是为了单测与纯本地部署兜底;
+//   **生产必须装配**(cmd/fresh-meat/main.go 装 cubesource.NewCachedResolver),
+//   否则有源门店的销售永远读不到 ⇒ 毛利看板恒 0(2026-10-26 门店反馈的根因)。
+func (s *Service) SetSourceResolver(r cubesource.Resolver) {
+	if r == nil {
+		return
+	}
+	s.sources = r
 }
 
 // 静默引用 os(为 env 读取预留)。
