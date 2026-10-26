@@ -30,7 +30,6 @@ import (
 	"github.com/YunBright/supertrade/internal/cubesource"
 	"github.com/YunBright/supertrade/internal/fresh-meat/model"
 	"github.com/shopspring/decimal"
-	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -68,6 +67,14 @@ type Service struct {
 	scopeMu    sync.RWMutex
 	scopeCache map[string]scopeCacheEntry
 	scopeTTL   time.Duration
+	// adviceInFlight 记录"正在后台生成分割建议"的猪 ID(防重复触发)。
+	//
+	// ⚠️ 用户可能连点「重新生成建议」⇒ 同一头猪同时只跑一个后台任务。
+	adviceInFlight sync.Map
+	// adviceRunner 执行后台任务(默认 go f();测试注入**同步**执行,保持确定性)。
+	//
+	// ⚠️ 生产必须保持异步(录猪不等 LLM)—— 见 RecordWholePig 的说明。
+	adviceRunner func(func())
 	// scopeStaleTTL 是过期缓存仍可兜底的时间窗(stale-while-error)。
 	//
 	// ⚠️ 0 = 关闭兜底(过期即失效,userd 失败直接 503)。
@@ -138,7 +145,22 @@ func New(db *gorm.DB) *Service {
 		scopeStaleTTL: defaultScopeStaleTTL,
 		predictFn:  defaultPredictFn, // 默认 history_avg 降级路径
 		bizTZ:      time.FixedZone("Asia/Shanghai", 8*3600),
+		adviceRunner: func(f func()) { go f() },
 	}
+}
+
+// SetAdviceRunner 注入后台任务的执行方式(**仅测试用**)。
+//
+// ⚠️ 生产**不要**注入同步版本:录猪必须立即返回,不等 LLM
+//   (同步等 ⇒ 客户端 dio receiveTimeout(30s)与服务端 LLM 超时(30s)撞车
+//   ⇒ 客户端超时断开 ⇒ 建议永久丢失 —— 2026-10-26 门店反馈的真因)。
+//
+// 单测注入同步执行 ⇒ 断言"录猪后建议已就绪"是确定性的,不用 sleep 轮询。
+func (s *Service) SetAdviceRunner(fn func(func())) {
+	if fn == nil {
+		return
+	}
+	s.adviceRunner = fn
 }
 
 // SetBizTZ 注入营业日界时区(nil = 保持当前)。
@@ -266,13 +288,27 @@ var (
 
 // ---- 整猪录入(RecordWholePig) ----
 
-// RecordWholePig 录入一头猪 + 同步调 LLM。
+// RecordWholePig 录入一头猪 + **异步**生成分割建议。
 //
-// 流程:DB insert → 调 s.predictFn(pig, history) →
+// 流程:DB insert → 立即返回(200)→ 后台调 s.predictFn(pig, history) →
 //   - 成功 → UPDATE whole_pig SET llm_advice_json=?, data_source='llm'
 //   - 失败 / 超时 → 走 history_avg 兜底(UPDATE data_source='history_avg')
+//   - 双失败 → advice_status='failed'(门店可「重新生成建议」)
 //
-// **失败不视为业务错误**:返 200 + data_source=history_avg 给仓管。
+// # ⚠️ 为什么建议是异步的(2026-10-26 门店反馈)
+//
+// 「点提交录入并生成分割建议 ⇒ 报网络错误;刷新后猪录进去了,却没有分割建议。」
+//
+// 之前这里是**同步**调 LLM ⇒ 客户端 dio receiveTimeout(30s)与服务端 LLM 超时
+// (FRESHMEAT_LLM_TIMEOUT,默认 30s)**撞车** ⇒ 客户端先超时并断开
+// ⇒ 请求 ctx 被取消 ⇒ LLM 调用、history_avg 回落、写回**全被取消**
+// ⇒ 猪在库里,但建议**永久丢失**且无补偿。
+//
+// ⇒ 现在:猪先落库、**立即返回**;建议在后台用**独立 ctx**生成
+//   (见 service/pig_advice.go)⇒ 客户端断网/超时都不影响建议落库。
+//
+// **失败不视为业务错误**:录猪本身是"事实录入",成功就成功;
+// 建议是辅助产物,失败只影响建议状态。
 func (s *Service) RecordWholePig(ctx context.Context, branchID string, in model.RecordWholePigInput, operatorID string) (*model.WholePig, error) {
 	if branchID == "" {
 		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
@@ -341,6 +377,8 @@ func (s *Service) RecordWholePig(ctx context.Context, branchID string, in model.
 		ArrivedAt:             in.ArrivedAt,
 		RecordedBy:            operatorID,
 		DataSource:            model.DataSourceStub,
+		// 建议是**异步**生成的 ⇒ 落库时就是"生成中"。
+		AdviceStatus:          model.AdviceStatusGenerating,
 		HalfPig:               in.HalfPig,
 		OffalIncluded:         in.OffalIncluded,
 		PurchaseGroupID:       strings.TrimSpace(in.PurchaseGroupID),
@@ -357,40 +395,16 @@ func (s *Service) RecordWholePig(ctx context.Context, branchID string, in model.
 			"branch_id", branchID, "pig_id", pig.ID, "err", err)
 	}
 
-	// 查近 30 天 ±10% 重量段历史 + 调 LLM。
-	history := s.findHistoryPigs(ctx, branchID, in.GrossWeightKg, in.ArrivedAt)
-	result, predictErr := s.predictFn(ctx, pig, history)
-	if predictErr != nil {
-		s.pubLogger.Warn("RecordWholePig: predictFn failed, fallback to history_avg",
-			"pig_id", pig.ID,
-			"err", predictErr)
-		result, predictErr = defaultPredictFn(ctx, pig, history)
-		if predictErr != nil {
-			s.pubLogger.Warn("RecordWholePig: history_avg fallback also failed",
-				"pig_id", pig.ID,
-				"err", predictErr)
-			// 双失败:仍返 200 给仓管,DataSource 留 stub + llm_advice_json 留 NULL。
-			return pig, nil
-		}
-	}
-
-	// 写回 llm_advice_json + data_source。
-	ds := model.DataSource(result.Source)
-	if ds != model.DataSourceLLM && ds != model.DataSourceHistoryAvg {
-		ds = model.DataSourceHistoryAvg
-	}
-	if err := s.db.WithContext(ctx).Model(pig).Updates(map[string]any{
-		"llm_advice_json": datatypes.JSON(result.RawJSON),
-		"data_source":     ds,
-		"updated_at":      now,
-	}).Error; err != nil {
-		s.pubLogger.Warn("RecordWholePig: update llm_advice_json failed",
-			"pig_id", pig.ID, "err", err)
-		// DB 写失败不影响业务:返 pig 但 DB 上字段可能仍是 stub。
-		return pig, nil
-	}
-	pig.LLMAdviceJSON = datatypes.JSON(result.RawJSON)
-	pig.DataSource = ds
+	// ---- 分割建议:**异步**生成(2026-10-26)----
+	//
+	// ⚠️ 这里**不再同步等 LLM**:同步等 ⇒ 客户端 dio receiveTimeout(30s)与服务端
+	//   LLM 超时(默认 30s)撞车 ⇒ 客户端先超时并断开 ⇒ 请求 ctx 被取消
+	//   ⇒ LLM 调用 / history_avg 回落 / 写回**全被取消**
+	//   ⇒ 猪录进去了、建议永久丢失(生产实测 19:32 那次)。
+	//
+	// ⇒ 现在:猪先落库、**立即返回**;建议在后台用**独立 ctx**生成
+	//   (客户端断网/超时都不影响它落库)⇒ 见 service/pig_advice.go。
+	s.kickAdviceGeneration(ctx, pig.ID, branchID)
 	return pig, nil
 }
 

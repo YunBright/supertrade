@@ -220,6 +220,24 @@ const (
 	DataSourceStub       DataSource = "stub"        // 骨架占位;LLM 真实接入后不再使用
 )
 
+// ---- 分割建议的生成状态 ----
+//
+// ⚠️ 2026-10-26:录猪后建议改成**异步**生成(见 service.RecordWholePig)
+// ⇒ 前端必须能区分「还在算」「算好了」「算失败」。
+//
+// 光看 llm_advice_json 是否为空**分不出来**
+// (空既可能是"在算",也可能是"算失败")⇒ 需要一个显式状态。
+const (
+	// AdviceStatusNone = 没生成过(历史数据 / 还没触发)。
+	AdviceStatusNone = "none"
+	// AdviceStatusGenerating = 生成中(前端显示"生成中"并轮询)。
+	AdviceStatusGenerating = "generating"
+	// AdviceStatusReady = 已就绪(llm_advice_json 有值)。
+	AdviceStatusReady = "ready"
+	// AdviceStatusFailed = 生成失败(前端给「重新生成建议」入口)。
+	AdviceStatusFailed = "failed"
+)
+
 // ---- 表1:whole_pig ----
 
 // WholePig 整猪录入(早盘,一头一行)。
@@ -239,6 +257,11 @@ type WholePig struct {
 	RecordedBy            string          `gorm:"column:recorded_by;type:varchar(64);not null" json:"recorded_by"`
 	LLMAdviceJSON         datatypes.JSON  `gorm:"column:llm_advice_json;type:jsonb" json:"llm_advice_json,omitempty"`
 	DataSource            DataSource      `gorm:"column:data_source;type:varchar(16);not null;default:'stub'" json:"data_source"`
+	// AdviceStatus 是**分割建议的生成状态**(见上面的 AdviceStatus* 常量)。
+	//
+	// ⚠️ 录猪后建议是**异步**生成的(2026-10-26)⇒ 前端靠它区分
+	//「生成中 / 已就绪 / 失败」——光看 llm_advice_json 是否为空分不出来。
+	AdviceStatus string `gorm:"column:advice_status;type:varchar(16);not null;default:'none'" json:"advice_status"`
 	// 场景一/二/三区分:
 	HalfPig         bool      `gorm:"column:half_pig;not null;default:false" json:"half_pig"`                                                         // 半头猪
 	OffalIncluded   bool      `gorm:"column:offal_included;not null;default:false" json:"offal_included"`                                             // 带全猪下水

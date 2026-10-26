@@ -59,7 +59,22 @@ func (l *recordingLogger) info(msg string, kv ...any) {
 }
 
 // setupTestService 起 SQLite + 录 publisher + 固定时钟。
+//
+// 默认注入**同步**的后台执行器(分割建议同步跑完)⇒ 断言确定性好、不用 sleep。
 func setupTestService(t *testing.T) (*service.Service, *recordingPublisher) {
+	return setupTestServiceMode(t, true)
+}
+
+// setupTestServiceAsync 起 SQLite + 录 publisher + 固定时钟,
+// 但**不**覆盖后台执行器 ⇒ 分割建议按生产的**异步**方式生成。
+//
+// ⚠️ 用于验证"录猪不等 LLM""客户端断开不影响建议"这类**时序**行为
+// (2026-10-26 门店反馈的真因就在这里)。
+func setupTestServiceAsync(t *testing.T) (*service.Service, *recordingPublisher) {
+	return setupTestServiceMode(t, false)
+}
+
+func setupTestServiceMode(t *testing.T, syncAdvice bool) (*service.Service, *recordingPublisher) {
 	t.Helper()
 	db, err := testdb.OpenSQLite(":memory:?_pragma=foreign_keys(1)")
 	if err != nil {
@@ -107,6 +122,13 @@ func setupTestService(t *testing.T) (*service.Service, *recordingPublisher) {
 
 	pub := &recordingPublisher{}
 	svc.SetPublisher(pub)
+	// ⚠️ 分割建议改成**异步**生成(2026-10-26)⇒ 单测默认注入**同步**执行器:
+	//   "录猪后建议已就绪"是确定性的,不用 sleep 轮询。
+	//   (生产保持异步 —— 见 service.SetAdviceRunner 的说明。)
+	//   要验证异步时序 ⇒ 用 setupTestServiceAsync。
+	if syncAdvice {
+		svc.SetAdviceRunner(func(f func()) { f() })
+	}
 	// 把 db 挂到 testDBSingleton,Stage 4 测试需要直接写 llm_advice_json 模拟。
 	testDBSingleton = db
 	return svc, pub
@@ -133,6 +155,18 @@ func mustNoErr(t *testing.T, err error, label string) {
 	}
 }
 
+// reloadPig 从库里读回整猪。
+//
+// ⚠️ 分割建议是**异步**写回的(2026-10-26)⇒ 断言建议相关字段时
+// **必须查库**,不能只看 RecordWholePig 的返回值(返回值是"刚落库那一刻"的状态,
+// data_source 还是 stub、advice_status 是 generating)。
+func reloadPig(t *testing.T, svc *service.Service, branchID, pigID string) *model.WholePig {
+	t.Helper()
+	pig, err := svc.GetWholePig(context.Background(), branchID, pigID)
+	mustNoErr(t, err, "GetWholePig")
+	return pig
+}
+
 // ---- 整猪 ----
 
 func TestRecordWholePig_OK_PurchaseCostPrecision(t *testing.T) {
@@ -153,8 +187,14 @@ func TestRecordWholePig_OK_PurchaseCostPrecision(t *testing.T) {
 	}
 	// 默认 predictFn = defaultPredictFn → data_source 应为 history_avg
 	// (单测没注入真 LLM,降级路径必触发;`stub` 语义在 production 已不可达)。
-	if pig.DataSource != model.DataSourceHistoryAvg {
-		t.Errorf("data_source = %q, want history_avg(单测无 LLM,降级路径)", pig.DataSource)
+	//
+	// ⚠️ 建议是**异步**写回的 ⇒ 断言必须**查库**(见 reloadPig)。
+	row := reloadPig(t, svc, "S001", pig.ID)
+	if row.DataSource != model.DataSourceHistoryAvg {
+		t.Errorf("data_source = %q, want history_avg(单测无 LLM,降级路径)", row.DataSource)
+	}
+	if row.AdviceStatus != model.AdviceStatusReady {
+		t.Errorf("advice_status = %q, want ready", row.AdviceStatus)
 	}
 	if pig.ID == "" || pig.ID[:2] != "WP" {
 		t.Errorf("id 前缀应是 WP, got %q", pig.ID)
@@ -821,11 +861,16 @@ func TestRecordWholePig_LLM_Success(t *testing.T) {
 	if fake.calls != 1 {
 		t.Errorf("predictFn calls = %d, want 1", fake.calls)
 	}
-	if pig.DataSource != model.DataSourceLLM {
-		t.Errorf("data_source = %q, want llm", pig.DataSource)
+	// ⚠️ 建议是**异步**写回的 ⇒ 查库断言(见 reloadPig)。
+	row := reloadPig(t, svc, "S001", pig.ID)
+	if row.DataSource != model.DataSourceLLM {
+		t.Errorf("data_source = %q, want llm", row.DataSource)
 	}
-	if len(pig.LLMAdviceJSON) == 0 {
+	if len(row.LLMAdviceJSON) == 0 {
 		t.Errorf("llm_advice_json 应非空")
+	}
+	if row.AdviceStatus != model.AdviceStatusReady {
+		t.Errorf("advice_status = %q, want ready", row.AdviceStatus)
 	}
 }
 
@@ -845,11 +890,13 @@ func TestRecordWholePig_LLM_Timeout_FallbackHistory(t *testing.T) {
 	if fake.calls != 1 {
 		t.Errorf("predictFn 调用 1 次后降级,got %d", fake.calls)
 	}
-	if pig.DataSource != model.DataSourceHistoryAvg {
-		t.Errorf("data_source = %q, want history_avg", pig.DataSource)
+	// ⚠️ 建议是**异步**写回的 ⇒ 查库断言。
+	row := reloadPig(t, svc, "S001", pig.ID)
+	if row.DataSource != model.DataSourceHistoryAvg {
+		t.Errorf("data_source = %q, want history_avg", row.DataSource)
 	}
 	// llm_advice_json 应记录"fallback_used" 元数据(由 defaultPredictFn 写入)
-	if len(pig.LLMAdviceJSON) == 0 {
+	if len(row.LLMAdviceJSON) == 0 {
 		t.Errorf("history_avg fallback 也应写 llm_advice_json(占位)")
 	}
 }
@@ -867,8 +914,10 @@ func TestRecordWholePig_LLM_5xx_FallbackHistory(t *testing.T) {
 			SupplierID: "SUP-1", ArrivedAt: time.Date(2026, 10, 1, 6, 0, 0, 0, time.UTC),
 		}, "u-1")
 	mustNoErr(t, err, "RecordWholePig")
-	if pig.DataSource != model.DataSourceHistoryAvg {
-		t.Errorf("data_source = %q, want history_avg", pig.DataSource)
+	// ⚠️ 建议是**异步**写回的 ⇒ 查库断言。
+	row := reloadPig(t, svc, "S001", pig.ID)
+	if row.DataSource != model.DataSourceHistoryAvg {
+		t.Errorf("data_source = %q, want history_avg", row.DataSource)
 	}
 }
 
@@ -881,8 +930,10 @@ func TestRecordWholePig_DefaultPredictFn_HistoryAvg(t *testing.T) {
 			SupplierID: "SUP-1", ArrivedAt: time.Date(2026, 10, 1, 6, 0, 0, 0, time.UTC),
 		}, "u-1")
 	mustNoErr(t, err, "RecordWholePig")
-	if pig.DataSource != model.DataSourceHistoryAvg {
-		t.Errorf("data_source = %q, want history_avg(默认降级路径)", pig.DataSource)
+	// ⚠️ 建议是**异步**写回的 ⇒ 查库断言。
+	row := reloadPig(t, svc, "S001", pig.ID)
+	if row.DataSource != model.DataSourceHistoryAvg {
+		t.Errorf("data_source = %q, want history_avg(默认降级路径)", row.DataSource)
 	}
 }
 

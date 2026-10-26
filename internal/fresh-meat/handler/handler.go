@@ -74,6 +74,9 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.POST("/whole-pigs", requireBranch, h.RecordWholePig)
 	r.GET("/whole-pigs", requireBranch, h.ListWholePigsByDay)
 	r.GET("/whole-pigs/:pig_id", requireBranch, h.GetWholePig)
+	// ★ 重新生成分割建议(2026-10-26:建议改成**异步**生成后,仍可能因为
+	//   "服务重启 / LLM 连续失败"而没有建议 ⇒ 门店需要一个补救入口)。
+	r.POST("/whole-pigs/:pig_id/advice", requireBranch, h.RegeneratePigAdvice)
 	// ★ 删掉**录错了**的猪（2026-10-25 门店反馈："多录了一头，只能将错就错"）。
 	//   只允许删**干净**的猪：没有分割补录、没有销售归属、且不在已审计期间。
 	r.DELETE("/whole-pigs/:pig_id", requireBranch, h.DeleteWholePig)
@@ -339,6 +342,37 @@ func (h *Handler) GetWholePig(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+// RegeneratePigAdvice POST /whole-pigs/:pig_id/advice
+//
+// 手动重跑分割建议(**异步**,立即返回 202 + advice_status=generating)。
+//
+// ⚠️ 为什么需要它(2026-10-26 门店反馈):
+// 建议改成异步生成后,仍可能因为"服务重启 / LLM 连续失败"而没有建议
+// ⇒ 门店需要一个**补救入口**(不然这头猪的成本就摊不出去)。
+//
+// 权限:freshmeat:write。
+func (h *Handler) RegeneratePigAdvice(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	pigID := strings.TrimSpace(c.Param("pig_id"))
+	if pigID == "" {
+		writeError(c, http.StatusBadRequest, "missing_pig_id", "pig_id 必填")
+		return
+	}
+	out, err := h.svc.RegeneratePigAdvice(c.Request.Context(), branchID, pigID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{
+		"ok":            true,
+		"pig_id":        pigID,
+		"advice_status": out.AdviceStatus,
+	})
 }
 
 // DeleteWholePig DELETE /whole-pigs/:pig_id
