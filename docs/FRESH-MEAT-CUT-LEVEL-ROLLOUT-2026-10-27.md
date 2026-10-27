@@ -147,3 +147,109 @@
 ### 7.5 回滚
 
 同 §6：`git revert` 后重新部署 `fresh-meat`。⚠️ 已审计冻结的门店，其后数据被冻结 ⇒ 回滚前确认。
+---
+
+## 8. 已知项：长期毛利 / 每日毛利的查询耗时（2026-10-27 生产实测）
+
+### 8.1 现象
+
+| 接口 | 目标日期 | 耗时 |
+|---|---|---|
+| `GET /gross-margin` | 10-02 | ~0.7s |
+| `GET /gross-margin` | 10-12 | ~4.0s |
+| `GET /gross-margin` | 10-27 | **~8.9s** |
+| `GET /gross-margin/period` | 10-02 ~ 10-27(26 天) | ~8.8s |
+
+⇒ **耗时随"目标日期离基线多远"线性增长**。
+
+### 8.2 根因
+
+`loadCutOpening` 的第 ② 步(上一营业日的实时余额链 `closingForDay`)在**未审计**的门店
+会走 `deriveColdChain` ⇒ **每次调用都把整条链重算一遍**。
+而链式回溯**每天**都会调一次 ⇒ O(天²)。
+
+⇒ 物化(`cut_cost_daily`)虽然已把成本链接上，但**物理库存链**(`cut_stock_daily`)
+仍要走实时推链 ⇒ 加速不明显。
+
+### 8.3 方案(下一轮做)
+
+1. `loadCutOpening` 的 ② 改为**惰性求值 + 请求级缓存**:
+   `deriveColdChain` 一次调用就能给出**所有天**的日终结余
+   ⇒ 链回溯时每天从它里面取 ⇒ 全链只算一次 ⇒ O(天²) → O(天)。
+2. ⚠️ **不能**直接用成本链的结余替代物理库存链的结余 ——
+   两者语义不同(账面结余 vs 冷库/柜台实盘结余),且审计后 `cut_stock_daily` 是**冻结**的。
+   ⇒ 只能缓存、不能替换。
+3. 审计结转之后(`cut_stock_daily` 落地)⇒ ② 直接读快照 ⇒ 本问题自动消失。
+
+### 8.4 当前可接受的结论
+
+- 数字**是对的**(对账差额恒 0、恒等式闭合、链逐日接续)。
+- 慢**只影响查询耗时**,不影响数据正确性。
+- 门店开始做日终盘点 + 审计结转后 ⇒ 这个问题自然消失(② 读冻结快照)。
+
+---
+
+## 9. 第三轮修订：报告级 `cost_incomplete` + 区间级提示不再漏报（2026-10-27）
+
+### 9.1 起因（一个真实漏报）
+
+Flutter 标注交付后自审发现：**区间级提示会被漏报**，而且生产场景正好落进缝里。
+
+后端 `PeriodMarginReport` 有**两个**口径，含义差一半：
+
+| 字段 | 口径 | 宽/严 |
+|---|---|---|
+| `cost_incomplete` | 区间里**有任何一天/部位**算不出来就算 true | **宽** |
+| `days_without_cost_baseline` | 只数"**整天所有部位**都算不出来"的天 | **严** |
+
+前端区间级提示原本由 `days_without_cost_baseline > 0` 驱动 ⇒ 生产真实场景漏报：
+
+- 店 00 的 10-01：有 **22 个部位**成本算不出来，但当天**只有部分部位**算不出来
+  （trotter 9.23kg@8元 有价）⇒ 那天**不是**"整天缺基线"。
+- ⇒ `days_without_cost_baseline = 0` ⇒ **一条提示都不显示**。
+- ⇒ 店长只看得到"毛利 13.47%"，完全不知道 10-01 的成本是被低估的。
+
+### 9.2 后端改动
+
+| 改动 | 原因 |
+|---|---|
+| `PeriodMarginReport` 新增 `cost_incomplete_note` | 与每日毛利 `cost_incomplete_note` 对齐 ⇒ 前端**原样显示后端口径**，不自己拼 |
+| `note` 里「其中 N 天成本算不出来」拆成两种分支 | 旧写法在 `cost_incomplete=true` 但 `days_without_cost_baseline=0` 时会拼出**「其中 0 天成本算不出来」** ⇒ 自相矛盾且误导店长（生产实测已复现） |
+
+新文案：
+
+- 整天缺基线（`days_without_cost_baseline > 0`）：
+  「⚠ 本区间有 N 天的成本**完全算不出来**（既没有期初结转、也没有进货）⇒ 这 N 天的毛利被高估」
+- 部分天 / 部分部位：
+  「⚠ 本区间有部分天、部分部位的成本**算不出来**（既没有期初结转、也没有进货）⇒ 那部分成本被低估、毛利被高估」
+
+### 9.3 前端改动
+
+| 文件 | 改动 |
+|---|---|
+| `lib/domain/fresh_meat/fresh_meat_period_margin.dart` | 解析报告级 `cost_incomplete` / `cost_incomplete_note`（缺字段 ⇒ false / ''，**绝不**「缺了就当有问题」） |
+| `lib/ui/fresh_meat/margin/period_margin_cost_warning.dart` | `PeriodMarginDaysWarning` → `PeriodMarginCostWarning`：按**报告**驱动，优先后端原话，缺字段走降级文案 |
+| `lib/ui/fresh_meat/margin/period_margin_table.dart` | 触发条件 = `costIncomplete \|\| daysWithoutCostBaseline > 0` |
+
+⚠️ **兼容旧后端**：两个条件都是后端**明确报的事实** ⇒ 缺字段时两者皆空 ⇒ 不显示（不误报）；
+旧后端只发 `days_without_cost_baseline` 时也照样能提示 ⇒ Flutter 与后端**可分头发版**。
+
+### 9.4 测试
+
+- **后端**：`TestPeriodMargin_PartialCostIncomplete_ReportLevelFlag`（新增）——
+  造「belly 有基线 + trotter 无基线」场景，断言报告级 flag=true、天数=0、两处文案都**不出现「0 天」**。
+  ⚠️ 判别力自检：把 `note` 改回旧写法 ⇒ 用例立刻变红（症状与生产事故一致）。
+- **前端**：domain 解析 5 条 + 表格 widget 3 条 + 页面 widget 2 条。
+
+### 9.5 契约变化
+
+```json
+{
+  "cost_incomplete": true,
+  "cost_incomplete_note": "⚠ 本区间有部分天、部分部位的成本**算不出来**（既没有期初结转、也没有进货）⇒ 那部分成本被低估、毛利被高估",
+  "days_without_cost_baseline": 0
+}
+```
+
+⚠️ `cost_incomplete` / `cost_incomplete_note` 都是 `omitempty` ⇒ 后端没报时**字段不存在**
+⇒ 前端按"没有标注"处理（宁可漏报也不能误报）。

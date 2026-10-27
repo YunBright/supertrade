@@ -199,7 +199,7 @@
    - **审计结转**（物化点）本来就逐日物化整条链：审计前置条件 = 区间内每天都有完整日终盘点 ⇒ 每天都会落 ⇒ 审计过的区间秒回。
 4. **「成本算不出来」 ≠ 「成本为 0」**：
    - 引擎：`CutDailyCost.CostUncomputable`。
-   - 期间毛利：行级 `cost_incomplete` + 报告级 `days_without_cost_baseline` + Note。
+   - 期间毛利：行级 `cost_incomplete` + 报告级 `cost_incomplete`（宽）/ `days_without_cost_baseline`（严）/ `cost_incomplete_note` + Note。
    - 每日毛利：报告级 `cost_incomplete` + `cost_incomplete_note` + 部位行 `cost_incomplete`。
 5. **期初结转生效日 = 链的起点**：门店在那一天重新定义了库存与进价 ⇒ 那天的期初用门店录的值
    （不再被「昨天卖剩的量」覆盖），且门店给的进价优先于历史单价。
@@ -213,6 +213,7 @@
 | 无基线的天必须标注（不算成成本 0） | `TestCutChain_NoBaseline_CostMarkedUncomputable` / `TestGrossMargin_CostIncompleteMarked` |
 | 写路径会物化（不绑盘点） | `TestCutChain_WritePathMaterializesChain` |
 | 长期毛利 = 每日毛利之和 | `TestCutChain_PeriodMarginEqualsSumOfDaily` / `TestPeriodMargin_AuditMaterializesEveryDay` |
+| 报告级 `cost_incomplete`（宽）与 `days_without_cost_baseline`（严）**口径不同**、且文案不得出现「0 天」 | `TestPeriodMargin_PartialCostIncomplete_ReportLevelFlag` |
 
 > ⚠️ **判别力**：摘掉链式接续 ⇒ 链测试立即变红（症状「链断了」）。
 > ⚠️ **cube 假身必须按 `oper_date` 返回**：链现在逐日回溯，假身若对任何日期返回同一批销售 ⇒ 销售被重复计入每一天。
@@ -221,8 +222,16 @@
 
 `GET /fresh-meat/gross-margin/period`：
 - 行新增 `cost_incomplete`（bool）
-- 报告新增 `days_without_cost_baseline`（int）—— 口径是「成本**完全**算不出来」的天数（部分算不出来只影响行级 `cost_incomplete`）
-- Note 追加「成本算不出来」的说明
+- 报告新增 `cost_incomplete`（bool）—— 口径是「区间里**有任何一天/部位**算不出来」（**宽**）
+- 报告新增 `cost_incomplete_note`（string）—— 给门店看的**人话**说明，前端**原样显示**
+- 报告新增 `days_without_cost_baseline`（int）—— 口径是「成本**完全**算不出来」的天数（**严**）
+- Note 追加「成本算不出来」的说明（⚠️ **按宽/严拆成两种文案**：旧写法在
+  `cost_incomplete=true` 但 `days_without_cost_baseline=0` 时会拼出**「其中 0 天成本算不出来」**
+  ⇒ 自相矛盾且误导店长，生产实测已复现）
+
+> ⚠️ **区间级提示必须由报告级 `cost_incomplete`（宽口径）驱动**，
+> `days_without_cost_baseline` 只作补充 —— 店 00 的 10 月区间正是
+> 「部分天/部分部位算不出来」（天数 = 0），按天数驱动 ⇒ **一条提示都不显示**。
 
 `GET /fresh-meat/gross-margin`：
 - 报告新增 `cost_incomplete`（bool）、`cost_incomplete_note`（string）

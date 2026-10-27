@@ -103,7 +103,19 @@ type PeriodMarginReport struct {
 	DaysWithoutCostBaseline int `json:"days_without_cost_baseline,omitempty"`
 	// CostIncomplete = true ⇒ 区间里有**成本算不出来**的天
 	// (部分或全部)⇒ **期间毛利被高估** ⇒ 前端必须提示,别让店长把"毛利 100%"当真。
+	//
+	// ⚠️ 与 DaysWithoutCostBaseline 的区别(和每日毛利口径一致):
+	//   CostIncomplete            ⇒ 区间里**有任何一天/部位**算不出来就算 true(宽)
+	//   DaysWithoutCostBaseline   ⇒ 只数"**整天所有部位**都算不出来"的天(严)
+	// ⇒ 报告级提示由 **CostIncomplete** 驱动(宽口径才不漏报);
+	//   天数只是补充说明,不能当触发条件(实测:10-01 有 22 个部位算不出来、
+	//   但当天只有部分部位算不出来 ⇒ 整天缺基线 = 0 ⇒ 按天数触发会漏报)。
 	CostIncomplete bool `json:"cost_incomplete,omitempty"`
+	// CostIncompleteNote 是给门店看的**人话**说明(前端**原样显示**,不改写)。
+	//
+	// ⚠️ 与每日毛利的 `cost_incomplete_note` 对齐 ⇒ 同一个 widget 两条链路复用。
+	// ⚠️ 缺字段 = 后端没报 ⇒ 前端走降级文案(见前端 PeriodMarginCostWarning)。
+	CostIncompleteNote string `json:"cost_incomplete_note,omitempty"`
 	// Note 说明口径(尤其是"期初存货成本在售出时结转")。
 	Note string `json:"note,omitempty"`
 }
@@ -244,9 +256,26 @@ func (s *Service) ComputePeriodMargin(ctx context.Context, branchID, from, to, g
 		note = "SKU 粒度:营收/销量按货号(销售流水口径);" +
 			"成本按**当日该部位**的移动加权单价分摊(库存是部位的 ⇒ 货号级成本只能近似)。"
 	}
+	// ⚠️ 「成本算不出来」的人话说明 + note 里的口径补充。
+	//
+	// ⚠️ **两种情况必须分开写**:
+	//   costIncomplete=true 但 daysWithoutBaseline==0 ⇒ 区间里是"部分天/部分部位"算不出来
+	//   (实测店 00 的 10-01:22 个部位算不出来,但 trotter 有价 ⇒ 整天缺基线=0)
+	//   ⇒ 旧写法会拼出「其中 **0** 天成本算不出来」——自相矛盾且会误导店长。
+	costIncompleteNote := ""
 	if costIncomplete {
-		note += fmt.Sprintf(";其中 %d 天成本**算不出来**(链起算点之前:既没有期初库存也没有进货)"+
-			"⇒ 这部分成本被低估、毛利被高估(cost_incomplete=true 的行)", daysWithoutBaseline)
+		if daysWithoutBaseline > 0 {
+			costIncompleteNote = fmt.Sprintf("⚠ 本区间有 %d 天的成本**完全算不出来**"+
+				"(既没有期初结转、也没有进货)⇒ 这 %d 天的毛利被高估", daysWithoutBaseline, daysWithoutBaseline)
+			note += fmt.Sprintf(";其中 %d 天成本**完全算不出来**(链起算点之前:既没有期初库存也没有进货)"+
+				"⇒ 这部分成本被低估、毛利被高估(cost_incomplete=true 的行)", daysWithoutBaseline)
+		} else {
+			costIncompleteNote = "⚠ 本区间有部分天、部分部位的成本**算不出来**" +
+				"(既没有期初结转、也没有进货)⇒ 那部分成本被低估、毛利被高估"
+			note += ";区间里有部分天、部分部位的成本**算不出来**" +
+				"(链起算点之前:既没有期初库存也没有进货)" +
+				"⇒ 那部分成本被低估、毛利被高估(cost_incomplete=true 的行)"
+		}
 	}
 	return &PeriodMarginReport{
 		BranchID:                branchID,
@@ -258,6 +287,7 @@ func (s *Service) ComputePeriodMargin(ctx context.Context, branchID, from, to, g
 		Days:                    days,
 		DaysWithoutCostBaseline: daysWithoutBaseline,
 		CostIncomplete:          costIncomplete,
+		CostIncompleteNote:      costIncompleteNote,
 		Note:                    note,
 	}, nil
 }

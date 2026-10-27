@@ -20,6 +20,7 @@ package service_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -425,5 +426,74 @@ func TestCutChain_PeriodMarginEqualsSumOfDaily(t *testing.T) {
 	if period.Total.GrossMarginYuan.Sub(sumDaily).Abs().GreaterThan(d("0.000001")) {
 		t.Errorf("★ 长期毛利应是每日毛利之和: 期间 %s vs 每日之和 %s",
 			period.Total.GrossMarginYuan, sumDaily)
+	}
+}
+
+// TestPeriodMargin_PartialCostIncomplete_ReportLevelFlag 锁 ④。
+//
+// # 场景(生产真实形态:店 00 的 10-01)
+//
+//	belly   有期初结转(10-01 录 100kg@18)⇒ 成本**算得出来**
+//	trotter 既无期初结转、当天也没进货、只卖货 ⇒ 成本**算不出来**
+//	⇒ 那天是"**部分**算不出来",不是"**完全**算不出来"。
+//
+// # 期望
+//
+//	① 报告级 cost_incomplete = true（宽口径 ⇒ 必须报）
+//	② days_without_cost_baseline = 0（严口径 ⇒ 那天不是"整天缺基线"）
+//	③ cost_incomplete_note 非空，且**不能**出现"0 天"这种自相矛盾的说法
+//	④ note 同样不能出现"0 天"
+//
+// # 为什么锁这条
+//
+//	前端若用 `days_without_cost_baseline > 0` 驱动区间级提示 ⇒
+//	店 00 的 10 月区间(days=0)会**一条提示都不显示** ⇒
+//	店长只看得到"毛利 13.47%",完全不知道 10-01 那天的成本是被低估的。
+//	⇒ 区间级提示必须由**报告级** cost_incomplete 驱动。
+func TestPeriodMargin_PartialCostIncomplete_ReportLevelFlag(t *testing.T) {
+	day2 := fmDay1.Add(24 * time.Hour) // 2026-10-02
+	svc, ctx := fmChainSetup(t, map[string][]map[string]any{
+		"2026-10-02": {
+			fmCubeSalesRow("P-BELLY", "10", "180"),
+			fmCubeSalesRow("P-TROTTER", "5", "120"),
+		},
+	})
+	// 第二个部位(trotter):**没有**期初结转 ⇒ 它的成本算不出来。
+	if _, err := svc.CreateBranchCutMapping(ctx, "S001",
+		model.CreateBranchCutMappingInput{CutType: model.CutTrotter, CubeProductID: "P-TROTTER"}); err != nil {
+		t.Fatalf("CreateBranchCutMapping(trotter): %v", err)
+	}
+	// 只有 belly 有基线。
+	if _, err := svc.SaveStockOpenings(ctx, "S001", []service.StockOpeningInput{
+		{CutType: model.CutBelly, BizDate: "2026-10-01",
+			ColdStoreKg: d("100"), UnitPriceYuan: d("18")},
+	}); err != nil {
+		t.Fatalf("SaveStockOpenings: %v", err)
+	}
+	svc.SetClock(fmClock(day2))
+
+	rep, err := svc.ComputePeriodMargin(ctx, "S001", "2026-10-02", "2026-10-02", "day")
+	mustNoErr(t, err, "ComputePeriodMargin")
+
+	// ① 报告级标志(宽口径)。
+	if !rep.CostIncomplete {
+		t.Errorf("★ 区间里有部位成本算不出来 ⇒ 报告级 cost_incomplete 必须为 true, got false —— "+
+			"前端会用它决定要不要给店长提示(缺了 ⇒ 门店看不到毛利被高估)")
+	}
+	// ② 严口径的天数:那天不是"整天缺基线"(belly 算得出来)。
+	if rep.DaysWithoutCostBaseline != 0 {
+		t.Errorf("★ 部分算不出来 ≠ 整天算不出来 ⇒ days_without_cost_baseline 应为 0, got %d",
+			rep.DaysWithoutCostBaseline)
+	}
+	// ③ 人话说明:非空 + 不出现"0 天"。
+	if rep.CostIncompleteNote == "" {
+		t.Error("★ cost_incomplete_note 必须非空 —— 前端要原样显示它(口径是后端的职责)")
+	}
+	if strings.Contains(rep.CostIncompleteNote, "0 天") {
+		t.Errorf("★ cost_incomplete_note 不能出现「0 天」(自相矛盾): %q", rep.CostIncompleteNote)
+	}
+	// ④ note 同样不能出现"0 天"(旧写法会拼出「其中 0 天成本算不出来」)。
+	if strings.Contains(rep.Note, "0 天") {
+		t.Errorf("★ note 不能出现「0 天」(自相矛盾): %q", rep.Note)
 	}
 }
