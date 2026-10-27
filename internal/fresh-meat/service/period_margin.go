@@ -11,12 +11,24 @@
 //
 // # 数据源(2026-10-27:成本链改部位级)
 //
-//	`cut_cost_daily`(**部位级**成本日快照)—— 它已经是移动加权口径
-//	(期初/入库/销售/期末/加权单价/销售成本都在),所以长期聚合就是**把日快照加起来**,
-//	不需要重算任何东西。
+//	**逐日**取部位级成本数据,两种来源按优先级:
+//
+//	① `cut_cost_daily`(**部位级**成本日快照)—— 它已经是移动加权口径
+//	  (期初/入库/销售/期末/加权单价/销售成本都在),所以长期聚合就是**把日快照加起来**。
+//	② **没有快照的那天 ⇒ 实时算**(见下面的"为什么必须有 ②")。
 //
 // ⚠️ 旧的 `sku_cost_daily`(SKU 级)**已停写** ⇒ 这里**不能再查它**
 //   (查了就是空/过期数据,而这个接口是对外的)。
+//
+// # ⚠️ 为什么必须有 ②(2026-10-27 生产实测踩到的坑)
+//
+//	日快照**只在日终盘点提交后落库** —— 而真实门店(00/01)**从 9 月至今没有盘点单**
+//	⇒ `cut_cost_daily` 是空的
+//	⇒ 只读快照 ⇒ `group_by=day|cut` 返回**全 0**、`group_by=sku` 成本恒 0
+//	⇒ **接口看起来"正常"但没有数据**(最坏的一种坏法:没人发现)。
+//
+//	⇒ 缺快照的那天**实时算**(与每日毛利同一个引擎)⇒ 口径一致、数字不为 0。
+//	⇒ 有快照的天用快照(快)⇒ 门店开始做日终盘点后,这个接口会自己变快。
 //
 // # 口径
 //
@@ -31,7 +43,7 @@
 //
 // # group_by=sku 的口径(近似,见 Note)
 //
-// 部位快照里**没有 SKU 粒度** ⇒ SKU 粒度是**算出来**的:
+// 部位数据里**没有 SKU 粒度** ⇒ SKU 粒度是**算出来**的:
 //
 //	营收 / 销量  = 按 SKU(销售流水本来就是 SKU 级)
 //	销售成本     = 该 SKU 当日销量 × 当日该部位的移动加权单价(按部位分摊)
@@ -80,6 +92,80 @@ type PeriodMarginReport struct {
 	Note string `json:"note,omitempty"`
 }
 
+// periodCutRow 某营业日某部位的**期间毛利累加源**(快照或实时算,归一后的同一形状)。
+type periodCutRow struct {
+	revenue       decimal.Decimal
+	salesCost     decimal.Decimal
+	bulkCost      decimal.Decimal
+	wasteCost     decimal.Decimal
+	soldKg        decimal.Decimal
+	producedKg    decimal.Decimal
+	openingKg     decimal.Decimal
+	closingKg     decimal.Decimal
+	presaleMargin decimal.Decimal
+	// unit 是当日该部位的移动加权单价 —— SKU 粒度按它分摊成本。
+	unit decimal.Decimal
+}
+
+// periodDayData 某营业日的期间毛利源数据。
+type periodDayData struct {
+	// cuts 是**按部位**归一后的数据(快照或实时算,同一形状)。
+	cuts map[string]periodCutRow
+	// skus 只有**实时算**路径才有(引擎产出的 SKU 销售行)。
+	// 快照路径没有 SKU 粒度 ⇒ 由调用方用 loadSkuFlows 补。
+	skus []SkuDailyCost
+	// fromSnapshot = true ⇒ 这一天用的是落库的日快照。
+	fromSnapshot bool
+}
+
+// periodDayCuts 取某营业日的部位级数据:**快照优先,没有快照就实时算**。
+//
+// ⚠️ 实时算用的是**与每日毛利完全同一个引擎** ⇒ 长期毛利 = 每日毛利之和。
+func (s *Service) periodDayCuts(ctx context.Context, branchID string, day time.Time,
+	snaps []model.CutCostDaily) (periodDayData, error) {
+	out := periodDayData{cuts: map[string]periodCutRow{}}
+	if len(snaps) > 0 {
+		out.fromSnapshot = true
+		for _, r := range snaps {
+			out.cuts[string(r.CutType)] = periodCutRow{
+				revenue:    r.SoldAmount.Add(r.BulkSoldAmount),
+				salesCost:  r.SalesCostYuan,
+				bulkCost:   r.BulkCostYuan,
+				wasteCost:  r.WasteCostYuan,
+				soldKg:     r.SoldKg.Add(r.BulkSoldKg),
+				producedKg: r.ProducedKg,
+				openingKg:  r.OpeningKg,
+				closingKg:  r.ClosingKg,
+				// 快照里的毛利已含预售重估 ⇒ 这里只取重估额(用于单列)。
+				presaleMargin: r.PresaleMarginYuan,
+				unit:          r.MovingAvgUnitCost,
+			}
+		}
+		return out, nil
+	}
+	// 没有快照 ⇒ 实时算(门店还没做日终盘点,快照不存在)。
+	cutRows, skuRows, _, _, err := s.computeCutDailyCosts(ctx, branchID, day)
+	if err != nil {
+		return out, err
+	}
+	out.skus = skuRows
+	for _, r := range cutRows {
+		out.cuts[string(r.CutType)] = periodCutRow{
+			revenue:       r.RevenueYuan,
+			salesCost:     r.SalesCostYuan,
+			bulkCost:      r.BulkCostYuan,
+			wasteCost:     r.WasteCostYuan,
+			soldKg:        r.SoldKg.Add(r.BulkSoldKg),
+			producedKg:    r.ProducedKg,
+			openingKg:     r.OpeningKg,
+			closingKg:     r.ClosingKg,
+			presaleMargin: r.PresaleMarginYuan,
+			unit:          r.MovingAvgUnitCost,
+		}
+	}
+	return out, nil
+}
+
 // ComputePeriodMargin 算某店某期间的毛利。
 //
 // groupBy:day(默认) | cut | sku
@@ -109,46 +195,71 @@ func (s *Service) ComputePeriodMargin(ctx context.Context, branchID, from, to, g
 	fromDate := datatypesDate(fromT)
 	toDate := datatypesDate(toT)
 
-	// ⚠️ **部位级**成本日快照(旧的 sku_cost_daily 已停写)。
-	var rows []model.CutCostDaily
+	// 区间内的部位级日快照(有快照的天用它;没有的那天实时算)。
+	var snaps []model.CutCostDaily
 	if err := s.db.WithContext(ctx).
 		Where("branch_id = ? AND biz_date >= ? AND biz_date <= ?", branchID, fromDate, toDate).
-		Find(&rows).Error; err != nil {
+		Find(&snaps).Error; err != nil {
 		return nil, fmt.Errorf("query cut_cost_daily: %w", err)
 	}
-
-	if groupBy == "sku" {
-		return s.periodMarginBySku(ctx, branchID, fromT, toT, from, to, rows)
+	snapsByDay := map[string][]model.CutCostDaily{}
+	for _, r := range snaps {
+		d := dateKey(r.BizDate)
+		snapsByDay[d] = append(snapsByDay[d], r)
 	}
 
 	agg := map[string]*PeriodMarginRow{}
 	label := map[string]string{}
 	cutOf := map[string]model.CutType{}
-	for _, r := range rows {
-		key := dateKey(r.BizDate)
-		lbl := dateKey(r.BizDate)
-		switch groupBy {
-		case "cut":
-			key = string(r.CutType)
-			lbl = model.CutLabel(r.CutType)
+	// 逐日推进。
+	days := 0
+	realTimeDays := 0
+	for d := fromT; !d.After(toT); d = d.AddDate(0, 0, 1) {
+		days++
+		key := d.Format("2006-01-02")
+		data, err := s.periodDayCuts(ctx, branchID, d, snapsByDay[key])
+		if err != nil {
+			return nil, err
 		}
-		row, ok := agg[key]
-		if !ok {
-			row = &PeriodMarginRow{Key: key}
-			agg[key] = row
+		if !data.fromSnapshot {
+			realTimeDays++
 		}
-		label[key] = lbl
-		cutOf[key] = r.CutType
-		// 营收 = 零售 + 统收。
-		row.RevenueYuan = row.RevenueYuan.Add(r.SoldAmount).Add(r.BulkSoldAmount)
-		// 成本三块:销售 + 统收 + 报损(都在损益里)。
-		row.SalesCostYuan = row.SalesCostYuan.Add(r.SalesCostYuan).Add(r.BulkCostYuan).Add(r.WasteCostYuan)
-		row.SoldKg = row.SoldKg.Add(r.SoldKg).Add(r.BulkSoldKg)
-		row.ProducedKg = row.ProducedKg.Add(r.ProducedKg)
-		row.OpeningKg = row.OpeningKg.Add(r.OpeningKg)
-		row.ClosingKg = row.ClosingKg.Add(r.ClosingKg)
-		// 预售结转的预期毛利(与每日毛利同口径 ⇒ 长期毛利 = 每日毛利之和)。
-		row.GrossMarginYuan = row.GrossMarginYuan.Add(r.PresaleMarginYuan)
+		// 部位级数据 → 聚合键。
+		for cut, c := range data.cuts {
+			aggKey := key
+			lbl := key
+			switch groupBy {
+			case "cut":
+				aggKey = cut
+				lbl = model.CutLabel(model.CutType(cut))
+			case "sku":
+				continue // SKU 粒度单独处理(见下)。
+			}
+			row, ok := agg[aggKey]
+			if !ok {
+				row = &PeriodMarginRow{Key: aggKey}
+				agg[aggKey] = row
+			}
+			label[aggKey] = lbl
+			cutOf[aggKey] = model.CutType(cut)
+			// 营收 = 零售 + 统收。
+			row.RevenueYuan = row.RevenueYuan.Add(c.revenue)
+			// 成本三块:销售 + 统收 + 报损(都在损益里)。
+			row.SalesCostYuan = row.SalesCostYuan.Add(c.salesCost).Add(c.bulkCost).Add(c.wasteCost)
+			row.SoldKg = row.SoldKg.Add(c.soldKg)
+			row.ProducedKg = row.ProducedKg.Add(c.producedKg)
+			row.OpeningKg = row.OpeningKg.Add(c.openingKg)
+			row.ClosingKg = row.ClosingKg.Add(c.closingKg)
+			// 预售结转的预期毛利(与每日毛利同口径 ⇒ 长期毛利 = 每日毛利之和)。
+			row.GrossMarginYuan = row.GrossMarginYuan.Add(c.presaleMargin)
+		}
+		if groupBy != "sku" {
+			continue
+		}
+		// SKU 粒度:营收/销量按货号;成本按当日该部位的移动加权单价分摊。
+		if err := s.accumulateSkuPeriod(ctx, branchID, d, data, agg, label); err != nil {
+			return nil, err
+		}
 	}
 
 	out := make([]PeriodMarginRow, 0, len(agg))
@@ -174,7 +285,15 @@ func (s *Service) ComputePeriodMargin(ctx context.Context, branchID, from, to, g
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 
-	days := int(toT.Sub(fromT).Hours()/24) + 1
+	note := "期间毛利 = 期间收入(零售+统收) − 期间成本(销售+统收+报损,移动加权结转);" +
+		"期初存货的成本在售出时结转,已含在期间成本内;预售结转的预期毛利也计在内。"
+	if groupBy == "sku" {
+		note = "SKU 粒度:营收/销量按货号(销售流水口径);" +
+			"成本按**当日该部位**的移动加权单价分摊(库存是部位的 ⇒ 货号级成本只能近似)。"
+	}
+	if realTimeDays > 0 {
+		note += fmt.Sprintf(";其中 %d 天没有日终盘点快照(门店未录日终盘点)⇒ 按当日实时计算补齐。", realTimeDays)
+	}
 	return &PeriodMarginReport{
 		BranchID: branchID,
 		FromDate: from,
@@ -183,105 +302,76 @@ func (s *Service) ComputePeriodMargin(ctx context.Context, branchID, from, to, g
 		Rows:     out,
 		Total:    tot,
 		Days:     days,
-		Note: "期间毛利 = 期间收入(零售+统收) − 期间成本(销售+统收+报损,移动加权结转);" +
-			"期初存货的成本在售出时结转,已含在期间成本内;预售结转的预期毛利也计在内。",
+		Note:     note,
 	}, nil
 }
 
-// periodMarginBySku 算 **SKU 粒度**的长期毛利(近似口径)。
+// accumulateSkuPeriod 把某营业日的**货号级**销售与分摊成本累加进期间聚合。
 //
-// # 为什么是近似的
-//
-// 部位级成本日快照里**没有 SKU 粒度**(唯一键是 branch_id + biz_date + cut_type)
-// ⇒ SKU 的成本只能**按部位单价分摊**:
-//
-//	营收 / 销量  = 按 SKU(销售流水本来就是 SKU 级)
-//	销售成本     = 该 SKU 当日销量 × 当日该部位的移动加权单价
-//
-// ⚠️ 当日**没有盘点** ⇒ 没有日快照 ⇒ 用**最近一次已知的部位单价**兜底。
-//
-// # 为什么不按货号拆成本
-//
-// 多货号部位里各货号的成本本来就不可分(库存是部位的)
-// ⇒ 与每日毛利的口径一致:成本看部位行,这里只是给个 SKU 视角的下钻。
-func (s *Service) periodMarginBySku(ctx context.Context, branchID string,
-	fromT, toT time.Time, from, to string, snaps []model.CutCostDaily) (*PeriodMarginReport, error) {
-	// 每日每部位的单价(来自部位级日快照)。
-	unitOfDay := map[string]map[string]decimal.Decimal{}
-	for _, r := range snaps {
-		d := dateKey(r.BizDate)
-		if unitOfDay[d] == nil {
-			unitOfDay[d] = map[string]decimal.Decimal{}
-		}
-		unitOfDay[d][string(r.CutType)] = r.MovingAvgUnitCost
-	}
+// ⚠️ 两条路径:
+//   - **实时算**的路径:引擎已经产出了 SKU 销售行 ⇒ 直接用(不重复查销售流水)。
+//   - **快照**的路径:快照没有 SKU 粒度 ⇒ 读一次销售流水。
+func (s *Service) accumulateSkuPeriod(ctx context.Context, branchID string, day time.Time,
+	data periodDayData, agg map[string]*PeriodMarginRow, label map[string]string) error {
 	cutOf, nameOf, err := s.loadSkuCatalog(ctx, branchID, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	agg := map[string]*PeriodMarginRow{}
-	// 最近一次已知的部位单价(逐日往后带)。
-	lastUnit := map[string]decimal.Decimal{}
-	for d := fromT; !d.After(toT); d = d.AddDate(0, 0, 1) {
-		key := d.Format("2006-01-02")
-		for cut, unit := range unitOfDay[key] {
-			lastUnit[cut] = unit
+	type skuLine struct {
+		cut    model.CutType
+		kg     decimal.Decimal
+		amount decimal.Decimal
+	}
+	lines := map[string]skuLine{}
+	if len(data.skus) > 0 {
+		for _, r := range data.skus {
+			kg := r.SoldKg.Add(r.BulkSoldKg)
+			if kg.IsZero() && r.SoldAmount.IsZero() && r.BulkSoldAmount.IsZero() {
+				continue
+			}
+			lines[r.CubeProductID] = skuLine{
+				cut:    r.CutType,
+				kg:     kg,
+				amount: r.SoldAmount.Add(r.BulkSoldAmount),
+			}
 		}
-		start, end := s.businessDayBounds(d)
+	} else {
+		start, end := s.businessDayBounds(day)
 		soldKg, soldAmount, bulkKg, bulkAmount, _, cutFromSales, err :=
 			s.loadSkuFlows(ctx, branchID, start, end)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		for sku, kg := range soldKg {
-			cut := string(cutOf[sku])
+			cut := cutOf[sku]
 			if cut == "" {
-				cut = string(cutFromSales[sku])
+				cut = cutFromSales[sku]
 			}
 			if cut == "" {
 				continue
 			}
-			row, ok := agg[sku]
-			if !ok {
-				row = &PeriodMarginRow{Key: sku, Label: nameOf[sku]}
-				agg[sku] = row
+			lines[sku] = skuLine{
+				cut:    cut,
+				kg:     kg.Add(bulkKg[sku]),
+				amount: soldAmount[sku].Add(bulkAmount[sku]),
 			}
-			row.RevenueYuan = row.RevenueYuan.Add(soldAmount[sku]).Add(bulkAmount[sku])
-			row.SoldKg = row.SoldKg.Add(kg).Add(bulkKg[sku])
-			// 成本 = 该 SKU 当日销量 × 当日该部位的移动加权单价(按部位分摊)。
-			row.SalesCostYuan = row.SalesCostYuan.Add(kg.Mul(lastUnit[cut]))
 		}
 	}
-	out := make([]PeriodMarginRow, 0, len(agg))
-	var tot TotalGrossMargin
-	for _, row := range agg {
-		row.GrossMarginYuan = row.RevenueYuan.Sub(row.SalesCostYuan)
-		if !row.RevenueYuan.IsZero() {
-			f, _ := row.GrossMarginYuan.Mul(decimal.NewFromInt(100)).Div(row.RevenueYuan).Float64()
-			row.GrossMarginPct = f
+	for sku, l := range lines {
+		if l.cut == "" {
+			continue
 		}
-		out = append(out, *row)
-		tot.RevenueYuan = tot.RevenueYuan.Add(row.RevenueYuan)
-		tot.SalesCostYuan = tot.SalesCostYuan.Add(row.SalesCostYuan)
-		tot.GrossMarginYuan = tot.GrossMarginYuan.Add(row.GrossMarginYuan)
+		row, ok := agg[sku]
+		if !ok {
+			row = &PeriodMarginRow{Key: sku, Label: nameOf[sku]}
+			agg[sku] = row
+		}
+		label[sku] = nameOf[sku]
+		row.RevenueYuan = row.RevenueYuan.Add(l.amount)
+		row.SoldKg = row.SoldKg.Add(l.kg)
+		// 成本 = 该 SKU 当日销量 × 当日该部位的移动加权单价(按部位分摊)。
+		unit := data.cuts[string(l.cut)].unit
+		row.SalesCostYuan = row.SalesCostYuan.Add(l.kg.Mul(unit))
 	}
-	if !tot.RevenueYuan.IsZero() {
-		f, _ := tot.GrossMarginYuan.Mul(decimal.NewFromInt(100)).Div(tot.RevenueYuan).Float64()
-		tot.GrossMarginPct = f
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
-
-	days := int(toT.Sub(fromT).Hours()/24) + 1
-	return &PeriodMarginReport{
-		BranchID: branchID,
-		FromDate: from,
-		ToDate:   to,
-		GroupBy:  "sku",
-		Rows:     out,
-		Total:    tot,
-		Days:     days,
-		Note: "SKU 粒度:营收/销量按货号(销售流水口径);" +
-			"成本按**当日该部位**的移动加权单价分摊(库存是部位的 ⇒ 货号级成本只能近似);" +
-			"当日没有盘点时用最近一次已知的部位单价。",
-	}, nil
+	return nil
 }
