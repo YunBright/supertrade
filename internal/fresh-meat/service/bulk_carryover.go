@@ -63,64 +63,69 @@ func (s *Service) bulkStorageSKU(ctx context.Context, branchID string, prod *mod
 	return s.bulkCutSku(ctx, branchID, prod.CutType)
 }
 
-// bulkUnitCost 取某 SKU 当前的移动加权单价(元/kg)。
+// bulkUnitCost 取某**部位**当前的移动加权单价(元/kg)。
 //
-// 优先用已落库的**成本状态**(每次盘点后刷新);没有就用当日实时算的。
+// ⚠️ 2026-10-27:成本链改**部位级** ⇒ 大宗成本单价也按**部位**取
+// (大宗本来就是按部位记的:bulk_settlement_allocations.cut_type
+//  与 bulk_products.cut_type ⇒ 口径更一致)。
+//
+// 优先用已落库的**部位级成本状态**(cut_cost_states,每次盘点后刷新);
+// 没有就用当日实时算的。
 // 拿不到就返回 0(调用方要能容忍 0 —— 别把"没有成本"当成"成本是 0"来静默通过)。
-func (s *Service) bulkUnitCost(ctx context.Context, branchID, sku string, day time.Time) decimal.Decimal {
-	if sku == "" {
+func (s *Service) bulkUnitCost(ctx context.Context, branchID string, cut model.CutType, day time.Time) decimal.Decimal {
+	if cut == "" {
 		return decimal.Zero
 	}
-	var st model.SkuCostState
+	var st model.CutCostState
 	if err := s.db.WithContext(ctx).
-		Where("branch_id = ? AND cube_product_id = ?", branchID, sku).
+		Where("branch_id = ? AND cut_type = ?", branchID, cut).
 		First(&st).Error; err == nil && st.MovingAvgUnitCost.IsPositive() {
 		return st.MovingAvgUnitCost
 	}
-	rows, _, _, err := s.computeSkuDailyCosts(ctx, branchID, day)
+	rows, _, _, _, err := s.computeCutDailyCosts(ctx, branchID, day)
 	if err != nil {
 		return decimal.Zero
 	}
 	for _, r := range rows {
-		if r.CubeProductID == sku && r.MovingAvgUnitCost.IsPositive() {
+		if r.CutType == cut && r.MovingAvgUnitCost.IsPositive() {
 			return r.MovingAvgUnitCost
 		}
 	}
 	return decimal.Zero
 }
 
-// bulkUnitCostMap **一次性**取多个 SKU 的移动加权单价(元/kg)。
+// bulkUnitCostMap **一次性**取多个**部位**的移动加权单价(元/kg)。
 //
-// ⚠️ 为什么必须批量:兜底路径 computeSkuDailyCosts 会算**一整天**的成本,
+// ⚠️ 为什么必须批量:兜底路径 computeCutDailyCosts 会算**一整天**的成本,
 //
-//	逐个 SKU 调用 ⇒ N 倍开销(一次盘点几十个 SKU ⇒ 几十遍全量成本计算)。
+//	逐个部位调用 ⇒ N 倍开销(一次盘点几十个部位 ⇒ 几十遍全量成本计算)。
 //
 // ⇒ 这里先查**成本状态**(便宜),只对**缺的**那批算**一次**当天成本。
-func (s *Service) bulkUnitCostMap(ctx context.Context, branchID string, day time.Time, skus []string) map[string]decimal.Decimal {
-	out := map[string]decimal.Decimal{}
-	if len(skus) == 0 {
+func (s *Service) bulkUnitCostMap(ctx context.Context, branchID string, day time.Time, cuts []model.CutType) map[model.CutType]decimal.Decimal {
+	out := map[model.CutType]decimal.Decimal{}
+	if len(cuts) == 0 {
 		return out
 	}
-	var states []model.SkuCostState
+	var states []model.CutCostState
 	if err := s.db.WithContext(ctx).
-		Where("branch_id = ? AND cube_product_id IN ?", branchID, skus).
+		Where("branch_id = ? AND cut_type IN ?", branchID, cuts).
 		Find(&states).Error; err == nil {
 		for _, st := range states {
 			if st.MovingAvgUnitCost.IsPositive() {
-				out[st.CubeProductID] = st.MovingAvgUnitCost
+				out[st.CutType] = st.MovingAvgUnitCost
 			}
 		}
 	}
-	var missing []string
-	for _, sku := range skus {
-		if _, ok := out[sku]; !ok {
-			missing = append(missing, sku)
+	var missing []model.CutType
+	for _, cut := range cuts {
+		if _, ok := out[cut]; !ok {
+			missing = append(missing, cut)
 		}
 	}
 	if len(missing) == 0 {
 		return out
 	}
-	rows, _, _, err := s.computeSkuDailyCosts(ctx, branchID, day)
+	rows, _, _, _, err := s.computeCutDailyCosts(ctx, branchID, day)
 	if err != nil {
 		s.pubLogger.Warn("bulkUnitCostMap: 当天成本算不出来,成本快照按 0 记",
 			"branch_id", branchID, "err", err)
@@ -128,7 +133,7 @@ func (s *Service) bulkUnitCostMap(ctx context.Context, branchID string, day time
 	}
 	for _, r := range rows {
 		if r.MovingAvgUnitCost.IsPositive() {
-			out[r.CubeProductID] = r.MovingAvgUnitCost
+			out[r.CutType] = r.MovingAvgUnitCost
 		}
 	}
 	return out

@@ -46,7 +46,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -54,7 +53,6 @@ import (
 	"github.com/YunBright/supertrade/internal/cubesource"
 	"github.com/YunBright/supertrade/internal/fresh-meat/model"
 	"github.com/shopspring/decimal"
-	"gorm.io/gorm"
 )
 
 // SkuDailyCost 单 SKU 的当日移动加权成本明细(对外 JSON)。
@@ -150,312 +148,6 @@ type LossSummary struct {
 	OvernightShrinkKg    decimal.Decimal `json:"overnight_shrink_kg"`
 	OvernightShrinkPct   float64         `json:"overnight_shrink_pct"`
 	ShrinkNote           string          `json:"shrink_note,omitempty"`
-}
-
-// computeSkuDailyCosts 算某店某营业日的 SKU 级移动加权成本。
-//
-// 返回按 cube_product_id 升序的明细(输出稳定,便于断言)。
-func (s *Service) computeSkuDailyCosts(ctx context.Context, branchID string, day time.Time) ([]SkuDailyCost, *ReconciliationRow, *LossSummary, error) {
-	if branchID == "" {
-		return nil, nil, nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
-	}
-	startOfDay, endOfDay := s.businessDayBounds(day)
-	bizDate := day.In(s.bizTZOrUTC())
-
-	// ---- 1. 今日进场的猪 + 它们的成本 ----
-	var pigs []model.WholePig
-	if err := s.db.WithContext(ctx).
-		Where("branch_id = ? AND arrived_at >= ? AND arrived_at < ?", branchID, startOfDay, endOfDay).
-		Find(&pigs).Error; err != nil {
-		return nil, nil, nil, fmt.Errorf("query whole_pigs: %w", err)
-	}
-	pigCost := make(map[string]decimal.Decimal, len(pigs))
-	for _, p := range pigs {
-		pigCost[p.ID] = p.PurchaseCostYuan
-	}
-
-	// ---- 2. 今日产出: pig_cuts(实录)+ LLM 兜底,归到 SKU ----
-	producedKg, producedByPigKg, unallocatedPigCost, cuttingLossKg, err :=
-		s.computeProducedBySku(ctx, branchID, startOfDay, endOfDay, pigs, pigCost)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	// ---- 3. 卖出 / 统收 / 报损 ----
-	soldKg, soldAmount, bulkKg, bulkAmount, wasteKg, cutFromSales, err :=
-		s.loadSkuFlows(ctx, branchID, startOfDay, endOfDay)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	// ---- 3b. 入库量兜底:没有分割补录时,用"销售 + 盘点结转 − 搬上台"倒推 ----
-	//
-	// ⚠️ 这三个量里的"盘点结转"与"搬上台"来自**袋子表**(标签号),
-	// 所以门店**贴标签**是这条兜底能生效的前提。
-	if err := s.applyProducedFallback(ctx, branchID, bizDate,
-		producedKg, producedByPigKg, pigs, soldKg); err != nil {
-		return nil, nil, nil, err
-	}
-
-	// ---- 4. 期初(全店)与期末(全店) ----
-	openingKg, openingAmount, err := s.loadSkuOpening(ctx, branchID, bizDate)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	// ---- 4b. 预期毛利(预售结转)的**期末重估** ----
-	//
-	// 审计日(D)做过预售结转 ⇒ 该日的结余按**预期销售单价**估值:
-	//
-	//	期末金额(重估后) = 结余 kg × 预期销售单价
-	//	重估差额         = 结余 kg × (预期售价 − 成本口径单价) = 预售毛利
-	//
-	// ⇒ 本期毛利自动含进这笔预期毛利(销售成本被"减"掉了这一块);
-	// ⇒ 下一期的期初金额从上一日的 closing_amount 读 ⇒ 自动按预期售价进来
-	//    (链式一致,不需要额外旁路)。
-	presaleUnits, err := s.loadPresaleUnits(ctx, branchID, bizDate)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	_, coldKg, hasStocktake, dataSource, err := s.loadSkuCounterAndCold(ctx, branchID, startOfDay, endOfDay)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	// ---- 5. 位置分布(期末)----
-	//
-	// ⚠️ 2026-10-24:有盘点 ⇒ 期末用**按营业日推导的结余快照**(柜台实盘 + 冷库余额)
-	// (sku_stock_daily)⇒ 补录往日的盘点 ⇒ 那天的期末是对的,不是"今天的余额"。
-	// 无盘点 ⇒ 用账面位置余额(与原来一致)。
-	//
-	// ⚠️ 与上面的 counterActualKg 不同:那是账面柜台余额,
-	// 这里是**期末位置分布**(报表要展示的是期末结余,不是当前余额)。
-	counterKg, coldKg, err := s.loadSkuPositions(ctx, branchID)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	if hasStocktake {
-		// ⚠️ 结余是**按部位**算的(门店口径:「这个模块只管部位数据」)
-		// ⇒ 这里拿到的是部位的日终冷库 ⇒ 内部再按 SKU 拆开(见 splitCutClosing)。
-		cutCounter, cutCold, ok, derr := s.closingForDay(ctx, branchID, bizDate)
-		if derr != nil {
-			s.pubLogger.Warn("computeSkuDailyCosts: 读取按营业日的结余失败(回退账面余额)",
-				"branch_id", branchID, "biz_date", bizDate.Format("2006-01-02"), "err", derr)
-		} else if ok {
-			counterKg, coldKg = s.splitCutClosing(ctx, branchID, cutCounter, cutCold)
-		}
-	}
-
-	// ---- 6. 汇总 SKU 集合 ----
-	skuSet := map[string]struct{}{}
-	add := func(m map[string]decimal.Decimal) {
-		for k, v := range m {
-			if !v.IsZero() {
-				skuSet[k] = struct{}{}
-			}
-		}
-	}
-	add(producedKg)
-	add(soldKg)
-	add(bulkKg)
-	add(wasteKg)
-	add(openingKg)
-	add(counterKg)
-	add(coldKg)
-
-	cutOfSku, nameOfSku, err := s.loadSkuCatalog(ctx, branchID, skuSet)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	// 没有部位映射的 SKU(如特价档)⇒ 用销售行自带的 cut_type 兜底,
-	// 否则这类销售会落进一个**空 cut_type 的桶**(报表上"无名桶")。
-	for sku, cut := range cutFromSales {
-		if cutOfSku[sku] == "" {
-			cutOfSku[sku] = cut
-		}
-	}
-
-	// ---- 7. 逐 SKU 算移动加权 ----
-	out := make([]SkuDailyCost, 0, len(skuSet))
-	recon := &ReconciliationRow{}
-	for sku := range skuSet {
-		openKg := openingKg[sku]
-		openAmt := openingAmount[sku]
-		prodKg := producedKg[sku]
-		prodAmt := decimal.Zero
-		// 本期入库金额 = 该 SKU 的产出 kg 占"今日总产出 kg"的比例 × 今日猪成本合计。
-		//
-		// ⚠️ 逐猪摊(而不是全店池化):一头猪的成本只摊到它自己产出的部位上,
-		// 否则"这头猪的五花成本"会串到别的猪的产出上 ⇒ 整猪毛利失真。
-		if totalProducedKg := s.totalProducedKg(producedByPigKg); totalProducedKg.IsPositive() {
-			// 该 SKU 的成本 = Σ pig (pig_cost × sku_kg_in_pig / pig_total_produced_kg)
-			for pigID, perPig := range producedByPigKg {
-				kgInPig := perPig[sku]
-				if kgInPig.IsZero() {
-					continue
-				}
-				pigTotal := s.pigTotalProducedKg(perPig)
-				if !pigTotal.IsPositive() {
-					continue
-				}
-				prodAmt = prodAmt.Add(pigCost[pigID].Mul(kgInPig).Div(pigTotal))
-			}
-		}
-
-		availAmt := openAmt.Add(prodAmt)
-		availKg := openKg.Add(prodKg)
-		movingAvg := decimal.Zero
-		if availKg.IsPositive() {
-			movingAvg = availAmt.Div(availKg)
-		}
-		expectedCloseKg := availKg.Sub(soldKg[sku]).Sub(bulkKg[sku]).Sub(wasteKg[sku])
-		if expectedCloseKg.IsNegative() {
-			expectedCloseKg = decimal.Zero
-		}
-		// 期末(全店):
-		//   有盘点 → 柜台实盘 + 冷库余额
-		//   无盘点 → 账面(期初 + 入库 − 卖出 − 统收 − 报损)
-		//
-		// ⚠️ 无盘点时**不能**用 0:那会把"没卖掉的货"的全额成本算成当期销售成本
-		// ⇒ 毛利被严重低估。用账面值,成本就按 sold×加权单价 摊(与旧口径一致)。
-		closeKg := decimal.Zero
-		if hasStocktake {
-			// 期末(全店)= 柜台实盘 + 冷库余额
-			// (柜台实盘与冷库余额来自**按营业日推导的结余快照**;无快照时是账面余额)
-			closeKg = counterKg[sku].Add(coldKg[sku])
-		} else {
-			closeKg = expectedCloseKg
-		}
-		// 期末金额(**成本口径**)—— 这是写进 sku_cost_daily 的**冻结快照**的值。
-		closeAmtBasis := closeKg.Mul(movingAvg)
-
-		// 预期毛利(预售结转):期末结余按**预期销售单价**重估。
-		//
-		// ⚠️ 重估**不混进销售成本、也不写进冻结快照**:
-		//   它是"存货按预期售价重估"的 **accrual** ⇒ 单独进毛利(下面 gm 的
-		//   +revaluation)、对账行里单列、下一期期初金额里加回来
-		//   (见 loadSkuOpening)⇒ **冻结的快照始终是成本口径**
-		//   ⇒ 门店审计人改预售价时不用动冻结数据。
-		//
-		// ⚠️ 为什么不能靠"重估后的期末金额"去压销售成本:
-		//   预期售价 > 成本时,重估后的期末金额会**大于**账面可用金额
-		//   ⇒ 销售成本变负 ⇒ 被"盘盈"保护裁成 0 ⇒ 这笔预期毛利就被吃掉了。
-		revaluation := decimal.Zero
-		presaleUnit := decimal.Zero
-		// ⚠️ 判据是"**有没有预售结转行**",不是"单价是否大于 0":
-		//   维护为 **0 元**的货号也要结转(负毛利照做)⇒ 单价 0 一样要重估。
-		if unit, ok := presaleUnits[sku]; ok && closeKg.IsPositive() {
-			presaleUnit = unit
-			revaluation = closeKg.Mul(unit.Sub(movingAvg))
-		}
-		closeAmt := closeAmtBasis
-
-		bulkCost := bulkKg[sku].Mul(movingAvg)
-		wasteAmt := wasteKg[sku].Mul(movingAvg)
-		wasteCost := wasteAmt
-		// ⚠️ 销售成本用**成本口径**的期末金额(不含重估)——
-		//   重估是 accrual,不是成本(见上面的注释)。
-		salesCost := availAmt.Sub(closeAmtBasis).Sub(bulkCost).Sub(wasteCost)
-		if salesCost.IsNegative() {
-			// 期末实盘 > 账面可用(盘盈)⇒ 成本不能为负,裁到 0 并把差额记进对账行。
-			salesCost = decimal.Zero
-		}
-
-		revenue := soldAmount[sku].Add(bulkAmount[sku])
-		// ⚠️ 2026-10-23 修正:**统收成本与报损成本必须进损益**。
-		//
-		// 原来 gm = revenue − salesCost,而 salesCost 里**已经减掉了** bulkCost/wasteCost
-		// (它们从"可售金额"里被扣除,不代表成本已入账)⇒
-		//   · 统收收入(卖板油给酒店)被当成**零成本收入** ⇒ 毛利率 100%
-		//   · 报损的 kg 成本**凭空消失** ⇒ 报损不体现为损失
-		//
-		// 正确式:本期损益 = (零售收入 + 统收收入) − (零售销售成本 + 统收成本 + 报损成本)
-		//           + 预期毛利(预售结转的重估差额)。
-		gm := revenue.Sub(salesCost).Sub(bulkCost).Sub(wasteCost).Add(revaluation)
-		var gmPct float64
-		// 毛利率的分母:有预售结转时,本期毛利里含**预期收入**那一块
-		// ⇒ 分母也要含它,否则百分比会虚高(甚至 > 100%)。
-		presaleRevenue := decimal.Zero
-		if presaleUnit.IsPositive() {
-			presaleRevenue = closeKg.Mul(presaleUnit)
-		}
-		gmBase := revenue.Add(presaleRevenue)
-		if !gmBase.IsZero() {
-			f, _ := gm.Mul(decimal.NewFromInt(100)).Div(gmBase).Float64()
-			gmPct = f
-		}
-
-		out = append(out, SkuDailyCost{
-			BranchID:          branchID,
-			CubeProductID:     sku,
-			CubeProductName:   nameOfSku[sku],
-			CutType:           cutOfSku[sku],
-			OpeningKg:         openKg,
-			OpeningAmount:     openAmt,
-			ProducedKg:        prodKg,
-			ProducedAmount:    prodAmt,
-			SoldKg:            soldKg[sku],
-			SoldAmount:        soldAmount[sku],
-			BulkSoldKg:        bulkKg[sku],
-			BulkSoldAmount:    bulkAmount[sku],
-			WasteKg:           wasteKg[sku],
-			WasteAmount:       wasteAmt,
-			ExpectedClosingKg: expectedCloseKg,
-			ClosingKg:         closeKg,
-			ClosingAmount:     closeAmt,
-			MovingAvgUnitCost: movingAvg,
-			SalesCostYuan:     salesCost,
-			BulkCostYuan:      bulkCost,
-			WasteCostYuan:     wasteCost,
-			RevenueYuan:       revenue,
-			GrossMarginYuan:   gm,
-			GrossMarginPct:    gmPct,
-			CounterKg:         counterKg[sku],
-			ColdStoreKg:       coldKg[sku],
-			PresaleMarginYuan: revaluation,
-			PresaleExpectedRevenueYuan: presaleRevenue,
-			PresaleExpectedUnitYuan:    presaleUnit,
-			DataSource:        dataSource,
-		})
-
-		recon.OpeningInventoryCostYuan = recon.OpeningInventoryCostYuan.Add(openAmt)
-		recon.ProducedCostYuan = recon.ProducedCostYuan.Add(prodAmt)
-		recon.SalesCostYuan = recon.SalesCostYuan.Add(salesCost)
-		recon.BulkCostYuan = recon.BulkCostYuan.Add(bulkCost)
-		recon.WasteCostYuan = recon.WasteCostYuan.Add(wasteCost)
-		// ⚠️ 期末存货金额记**成本口径**(不含重估)⇒ 成本流恒等式不变:
-		//   「期初+入库 = 销售+统收+报损+期末(成本口径)」
-		//   重估差额是 accrual(预期值),单列在 RevaluationYuan,不当"钱"进恒等式。
-		recon.ClosingInventoryCostYuan = recon.ClosingInventoryCostYuan.Add(closeAmtBasis)
-		recon.RevaluationYuan = recon.RevaluationYuan.Add(revaluation)
-	}
-
-	// 对账行:差额 = (期初 + 入库) − (销售 + 统收 + 报损 + 期末)
-	//
-	// ⚠️ **要 round**:移动加权单价是"金额 ÷ kg"除出来的,十进制除法会留
-	// 1e-16 量级的尾数 ⇒ 差额显示成 "-0.0000000000000001"。
-	// 那一行是"差额必须为 0"的判据 ⇒ 显示成 1e-16 会让人以为**对账不平**。
-	// ⇒ round 到 4 位(0.0001 元 = 0.01 分):远低于任何有意义的金额,
-	// 真实的不平(几元、几十元)照样原样显示。
-	recon.PigPurchaseCostYuan = decimal.Zero
-	for _, p := range pigs {
-		recon.PigPurchaseCostYuan = recon.PigPurchaseCostYuan.Add(p.PurchaseCostYuan)
-	}
-	recon.UnallocatedPigCostYuan = unallocatedPigCost
-	// ⚠️ 恒等式里**不减**重估:重估是 accrual(预期毛利),不是成本流的一环。
-	//   (成本流恒等式用**成本口径**的期末金额 ⇒ 差额仍然是 0。)
-	recon.DiffYuan = recon.OpeningInventoryCostYuan.Add(recon.ProducedCostYuan).
-		Sub(recon.SalesCostYuan).Sub(recon.BulkCostYuan).
-		Sub(recon.WasteCostYuan).Sub(recon.ClosingInventoryCostYuan).
-		Round(4)
-	recon.CuttingLossKg = cuttingLossKg
-
-	// 隔夜失重·盘亏:昨日全店 − 今日全店 − (今日产出 − 今日卖出 − 今日报损)
-	losses, err := s.computeOvernightShrink(ctx, branchID, bizDate, out)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	recon.OvernightShrinkKg = losses.OvernightShrinkKg
-
-	sort.Slice(out, func(i, j int) bool { return out[i].CubeProductID < out[j].CubeProductID })
-	return out, recon, losses, nil
 }
 
 // computeProducedBySku 算今日产出(入库)按 SKU 归集。
@@ -647,17 +339,6 @@ func (s *Service) pigTotalProducedKg(perPig map[string]decimal.Decimal) decimal.
 	total := decimal.Zero
 	for _, kg := range perPig {
 		total = total.Add(kg)
-	}
-	return total
-}
-
-// totalProducedKg 全部猪今日产出的总 kg。
-func (s *Service) totalProducedKg(byPig map[string]map[string]decimal.Decimal) decimal.Decimal {
-	total := decimal.Zero
-	for _, perPig := range byPig {
-		for _, kg := range perPig {
-			total = total.Add(kg)
-		}
 	}
 	return total
 }
@@ -883,218 +564,6 @@ func (s *Service) mappedSkus(ctx context.Context, branchID string) ([]string, ma
 	return skus, cutOf, nil
 }
 
-// loadSkuOpening 取期初(全店)数量与金额。
-//
-// 优先取**上一营业日的日快照**(全店口径,链式一致);
-// 没有快照时回退到"上一日盘点(柜台实盘)+ 当前冷库余额",并把 data_source 降级。
-//
-// ⚠️ 回退分支最后会叠加**期初结转**(见 overlayStockOpenings):
-//
-//	生效日 == 当前营业日 的期初行 ⇒ 链的起点就在今天
-//	⇒ kg 与金额都取**门店给的**(重量、单价)
-//	⇒ 否则那批货零成本 ⇒ 毛利虚高(2026-10-25 门店口径)。
-func (s *Service) loadSkuOpening(ctx context.Context, branchID string, bizDate time.Time) (
-	kg, amount map[string]decimal.Decimal, err error,
-) {
-	kg = map[string]decimal.Decimal{}
-	amount = map[string]decimal.Decimal{}
-
-	prevStart, prevEnd := s.previousBizDayBounds(bizDate)
-	// 前一个营业日的日期键（"YYYY-MM-DD"）—— 纯基线日判定要用。
-	prevKey := prevStart.In(s.bizTZOrUTC()).Format("2006-01-02")
-	var prev []model.SkuCostDaily
-	e := s.db.WithContext(ctx).
-		Where("branch_id = ? AND biz_date >= ? AND biz_date < ?", branchID, prevStart, prevEnd).
-		Order("cube_product_id ASC").
-		Find(&prev).Error
-	if e != nil {
-		return nil, nil, fmt.Errorf("query sku_cost_daily(prev): %w", e)
-	}
-	if len(prev) > 0 {
-		// 上一日的**预售重估**(预期售价 − 成本口径单价)要加回期初金额:
-		// ⇒ 「下一期期初单价 = 预期销售单价」这条口径在这里落地;
-		// ⇒ 否则那批货会在本期**再结一次毛利**(两期总毛利多算)。
-		//
-		// ⚠️ 重估**不写进** sku_cost_daily.closing_amount(那是**冻结的成本口径快照**)
-		//   ⇒ 门店审计人改预售价时,冻结的快照不用动,只改预售那一层。
-		units, err := s.loadPresaleUnits(ctx, branchID, prevStart)
-		if err != nil {
-			return nil, nil, err
-		}
-		for _, r := range prev {
-			kg[r.CubeProductID] = r.ClosingKg
-			amount[r.CubeProductID] = r.ClosingAmount
-			// ⚠️ 判据是"**有没有预售结转行**",不是"单价是否大于 0":
-			//   维护为 0 元 / 取不到价的货号也是 0 ⇒ 也要重估(写减记)。
-			if unit, ok := units[r.CubeProductID]; ok {
-				amount[r.CubeProductID] = amount[r.CubeProductID].
-					Add(r.ClosingKg.Mul(unit.Sub(r.MovingAvgUnitCost)))
-			}
-		}
-		return kg, amount, nil
-	}
-
-	// 回退:上一营业日**盘点单的实盘**(盘点单存的是**全店**实盘 = 柜台实盘 + 冷库余额)
-	prevClosing, err := s.loadStocktakeClosing(ctx, branchID, prevStart, prevEnd)
-	if err != nil {
-		return nil, nil, err
-	}
-	for sku, v := range prevClosing {
-		kg[sku] = v
-	}
-	// 期初金额 = 期初量 × 上日的移动加权单价(来自 sku_cost_states)。
-	var states []model.SkuCostState
-	if err := s.db.WithContext(ctx).
-		Where("branch_id = ?", branchID).
-		Find(&states).Error; err != nil {
-		return nil, nil, fmt.Errorf("query sku_cost_states: %w", err)
-	}
-	for _, st := range states {
-		if q, ok := kg[st.CubeProductID]; ok {
-			amount[st.CubeProductID] = q.Mul(st.MovingAvgUnitCost)
-		}
-	}
-	// ⚠️ **期初结转覆盖**(2026-10-25 门店口径)—— 必须放在最后。
-	//
-	// 生效日 == 当前营业日 的期初行 ⇒ 链的起点就在今天
-	// ⇒ 这批货的 kg 与金额都用**门店给的**(重量、单价)
-	// ⇒ 否则它**零成本**(金额 0)⇒ 卖出去全是利润(毛利虚高)。
-	//
-	// ⚠️ 覆盖"盘点实盘"与"移动加权单价"两套口径:
-	//   上面的两套都是"链外"的兜底(链还没起 ⇒ 没有上一日的快照),
-	//   而期初结转才是这条链**真正的起点** ⇒ 它说了算。
-	if err := s.overlayStockOpenings(ctx, branchID, bizDate, kg, amount); err != nil {
-		return nil, nil, err
-	}
-	// ⚠️ **纯基线日的次日**:期初那一行就是前一天的"日终"(那天什么都没做)
-	//   ⇒ 次日的期初 = 期初的 kg / 金额。
-	//
-	//   不补这一条 ⇒ 上线第一天(10-02)的成本链里**没有**上线前那批货
-	//   ⇒ 期初那 1800 元的成本消失 ⇒ **毛利虚高**。
-	baseline, err := s.isBaselineDay(ctx, branchID, prevKey)
-	if err != nil {
-		return nil, nil, err
-	}
-	if baseline {
-		baseKg, baseAmt, _, err := s.openingBalancesAt(
-			ctx, branchID, mustParseDateInLoc(prevKey, s.bizTZOrUTC()))
-		if err != nil {
-			return nil, nil, err
-		}
-		for sku, v := range baseKg {
-			kg[sku] = v
-		}
-		for sku, v := range baseAmt {
-			amount[sku] = v
-		}
-	}
-	// ⚠️ 这里**不补**预售重估(回退路径上期初量本身就是空的/过期的,
-	//   硬补一次重估会让"两期总毛利"算错)⇒ 断链的那一天,成本链本来就不完整,
-	//   报表的数据_source 会标成 estimated,门店能看出来。
-	return kg, amount, nil
-}
-
-// loadStocktakeClosing 取某窗口的**盘点单实盘**(per-SKU,全店口径)。
-//
-// ⚠️ 2026-10-24(盘点口径拆分):盘点单里存的是**柜台实盘**(仓管只盘猪肉台),
-// 冷库余额**单独一个字段**(ColdStoreKg)⇒ 全店实盘 = 柜台实盘 + 冷库余额。
-//
-// ⚠️ 老数据(拆分之前)存的是**全店实盘**(ColdStoreKg 为 0)⇒ 公式一样成立。
-func (s *Service) loadStocktakeClosing(ctx context.Context, branchID string, start, end time.Time) (map[string]decimal.Decimal, error) {
-	out := map[string]decimal.Decimal{}
-	var st model.PorkCutsStocktake
-	err := s.db.WithContext(ctx).
-		Where("branch_id = ? AND taken_at >= ? AND taken_at < ? AND is_complete = ?", branchID, start, end, true).
-		Order("taken_at DESC").
-		First(&st).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return out, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("query prev stocktake: %w", err)
-	}
-	var snaps []model.CutSnapshot
-	if err := json.Unmarshal(st.Cuts, &snaps); err != nil {
-		return nil, fmt.Errorf("unmarshal prev stocktake cuts: %w", err)
-	}
-	for _, sn := range snaps {
-		sku := strings.TrimSpace(sn.CubeProductID)
-		if sku == "" {
-			continue
-		}
-		out[sku] = out[sku].Add(sn.ActualRemainKg).Add(sn.ColdStoreKg)
-	}
-	return out, nil
-}
-
-// loadSkuCounterAndCold 取**两位置**余额(账面)+ 今日盘点口径。
-//
-// ⚠️ **counter 就是账面余额,不用盘点值覆盖**。
-// 原因:日终盘点后会把柜台的货"搬进冷库过夜"(counter := 0,cold += 柜台实盘),
-// 此时冷库里**已经包含**了柜台那份 ⇒ 若再拿盘点值加一次就是**重复计算**
-// (曾导致全店期末翻倍:柜台 10 + 冷库 10 = 20,而真实是 10)。
-//
-// # 两个口径必须**分开**(2026-10-26 修正)
-//
-// ⚠️ hasStocktake 与 dataSource **不是一回事**,别用同一个判据:
-//
-//	hasStocktake —— **成本链**用:当天有没有**任何**盘点单
-//	               ⇒ 有 ⇒ 期末取"按营业日推导的日终结余"(closingForDay)
-//	                 而不是"今天的余额"(补录往日时,今天的余额是错的)
-//	               ⇒ **与 is_complete 无关**(半盘那天也有日终搬台链)
-//
-//	dataSource   —— **报表标注**用(只影响可信度,不影响任何金额):
-//	               actual / partial / estimated 三态(见下)
-//
-// 之前这里只查"当天有没有**任何**盘点单" ⇒ 返回的 dataSource 只有
-// actual / estimated 两个值 ⇒ gross_margin.go 里的 "partial" 分支是**死代码**。
-//
-// ⚠️ 更要紧的是:is_complete=false 的盘点单(is_complete 的语义见 model.go:
-// 「决定 BI 标注 ✓已盘点 / ⚠未盘点数据为推演」)被当成了**完整实盘** ⇒
-// 报表标注"已盘点"、而数据其实是推演 ⇒ 门店按"盘过了"看数,却拿到推演值。
-//
-// ⇒ dataSource 现在按 is_complete 分三态:
-//   - 有 is_complete=true 的单 ⇒ actual(真实实盘)
-//   - 有单但没有 is_complete=true 的 ⇒ partial(部分实盘)
-//   - 没有任何单 ⇒ estimated(纯账面推演)
-//
-// ⚠️ **成本/期末口径一个字没改**(hasStocktake 仍是"有没有任何盘点单")
-// ⇒ 本次修复只动**报表展示层**,不动成本链。
-func (s *Service) loadSkuCounterAndCold(ctx context.Context, branchID string, startOfDay, endOfDay time.Time) (
-	counter, cold map[string]decimal.Decimal, hasStocktake bool, dataSource string, err error,
-) {
-	counter, cold, err = s.loadSkuPositions(ctx, branchID)
-	if err != nil {
-		return nil, nil, false, "", err
-	}
-	// 只打索引列(branch_id + taken_at),不扫全表。
-	var nAll, nComplete int64
-	if err := s.db.WithContext(ctx).
-		Model(&model.PorkCutsStocktake{}).
-		Where("branch_id = ? AND taken_at >= ? AND taken_at < ?", branchID, startOfDay, endOfDay).
-		Count(&nAll).Error; err != nil {
-		return nil, nil, false, "", fmt.Errorf("count stocktake: %w", err)
-	}
-	if nAll == 0 {
-		return counter, cold, false, dataSourceEstimated, nil
-	}
-	if err := s.db.WithContext(ctx).
-		Model(&model.PorkCutsStocktake{}).
-		Where("branch_id = ? AND taken_at >= ? AND taken_at < ? AND is_complete = ?",
-			branchID, startOfDay, endOfDay, true).
-		Count(&nComplete).Error; err != nil {
-		return nil, nil, false, "", fmt.Errorf("count complete stocktake: %w", err)
-	}
-	if nComplete == 0 {
-		// ⚠️ 有盘点单但**没有一张是完整的** ⇒ 口径标 partial(**不是实盘**)。
-		//
-		// ⚠️ hasStocktake 仍是 **true**:那天有日终动作(搬台链),
-		// 期末照样取"按营业日推导的结余" —— 跟修复前完全一致(不动成本链)。
-		return counter, cold, true, dataSourcePartial, nil
-	}
-	return counter, cold, true, dataSourceActual, nil
-}
-
 // loadSkuPositions 读当前两位置余额。
 func (s *Service) loadSkuPositions(ctx context.Context, branchID string) (counter, cold map[string]decimal.Decimal, err error) {
 	counter = map[string]decimal.Decimal{}
@@ -1160,11 +629,14 @@ func (s *Service) primarySkuPerCut(ctx context.Context, branchID string) (map[mo
 	return out, nil
 }
 
-// expectedPerCutByEngine 用**移动加权引擎**算各部位的账面应有期末量(全店口径)。
+// expectedPerCutByEngine 用**部位级**移动加权引擎算各部位的账面应有期末量(全店口径)。
 //
-// ⚠️ 2026-10-23:盘点单的 expected 改用它,而不是旧的 computeExpectedRemainKgByCut。
-// 理由:旧算法是**部位级**、且不含"昨天的货";新算法是 SKU 级全店口径,
-// 与毛利报告**同一个引擎** ⇒ 不会出现"盘点单的应有"与"报表的应有"两套口径。
+// ⚠️ 2026-10-27:成本链改部位级 ⇒ 这里的 expected 也是**部位级**的
+// (引擎直接给 ExpectedClosingKg / OpeningKg / WasteKg,不用再汇总 SKU)。
+//
+// ⚠️ 2026-10-23:盘点单的 expected 改用引擎,而不是旧算法。
+// 理由:引擎的 expected(ExpectedClosingKg)与毛利报告**同一个引擎**
+// ⇒ 不会出现"盘点单的应有"与"报表的应有"两套口径。
 //
 // 引擎里的 expected(ExpectedClosingKg)不依赖盘点单 ⇒ 盘点提交前就能算。
 func (s *Service) expectedPerCutByEngine(ctx context.Context, branchID string, day time.Time) (
@@ -1173,38 +645,16 @@ func (s *Service) expectedPerCutByEngine(ctx context.Context, branchID string, d
 	expected = map[model.CutType]decimal.Decimal{}
 	opening = map[model.CutType]decimal.Decimal{}
 	waste = map[model.CutType]decimal.Decimal{}
-	rows, _, _, err := s.computeSkuDailyCosts(ctx, branchID, day)
+	rows, _, _, _, err := s.computeCutDailyCosts(ctx, branchID, day)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	for _, r := range rows {
-		expected[r.CutType] = expected[r.CutType].Add(r.ExpectedClosingKg)
-		opening[r.CutType] = opening[r.CutType].Add(r.OpeningKg)
-		waste[r.CutType] = waste[r.CutType].Add(r.WasteKg)
+		expected[r.CutType] = r.ExpectedClosingKg
+		opening[r.CutType] = r.OpeningKg
+		waste[r.CutType] = r.WasteKg
 	}
 	return expected, opening, waste, nil
-}
-
-// loadSkuClosingAll 取某窗口的**全店**期末量(柜台 + 冷库)。
-//
-// 有盘点 → 柜台实盘 + 冷库余额;无盘点 → 账面(柜台账面 + 冷库余额)。
-func (s *Service) loadSkuClosingAll(ctx context.Context, branchID string, start, end time.Time) (map[string]decimal.Decimal, error) {
-	counter, cold, hasStocktake, _, err := s.loadSkuCounterAndCold(ctx, branchID, start, end)
-	if err != nil {
-		return nil, err
-	}
-	out := map[string]decimal.Decimal{}
-	for sku, v := range counter {
-		out[sku] = v
-	}
-	for sku, v := range cold {
-		out[sku] = out[sku].Add(v)
-	}
-	if !hasStocktake {
-		// 无盘点 ⇒ 账面里没有"卖掉了多少"的信息,退回按位置余额(全店口径仍成立)。
-		return out, nil
-	}
-	return out, nil
 }
 
 // bizTZOrUTC 返回营业日时区(未注入时用 UTC)。
@@ -1251,48 +701,4 @@ func (s *Service) fmSaleDateExpr() string {
 		return "substr(sale_date::text, 1, 10) = ?"
 	}
 	return "substr(sale_date, 1, 10) = ?"
-}
-
-// computeOvernightShrink 估"隔夜失重·盘亏"。
-//
-// 口径:昨日全店实盘 − 今日全店实盘 − (今日产出 − 今日卖出 − 今日报损)
-// ⇒ 差额只能是隔夜失重 + 称重误差 + 盘亏(因为进货/销售/报损都已在里面扣掉)。
-//
-// ⚠️ **不是纯隔夜失重**:门店按"昨晚称好的重量"上��(2026-10-23 口径),
-// 今天的货实际可能轻了,但系统里没有今天的实称值 ⇒ 只能估,不能测。
-func (s *Service) computeOvernightShrink(ctx context.Context, branchID string, bizDate time.Time, rows []SkuDailyCost) (*LossSummary, error) {
-	out := &LossSummary{ShrinkNote: "期初沿用昨日日终重量,未做隔夜失重修正;实测销量可能被高估。"}
-
-	prevStart, prevEnd := s.previousBizDayBounds(bizDate)
-	prevClosing, err := s.loadSkuClosingAll(ctx, branchID, prevStart, prevEnd)
-	if err != nil {
-		return nil, err
-	}
-	if len(prevClosing) == 0 {
-		return out, nil
-	}
-	prevTotal := decimal.Zero
-	for _, v := range prevClosing {
-		prevTotal = prevTotal.Add(v)
-	}
-	if prevTotal.IsZero() {
-		return out, nil
-	}
-	curTotal := decimal.Zero
-	for _, r := range rows {
-		curTotal = curTotal.Add(r.ClosingKg)
-	}
-	// 今日净变动 = 产出 − 卖出 − 报损
-	netMove := decimal.Zero
-	for _, r := range rows {
-		netMove = netMove.Add(r.ProducedKg).Sub(r.SoldKg).Sub(r.WasteKg)
-	}
-	shrink := prevTotal.Add(netMove).Sub(curTotal)
-	if shrink.IsNegative() {
-		shrink = decimal.Zero
-	}
-	out.OvernightShrinkKg = shrink
-	f, _ := shrink.Mul(decimal.NewFromInt(100)).Div(prevTotal).Float64()
-	out.OvernightShrinkPct = f
-	return out, nil
 }

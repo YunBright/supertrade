@@ -754,6 +754,106 @@ type SkuCostDaily struct {
 // TableName 显式表名。
 func (SkuCostDaily) TableName() string { return "sku_cost_daily" }
 
+// ---- 表9b:cut_cost_daily(部位级成本日快照)----
+//
+// CutCostDaily 某个营业日**某部位**的成本**日快照** —— 成本链的载体。
+//
+// # 为什么是**部位**而不是 SKU(2026-10-27 口径决议)
+//
+// 门店口径(一直如此,见 CutStockDaily / SkuStockOpening 的注释):
+// 「鲜肉只管部位数据,不管 SKU;SKU 映射只是为了把销售、数量等数据聚合到其部位」
+// ⇒ **库存、结余、盘点、期初结转、大宗结算全是部位口径**。
+//
+// 而旧的成本链(`sku_cost_daily` / `sku_cost_states`)是 **SKU 主键** ⇒ 两套粒度打架:
+// `overlayStockOpenings` 把**部位**的期初 100% 记到该部位的「主 SKU」,
+// 同部位其它 SKU 的期初被清零 ⇒ 那个货号账面恒为 0 ⇒ 卖出即**零成本**
+// ⇒ 毛利率 100%(毛利虚高),且「应有」被负数裁剪分支抹掉(恒等式对不上)。
+//
+// ⇒ 成本链改到部位级:这张表就是新链的「上一日结余」来源。
+//
+// # 与旧表的关系
+//
+// `sku_cost_daily` / `sku_cost_states` **停止写入**(历史保留只读)。
+// ⚠️ 两张表粒度不同,**不要**混查。
+type CutCostDaily struct {
+	// ID 是**确定性**代理主键(surrogateID("CCD", branch_id, biz_date, cut_type))
+	// ⇒ 同一 (门店, 归属日, 部位) 永远只有一行 ⇒ 重算 = 覆盖。
+	ID       string         `gorm:"primaryKey;column:id;type:varchar(64)" json:"id"`
+	BranchID string         `gorm:"column:branch_id;type:varchar(64);not null;uniqueIndex:idx_cut_cost_daily,priority:1" json:"branch_id"`
+	BizDate  datatypes.Date `gorm:"column:biz_date;not null;uniqueIndex:idx_cut_cost_daily,priority:2" json:"biz_date"`
+	// CutType 是**部位**(五花肉 / 猪蹄 …)—— 成本链的计算单元。
+	CutType CutType `gorm:"column:cut_type;type:varchar(32);not null;uniqueIndex:idx_cut_cost_daily,priority:3" json:"cut_type"`
+
+	// OpeningKg / OpeningAmount 是**期初**(kg / 元):上一营业日的部位结余。
+	OpeningKg     decimal.Decimal `gorm:"column:opening_kg;type:decimal(14,3);not null;default:0" json:"opening_kg"`
+	OpeningAmount decimal.Decimal `gorm:"column:opening_amount;type:decimal(16,2);not null;default:0" json:"opening_amount"`
+	// ProducedKg / ProducedAmount 是**本期入库**(今日分割产出 kg + 其猪成本分摊额)。
+	ProducedKg     decimal.Decimal `gorm:"column:produced_kg;type:decimal(14,3);not null;default:0" json:"produced_kg"`
+	ProducedAmount decimal.Decimal `gorm:"column:produced_amount;type:decimal(16,2);not null;default:0" json:"produced_amount"`
+	// SoldKg / SoldAmount 是**本期零售销售**。
+	SoldKg     decimal.Decimal `gorm:"column:sold_kg;type:decimal(14,3);not null;default:0" json:"sold_kg"`
+	SoldAmount decimal.Decimal `gorm:"column:sold_amount;type:decimal(16,2);not null;default:0" json:"sold_amount"`
+	// BulkSoldKg / BulkSoldAmount 是**统收**(酒店批量出库)。
+	BulkSoldKg     decimal.Decimal `gorm:"column:bulk_sold_kg;type:decimal(14,3);not null;default:0" json:"bulk_sold_kg"`
+	BulkSoldAmount decimal.Decimal `gorm:"column:bulk_sold_amount;type:decimal(16,2);not null;default:0" json:"bulk_sold_amount"`
+	// WasteKg / WasteAmount 是**报损**。
+	WasteKg     decimal.Decimal `gorm:"column:waste_kg;type:decimal(14,3);not null;default:0" json:"waste_kg"`
+	WasteAmount decimal.Decimal `gorm:"column:waste_amount;type:decimal(16,2);not null;default:0" json:"waste_amount"`
+
+	// ExpectedClosingKg 是**账面应有**期末量 = 期初 + 入库 − 销售 − 统收 − 报损。
+	//
+	// ⚠️ **不裁 0**:负数 = **账面短卖**(卖超了库存)⇒ 必须看得见。
+	//   旧引擎在这里裁 0 ⇒ 缺口被抹掉 ⇒ 部位"应有"反而变正 ⇒ 门店看到的行自相矛盾。
+	ExpectedClosingKg decimal.Decimal `gorm:"column:expected_closing_kg;type:decimal(14,3);not null;default:0" json:"expected_closing_kg"`
+	// ClosingKg 是**期末**量(有盘点 = 实盘;无盘点 = 账面推演)。
+	ClosingKg     decimal.Decimal `gorm:"column:closing_kg;type:decimal(14,3);not null;default:0" json:"closing_kg"`
+	ClosingAmount decimal.Decimal `gorm:"column:closing_amount;type:decimal(16,2);not null;default:0" json:"closing_amount"`
+
+	// MovingAvgUnitCost 是该部位的移动加权平均成本(元/kg)。
+	MovingAvgUnitCost decimal.Decimal `gorm:"column:moving_avg_unit_cost;type:decimal(16,4);not null;default:0" json:"moving_avg_unit_cost"`
+	// SalesCostYuan / BulkCostYuan / WasteCostYuan 是本期成本三块。
+	SalesCostYuan decimal.Decimal `gorm:"column:sales_cost_yuan;type:decimal(16,2);not null;default:0" json:"sales_cost_yuan"`
+	BulkCostYuan  decimal.Decimal `gorm:"column:bulk_cost_yuan;type:decimal(16,2);not null;default:0" json:"bulk_cost_yuan"`
+	WasteCostYuan decimal.Decimal `gorm:"column:waste_cost_yuan;type:decimal(16,2);not null;default:0" json:"waste_cost_yuan"`
+	// RevenueYuan / GrossMarginYuan / GrossMarginPct 是损益三件套。
+	RevenueYuan     decimal.Decimal `gorm:"column:revenue_yuan;type:decimal(16,2);not null;default:0" json:"revenue_yuan"`
+	GrossMarginYuan decimal.Decimal `gorm:"column:gross_margin_yuan;type:decimal(16,2);not null;default:0" json:"gross_margin_yuan"`
+	GrossMarginPct  float64         `gorm:"column:gross_margin_pct;type:numeric(8,4);not null;default:0" json:"gross_margin_pct"`
+	// PresaleMarginYuan / PresaleExpectedRevenueYuan 是**预期毛利(预售结转)**。
+	PresaleMarginYuan          decimal.Decimal `gorm:"column:presale_margin_yuan;type:decimal(16,2);not null;default:0" json:"presale_margin_yuan"`
+	PresaleExpectedRevenueYuan decimal.Decimal `gorm:"column:presale_expected_revenue_yuan;type:decimal(16,2);not null;default:0" json:"presale_expected_revenue_yuan"`
+
+	// DataSource:actual(有完整实盘) | partial(有盘点但未完成) | estimated(无盘点)
+	DataSource string    `gorm:"column:data_source;type:varchar(16);not null;default:'estimated'" json:"data_source"`
+	CreatedAt  time.Time `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt  time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
+}
+
+// TableName 显式表名。
+func (CutCostDaily) TableName() string { return "cut_cost_daily" }
+
+// ---- 表9c:cut_cost_states(部位级成本状态)----
+//
+// CutCostState 某店某**部位**的移动加权成本状态(当日有效)。
+//
+// ⚠️ 这是**部位级**的"账" —— 昨天的单价就是今天的期初金额基准。
+//   (旧的 `sku_cost_states` 是 SKU 级 ⇒ 多货号部位只有一个货号有单价,
+//    另一个货号卖出时移动加权单价恒为 0 ⇒ 零成本 ⇒ 毛利率 100%。)
+type CutCostState struct {
+	// ID 是**确定性**代理主键(surrogateID("CCS", branch_id, cut_type))。
+	ID       string  `gorm:"primaryKey;column:id;type:varchar(64)" json:"id"`
+	BranchID string  `gorm:"column:branch_id;type:varchar(64);not null;uniqueIndex:idx_cut_cost_state,priority:1" json:"branch_id"`
+	CutType  CutType `gorm:"column:cut_type;type:varchar(32);not null;uniqueIndex:idx_cut_cost_state,priority:2" json:"cut_type"`
+	// QtyKg / AmountYuan 是当前结余(kg / 元)。
+	QtyKg             decimal.Decimal `gorm:"column:qty_kg;type:decimal(14,3);not null;default:0" json:"qty_kg"`
+	AmountYuan        decimal.Decimal `gorm:"column:amount_yuan;type:decimal(16,2);not null;default:0" json:"amount_yuan"`
+	MovingAvgUnitCost decimal.Decimal `gorm:"column:moving_avg_unit_cost;type:decimal(16,4);not null;default:0" json:"moving_avg_unit_cost"`
+	LastBizDate       datatypes.Date  `gorm:"column:last_biz_date;not null" json:"last_biz_date"`
+}
+
+// TableName 显式表名。
+func (CutCostState) TableName() string { return "cut_cost_states" }
+
 // ---- 表10:bulk_products ----
 
 // BulkProduct 大宗品项登记表(冷库里"不是零售、攒着统一结算"的东西)。

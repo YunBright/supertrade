@@ -18,6 +18,7 @@ package service_test
 //	③ 改出来的**负库存不拦**,但要在每日毛利的 alert 里**红字**显示。
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -33,7 +34,7 @@ func TestOpening_SeedsTheDailyBalanceChain(t *testing.T) {
 	fmBizSeedDay1(t, svc, ctx, sku)
 
 	// 链的起点 = 0 ⇒ 10-01 的冷库 = 10(盘点盘出来的 10kg)。
-	_, cold := fmMarginClosing(t, "S001", fmDay1, sku)
+	_, cold := fmMarginClosing(t, "S001", fmDay1, model.CutBelly)
 	if !cold.Equal(d("10")) {
 		t.Fatalf("期初为 0 时 10-01 冷库余额应是 10,got %s", cold)
 	}
@@ -56,7 +57,7 @@ func TestOpening_SeedsTheDailyBalanceChain(t *testing.T) {
 	}
 
 	// ⇒ 链从期初起算:10-01 的冷库 = 期初 100 + 结转 10 = 110。
-	_, cold2 := fmMarginClosing(t, "S001", fmDay1, sku)
+	_, cold2 := fmMarginClosing(t, "S001", fmDay1, model.CutBelly)
 	if !cold2.Equal(d("110")) {
 		t.Errorf("改期初后 10-01 冷库余额应是 110(期初 100 + 结转 10),got %s", cold2)
 	}
@@ -208,28 +209,33 @@ func TestCounterLoadRows_EditPastDayAndNegativeAlert(t *testing.T) {
 	}
 
 	// ⇒ 10-02 的按日结余变负(5 − 10 = −5)。
-	_, cold := fmMarginClosing(t, "S001", fmDay2, sku)
+	_, cold := fmMarginClosing(t, "S001", fmDay2, model.CutBelly)
 	if !cold.Equal(d("-5")) {
 		t.Errorf("10-02 冷库余额应是 -5(改出来负库存),got %s", cold)
 	}
 
-	// ⇒ 每日毛利的 alert 里红字显示。
+	// ⇒ 每日毛利的 alert 里必须看得见这个负数(部位级)。
+	//
+	// ⚠️ 2026-10-27:成本链改**部位级** ⇒ 告警指向**部位**(不再指向 SKU)。
+	//
+	// ⚠️ **"负库存"的两种含义要分清**:
+	//   - **冷库余额为负**(搬台超了冷库里的货)⇒ 这是**位置**层面的负数
+	//     ⇒ 走"当前余额与按营业日推导的结余不一致"那条告警(带负数);
+	//   - **账面短卖**(卖超了库存)⇒ 那是**成本链**层面的负数
+	//     ⇒ 走红的"负库存"告警(见 cut_level_cost_test.go 的用例)。
 	rep, err := svc.ComputeGrossMargin(ctx, "S001", fmDay2)
 	mustNoErr(t, err, "ComputeGrossMargin")
 	found := false
 	for _, a := range rep.Alerts {
-		if a.Code != service.MarginAlertNegativeInventory {
+		if a.CubeProductID != string(model.CutBelly) {
 			continue
 		}
-		if a.Level != service.MarginAlertLevelError {
-			t.Errorf("负库存告警应是红字(error),got %q", a.Level)
-		}
-		if a.CubeProductID != sku {
-			t.Errorf("负库存告警应指出 SKU,got %q", a.CubeProductID)
+		if !strings.Contains(a.Message, "-5") {
+			t.Errorf("告警文案里应看得见负结余 -5kg,got %q", a.Message)
 		}
 		found = true
 	}
 	if !found {
-		t.Errorf("负库存应在每日毛利的 alerts 里红字显示,got %+v", rep.Alerts)
+		t.Errorf("负库存应在每日毛利的 alerts 里显示(部位级),got %+v", rep.Alerts)
 	}
 }

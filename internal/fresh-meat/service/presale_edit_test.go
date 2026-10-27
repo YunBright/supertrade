@@ -89,13 +89,9 @@ func TestUpdatePresale_ChangesPriceAndRederives(t *testing.T) {
 	}
 	rep3, err := svc.ComputeGrossMargin(ctx, "S001", fmDay2.Add(24*time.Hour))
 	mustNoErr(t, err, "ComputeGrossMargin(10-03)")
-	for _, r := range rep3.PerSku {
-		if r.CubeProductID != sku {
-			continue
-		}
-		if !r.OpeningAmount.Equal(d("1200")) {
-			t.Errorf("改价后 10-03 期初应是 2000 + (60−100)×20 = 1200,got %s", r.OpeningAmount)
-		}
+	if !rep3.Reconciliation.OpeningInventoryCostYuan.Equal(d("1200")) {
+		t.Errorf("改价后 10-03 期初应是 2000 + (60−100)×20 = 1200,got %s",
+			rep3.Reconciliation.OpeningInventoryCostYuan)
 	}
 }
 

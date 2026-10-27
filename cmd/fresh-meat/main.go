@@ -106,6 +106,16 @@ func initApp() error {
 		&model.CutPresale{},
 		&model.PigPresaleMargin{},
 		&model.CutPresaleEdit{},
+		// 2026-10-27:成本链改**部位级** ⇒ 部位级成本日快照 + 部位级成本状态。
+		//
+		// ⚠️ **必须在这里**:AutoMigrate 是本服务自己建表(生产上 fresh-meat 与其它服务
+		//   共用同一个 PG)⇒ 漏登记 ⇒ 部署后第一次写快照就报
+		//   "relation cut_cost_daily does not exist" ⇒ **上线即炸**。
+		//
+		// ⚠️ 旧的 sku_cost_daily / sku_cost_states **停写**(历史保留只读)
+		//   ⇒ 上面两行保留在列表里(表还得在,历史数据还要能读)。
+		&model.CutCostDaily{},
+		&model.CutCostState{},
 	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
 	}

@@ -204,7 +204,9 @@ func (s *Service) RecordBulkProduction(ctx context.Context, branchID string, in 
 		return nil, fmt.Errorf("%w: %s 当天的日终盘点已经登记过结转记录了,不用再手工录", ErrInvalidInput, prod.Name)
 	}
 	// 成本快照:入冷库那一刻的移动加权单价 —— 这就是"记录分摊成本"。
-	unitCost := s.bulkUnitCost(ctx, branchID, sku, time.Time(bizDate))
+	//
+	// ⚠️ 2026-10-27:成本链改部位级 ⇒ 单价按**部位**取(大宗本来就按部位记)。
+	unitCost := s.bulkUnitCost(ctx, branchID, prod.CutType, time.Time(bizDate))
 	productionID := generateID(now, "BKP")
 	// 归属快照:这批货是当天哪几头猪的产出(按分割补录;没有就空 ⇒ 结算时按毛重兜底)。
 	alloc, err := s.bagPigAlloc(ctx, branchID, prod.CutType, sku, time.Time(bizDate))
@@ -766,7 +768,7 @@ func (s *Service) ListBulkBalances(ctx context.Context, branchID string) ([]Bulk
 		settled := decimal.Zero
 		if skuErr == nil {
 			coldKg = cold[sku]
-			unitCost = s.bulkUnitCost(ctx, branchID, sku, now)
+			unitCost = s.bulkUnitCost(ctx, branchID, p.CutType, now)
 			// 该 SKU 的**全部结转记录**(袋子 + 散货行)⇒ 产出与队列剩余。
 			var bags []model.StockBag
 			if err := s.db.WithContext(ctx).

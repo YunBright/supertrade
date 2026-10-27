@@ -203,21 +203,31 @@ func TestPresale_AuditSettlesMarginAndRebasesNextOpening(t *testing.T) {
 		t.Errorf("重估额应是 500,got %s", rep2.Reconciliation.RevaluationYuan)
 	}
 
-	// ② 审计日的成本日快照:**冻结的成本口径**(2000)——
-	//    预售价是另一层(可改),不写进冻结快照。
-	var snap model.SkuCostDaily
-	if err := testDBSingleton.Where("branch_id = ? AND cube_product_id = ? AND biz_date LIKE ?",
-		"S001", sku, "2026-10-02%").First(&snap).Error; err != nil {
-		t.Fatalf("查 10-02 成本日快照: %v", err)
+	// ② 审计日的成本日快照(**部位级**:cut_cost_daily):
+	//    - **成本口径**仍是 2000(20kg × 100 元/kg)—— 预售价是另一层;
+	//    - **结转金额**(下一期的期初来源)= 预期售价口径 3000(20kg × 150)。
+	//
+	// ⚠️ 2026-10-27:成本链改部位级 ⇒ 快照落在 `cut_cost_daily`(按部位),
+	//   旧的 `sku_cost_daily`(按 SKU)已停写。
+	snap, ok := fmCutCostDaily(t, "S001", "2026-10-02", model.CutBelly)
+	if !ok {
+		t.Fatalf("查 10-02 成本日快照(部位级): 没有行")
 	}
-	if !snap.ClosingAmount.Equal(d("2000")) {
-		t.Errorf("10-02 期末金额应是**成本口径** 2000(冻结快照不被预售价改动),got %s", snap.ClosingAmount)
+	if !snap.ClosingKg.Equal(d("20")) {
+		t.Errorf("10-02 期末量应是 20kg,got %s", snap.ClosingKg)
 	}
 	if !snap.MovingAvgUnitCost.Equal(d("100")) {
 		t.Errorf("移动加权单价仍是**成本口径**(100),got %s", snap.MovingAvgUnitCost)
 	}
+	if !snap.ClosingKg.Mul(snap.MovingAvgUnitCost).Equal(d("2000")) {
+		t.Errorf("10-02 成本口径期末金额应是 2000(20kg × 100),got %s",
+			snap.ClosingKg.Mul(snap.MovingAvgUnitCost))
+	}
+	if !snap.ClosingAmount.Equal(d("3000")) {
+		t.Errorf("10-02 结转金额应是**预期售价口径** 3000(20kg × 150),got %s", snap.ClosingAmount)
+	}
 
-	// ③ 下一期(10-03):期初单价 = 预期销售单价(100)。
+	// ③ 下一期(10-03):期初单价 = 预期销售单价(150)。
 	svc.SetClock(fmClock(fmDay2.Add(24 * time.Hour)))
 	if _, err := svc.RecordPorkCutsStocktake(ctx, "S001", model.RecordPorkCutsStocktakeInput{
 		IsComplete: true,
@@ -230,16 +240,17 @@ func TestPresale_AuditSettlesMarginAndRebasesNextOpening(t *testing.T) {
 	}
 	rep3, err := svc.ComputeGrossMargin(ctx, "S001", fmDay2.Add(24*time.Hour))
 	mustNoErr(t, err, "ComputeGrossMargin(10-03)")
-	for _, r := range rep3.PerSku {
-		if r.CubeProductID != sku {
-			continue
-		}
-		if !r.OpeningAmount.Equal(d("3000")) {
-			t.Errorf("10-03 期初金额应是 2000(上期期末重估值),got %s", r.OpeningAmount)
-		}
-		if !r.MovingAvgUnitCost.Equal(d("150")) {
-			t.Errorf("10-03 移动加权单价应是 150(上一期的预期销售单价),got %s", r.MovingAvgUnitCost)
-		}
+	row3 := fmCutRowFor(t, rep3, model.CutBelly)
+	if !row3.OpeningKg.Equal(d("20")) {
+		t.Errorf("10-03 期初 kg 应是 20(上期结转),got %s", row3.OpeningKg)
+	}
+	// 期初金额 = 3000(预期售价口径)⇒ 加权单价 = 3000 / 20 = 150。
+	if !rep3.Reconciliation.OpeningInventoryCostYuan.Equal(d("3000")) {
+		t.Errorf("10-03 期初金额应是 3000(上期期末的预期售价口径),got %s",
+			rep3.Reconciliation.OpeningInventoryCostYuan)
+	}
+	if !row3.MovingAvgUnitCost.Equal(d("150")) {
+		t.Errorf("10-03 移动加权单价应是 150(上一期的预期销售单价),got %s", row3.MovingAvgUnitCost)
 	}
 }
 
@@ -337,14 +348,23 @@ func TestPresale_SkuWithoutPriceUsesZero(t *testing.T) {
 	if len(st.Presale.MissingSkus) != 1 || st.Presale.MissingSkus[0] != sku {
 		t.Errorf("取不到价的 SKU 应显式列出,got %+v", st.Presale.MissingSkus)
 	}
-	// 冻结快照仍是**成本口径**(2000)—— 预售价是另一层,可改。
-	var snap model.SkuCostDaily
-	if err := testDBSingleton.Where("branch_id = ? AND cube_product_id = ? AND biz_date LIKE ?",
-		"S001", sku, "2026-10-02%").First(&snap).Error; err != nil {
-		t.Fatalf("查 10-02 成本日快照: %v", err)
+	// 冻结快照的**成本口径**仍是 2000(20kg × 100 元/kg)—— 预售价是另一层,可改。
+	//
+	// ⚠️ 2026-10-27:成本链改部位级 ⇒ 快照落在 `cut_cost_daily`(按部位)。
+	snap, ok := fmCutCostDaily(t, "S001", "2026-10-02", model.CutBelly)
+	if !ok {
+		t.Fatalf("查 10-02 成本日快照(部位级): 没有行")
 	}
-	if !snap.ClosingAmount.Equal(d("2000")) {
-		t.Errorf("冻结快照应是成本口径 2000,got %s", snap.ClosingAmount)
+	if !snap.ClosingKg.Mul(snap.MovingAvgUnitCost).Equal(d("2000")) {
+		t.Errorf("冻结快照的成本口径应是 2000(20kg × 100),got %s",
+			snap.ClosingKg.Mul(snap.MovingAvgUnitCost))
+	}
+	if !snap.MovingAvgUnitCost.Equal(d("100")) {
+		t.Errorf("移动加权单价应是**成本口径**(100),got %s", snap.MovingAvgUnitCost)
+	}
+	// 结转金额(下一期的期初来源)= 预期售价口径:0 元价 ⇒ 0(写减记)。
+	if !snap.ClosingAmount.Equal(d("0")) {
+		t.Errorf("0 元价 ⇒ 结转金额应是 0(写减记),got %s", snap.ClosingAmount)
 	}
 	// 下一期期初 = 成本口径 2000 + 重估(0 − 100)×20 = 0(写减记)。
 	svc.SetClock(fmClock(fmDay2.Add(24 * time.Hour)))
@@ -359,13 +379,9 @@ func TestPresale_SkuWithoutPriceUsesZero(t *testing.T) {
 	}
 	rep3, err := svc.ComputeGrossMargin(ctx, "S001", fmDay2.Add(24*time.Hour))
 	mustNoErr(t, err, "ComputeGrossMargin(10-03)")
-	for _, r := range rep3.PerSku {
-		if r.CubeProductID != sku {
-			continue
-		}
-		if !r.OpeningAmount.IsZero() {
-			t.Errorf("取不到价 ⇒ 10-03 期初金额应是 0(写减记),got %s", r.OpeningAmount)
-		}
+	if !rep3.Reconciliation.OpeningInventoryCostYuan.IsZero() {
+		t.Errorf("取不到价 ⇒ 10-03 期初金额应是 0(写减记),got %s",
+			rep3.Reconciliation.OpeningInventoryCostYuan)
 	}
 }
 
@@ -414,13 +430,9 @@ func TestPresale_ZeroPriceBooksNegativeMargin(t *testing.T) {
 	}
 	rep3, err := svc.ComputeGrossMargin(ctx, "S001", fmDay2.Add(24*time.Hour))
 	mustNoErr(t, err, "ComputeGrossMargin(10-03)")
-	for _, r := range rep3.PerSku {
-		if r.CubeProductID != sku {
-			continue
-		}
-		if !r.OpeningAmount.IsZero() {
-			t.Errorf("0 元价 ⇒ 10-03 期初金额应是 0(写减记),got %s", r.OpeningAmount)
-		}
+	if !rep3.Reconciliation.OpeningInventoryCostYuan.IsZero() {
+		t.Errorf("0 元价 ⇒ 10-03 期初金额应是 0(写减记),got %s",
+			rep3.Reconciliation.OpeningInventoryCostYuan)
 	}
 }
 
@@ -532,7 +544,7 @@ func TestAudit_ZeroesNegativeStockAndShowsDiffTable(t *testing.T) {
 		t.Fatalf("10-03 盘点: %v", err)
 	}
 	// 10-03 日终冷库 = 20 + 0(结转) − 25(搬台) = −5 ⇒ 负库存。
-	_, cold := fmMarginClosing(t, "S001", day3, sku)
+	_, cold := fmMarginClosing(t, "S001", day3, model.CutBelly)
 	if !cold.Equal(d("-5")) {
 		t.Fatalf("10-03 冷库应是 −5(负库存),got %s", cold)
 	}

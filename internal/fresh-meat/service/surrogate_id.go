@@ -51,8 +51,26 @@ func StockPositionID(branchID, cubeProductID, location string) string {
 }
 
 // SkuCostStateID 成本状态表(sku_cost_states)的代理主键。
+//
+// ⚠️ **2026-10-27 起这张表停止写入**(成本链改部位级)⇒ 只保留给历史数据读。
 func SkuCostStateID(branchID, cubeProductID string) string {
 	return surrogateID("SCS", branchID, cubeProductID)
+}
+
+// CutCostDailyID 部位级成本日快照(cut_cost_daily)的代理主键。
+//
+// bizDate 是**归属日**("YYYY-MM-DD",营业日界时区)。
+//
+// ⇒ 同一 (门店, 归属日, 部位) 永远是同一行 ⇒ 重算 = 覆盖(不堆重复行)。
+func CutCostDailyID(branchID, bizDate, cutType string) string {
+	return surrogateID("CCD", branchID, bizDate, cutType)
+}
+
+// CutCostStateID 部位级成本状态(cut_cost_states)的代理主键。
+//
+// ⇒ 同一 (门店, 部位) 永远只有一行 ⇒ 每次盘点刷新同一行。
+func CutCostStateID(branchID, cutType string) string {
+	return surrogateID("CCS", branchID, cutType)
 }
 
 // StocktakeID 盘点单(pork_cuts_stocktakes)的**确定性**代理主键。

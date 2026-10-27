@@ -316,29 +316,44 @@ func (s *Service) buildPresalePlan(ctx context.Context, branchID string, cutoff 
 
 // presaleSkuRows 取该日**有结余**的 SKU 行(结余 kg + 成本口径单价)。
 //
-// 数据来源 = 该营业日的**成本日快照**(sku_cost_daily):
-// 结余 kg 与结余成本必须来自**同一行**(否则 kg 与金额对不上)。
+// # 数据来源 = 该营业日的**部位级**成本日快照(cut_cost_daily)
+//
+// ⚠️ 2026-10-27:成本链改**部位级** ⇒ 快照里**没有 SKU 粒度**
+//   (cut_cost_daily 的唯一键是 branch_id + biz_date + cut_type)
+//   ⇒ 结余 kg 与结余成本先按**部位**取,再按该部位各货号的**当前冷库余额占比**
+//   拆到货号(见 cut_split.go 的 splitCutClosingToSkus)
+//   ⇒ 预期售价是**货号级**的 ⇒ 拆开之后每个货号按**自己的**售价结转。
+//
+// ⇒ 结余 kg 与结余成本必须来自**同一部位的同一行**(否则 kg 与金额对不上)。
 func (s *Service) presaleSkuRows(ctx context.Context, branchID string, cutoff time.Time) ([]presaleRow, error) {
 	start, end := s.businessDayBounds(cutoff)
-	var snaps []model.SkuCostDaily
+	var snaps []model.CutCostDaily
 	if err := s.db.WithContext(ctx).
 		Where("branch_id = ? AND biz_date >= ? AND biz_date < ?", branchID, start, end).
-		Order("cube_product_id ASC").
+		Order("cut_type ASC").
 		Find(&snaps).Error; err != nil {
-		return nil, fmt.Errorf("query sku_cost_daily(presale): %w", err)
+		return nil, fmt.Errorf("query cut_cost_daily(presale): %w", err)
 	}
 	cutOf, _, err := s.loadSkuCatalog(ctx, branchID, nil)
 	if err != nil {
 		return nil, err
+	}
+	// 部位 → 货号列表(拆开用)。
+	skusOfCut := map[model.CutType][]string{}
+	for sku, cut := range cutOf {
+		if cut == "" || sku == "" {
+			continue
+		}
+		skusOfCut[cut] = append(skusOfCut[cut], sku)
 	}
 	out := make([]presaleRow, 0, len(snaps))
 	for _, sn := range snaps {
 		if !sn.ClosingKg.IsPositive() {
 			continue
 		}
-		cut := cutOf[sn.CubeProductID]
+		cut := sn.CutType
 		if cut == "" {
-			// 没有部位映射的 SKU ⇒ 不参与预售(部位口径之外的桶)。
+			// 没有部位映射的桶 ⇒ 不参与预售(部位口径之外的桶)。
 			continue
 		}
 		costUnit := sn.MovingAvgUnitCost
@@ -346,13 +361,26 @@ func (s *Service) presaleSkuRows(ctx context.Context, branchID string, cutoff ti
 			// 没有成本口径(从没进过成本池)⇒ 预售无从谈起。
 			continue
 		}
-		out = append(out, presaleRow{
-			sku:        sn.CubeProductID,
-			cut:        cut,
-			qtyKg:      sn.ClosingKg,
-			costUnit:   costUnit,
-			costAmount: sn.ClosingKg.Mul(costUnit),
-		})
+		skus := skusOfCut[cut]
+		if len(skus) == 0 {
+			continue
+		}
+		// 部位结余按货号拆(当前冷库余额占比;拆不动给主 SKU)。
+		cutClosing := map[string]decimal.Decimal{string(cut): sn.ClosingKg}
+		split := s.splitCutClosingToSkus(ctx, branchID, cutClosing)
+		for _, sku := range skus {
+			qty := split[sku]
+			if !qty.IsPositive() {
+				continue
+			}
+			out = append(out, presaleRow{
+				sku:        sku,
+				cut:        cut,
+				qtyKg:      qty,
+				costUnit:   costUnit,
+				costAmount: qty.Mul(costUnit),
+			})
+		}
 	}
 	return out, nil
 }

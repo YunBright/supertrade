@@ -334,14 +334,22 @@ func (s *Service) ListStock(ctx context.Context, branchID string, scope model.St
 	if err != nil {
 		return nil, err
 	}
-	// 移动加权单价
-	unitCost := map[string]decimal.Decimal{}
-	var states []model.SkuCostState
+	// 移动加权单价(**部位级**,2026-10-27)。
+	//
+	// ⚠️ 成本链改部位级 ⇒ `sku_cost_states` **停止写入** ⇒ 不能再按 SKU 查
+	//   (那样查出来恒为 0 ⇒ 门店在「库存查询」里看到的单价永远是 0)。
+	// ⇒ 改成按**部位**读 `cut_cost_states`(部位级成本状态,每次盘点后刷新)。
+	//   同一部位的货号共用该部位的单价 —— 成本本来就是部位口径
+	//   (门店口径:「鲜肉只管部位数据,不管 SKU」)。
+	unitCostByCut := map[model.CutType]decimal.Decimal{}
+	var states []model.CutCostState
 	if err := s.db.WithContext(ctx).Where("branch_id = ?", branchID).Find(&states).Error; err != nil {
-		return nil, fmt.Errorf("query sku_cost_states: %w", err)
+		return nil, fmt.Errorf("query cut_cost_states: %w", err)
 	}
 	for _, st := range states {
-		unitCost[st.CubeProductID] = st.MovingAvgUnitCost
+		if st.MovingAvgUnitCost.IsPositive() {
+			unitCostByCut[st.CutType] = st.MovingAvgUnitCost
+		}
 	}
 
 	skuSet := map[string]struct{}{}
@@ -367,7 +375,7 @@ func (s *Service) ListStock(ctx context.Context, branchID string, scope model.St
 			CounterKg:         c,
 			ColdStoreKg:       cd,
 			TotalKg:           t,
-			MovingAvgUnitCost: unitCost[sku],
+			MovingAvgUnitCost: unitCostByCut[cutOf[sku]],
 		})
 		total = total.Add(t)
 	}
@@ -482,76 +490,122 @@ func (s *Service) applyOvernightMove(ctx context.Context, branchID string, count
 	})
 }
 
-// PersistSkuCostDaily 落当日 SKU 成本快照(幂等 upsert),并刷新 sku_cost_states。
+// PersistCutCostDaily 落当日**部位级**成本快照(幂等 upsert),并刷新 cut_cost_states。
 //
 // 触发点:**日终盘点提交后** —— 那是"这一天算完了"的自然时点。
 // 快照同时是**次日期初的来源**(链式一致,不会因为某天漏算而断链)。
-func (s *Service) PersistSkuCostDaily(ctx context.Context, branchID string, day time.Time) (int, error) {
-	return s.persistSkuCostDaily(ctx, branchID, day, true)
+//
+// ⚠️ 2026-10-27:成本链改**部位级** ⇒ 落的是 `cut_cost_daily` / `cut_cost_states`。
+//   旧的 `sku_cost_daily` / `sku_cost_states` **停止写入**(历史保留只读)。
+func (s *Service) PersistCutCostDaily(ctx context.Context, branchID string, day time.Time) (int, error) {
+	return s.persistCutCostDaily(ctx, branchID, day, true)
 }
 
-// persistSkuCostDaily 落某营业日的 SKU 成本快照(幂等 upsert)。
+// persistCutCostDaily 落某营业日的**部位级**成本快照(幂等 upsert)。
 //
 // # updateState 的含义(2026-10-24)
 //
-// true  —— 同时刷新 **sku_cost_states**(「当前」成本状态)⇒ 只用于**今天**那次盘点;
-// false —— **只写 sku_cost_daily**(按营业日的成本快照)⇒ 用于**补录往日**时的重算:
+// true  —— 同时刷新 **cut_cost_states**(「当前」成本状态)⇒ 只用于**今天**那次盘点;
+// false —— **只写 cut_cost_daily**(按营业日的成本快照)⇒ 用于**补录往日**时的重算:
 //         补录不能把"当前成本状态"改成历史某天的值(那会把今天的毛利带歪)。
-func (s *Service) persistSkuCostDaily(ctx context.Context, branchID string, day time.Time, updateState bool) (int, error) {
-	rows, _, _, err := s.computeSkuDailyCosts(ctx, branchID, day)
+//
+// # closing_amount 记的是**结转口径**(下一期的期初金额来源)
+//
+// ⚠️ 有**预售结转**的那天:期末金额按**预期售价口径**记
+//   (成本口径金额 + 预售重估)⇒ 下一期的期初单价自动 = 预期销售单价
+//   ⇒ 两期总毛利 = 实际毛利(不多算、不少算)。
+//
+//   成本口径本身仍然保留在快照里:closing_kg × moving_avg_unit_cost。
+//
+// # ⚠️ 成本状态(**单价**)只从"**上一营业日有冻结快照**"的那天刷新
+//
+// 为什么:成本状态里的单价会被引擎拿来给**期初定价**(见 cut_cost.go 的
+// loadCutOpening:② cut_cost_states 的部位移动加权单价)。
+// 若把**当天自己的**单价写进状态 ⇒ 当天被重算时,期初会被**自己昨天的单价**
+// 重新定价 ⇒ 门店给的期初进价被覆盖 ⇒ 报告的数字与冻结快照对不上
+// ⇒ 而且每重算一次就漂一次(自引用)。
+//
+// ⇒ 只在"上一营业日有冻结快照"时刷新状态(= 链真的从冻结快照接续过来);
+//   链的起点那天(上一日没有快照)不刷新 ⇒ 期初由**门店给的进价**定价。
+//
+// (根因在 cut_cost.go 的定价优先级:它没有比较状态的 last_biz_date;
+//  这边用"刷新时机"规避,不改引擎。)
+func (s *Service) persistCutCostDaily(ctx context.Context, branchID string, day time.Time, updateState bool) (int, error) {
+	rows, _, _, _, err := s.computeCutDailyCosts(ctx, branchID, day)
 	if err != nil {
 		return 0, err
 	}
 	bizDate := day.In(s.bizTZOrUTC())
+	bizKey := bizDate.Format("2006-01-02")
 	now := s.now()
+	// 上一营业日**有冻结快照**的部位(⇒ 状态可以刷新,见上面的说明)。
+	frozenCuts, err := s.cutsWithFrozenPrevDay(ctx, branchID, day)
+	if err != nil {
+		return 0, err
+	}
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for _, r := range rows {
-			snap := model.SkuCostDaily{
-				ID:               generateID(now, "SCD"),
-				BranchID:         r.BranchID,
-				BizDate:          datatypesDate(bizDate),
-				CubeProductID:    r.CubeProductID,
-				CutType:          r.CutType,
-				OpeningKg:        r.OpeningKg,
-				OpeningAmount:    r.OpeningAmount,
-				ProducedKg:       r.ProducedKg,
-				ProducedAmount:   r.ProducedAmount,
-				SoldKg:           r.SoldKg,
-				SoldAmount:       r.SoldAmount,
-				BulkSoldKg:       r.BulkSoldKg,
-				BulkSoldAmount:   r.BulkSoldAmount,
-				WasteKg:          r.WasteKg,
-				WasteAmount:      r.WasteAmount,
-				ClosingKg:        r.ClosingKg,
-				ClosingAmount:    r.ClosingAmount,
-				MovingAvgUnitCost: r.MovingAvgUnitCost,
-				SalesCostYuan:    r.SalesCostYuan,
-				CounterQty:        r.CounterKg,
-				ColdStoreQty:      r.ColdStoreKg,
-				DataSource:       r.DataSource,
-				CreatedAt:        now,
+			// 结转金额 = 成本口径期末金额 + 预售重估(有预售结转的那天)。
+			// ⇒ 下一期的期初金额从这张表读 ⇒ 自动按预期售价进来(链式)。
+			closingAmount := r.ClosingAmount.Add(r.PresaleMarginYuan)
+			snap := model.CutCostDaily{
+				ID:                        CutCostDailyID(branchID, bizKey, string(r.CutType)),
+				BranchID:                  branchID,
+				BizDate:                   datatypesDate(bizDate),
+				CutType:                   r.CutType,
+				OpeningKg:                 r.OpeningKg,
+				OpeningAmount:             r.OpeningAmount,
+				ProducedKg:                r.ProducedKg,
+				ProducedAmount:            r.ProducedAmount,
+				SoldKg:                    r.SoldKg,
+				SoldAmount:                r.SoldAmount,
+				BulkSoldKg:                r.BulkSoldKg,
+				BulkSoldAmount:            r.BulkSoldAmount,
+				WasteKg:                   r.WasteKg,
+				WasteAmount:               r.WasteAmount,
+				ExpectedClosingKg:         r.ExpectedClosingKg,
+				ClosingKg:                 r.ClosingKg,
+				ClosingAmount:             closingAmount,
+				MovingAvgUnitCost:         r.MovingAvgUnitCost,
+				SalesCostYuan:             r.SalesCostYuan,
+				BulkCostYuan:              r.BulkCostYuan,
+				WasteCostYuan:             r.WasteCostYuan,
+				RevenueYuan:               r.RevenueYuan,
+				GrossMarginYuan:           r.GrossMarginYuan,
+				GrossMarginPct:            r.GrossMarginPct,
+				PresaleMarginYuan:         r.PresaleMarginYuan,
+				PresaleExpectedRevenueYuan: r.PresaleExpectedRevenueYuan,
+				DataSource:                r.DataSource,
+				CreatedAt:                 now,
+				UpdatedAt:                 now,
 			}
 			if err := tx.Clauses(clause.OnConflict{
-				Columns: []clause.Column{{Name: "branch_id"}, {Name: "biz_date"}, {Name: "cube_product_id"}},
+				Columns: []clause.Column{{Name: "branch_id"}, {Name: "biz_date"}, {Name: "cut_type"}},
 				DoUpdates: clause.Assignments(map[string]any{
-					"cut_type":            r.CutType,
-					"opening_kg":          r.OpeningKg,
-					"opening_amount":      r.OpeningAmount,
-					"produced_kg":         r.ProducedKg,
-					"produced_amount":     r.ProducedAmount,
-					"sold_kg":             r.SoldKg,
-					"sold_amount":         r.SoldAmount,
-					"bulk_sold_kg":        r.BulkSoldKg,
-					"bulk_sold_amount":    r.BulkSoldAmount,
-					"waste_kg":            r.WasteKg,
-					"waste_amount":        r.WasteAmount,
-					"closing_kg":          r.ClosingKg,
-					"closing_amount":      r.ClosingAmount,
-					"moving_avg_unit_cost": r.MovingAvgUnitCost,
-					"sales_cost_yuan":     r.SalesCostYuan,
-					"counter_qty":         r.CounterKg,
-					"cold_store_qty":      r.ColdStoreKg,
-					"data_source":         r.DataSource,
+					"opening_kg":                  r.OpeningKg,
+					"opening_amount":              r.OpeningAmount,
+					"produced_kg":                 r.ProducedKg,
+					"produced_amount":             r.ProducedAmount,
+					"sold_kg":                     r.SoldKg,
+					"sold_amount":                 r.SoldAmount,
+					"bulk_sold_kg":                r.BulkSoldKg,
+					"bulk_sold_amount":            r.BulkSoldAmount,
+					"waste_kg":                    r.WasteKg,
+					"waste_amount":                r.WasteAmount,
+					"expected_closing_kg":         r.ExpectedClosingKg,
+					"closing_kg":                  r.ClosingKg,
+					"closing_amount":              closingAmount,
+					"moving_avg_unit_cost":        r.MovingAvgUnitCost,
+					"sales_cost_yuan":             r.SalesCostYuan,
+					"bulk_cost_yuan":              r.BulkCostYuan,
+					"waste_cost_yuan":             r.WasteCostYuan,
+					"revenue_yuan":                r.RevenueYuan,
+					"gross_margin_yuan":           r.GrossMarginYuan,
+					"gross_margin_pct":            r.GrossMarginPct,
+					"presale_margin_yuan":         r.PresaleMarginYuan,
+					"presale_expected_revenue_yuan": r.PresaleExpectedRevenueYuan,
+					"data_source":                 r.DataSource,
+					"updated_at":                  now,
 				}),
 			}).Create(&snap).Error; err != nil {
 				return err
@@ -562,20 +616,26 @@ func (s *Service) persistSkuCostDaily(ctx context.Context, branchID string, day 
 			if !updateState {
 				continue
 			}
-			state := model.SkuCostState{
-				ID:                SkuCostStateID(branchID, r.CubeProductID),
-				BranchID:          r.BranchID,
-				CubeProductID:     r.CubeProductID,
+			// ⚠️ 只在"上一营业日有冻结快照"时刷新(见函数头的说明):
+			//   否则当天自己的单价会反过来给当天的期初定价(自引用)⇒
+			//   门店给的期初进价被历史单价覆盖 ⇒ 报告与冻结快照对不上。
+			if !frozenCuts[string(r.CutType)] {
+				continue
+			}
+			state := model.CutCostState{
+				ID:                CutCostStateID(branchID, string(r.CutType)),
+				BranchID:          branchID,
+				CutType:           r.CutType,
 				QtyKg:             r.ClosingKg,
-				AmountYuan:        r.ClosingAmount,
+				AmountYuan:        closingAmount,
 				MovingAvgUnitCost: r.MovingAvgUnitCost,
 				LastBizDate:       datatypesDate(bizDate),
 			}
 			if err := tx.Clauses(clause.OnConflict{
-				Columns: []clause.Column{{Name: "branch_id"}, {Name: "cube_product_id"}},
+				Columns: []clause.Column{{Name: "branch_id"}, {Name: "cut_type"}},
 				DoUpdates: clause.Assignments(map[string]any{
 					"qty_kg":               r.ClosingKg,
-					"amount_yuan":          r.ClosingAmount,
+					"amount_yuan":          closingAmount,
 					"moving_avg_unit_cost": r.MovingAvgUnitCost,
 					"last_biz_date":        datatypesDate(bizDate),
 				}),
@@ -589,4 +649,24 @@ func (s *Service) persistSkuCostDaily(ctx context.Context, branchID string, day 
 		return 0, err
 	}
 	return len(rows), nil
+}
+
+// cutsWithFrozenPrevDay 取"上一营业日**有冻结成本快照**"的部位集合。
+//
+// ⚠️ 这是成本状态刷新时机的判据(见 persistCutCostDaily 的说明):
+//   上一日有冻结快照 ⇒ 链真的从冻结快照接续 ⇒ 当天的期初金额来自快照
+//   ⇒ 刷新状态里的单价不会反过来影响当天的期初定价。
+func (s *Service) cutsWithFrozenPrevDay(ctx context.Context, branchID string, day time.Time) (map[string]bool, error) {
+	out := map[string]bool{}
+	prevStart, prevEnd := s.previousBizDayBounds(day.In(s.bizTZOrUTC()))
+	var prev []model.CutCostDaily
+	if err := s.db.WithContext(ctx).
+		Where("branch_id = ? AND biz_date >= ? AND biz_date < ?", branchID, prevStart, prevEnd).
+		Find(&prev).Error; err != nil {
+		return nil, fmt.Errorf("query cut_cost_daily(prev, frozen): %w", err)
+	}
+	for _, r := range prev {
+		out[string(r.CutType)] = true
+	}
+	return out, nil
 }

@@ -73,6 +73,8 @@ func newArchiveDB(t *testing.T) *gorm.DB {
 		&model.PromoSku{},
 		&model.BulkProduct{}, &model.BulkProduction{}, &model.BulkSettlement{},
 		&model.BulkSettlementAllocation{}, &model.PigForecastBaseline{},
+		// 2026-10-27:成本链改部位级。
+		&model.CutCostDaily{}, &model.CutCostState{},
 	))
 	return db
 }

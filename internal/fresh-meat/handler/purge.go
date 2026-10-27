@@ -57,6 +57,15 @@ func PurgeRegistry() *purge.Registry {
 		purge.Model{Table: "sku_stock_positions", Model: &model.SkuStockPosition{}},
 		purge.Model{Table: "sku_cost_states", Model: &model.SkuCostState{}},
 		purge.Model{Table: "sku_cost_daily", Model: &model.SkuCostDaily{}},
+		// 2026-10-27:成本链改**部位级** ⇒ 新增两张部位级成本表。
+		//
+		// ⚠️ 两张表都是**单列代理主键**(确定性哈希)⇒ 能进 PurgeRegistry
+		// ⇒ 契约测试 / 单测写在上面的行**清得掉**。
+		//
+		// ⚠️ 旧的 `sku_cost_daily` / `sku_cost_states` **停写**(历史保留只读)
+		//   ⇒ 仍留在清单里(清掉历史残留),但不会再有新行。
+		purge.Model{Table: "cut_cost_daily", Model: &model.CutCostDaily{}},
+		purge.Model{Table: "cut_cost_states", Model: &model.CutCostState{}},
 		// 2026-10-24:营业日状态机 + 搬台流水 + 按营业日的结余快照。
 		//
 		// ⚠️ 这三张表都有**单列代理主键**(确定性哈希)⇒ 能进 PurgeRegistry

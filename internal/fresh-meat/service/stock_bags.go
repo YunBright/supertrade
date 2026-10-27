@@ -145,22 +145,23 @@ func (s *Service) registerStockBags(ctx context.Context, branchID string, origin
 	submittedIDs := make([]string, 0, len(cuts))
 	submittedSKUs := map[string]bool{}
 
-	// 成本快照(按 SKU):入冷库那一刻的移动加权单价 —— 这就是"记录分摊成本"。
+	// 成本快照(按**部位**):入冷库那一刻的移动加权单价 —— 这就是"记录分摊成本"。
 	//
-	// ⚠️ **一次性**算齐(不能逐 SKU 调):兜底路径会算一整天的成本
-	//   ⇒ 逐个 SKU 调 ⇒ 一次盘点几十倍开销。
-	skuSet := map[string]bool{}
+	// ⚠️ **一次性**算齐(不能逐部位调):兜底路径会算一整天的成本
+	//   ⇒ 逐个部位调 ⇒ 一次盘点几十倍开销。
+	//
+	// ⚠️ 2026-10-27:成本链改部位级 ⇒ 成本单价按**部位**取。
+	cutSet := map[model.CutType]bool{}
 	for _, c := range cuts {
-		sku := strings.TrimSpace(c.CubeProductID)
-		if sku != "" {
-			skuSet[sku] = true
+		if c.CutType != "" {
+			cutSet[c.CutType] = true
 		}
 	}
-	skus := make([]string, 0, len(skuSet))
-	for sku := range skuSet {
-		skus = append(skus, sku)
+	cutList := make([]model.CutType, 0, len(cutSet))
+	for cut := range cutSet {
+		cutList = append(cutList, cut)
 	}
-	unitCosts := s.bulkUnitCostMap(ctx, branchID, origin, skus)
+	unitCosts := s.bulkUnitCostMap(ctx, branchID, origin, cutList)
 
 	for _, c := range cuts {
 		label := strings.TrimSpace(c.Label)
@@ -168,8 +169,7 @@ func (s *Service) registerStockBags(ctx context.Context, branchID string, origin
 		if err != nil {
 			return err
 		}
-		sku := strings.TrimSpace(c.CubeProductID)
-		unitCost := unitCosts[sku]
+		unitCost := unitCosts[c.CutType]
 		if label == "" {
 			// ---- 不装袋的散货结转记录 ----
 			bag := model.StockBag{

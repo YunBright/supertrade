@@ -84,10 +84,14 @@ type GrossMarginReport struct {
 	// SalesSourceNote 是给门店看的**人话**说明(前端直接显示)。
 	SalesSourceNote string `json:"sales_source_note,omitempty"`
 	PerCut              []PerCutGrossMargin `json:"per_cut"`
-	// PerSku 是 SKU 级明细 —— **这才是实际的计算单元**
-	// (一个部位挂多个 SKU 时,部位行是它们的汇总)。
-	PerSku []SkuDailyCost `json:"per_sku"`
-	Total  TotalGrossMargin `json:"total"`
+	// PerSku 是**货号级销售明细** —— 只承载"货号粒度真实存在"的量
+	// (产出 / 销量 / 营收 / 统收 / 报损)。
+	//
+	// ⚠️ 2026-10-27:成本链改**部位级** ⇒ **计算单元是部位行**(`per_cut`),
+	//   库存 / 成本 / 毛利**不在货号行里**(那些键是**缺失**,不是 0)
+	//   ⇒ 门店要看成本看部位行,货号行只回答"这个货号卖了多少、卖了多少钱"。
+	PerSku []PerSkuGrossMargin `json:"per_sku"`
+	Total  TotalGrossMargin   `json:"total"`
 	// Reconciliation 成本对账行。
 	Reconciliation ReconciliationRow `json:"reconciliation"`
 	// Losses 显式化的损耗(以前这些 kg 完全不在任何表里,成本凭空消失)。
@@ -154,67 +158,6 @@ const (
 	// MarginAlertBalanceMismatch 当前余额与"按营业日推导"的余额不一致。
 	MarginAlertBalanceMismatch = "balance_mismatch"
 )
-
-// buildMarginAlerts 生成当天的红字/黄字告警。
-//
-// # ① 负库存(红字)
-//
-// 门店口径(2026-10-24):「修改值造成负库存时,需要在每日毛利的 alert 上红字显示」
-// ⇒ 改/撤搬台流水**不拦**(允许改成负数)⇒ 负数必须在这里显式暴露。
-//
-// # ② 余额与按日推导不一致(黄字)
-//
-// 位置表是"当前余额"(增量维护),按营业日推导的快照是"那天的结余"
-// ⇒ 补录往日之后两者会分叉 ⇒ 用黄字提示,让人去核对。
-func (s *Service) buildMarginAlerts(ctx context.Context, branchID string, day time.Time, rows []SkuDailyCost) []MarginAlert {
-	var out []MarginAlert
-	counter, cold, err := s.loadSkuPositions(ctx, branchID)
-	if err != nil {
-		return out
-	}
-	for _, r := range rows {
-		if r.CounterKg.IsNegative() {
-			out = append(out, MarginAlert{
-				Level:         MarginAlertLevelError,
-				Code:          MarginAlertNegativeInventory,
-				Message:       fmt.Sprintf("%s 柜台余额为负 %s kg", r.CubeProductID, r.CounterKg.String()),
-				CubeProductID: r.CubeProductID,
-				Kg:            r.CounterKg,
-			})
-		}
-		if r.ColdStoreKg.IsNegative() {
-			out = append(out, MarginAlert{
-				Level:         MarginAlertLevelError,
-				Code:          MarginAlertNegativeInventory,
-				Message:       fmt.Sprintf("%s 冷库余额为负 %s kg", r.CubeProductID, r.ColdStoreKg.String()),
-				CubeProductID: r.CubeProductID,
-				Kg:            r.ColdStoreKg,
-			})
-		}
-	}
-	// ② 当前余额 vs 按营业日推导的结余(有当天快照时才可比)。
-	snapCounter, snapCold, ok, err := s.closingForDay(ctx, branchID, day)
-	if err != nil || !ok {
-		return out
-	}
-	for sku, v := range snapCold {
-		live := cold[sku].Add(counter[sku])
-		derived := v.Add(snapCounter[sku])
-		diff := derived.Sub(live)
-		if diff.IsZero() {
-			continue
-		}
-		out = append(out, MarginAlert{
-			Level:         MarginAlertLevelWarning,
-			Code:          MarginAlertBalanceMismatch,
-			Message: fmt.Sprintf("%s 当前余额 %s kg 与按营业日推导的结余 %s kg 不一致(差 %s kg)",
-				sku, live.String(), derived.String(), diff.String()),
-			CubeProductID: sku,
-			Kg:            diff,
-		})
-	}
-	return out
-}
 
 // PerCutGrossMargin 单部位的毛利明细(由其下各 SKU 汇总)。
 type PerCutGrossMargin struct {
@@ -285,17 +228,17 @@ func (s *Service) ComputeGrossMargin(ctx context.Context, branchID string, day t
 	if branchID == "" {
 		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
 	}
-	rows, recon, losses, err := s.computeSkuDailyCosts(ctx, branchID, day)
+	cutRows, skuRows, recon, losses, err := s.computeCutDailyCosts(ctx, branchID, day)
 	if err != nil {
 		return nil, err
 	}
-	promoAlloc := allocatePromo(rows)
+	promoAlloc := allocatePromo(promoRowsOf(cutRows))
 
-	perCut, total := rollUpPerCut(rows, promoAlloc)
+	perCut, total := rollUpPerCutCuts(cutRows, promoAlloc)
 
 	dataSource := dataSourceEstimated
 	isComplete := false
-	for _, r := range rows {
+	for _, r := range cutRows {
 		if r.DataSource == dataSourceActual {
 			dataSource = dataSourceActual
 			isComplete = true
@@ -337,227 +280,18 @@ func (s *Service) ComputeGrossMargin(ctx context.Context, branchID string, day t
 		SalesSource:         salesSource,
 		SalesSourceNote:     salesSourceNote,
 		PerCut:              perCut,
-		PerSku:              rows,
+		// ⚠️ SKU 明细**只承载销售 / 营收 / 分割产出**(2026-10-27 口径):
+		//   库存 / 成本 / 毛利是**部位口径** ⇒ SKU 行里**不返**(键缺失)。
+		PerSku: perSkuGrossMarginsOf(skuRows),
 		Total:               total,
 		Reconciliation:      *recon,
 		Losses:              *losses,
 		PromoAllocation:     promoAlloc,
-		Alerts:              s.buildMarginAlerts(ctx, branchID, day, rows),
+		Alerts:              s.buildCutMarginAlerts(ctx, branchID, day, cutRows),
 		Presale:             presale,
 		PresaleHint:         hint,
 		GeneratedAt:         s.now(),
 	}, nil
-}
-
-// splitCutClosing 把**按部位**的日终结余拆成**按 SKU**的内部视图。
-//
-// # 为什么
-//
-// 门店口径(2026-10-24):「这个模块只管部位数据,不管 SKU;SKU 映射只是为了聚合
-//   销售、数量等数据到其部位」⇒ **库存/结余是部位的**。
-// 但移动加权引擎的成本计算单元仍是 SKU(每个 SKU 的加权单价不同)
-// ⇒ 引擎内部需要一个 SKU 级的期末量。
-//
-// # 口径保证
-//
-// ⇒ **部位的总额精确**(各 SKU 之和 = 部位值)⇒ 每日毛利(按部位)完全不受影响;
-// ⇒ SKU 级只是**内部拆分**:按该部位各 SKU 的**当前冷库余额**占比分摊,
-//   余额不足的份额给该部位的**主 SKU**(确定性)。
-//
-// ⚠️ 门店只看点位的毛利 ⇒ SKU 级的这层拆分只是过渡,不影响对外口径。
-func (s *Service) splitCutClosing(ctx context.Context, branchID string,
-	cutCounter, cutCold map[string]decimal.Decimal) (counter, cold map[string]decimal.Decimal) {
-	counter = map[string]decimal.Decimal{}
-	cold = map[string]decimal.Decimal{}
-	cutToSku, err := s.primarySkuPerCut(ctx, branchID)
-	if err != nil {
-		return counter, cold
-	}
-	_, liveCold, err := s.loadSkuPositions(ctx, branchID)
-	if err != nil {
-		return counter, cold
-	}
-	for cut, v := range cutCold {
-		primary := cutToSku[model.CutType(cut)]
-		if primary == "" {
-			continue
-		}
-		// 该部位各 SKU 的当前冷库余额之和(占比的分母)。
-		var total decimal.Decimal
-		for c, sku := range cutToSku {
-			if c == model.CutType(cut) {
-				total = total.Add(liveCold[sku])
-			}
-		}
-		if !total.IsPositive() {
-			cold[primary] = cold[primary].Add(v)
-			continue
-		}
-		for c, sku := range cutToSku {
-			if c != model.CutType(cut) {
-				continue
-			}
-			cold[sku] = cold[sku].Add(v.Mul(liveCold[sku]).Div(total))
-		}
-	}
-	for cut, v := range cutCounter {
-		primary := cutToSku[model.CutType(cut)]
-		if primary == "" {
-			continue
-		}
-		counter[primary] = counter[primary].Add(v)
-	}
-	return counter, cold
-}
-
-// rollUpPerCut 把 SKU 级明细汇总到部位级 + 全店。
-//
-// promoAlloc 是特价分摊结果:
-//   - **分摊成功** ⇒ 部位行加上分摊进来的特价 kg/金额/成本,
-//     且**不再单列 promo 桶**(否则同一笔收入被算两次);
-//   - **分摊失败** ⇒ promo 桶原样保留(金额重量仍然可见,只是没分到部位)。
-func rollUpPerCut(rows []SkuDailyCost, promoAlloc *PromoAllocation) ([]PerCutGrossMargin, TotalGrossMargin) {
-	allocByCut := promoAllocByCut(promoAlloc)
-	allocated := promoAlloc != nil && !promoAlloc.IsEstimated && len(promoAlloc.Allocated) > 0
-
-	type agg struct {
-		openingKg, producedKg, soldKg, bulkKg, wasteKg decimal.Decimal
-		expectedKg, actualKg                           decimal.Decimal
-		revenue, salesCost                             decimal.Decimal
-		bulkCost, wasteCost                            decimal.Decimal
-		availAmount, availKg                           decimal.Decimal
-		presaleMargin, presaleRevenue                  decimal.Decimal
-		// hasActualStocktake = 该部位**有真实盘点**。
-		//
-		// ⚠️ 没有它就不能把 ClosingKg 当"实盘剩余"展示(2026-10-26 门店反馈):
-		//   引擎在**无盘点日**把 ClosingKg 设成 expectedCloseKg(账面推演值,
-		//   见 moving_average.go 的 closeKg 分支)—— 那是**成本计算**需要的
-		//   (期末存货金额要进恒等式),但它**不是实盘**。
-		//   ⇒ 无盘点日若照样填进"实盘剩余"列,门店会看到:
-		//     · "实盘剩余"有值(其实是账面推演)
-		//     · "差异"恒为 0(推演值 − 推演值 = 0)⇒ 看起来"盘点全对"
-		//   ⇒ 门店说"我没录日终实盘,怎么有实盘剩余"——**就是这么来的**。
-		hasActualStocktake bool
-	}
-	byCut := map[model.CutType]*agg{}
-	get := func(c model.CutType) *agg {
-		if byCut[c] == nil {
-			byCut[c] = &agg{}
-		}
-		return byCut[c]
-	}
-
-	for _, r := range rows {
-		if allocated && r.CutType == model.CutPromo {
-			// 已分摊到各部位 ⇒ 这里不再计(否则重复)。
-			continue
-		}
-		a := get(r.CutType)
-		a.openingKg = a.openingKg.Add(r.OpeningKg)
-		a.producedKg = a.producedKg.Add(r.ProducedKg)
-		a.soldKg = a.soldKg.Add(r.SoldKg)
-		a.bulkKg = a.bulkKg.Add(r.BulkSoldKg)
-		a.wasteKg = a.wasteKg.Add(r.WasteKg)
-		a.expectedKg = a.expectedKg.Add(r.ExpectedClosingKg)
-		// ⚠️ **只有真实盘点**的 ClosingKg 才是"实盘剩余"。
-		// 无盘点日 ClosingKg = 账面推演值(引擎用来算成本)⇒ 不能进这一列。
-		if r.DataSource == dataSourceActual {
-			a.actualKg = a.actualKg.Add(r.ClosingKg)
-			a.hasActualStocktake = true
-		}
-		a.revenue = a.revenue.Add(r.RevenueYuan)
-		a.salesCost = a.salesCost.Add(r.SalesCostYuan)
-		// ⚠️ 统收成本 / 报损成本必须一起汇总 —— 少了它们,
-		// 部位行与全店合计的毛利会把"卖板油"和"报损"算成零成本收入。
-		a.bulkCost = a.bulkCost.Add(r.BulkCostYuan)
-		a.wasteCost = a.wasteCost.Add(r.WasteCostYuan)
-		a.availAmount = a.availAmount.Add(r.OpeningAmount).Add(r.ProducedAmount)
-		a.availKg = a.availKg.Add(r.OpeningKg).Add(r.ProducedKg)
-		// 预期毛利(预售结转):已经含在 r.GrossMarginYuan 里,这里只做**单列**。
-		a.presaleMargin = a.presaleMargin.Add(r.PresaleMarginYuan)
-		a.presaleRevenue = a.presaleRevenue.Add(r.PresaleExpectedRevenueYuan)
-	}
-
-	perCut := make([]PerCutGrossMargin, 0, len(byCut))
-	var tot TotalGrossMargin
-	for cut, a := range byCut {
-		movingAvg := decimal.Zero
-		if a.availKg.IsPositive() {
-			movingAvg = a.availAmount.Div(a.availKg)
-		}
-		revenue := a.revenue
-		soldKg := a.soldKg
-		salesCost := a.salesCost
-		bulkCost := a.bulkCost
-		wasteCost := a.wasteCost
-		// 分摊进来的特价:重量 + 收入 + 成本(成本 = kg × 该部位移动加权单价)
-		if pa, ok := allocByCut[cut]; ok {
-			soldKg = soldKg.Add(pa.PromoKg)
-			revenue = revenue.Add(pa.PromoAmount)
-			salesCost = salesCost.Add(pa.PromoKg.Mul(movingAvg))
-		}
-		// 毛利 = 收入 − 销售成本 − 统收成本 − 报损成本 + 预期毛利(预售结转的重估)
-		// (⚠️ 少减后两项 ⇒ 大宗销售/报损被算成零成本收入 ⇒ 毛利虚高)
-		//
-		// ⚠️ 预售毛利**必须加上**:它已经计进了 SKU 行的毛利,
-		//   但销售成本里**没有**它(重估是 accrual,不是成本)⇒ 不加就丢了。
-		gm := revenue.Sub(salesCost).Sub(bulkCost).Sub(wasteCost).Add(a.presaleMargin)
-		var gmPct float64
-		// ⚠️ 有预售结转时,毛利里含**预期收入**那一块 ⇒ 分母也要含它
-		//   (否则百分比虚高,甚至 > 100%)。
-		gmBase := revenue.Add(a.presaleRevenue)
-		if !gmBase.IsZero() {
-			f, _ := gm.Mul(decimal.NewFromInt(100)).Div(gmBase).Float64()
-			gmPct = f
-		}
-		row := PerCutGrossMargin{
-			CutType:           cut,
-			OpeningKg:         a.openingKg,
-			PurchasedKg:       a.producedKg,
-			SoldKg:            soldKg,
-			BulkSoldKg:        a.bulkKg,
-			WasteKg:           a.wasteKg,
-			ExpectedRemainKg:  a.expectedKg,
-			RevenueYuan:       revenue,
-			SalesCostYuan:     salesCost,
-			BulkCostYuan:      bulkCost,
-			WasteCostYuan:     wasteCost,
-			GrossMarginYuan:   gm,
-			GrossMarginPct:    gmPct,
-			PresaleMarginYuan: a.presaleMargin,
-			PresaleExpectedRevenueYuan: a.presaleRevenue,
-			MovingAvgUnitCost: movingAvg,
-		}
-		// ⚠️ 「实盘剩余」**只在有真实盘点时才有值**。
-		// 无盘点 ⇒ 留空(指针 nil ⇒ JSON 里**没有这个键**)⇒ 前端显示「—」,
-		// 而不是把账面推演值冒充成实盘(2026-10-26 门店反馈)。
-		//
-		// 「差异」= 实盘 − 应有 ⇒ 没有实盘就没有差异(恒 0 是**假的**"对上了")。
-		if a.hasActualStocktake {
-			actual := a.actualKg
-			variance := a.actualKg.Sub(a.expectedKg)
-			row.ActualRemainKg = &actual
-			row.VarianceKg = &variance
-		}
-		perCut = append(perCut, row)
-
-		tot.RevenueYuan = tot.RevenueYuan.Add(revenue)
-		tot.SalesCostYuan = tot.SalesCostYuan.Add(salesCost)
-		tot.BulkCostYuan = tot.BulkCostYuan.Add(bulkCost)
-		tot.WasteCostYuan = tot.WasteCostYuan.Add(wasteCost)
-		tot.GrossMarginYuan = tot.GrossMarginYuan.Add(gm)
-		tot.PresaleMarginYuan = tot.PresaleMarginYuan.Add(a.presaleMargin)
-		tot.PresaleExpectedRevenueYuan = tot.PresaleExpectedRevenueYuan.Add(a.presaleRevenue)
-	}
-	if !tot.RevenueYuan.Add(tot.PresaleExpectedRevenueYuan).IsZero() {
-		f, _ := tot.GrossMarginYuan.Mul(decimal.NewFromInt(100)).
-			Div(tot.RevenueYuan.Add(tot.PresaleExpectedRevenueYuan)).Float64()
-		tot.GrossMarginPct = f
-	}
-
-	// 排序 by cut_type 字符串(输出稳定,便于 e2e 断言)。
-	sortPerCut(perCut)
-	return perCut, tot
 }
 
 // sortPerCut 按 cut_type 字符串升序(输出稳定,便于 e2e 断言)。

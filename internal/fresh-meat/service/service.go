@@ -834,8 +834,8 @@ func (s *Service) RecordPorkCutsStocktake(ctx context.Context, branchID string, 
 			s.pubLogger.Error("RecordPorkCutsStocktake: 结余快照重算失败(按日结余会缺,下次盘点会自愈)",
 				"branch_id", branchID, "stocktake_id", st.ID, "err", err)
 		}
-		// ④ 落 SKU 成本日快照(次日期初的来源)+ 刷新**当前**成本状态。
-		if _, err := s.PersistSkuCostDaily(ctx, branchID, st.TakenAt); err != nil {
+		// ④ 落**部位级**成本日快照(次日期初的来源)+ 刷新**当前**成本状态。
+		if _, err := s.PersistCutCostDaily(ctx, branchID, st.TakenAt); err != nil {
 			s.pubLogger.Error("RecordPorkCutsStocktake: 成本快照落库失败(次日期初会缺,下次盘点会自愈)",
 				"branch_id", branchID, "stocktake_id", st.ID, "err", err)
 		}

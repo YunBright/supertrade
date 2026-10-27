@@ -144,7 +144,7 @@ func TestAudit_BeforeAuditBackfillChangesLaterDays(t *testing.T) {
 	svc, ctx, sku := fmAuditSetup(t)
 
 	// 10-02 的日终冷库 = 上期 10 + 结转 8 = 18。
-	_, cold := fmMarginClosing(t, "S001", fmDay2, sku)
+	_, cold := fmMarginClosing(t, "S001", fmDay2, model.CutBelly)
 	if !cold.Equal(d("18")) {
 		t.Fatalf("10-02 冷库应是 18,got %s", cold)
 	}
@@ -161,7 +161,7 @@ func TestAudit_BeforeAuditBackfillChangesLaterDays(t *testing.T) {
 		t.Fatalf("补录 10-01: %v", err)
 	}
 
-	_, cold2 := fmMarginClosing(t, "S001", fmDay2, sku)
+	_, cold2 := fmMarginClosing(t, "S001", fmDay2, model.CutBelly)
 	if !cold2.Equal(d("13")) {
 		t.Errorf("补录 10-01 后 10-02 的冷库应跟着变(13),got %s", cold2)
 	}

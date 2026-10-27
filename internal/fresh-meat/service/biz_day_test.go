@@ -97,33 +97,48 @@ func fmDailySnapshot(t *testing.T, branchID, bizDate, cutType string) (model.Cut
 	return rec, true
 }
 
-// fmCostDailyClosing 查某店某营业日某 SKU 的**成本日快照期末量**(全店)。
-func fmCostDailyClosing(t *testing.T, branchID, bizDate, sku string) (decimal.Decimal, bool) {
+// fmCostDailyClosing 查某店某营业日某**部位**的**成本日快照期末量**(全店)。
+//
+// ⚠️ 2026-10-27:成本链改**部位级** ⇒ 快照落在 `cut_cost_daily`(按部位),
+//   旧的 `sku_cost_daily`(按 SKU)已停写 ⇒ 这里查部位快照。
+func fmCostDailyClosing(t *testing.T, branchID, bizDate string, cut model.CutType) (decimal.Decimal, bool) {
 	t.Helper()
-	var rec model.SkuCostDaily
-	err := testDBSingleton.Where("branch_id = ? AND cube_product_id = ? AND biz_date LIKE ?",
-		branchID, sku, bizDate+"%").First(&rec).Error
+	var rec model.CutCostDaily
+	err := testDBSingleton.Where("branch_id = ? AND cut_type = ? AND biz_date LIKE ?",
+		branchID, string(cut), bizDate+"%").First(&rec).Error
 	if err != nil {
 		return decimal.Zero, false
 	}
 	return rec.ClosingKg, true
 }
 
-// fmMarginClosing 查某营业日的**实时算**期末结余(per-SKU):柜台 + 冷库。
+// fmCutCostDaily 查某店某营业日某**部位**的**成本日快照**一行(部位级口径)。
 //
-// ⚠️ 审计前**不快照** ⇒ 结余是实时算的 ⇒ 从每日毛利的 per_sku 里读。
-func fmMarginClosing(t *testing.T, branchID string, day time.Time, sku string) (counter, cold decimal.Decimal) {
+// ⚠️ 2026-10-27:成本链改部位级 ⇒ 快照落在 `cut_cost_daily`。
+func fmCutCostDaily(t *testing.T, branchID, bizDate string, cut model.CutType) (model.CutCostDaily, bool) {
 	t.Helper()
-	rep, err := service.New(testDBSingleton).ComputeGrossMargin(context.Background(), branchID, day)
-	mustNoErr(t, err, "ComputeGrossMargin")
-	counter, cold = decimal.Zero, decimal.Zero
-	for _, r := range rep.PerSku {
-		if r.CubeProductID != sku {
-			continue
-		}
-		counter, cold = r.CounterKg, r.ColdStoreKg
+	var rec model.CutCostDaily
+	err := testDBSingleton.Where("branch_id = ? AND cut_type = ? AND biz_date LIKE ?",
+		branchID, string(cut), bizDate+"%").First(&rec).Error
+	if err != nil {
+		return rec, false
 	}
-	return counter, cold
+	return rec, true
+}
+
+// fmMarginClosing 查某营业日的**实时算**期末结余(**按部位**):柜台 + 冷库。
+//
+// ⚠️ 审计前**不快照** ⇒ 结余是实时算的 ⇒ 从**按营业日推导的结余链**读。
+//
+// ⚠️ 2026-10-27:成本链改**部位级** ⇒ 结余也是**部位级**
+//   (旧实现是从 per_sku 的 counter_kg/cold_store_kg 读的 —— 那是 SKU 粒度的
+//   **位置分布**,和部位级结余链不是一回事)。
+func fmMarginClosing(t *testing.T, branchID string, day time.Time, cut model.CutType) (counter, cold decimal.Decimal) {
+	t.Helper()
+	svc := service.New(testDBSingleton)
+	cutCounter, cutCold, err := service.ClosingByCutForTest(context.Background(), svc, branchID, day)
+	mustNoErr(t, err, "closingForDay")
+	return cutCounter[string(cut)], cutCold[string(cut)]
 }
 
 // ---- ① 前一营业日未盘点 ⇒ 录猪被拒 ----
@@ -373,7 +388,7 @@ func TestBizDay_BackfillRecomputesThatDayOnly(t *testing.T) {
 
 	// 审计前**不快照** ⇒ 结余是实时算的:10-02 日终柜台 0(夜里搬进冷库)、
 	// 冷库 = 上期 10 + 结转 2 − 搬台 4 = 8。
-	counter, cold := fmMarginClosing(t, "S001", fmDay2, sku)
+	counter, cold := fmMarginClosing(t, "S001", fmDay2, model.CutBelly)
 	if !counter.IsZero() {
 		t.Errorf("10-02 日终柜台应是 0(夜里过夜搬运),got %s", counter)
 	}
@@ -382,7 +397,7 @@ func TestBizDay_BackfillRecomputesThatDayOnly(t *testing.T) {
 	}
 
 	// 10-02 的成本日快照:期末 = 全店 8kg。
-	closing, ok := fmCostDailyClosing(t, "S001", "2026-10-02", sku)
+	closing, ok := fmCostDailyClosing(t, "S001", "2026-10-02", model.CutBelly)
 	if !ok {
 		t.Fatalf("补录后应重算 10-02 的成本日快照")
 	}
@@ -399,11 +414,11 @@ func TestBizDay_BackfillRecomputesThatDayOnly(t *testing.T) {
 
 	// 再补录一次(柜台实盘 3kg)⇒ 那天的结余被**重算**(冷库 9)。
 	backfill("3")
-	counter2, cold2 := fmMarginClosing(t, "S001", fmDay2, sku)
+	counter2, cold2 := fmMarginClosing(t, "S001", fmDay2, model.CutBelly)
 	if !counter2.IsZero() || !cold2.Equal(d("9")) {
 		t.Errorf("重复补录后 10-02 应是柜台 0 / 冷库 9,got %s / %s", counter2, cold2)
 	}
-	closing2, ok := fmCostDailyClosing(t, "S001", "2026-10-02", sku)
+	closing2, ok := fmCostDailyClosing(t, "S001", "2026-10-02", model.CutBelly)
 	if !ok || !closing2.Equal(d("9")) {
 		t.Errorf("重复补录后 10-02 成本快照期末应是 9,got %s(ok=%v)", closing2, ok)
 	}
@@ -503,12 +518,12 @@ func TestBizDay_CounterLoadSupportsTakenDate(t *testing.T) {
 
 	// 按营业日推导的冷库余额(实时算):10-02 虽没有盘点单,但有搬台流水
 	// ⇒ 日终冷库 = 上期 10 − 搬台 4 = 6(补录往期的搬台扣的是**那一天**的冷库)。
-	_, cold2 := fmMarginClosing(t, "S001", fmDay2, sku)
+	_, cold2 := fmMarginClosing(t, "S001", fmDay2, model.CutBelly)
 	if !cold2.Equal(d("6")) {
 		t.Errorf("10-02 冷库余额应是 6(上期 10 − 搬台 4),got %s", cold2)
 	}
 	// 10-01 的结余不受影响。
-	_, cold1 := fmMarginClosing(t, "S001", fmDay1, sku)
+	_, cold1 := fmMarginClosing(t, "S001", fmDay1, model.CutBelly)
 	if !cold1.Equal(d("10")) {
 		t.Errorf("10-01 冷库余额应是 10,got %s", cold1)
 	}

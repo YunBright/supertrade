@@ -431,6 +431,12 @@ func (s *Service) AuditBusinessDays(ctx context.Context, branchID string, in Biz
 		if err := s.settlePresale(ctx, branchID, cutoff, plan); err != nil {
 			return nil, fmt.Errorf("结转预期毛利(预售): %w", err)
 		}
+		// ⚠️ 预售结转后,截止日的**结转金额**变了(改成**预期售价口径**)
+		//   ⇒ 重落那天的成本日快照 ⇒ 下一期的期初单价 = 预期销售单价
+		//   ⇒ 两期总毛利 = 实际毛利(不多算、不少算)。
+		if _, err := s.persistCutCostDaily(ctx, branchID, cutoff, false); err != nil {
+			return nil, fmt.Errorf("结转重落成本快照(预售口径): %w", err)
+		}
 	}
 
 	// ---- 负库存清零:不把负数带给下一期 ----
@@ -532,37 +538,30 @@ func (s *Service) zeroNegativeBalances(ctx context.Context, branchID string, cut
 			return nil, err
 		}
 		// 成本日快照里这个部位的负期末也置 0。
-		cutOf, _, err := s.loadSkuCatalog(ctx, branchID, nil)
-		if err != nil {
-			return nil, err
-		}
+		//
+		// ⚠️ 2026-10-27:成本链改**部位级** ⇒ 查 `cut_cost_daily`(按部位),
+		//   不再按 SKU 查 `sku_cost_daily`(那张表已停写)。
 		writeoff := decimal.Zero
-		for sku, cut := range cutOf {
-			if cut != sn.CutType {
-				continue
-			}
-			// 先取负的期末金额(清零前)⇒ 核销金额 = 它的绝对值。
-			var neg []model.SkuCostDaily
-			if err := s.db.WithContext(ctx).
-				Where("branch_id = ? AND cube_product_id = ? AND biz_date >= ? AND biz_date < ?",
-					branchID, sku, start, end).
-				Where("closing_kg < 0 OR closing_amount < 0").
-				Find(&neg).Error; err != nil {
-				return nil, fmt.Errorf("query sku_cost_daily(zero %s): %w", sku, err)
-			}
-			for _, n := range neg {
-				writeoff = writeoff.Add(n.ClosingAmount.Abs())
-			}
-			if err := s.db.WithContext(ctx).Model(&model.SkuCostDaily{}).
-				Where("branch_id = ? AND cube_product_id = ? AND biz_date >= ? AND biz_date < ?",
-					branchID, sku, start, end).
-				Where("closing_kg < 0 OR closing_amount < 0").
-				Updates(map[string]any{
-					"closing_kg":     decimal.Zero,
-					"closing_amount": decimal.Zero,
-				}).Error; err != nil {
-				return nil, fmt.Errorf("update sku_cost_daily(zero %s): %w", sku, err)
-			}
+		var neg []model.CutCostDaily
+		if err := s.db.WithContext(ctx).
+			Where("branch_id = ? AND cut_type = ? AND biz_date >= ? AND biz_date < ?",
+				branchID, sn.CutType, start, end).
+			Where("closing_kg < 0 OR closing_amount < 0").
+			Find(&neg).Error; err != nil {
+			return nil, fmt.Errorf("query cut_cost_daily(zero %s): %w", sn.CutType, err)
+		}
+		for _, n := range neg {
+			writeoff = writeoff.Add(n.ClosingAmount.Abs())
+		}
+		if err := s.db.WithContext(ctx).Model(&model.CutCostDaily{}).
+			Where("branch_id = ? AND cut_type = ? AND biz_date >= ? AND biz_date < ?",
+				branchID, sn.CutType, start, end).
+			Where("closing_kg < 0 OR closing_amount < 0").
+			Updates(map[string]any{
+				"closing_kg":     decimal.Zero,
+				"closing_amount": decimal.Zero,
+			}).Error; err != nil {
+			return nil, fmt.Errorf("update cut_cost_daily(zero %s): %w", sn.CutType, err)
 		}
 		out = append(out, BalanceDiffRow{
 			CutType:            sn.CutType,
@@ -684,8 +683,8 @@ func (s *Service) calibrateCurrentBalance(ctx context.Context, branchID string, 
 	if err != nil {
 		return nil, err
 	}
-	// 部位 → SKU(按当前冷库余额占比拆;与 splitCutClosing 同一套规则)。
-	_, skuCold := s.splitCutClosing(ctx, branchID, nil, cutCold)
+	// 部位 → SKU(按当前冷库余额占比拆;见 cut_split.go 的 splitCutClosingToSkus)。
+	skuCold := s.splitCutClosingToSkus(ctx, branchID, cutCold)
 	rows := []StockCalibrationRow{}
 	for _, sku := range sortedKeys(skuCold) {
 		after := skuCold[sku]

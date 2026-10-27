@@ -173,6 +173,12 @@ func (s *Service) UpdatePresale(ctx context.Context, branchID string, in UpdateP
 	if err := s.writePigAllocations(ctx, branchID, cutoff, plan); err != nil {
 		return nil, err
 	}
+	// ⚠️ 改完预售价 ⇒ 截止日的**结转金额**变了(预期售价口径)
+	//   ⇒ 重落那天的成本日快照 ⇒ 下一期的期初单价跟着改
+	//   (门店口径:「改完要重算:本期毛利 / 按猪分摊 / 下一期期初单价 / 当前余额」)。
+	if _, err := s.persistCutCostDaily(ctx, branchID, cutoff, false); err != nil {
+		return nil, fmt.Errorf("改价后重落成本快照: %w", err)
+	}
 	if _, err := s.replayAfterAudit(ctx, branchID, cutoff); err != nil {
 		s.pubLogger.Error("修改预售价后重放失败",
 			"branch_id", branchID, "biz_date", in.BizDate, "err", err)

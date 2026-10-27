@@ -110,6 +110,9 @@ func setupTestServiceMode(t *testing.T, syncAdvice bool) (*service.Service, *rec
 		&model.CutPresale{},
 		&model.PigPresaleMargin{},
 		&model.CutPresaleEdit{},
+		// 2026-10-27:成本链改部位级(部位级成本日快照 + 部位级成本状态)。
+		&model.CutCostDaily{},
+		&model.CutCostState{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

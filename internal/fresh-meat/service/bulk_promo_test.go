@@ -371,6 +371,17 @@ func TestPeriodMargin_MatchesDailySnapshot(t *testing.T) {
 	if len(period.Rows) != 1 {
 		t.Errorf("按天聚合应 1 行, got %d", len(period.Rows))
 	}
+	// ⚠️ 2026-10-27(成本链改部位级):期间毛利改查 `cut_cost_daily`。
+	// ⇒ 加一条"不许静默返回空"的守卫:**营收与成本都不能是 0**
+	//   (旧表 sku_cost_daily 停写后,查错表 ⇒ 返回 0 ⇒ 接口看起来"正常"但没数据)。
+	if period.Total.RevenueYuan.IsZero() {
+		t.Errorf("★ 期间营收应是 340(查部位级快照 cut_cost_daily),got %s —— "+
+			"返回 0 = 查错了表(旧表已停写)", period.Total.RevenueYuan)
+	}
+	if period.Total.SalesCostYuan.IsZero() {
+		t.Errorf("★ 期间销售成本不该是 0(查部位级快照 cut_cost_daily),got %s —— "+
+			"返回 0 = 查错了表(旧表已停写)", period.Total.SalesCostYuan)
+	}
 }
 
 // ---- ④ 分割重量统计基线 ----

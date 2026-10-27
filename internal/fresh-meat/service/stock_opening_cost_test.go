@@ -92,15 +92,18 @@ func TestStockOpening_TotalIsComputed(t *testing.T) {
 
 // TestStockOpening_UnitPriceEntersCostChain 锁 ③：成本链认门店给的单价。
 //
-// 这是本轮最核心的一条：**期初当天**该 SKU 的
+// 这是本轮最核心的一条：**期初当天**该**部位**的
 //
 //	期初 kg      = 门店录的重量
 //	期初金额    = 重量 × 门店录的单价
 //	加权单价    = 门店录的单价
 //
 // ⇒ 断链之前：期初金额 0、加权单价 0 ⇒ 那批货零成本 ⇒ 毛利虚高。
+//
+// ⚠️ 2026-10-27:成本链改**部位级** ⇒ 断言从 per_sku 改成 **per_cut**
+//   (库存/成本/毛利都是部位口径;per_sku 只承载销售/营收/产出)。
 func TestStockOpening_UnitPriceEntersCostChain(t *testing.T) {
-	svc, ctx, sku := fmBizSetup(t)
+	svc, ctx, _ := fmBizSetup(t)
 
 	// 期初：五花 100kg @ 18 元/kg（2026-10-01 生效）⇒ 总价 1800。
 	out, err := svc.SaveStockOpenings(ctx, "S001", []service.StockOpeningInput{
@@ -114,27 +117,20 @@ func TestStockOpening_UnitPriceEntersCostChain(t *testing.T) {
 	// 当天的每日毛利（实时算）。
 	rep, err := service.New(testDBSingleton).ComputeGrossMargin(ctx, "S001", fmDay1)
 	mustNoErr(t, err, "ComputeGrossMargin")
-	var row *service.SkuDailyCost
-	for i := range rep.PerSku {
-		if rep.PerSku[i].CubeProductID == sku {
-			row = &rep.PerSku[i]
-		}
-	}
-	if row == nil {
-		t.Fatalf("每日毛利里应有 %s 这一行: %+v", sku, rep.PerSku)
-	}
+	row := fmCutRowFor(t, rep, model.CutBelly)
 	if !row.OpeningKg.Equal(d("100")) {
 		t.Errorf("★ 期初 kg 应是门店录的 100, got %s", row.OpeningKg)
 	}
-	if !row.OpeningAmount.Equal(d("1800")) {
+	// 期初金额 = 100 × 18 = 1800(部位级 ⇒ 走对账行的期初存货金额)。
+	if !rep.Reconciliation.OpeningInventoryCostYuan.Equal(d("1800")) {
 		t.Errorf("★ 期初金额应是 100 × 18 = 1800, got %s —— "+
-			"金额 0 ⇒ 那批货零成本 ⇒ 毛利虚高", row.OpeningAmount)
+			"金额 0 ⇒ 那批货零成本 ⇒ 毛利虚高", rep.Reconciliation.OpeningInventoryCostYuan)
 	}
 	if !row.MovingAvgUnitCost.Equal(d("18")) {
 		t.Errorf("★ 加权单价应是门店给的 18, got %s", row.MovingAvgUnitCost)
 	}
-	if !row.ClosingKg.Equal(d("100")) {
-		t.Errorf("期末应是 100kg(没卖没产出), got %s", row.ClosingKg)
+	if !row.ExpectedRemainKg.Equal(d("100")) {
+		t.Errorf("账面应有应是 100kg(没卖没产出), got %s", row.ExpectedRemainKg)
 	}
 	// 成本恒等式：期初 + 入库 = 销售 + 统收 + 报损 + 期末 ⇒ 差额 0。
 	if !rep.Reconciliation.DiffYuan.Equal(decimal.Zero) {

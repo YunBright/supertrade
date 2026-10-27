@@ -254,118 +254,6 @@ func (s *Service) loadOpenings(ctx context.Context, branchID string) (map[string
 	return out, nil
 }
 
-// openingBalancesAt 取**期初结转**在某营业日的 (kg, 金额),按 SKU。
-//
-// # 口径
-//
-//	只认"**生效日 == 该营业日**"的行 —— 那一天链从期初起算(见 deriveColdChain)。
-//	生效日更早的行属于**链的上一段** ⇒ 由上一日的成本日快照接续(见 loadSkuOpening 主路径)。
-//
-// # 金额
-//
-//	金额 = kg × **门店给的单价**(不是倒算的移动加权单价)
-//	⚠️ 没有单价 ⇒ 那批货**零成本** ⇒ 卖出去全是利润(毛利虚高)
-//	⇒ 门店盘冷库时知道自己这批货当时**多少钱一斤** ⇒ 让他填(2026-10-25 门店口径)。
-//
-// # 落到哪个 SKU
-//
-//	该部位的**主 SKU**(cube_product_id 最小的那个,与 applyOpeningToStock 同一处)
-//	⇒ 与位置表、FIFO 队列记在**同一个 SKU** 上 ⇒ 三处一致。
-//
-// # 返回的 covered
-//
-//	被期初覆盖的**部位**集合 —— 调用方要把它下面别的 SKU(特价档货号之类)交回期初,
-//	否则同一部位的货会被算两遍(期初一遍 + 盘点实盘一遍)。
-func (s *Service) openingBalancesAt(ctx context.Context, branchID string, bizDate time.Time) (
-	kg, amount map[string]decimal.Decimal, covered map[model.CutType]bool, err error) {
-	kg = map[string]decimal.Decimal{}
-	amount = map[string]decimal.Decimal{}
-	covered = map[model.CutType]bool{}
-
-	openings, err := s.loadOpenings(ctx, branchID)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	key := bizDate.In(s.bizTZOrUTC()).Format("2006-01-02")
-	matched := make([]stockOpening, 0, len(openings))
-	for _, op := range openings {
-		if op.dateKey != key || !op.kg.IsPositive() {
-			continue
-		}
-		matched = append(matched, op)
-	}
-	if len(matched) == 0 {
-		return kg, amount, covered, nil
-	}
-	cutToSku, err := s.primarySkuPerCut(ctx, branchID)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	for _, op := range matched {
-		primary := cutToSku[op.cutType]
-		if primary == "" {
-			// 该部位还没配 SKU ⇒ 期初无处安放(不猜、不静默写错)。
-			s.pubLogger.Warn("openingBalancesAt: 部位没有映射 SKU,期初余额无处安放",
-				"branch_id", branchID, "cut_type", op.cutType)
-			continue
-		}
-		covered[op.cutType] = true
-		kg[primary] = kg[primary].Add(op.kg)
-		amount[primary] = amount[primary].Add(op.kg.Mul(op.unitPrice))
-	}
-	return kg, amount, covered, nil
-}
-
-// overlayStockOpenings 用**期初结转**覆盖期初(kg, 金额)。
-//
-// # 口径
-//
-//	只覆盖"**生效日 == 该营业日**"的部位 —— 那一天链从期初起算(见 deriveColdChain)
-//	⇒ 该部位的期初 kg = 期初结转的 kg(不是"上一日盘点实盘")。
-//	生效日更早的行属于链的上一段 ⇒ 由上一日的成本日快照接续(见 loadSkuOpening 主路径)。
-//
-// # 为什么必须连金额一起覆盖
-//
-//	期初是**上线前就在冷库里的货**,它的成本不在本系统流水里
-//	⇒ 若金额取 0,那批货**零成本** ⇒ 卖出去全是利润(毛利虚高)
-//	⇒ 门店盘冷库时知道自己这批货当时**多少钱一斤** ⇒ 让他填单价。
-//
-// # 同部位其它 SKU
-//
-//	该部位下**别的 SKU**(如特价档货号)在这批期初里没有货
-//	⇒ 交回期初(把"盘点实盘"里同部位别的 SKU 清掉)
-//	⇒ 否则同一部位的货被**算两遍**(期初一遍 + 实盘一遍)。
-func (s *Service) overlayStockOpenings(ctx context.Context, branchID string, bizDate time.Time,
-	kg, amount map[string]decimal.Decimal) error {
-	openKg, openAmt, covered, err := s.openingBalancesAt(ctx, branchID, bizDate)
-	if err != nil {
-		return err
-	}
-	if len(openKg) == 0 {
-		return nil
-	}
-	cutToSku, err := s.primarySkuPerCut(ctx, branchID)
-	if err != nil {
-		return err
-	}
-	cutOfSku, _, err := s.loadSkuCatalog(ctx, branchID, nil)
-	if err != nil {
-		return err
-	}
-	for sku, cut := range cutOfSku {
-		if !covered[cut] || cutToSku[cut] == sku {
-			continue
-		}
-		delete(kg, sku)
-		delete(amount, sku)
-	}
-	for sku, v := range openKg {
-		kg[sku] = v
-		amount[sku] = openAmt[sku]
-	}
-	return nil
-}
-
 // chainBase 余额链的**起点**:上次审计结转的快照(= 该截止日的日终冷库余额)。
 //
 // 返回 (基准日 "YYYY-MM-DD", 各 SKU 的日终冷库余额)。
@@ -629,7 +517,7 @@ func (s *Service) closingForDay(ctx context.Context, branchID string, bizDate ti
 	return counter, cold, true, nil
 }
 
-// recomputeCostSnapshots 重算**某个营业日起**的成本日快照(sku_cost_daily)。
+// recomputeCostSnapshots 重算**某个营业日起**的成本日快照(**部位级**:cut_cost_daily)。
 //
 // # 做什么
 //
@@ -638,12 +526,12 @@ func (s *Service) closingForDay(ctx context.Context, branchID string, bizDate ti
 //
 // # 不做什么
 //
-// ⚠️ **不落按营业日的结余快照**(sku_stock_daily)—— 那是**审计结转**的产物
+// ⚠️ **不落按营业日的结余快照**(cut_stock_daily)—— 那是**审计结转**的产物
 //
 //	(审计前实时算、不快照;见 service/biz_audit.go)。
 //
 // ⚠️ **不动位置表**(sku_stock_positions)⇒ 今天的"当前余额"不会被补录写脏。
-// ⚠️ **不动 sku_cost_states**(当前成本状态)⇒ 它只由"今天那次盘点"刷新。
+// ⚠️ **不动 cut_cost_states**(当前成本状态)⇒ 它只由"今天那次盘点"刷新。
 func (s *Service) recomputeCostSnapshots(ctx context.Context, branchID string, fromDate time.Time) error {
 	chain, err := s.deriveColdChain(ctx, branchID, "", nil)
 	if err != nil {
@@ -670,7 +558,7 @@ func (s *Service) recomputeCostSnapshots(ctx context.Context, branchID string, f
 		if !hasTake[d] {
 			continue
 		}
-		if _, err := s.persistSkuCostDaily(ctx, branchID, mustParseDateInLoc(d, s.bizTZOrUTC()), false); err != nil {
+		if _, err := s.persistCutCostDaily(ctx, branchID, mustParseDateInLoc(d, s.bizTZOrUTC()), false); err != nil {
 			s.pubLogger.Error("recomputeCostSnapshots: 成本日快照重算失败",
 				"branch_id", branchID, "biz_date", d, "err", err)
 		}
