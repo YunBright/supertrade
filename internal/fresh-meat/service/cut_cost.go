@@ -231,6 +231,16 @@ func (s *Service) loadCutOpening(ctx context.Context, branchID string, bizDate t
 	hasSnap := map[string]bool{}
 	for _, r := range prev {
 		c := string(r.CutType)
+		// ⚠️ **该部位当天成本算不出来** ⇒ 它的期末金额是"0"(单价 0 × kg),
+		//   而 0 不是它的真实价值,是"不知道"。
+		//   ⇒ 不能拿来当今天的期初:否则可售金额被抹平、可售数量被压小
+		//     ⇒ **移动加权单价爆炸** ⇒ 成本变成天文数字
+		//     (2026-10-27 生产实测:10-02 成本 3061.57 → 10151.24,毛利率 −191%)。
+		//
+		// ⇒ 链在这个部位上自然断开(它本来就没有成本链)⇒ 数字安全。
+		if r.CostUncomputable {
+			continue
+		}
 		snapKg[c] = r.ClosingKg
 		snapAmt[c] = r.ClosingAmount
 		hasSnap[c] = true

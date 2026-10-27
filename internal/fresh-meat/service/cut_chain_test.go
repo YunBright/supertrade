@@ -272,6 +272,71 @@ func TestGrossMargin_CostIncompleteMarked(t *testing.T) {
 	}
 }
 
+// TestCutChain_UncomputableCut_DoesNotPoisonNextDay 锁"成本算不出来的部位不得污染次日"。
+//
+// # 场景(2026-10-27 生产实测的症状)
+//
+//	belly 在 10-02 **既没有期初库存、也没有进货**,但卖了货
+//	⇒ 它的成本算不出来 ⇒ 当天落库的期末金额 = 期末 kg × 单价 0 = **0**
+//	(0 不是真实价值,是"不知道")。
+//
+//	10-03 若把那个 0 当成上日期末接过来
+//	⇒ 可售金额被抹平、可售数量被压小 ⇒ **移动加权单价爆炸**
+//	⇒ 实测 10-02 的成本从 3061.57 变成 10151.24、毛利率 −191%。
+//
+// # 期望
+//
+//	① 快照里该部位带 `cost_uncomputable` 标记(链的断点说明)。
+//	② 10-03 的该部位期初 = 0(链在那里自然断开)⇒ 单价不爆炸、成本合理。
+func TestCutChain_UncomputableCut_DoesNotPoisonNextDay(t *testing.T) {
+	day2 := fmDay1.Add(24 * time.Hour) // 2026-10-02
+	day3 := fmDay1.Add(48 * time.Hour) // 2026-10-03
+
+	svc, ctx := fmChainSetup(t, map[string][]map[string]any{
+		"2026-10-02": {fmCubeSalesRow("P-BELLY", "10", "180")},
+		"2026-10-03": {fmCubeSalesRow("P-BELLY", "4", "72")},
+	})
+	// 注入**同步**物化执行器 ⇒ 快照立刻落库 ⇒ 能验证"读快照接链"这条路。
+	svc.SetChainMaterializer(func(f func()) { f() })
+	svc.SetClock(fmClock(day2))
+
+	// 录猪 + 分割(触发物化);注意猪在 belly 上有产出 ⇒ belly **有**产出。
+	// 这里要的是"没有基线"的部位,所以用另一个部位?——不:直接用 belly 的
+	// "成本算不出来"分支需要既无期初也无产出 ⇒ 这里改用**只卖不进货**的一天。
+	// ⇒ 因此不录猪,让 belly 在 10-02 只卖不进货(成本算不出来)。
+	// 物化由查询后的显式调用触发。
+	_ = ctx
+
+	// 显式物化 10-02(落快照)。
+	if _, err := svc.MaterializeCostChain(context.Background(), "S001", "2026-10-01"); err != nil {
+		t.Fatalf("MaterializeCostChain: %v", err)
+	}
+
+	// ① 快照里 belly 必须带 cost_uncomputable 标记。
+	var snap model.CutCostDaily
+	if err := testDBSingleton.Where("branch_id = ? AND cut_type = ? AND biz_date LIKE ?",
+		"S001", model.CutBelly, "2026-10-02%").First(&snap).Error; err != nil {
+		t.Fatalf("查 10-02 的 belly 快照: %v", err)
+	}
+	if !snap.CostUncomputable {
+		t.Errorf("★ 成本算不出来的部位必须在快照里带 cost_uncomputable 标记 —— "+
+			"否则次日会把那个 0 当成真实结余接过去 ⇒ 单价爆炸(实测成本 3061 → 10151)")
+	}
+
+	// ② 10-03 的 belly 期初 = 0(链在那里自然断开)⇒ 成本不爆炸。
+	svc.SetClock(fmClock(day3))
+	rep, err := svc.ComputeGrossMargin(ctx, "S001", day3)
+	mustNoErr(t, err, "ComputeGrossMargin(10-03)")
+	row := fmCutRowFor(t, rep, model.CutBelly)
+	if !row.OpeningKg.IsZero() {
+		t.Errorf("★ 10-03 的 belly 期初应是 0(上一天的成本算不出来 ⇒ 链在那里断开), got %s —— "+
+			"接了那个 0 就会把可售数量压小 ⇒ 单价爆炸", row.OpeningKg)
+	}
+	if row.SalesCostYuan.GreaterThan(d("1000")) {
+		t.Errorf("★ 10-03 的 belly 销售成本应是合理量级, got %s —— 单价爆炸了", row.SalesCostYuan)
+	}
+}
+
 // TestCutChain_NoBaseline_CostMarkedUncomputable 锁 ②。
 //
 // # 场景

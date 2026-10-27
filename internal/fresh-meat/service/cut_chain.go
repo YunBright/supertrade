@@ -39,7 +39,6 @@ package service
 import (
 	"context"
 	"fmt"
-	"sort"
 	"sync"
 	"time"
 
@@ -181,7 +180,17 @@ func (s *Service) cutChainBaseline(ctx context.Context, branchID string) (string
 
 // cutChainAnchor 找链的**锚点**:早于 from 的最近一个已落库快照的日子。
 //
-// 返回 (锚点那天的日期, 锚点的结余)。没有锚点时返回 (零值, nil)。
+// # ⚠️ 锚点必须**可信**(2026-10-27 生产实测)
+//
+//	锚点的 closing 是"链算到那天的结果" ⇒ 只有当**从基线到锚点日每一天都有快照**
+//	时它才是完整的。若中间断了(例如物化只覆盖了后半段)⇒
+//	锚点的 closing 是**断链**算出来的 ⇒ 接上它 ⇒ 数字错得更离谱
+//	(实测:成本 8.4 万 → 19.4 万、毛利率 −98.71%)。
+//
+// ⇒ 这里做**连续性校验**:基线 ~ 锚点日,每一天都要有快照,否则**不用锚点**
+//   (宁可慢一点回溯,也不能拿断链的结余当期初)。
+//
+// 返回 (锚点那天的日期, 锚点的结余)。没有可信锚点时返回 (零值, nil)。
 func (s *Service) cutChainAnchor(ctx context.Context, branchID string,
 	from time.Time,
 ) (time.Time, *cutOpeningOverride, error) {
@@ -200,6 +209,41 @@ func (s *Service) cutChainAnchor(ctx context.Context, branchID string,
 		return time.Time{}, nil, nil
 	}
 	anchorDay := time.Time(latest.BizDate).In(loc).Format("2006-01-02")
+
+	// ---- 连续性校验:基线 ~ 锚点日,每一天都要有快照 ----
+	baseline, err := s.cutChainBaseline(ctx, branchID)
+	if err != nil {
+		return time.Time{}, nil, err
+	}
+	if baseline == "" {
+		return time.Time{}, nil, nil
+	}
+	bs, err := time.ParseInLocation("2006-01-02", baseline, loc)
+	if err != nil {
+		return time.Time{}, nil, err
+	}
+	anchorDate, err := time.ParseInLocation("2006-01-02", anchorDay, loc)
+	if err != nil {
+		return time.Time{}, nil, err
+	}
+	if bs.After(anchorDate) {
+		return time.Time{}, nil, nil
+	}
+	var nSnap int64
+	if err := s.db.WithContext(ctx).
+		Model(&model.CutCostDaily{}).
+		Where("branch_id = ? AND biz_date >= ? AND biz_date <= ?",
+			branchID, datatypesDate(bs), datatypesDate(anchorDate)).
+		Distinct("biz_date").
+		Count(&nSnap).Error; err != nil {
+		return time.Time{}, nil, fmt.Errorf("count cut_cost_daily(anchor continuity): %w", err)
+	}
+	wantDays := int(anchorDate.Sub(bs).Hours()/24) + 1
+	if int(nSnap) < wantDays {
+		// 链是断的 ⇒ 锚点不可信 ⇒ 宁可回溯。
+		return time.Time{}, nil, nil
+	}
+
 	var rows []model.CutCostDaily
 	if err := s.db.WithContext(ctx).
 		Where("branch_id = ? AND biz_date >= ? AND biz_date < ?",
@@ -213,16 +257,17 @@ func (s *Service) cutChainAnchor(ctx context.Context, branchID string,
 		unit:   map[string]decimal.Decimal{},
 	}
 	for _, r := range rows {
+		// ⚠️ 该部位当天成本算不出来 ⇒ 它的期末金额是"0"而不是真实价值
+		//   ⇒ 不能当锚点(会抹平可售金额、压小可售数量 ⇒ 单价爆炸)。
+		if r.CostUncomputable {
+			continue
+		}
 		prev.kg[string(r.CutType)] = r.ClosingKg
 		prev.amount[string(r.CutType)] = r.ClosingAmount
 		// ★ 锚点也要带上移动加权单价(短卖时的兜底价)。
 		if r.MovingAvgUnitCost.IsPositive() {
 			prev.unit[string(r.CutType)] = r.MovingAvgUnitCost
 		}
-	}
-	anchorDate, err := time.ParseInLocation("2006-01-02", anchorDay, loc)
-	if err != nil {
-		return time.Time{}, nil, err
 	}
 	return anchorDate, prev, nil
 }
@@ -294,23 +339,32 @@ func (s *Service) materializeCostChain(ctx context.Context, branchID string, fro
 	loc := s.bizTZOrUTC()
 	// ⚠️ 用 s.now()(可注入时钟),不用 time.Now() ⇒ 单测里"今天"跟着测试时钟走。
 	today := s.now().In(loc)
-	chain, err := s.deriveColdChain(ctx, branchID, "", nil)
+	// ⚠️ **必须从链起点(基线)开始**(2026-10-27 生产实测):
+	//   只从某个中间的日子物化 ⇒ 那天的链是**断的**(接不到基线)
+	//   ⇒ 落下来的快照 closing 不完整 ⇒ 锚点接到它 ⇒ 数字错得更离谱
+	//   (实测:成本从 8.4 万变成 19.4 万、毛利率 −98.71%)。
+	baseline, err := s.cutChainBaseline(ctx, branchID)
 	if err != nil {
 		return 0, err
 	}
-	fromKey := fromDate.In(loc).Format("2006-01-02")
-	dates := make([]string, 0, len(chain))
-	for d := range chain {
-		if d >= fromKey && d <= today.Format("2006-01-02") {
-			dates = append(dates, d)
+	start := fromDate.In(loc)
+	if baseline != "" {
+		bs, perr := time.ParseInLocation("2006-01-02", baseline, loc)
+		if perr != nil {
+			return 0, perr
+		}
+		if bs.Before(start) {
+			start = bs
 		}
 	}
-	sort.Strings(dates)
+	// ⚠️ **按日历逐日**,不用 deriveColdChain 的日期集合 ——
+	//   那个集合只含"有流水记录的日子" ⇒ 会漏天 ⇒ 链被截断。
+	//   (引擎的 loadCutOpening ① 读前一日快照 ⇒ 逐日落库时链自动接续 ✓)
 	total := 0
-	for _, d := range dates {
-		n, err := s.persistCutCostDaily(ctx, branchID, mustParseDateInLoc(d, loc), false)
+	for d := start; !d.After(today); d = d.AddDate(0, 0, 1) {
+		n, err := s.persistCutCostDaily(ctx, branchID, d, false)
 		if err != nil {
-			return total, fmt.Errorf("物化 %s 的成本日快照: %w", d, err)
+			return total, fmt.Errorf("物化 %s 的成本日快照: %w", d.Format("2006-01-02"), err)
 		}
 		total += n
 	}

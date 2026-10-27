@@ -576,6 +576,7 @@ func (s *Service) persistCutCostDaily(ctx context.Context, branchID string, day 
 				PresaleMarginYuan:         r.PresaleMarginYuan,
 				PresaleExpectedRevenueYuan: r.PresaleExpectedRevenueYuan,
 				DataSource:                r.DataSource,
+				CostUncomputable:          r.CostUncomputable,
 				CreatedAt:                 now,
 				UpdatedAt:                 now,
 			}
@@ -605,6 +606,7 @@ func (s *Service) persistCutCostDaily(ctx context.Context, branchID string, day 
 					"presale_margin_yuan":         r.PresaleMarginYuan,
 					"presale_expected_revenue_yuan": r.PresaleExpectedRevenueYuan,
 					"data_source":                 r.DataSource,
+					"cost_uncomputable":           r.CostUncomputable,
 					"updated_at":                  now,
 				}),
 			}).Create(&snap).Error; err != nil {

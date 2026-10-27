@@ -825,8 +825,21 @@ type CutCostDaily struct {
 
 	// DataSource:actual(有完整实盘) | partial(有盘点但未完成) | estimated(无盘点)
 	DataSource string    `gorm:"column:data_source;type:varchar(16);not null;default:'estimated'" json:"data_source"`
-	CreatedAt  time.Time `gorm:"column:created_at;not null" json:"created_at"`
-	UpdatedAt  time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
+	// CostUncomputable = true ⇒ 该部位当天**成本算不出来**
+	// (既没有期初库存、当天也没有进货、又没有任何可用单价)。
+	//
+	// ⚠️ **这个标记是链的"断点说明"**(2026-10-27 生产实测):
+	//   这样的部位,期末金额 = 期末 kg × 单价 0 = **0** ——
+	//   而 0 **不是**它的真实价值,是"不知道"。
+	//   若下一日把 0 当成上日期末接过来 ⇒ 可售金额被抹平、
+	//   可售数量被压小 ⇒ **移动加权单价爆炸** ⇒ 成本变成天文数字
+	//   (实测:10-02 的成本从 3061.57 变成 10151.24,毛利率 −191%)。
+	//
+	// ⇒ 读前一日快照接链时,**必须跳过**标了这个的部位
+	//   ⇒ 链在那个部位上自然断开(它本来就没有成本链)⇒ 数字安全。
+	CostUncomputable bool      `gorm:"column:cost_uncomputable;not null;default:false" json:"cost_uncomputable"`
+	CreatedAt        time.Time `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt        time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
 }
 
 // TableName 显式表名。
