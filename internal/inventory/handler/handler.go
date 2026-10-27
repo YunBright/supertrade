@@ -9,41 +9,18 @@
 //	GET /archive/export?scope=stock&offset=&limit=                    库存快照导出(inventory:view)
 //	POST /archive/import                                             库存快照导入(inventory:manage)
 //
-// # ⚠️ **读路径按「门店配了数据源」分流**（2026-10-21 生产实测的修复）
+// # ⚠️ 读路径按「门店配了数据源」分流:配了源 ⇒ 走那个 cube 实例(库存在外部系统里);
+// 没配 ⇒ 走本域 PG;问不到路由 ⇒ 503(**不**回落本地;判据见 service/source.go)。
 //
-// 门店在 cube-router 的 branch_cube_sources 里配了数据源
-// (富百家 00 → cube-sixun-ysx-fb、佳乐 01 → cube-sixun-hbposv7-jiale)
-// ⇒ **该门店的库存在外部系统里**，本域 PG 没有它的行
-// ⇒ 读端点必须走那个 cube 实例；没配数据源的门店(自营店 10)⇒ 走本域 PG。
+// # ⚠️ scope 名来自 auth 的 permissions 表 seed(per-branch 实时解析):
+// `inventory:view`=查库存(读/导出端点)、`inventory:manage`=改库存(导入端点,它会
+// **改写**库存数量)、`inventory:approve`=审核盘点单。
 //
-// 判据与错误语义见 internal/inventory/service/source.go（与 member / catalog /
-// pricing 共用同一份实现）—— **问不到路由 ⇒ 503，不回落本地**。
+// # ⚠️ 门店只认 X-Branch-ID header:query 的 branch_id 只能与它一致,
+// 不一致 ⇒ 400 branch_mismatch(body/query 带别的门店就能看别人的库存)。
 //
-// # 权限
-//
-// 读端点 + 导出端点挂 `rbac.RequireScopeWithBranch("inventory:view", ...)` ——
-// scope 是 **per-branch 实时解析**的(走 auth 的 /internal/users/{id}/permissions)。
-//
-// ⚠️ **scope 名来自 auth 的 permissions 表 seed**
-// (auth/migrations/001_init_schema.up.sql:`inventory:view` = "查库存")。
-//
-//	同批还有 `inventory:manage`(改库存 / 盘点单)与 `inventory:approve`(审核盘点单),
-//	导入端点用 manage(它会**改写**库存数量),其余只读端点用 view。
-//
-// # 门店从哪来
-//
-// ⚠️ **门店只认 X-Branch-ID header(query 的 branch_id 只能与它一致)**。
-//
-//	body/query 里带一份别的门店就能看别人的库存 ⇒ 直接 400 branch_mismatch。
-//
-// # 错误映射
-//
-//	ErrStockLevelNotFound → 404 stock_level_not_found
-//	ErrInvalidInput       → 400 bad_request
-//	ErrCubeSourceUnavailable → 503 cube_unavailable
-//	ErrCubeSourceDisabled   → 503 cube_source_disabled
-//	ErrExternalSourceReadOnly → 409 member_source_is_external
-//	其它                  → 500 internal_error
+// # ⚠️ 错误映射:404 stock_level_not_found / 400 bad_request / 503 cube_unavailable、
+// 503 cube_source_disabled / 409 member_source_is_external / 其它 → 500 internal_error
 package handler
 
 import (
@@ -93,7 +70,7 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 		rbac.RequireScopeWithBranch("inventory:view", branchFromHeader, resolver),
 		h.listStockMoves)
 
-	// 2026-10-21 新增：库存快照的**归档导出**（一次性归档同步用）。
+	// 库存快照的**归档导出**（一次性归档同步用）。
 	//
 	// ⚠️ 输出契约 = internal/archivedto（与 cube-router 的 /v1/export 同一份字段名）。
 	// ⚠️ 门店配了数据源 ⇒ 转发 cube-router（该门店的库存在外部系统里）；
@@ -102,7 +79,7 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 		rbac.RequireScopeWithBranch("inventory:view", branchFromHeader, resolver),
 		h.exportArchive)
 
-	// 2026-10-21 新增：库存快照的**导入**（一次性归档同步用）。
+	// 库存快照的**导入**（一次性归档同步用）。
 	//
 	// ⚠️ 守门是 `inventory:manage`（不是 view）—— 导入会**改写**库存数量。
 	// ⚠️ 目标门店只从 X-Branch-ID header 取（body 里带门店就能跨店写）。

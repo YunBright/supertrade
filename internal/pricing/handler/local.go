@@ -79,8 +79,6 @@ type localPromoDTO struct {
 //
 //	配了数据源 ⇒ 走那个 cube 实例的**实时**价;
 //	没配数据源   ⇒ 走本域 PG。
-//	⇒ 旧的 /prices/local("只读本地表")已删除:名字承诺"本地"、
-//	  而门店 00 拿到的是**两天前的快照** ⇒ "批量查和单个查的价不一样"。
 func (h *Handler) getPrices(c *gin.Context) {
 	if h.prices == nil {
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
@@ -130,8 +128,8 @@ func (h *Handler) getPrices(c *gin.Context) {
 //
 // # ⚠️ 判据是「门店配没配数据源」(与 /quotes、/prices/export 同一套)
 //
-// 旧的 /promotions/local("只读本地表")已删除 —— 名字承诺"本地",
-// 而有数据源的门店拿到的是**本地快照** ⇒ 与实时价不一致。
+//	配了数据源 ⇒ 走那个 cube 实例的**实时**促销;
+//	没配数据源   ⇒ 走本域 PG。
 func (h *Handler) getPromotions(c *gin.Context) {
 	if h.prices == nil {
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{

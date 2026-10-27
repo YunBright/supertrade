@@ -57,7 +57,7 @@ func New(svc *service.Service) *Handler {
 //
 // 路径全部从 root 起(nginx 已剥 /api/v1/fresh-meat/ 前缀)。
 //
-// 中间件链(2026-10 重构对齐 stocktake):
+// 中间件链(对齐 stocktake):
 //
 //	middleware.RequireBranch()           // 拦 X-Branch-ID 缺失 → 400 branch_required
 //	h.requireScope(c, branchID, scope)  // 走 svc.HasEffectiveScope(60s 缓存)→ 401/503/403
@@ -74,11 +74,10 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.POST("/whole-pigs", requireBranch, h.RecordWholePig)
 	r.GET("/whole-pigs", requireBranch, h.ListWholePigsByDay)
 	r.GET("/whole-pigs/:pig_id", requireBranch, h.GetWholePig)
-	// ★ 重新生成分割建议(2026-10-26:建议改成**异步**生成后,仍可能因为
-	//   "服务重启 / LLM 连续失败"而没有建议 ⇒ 门店需要一个补救入口)。
+	// POST /whole-pigs/:pig_id/advice —— 重新生成分割建议(异步,立即返回 202)。
 	r.POST("/whole-pigs/:pig_id/advice", requireBranch, h.RegeneratePigAdvice)
-	// ★ 删掉**录错了**的猪（2026-10-25 门店反馈："多录了一头，只能将错就错"）。
-	//   只允许删**干净**的猪：没有分割补录、没有销售归属、且不在已审计期间。
+	// DELETE /whole-pigs/:pig_id —— 删掉**录错了**的猪。
+	//   ⚠️ 只允许删**干净**的猪：没有分割补录、没有销售归属、且不在已审计期间。
 	r.DELETE("/whole-pigs/:pig_id", requireBranch, h.DeleteWholePig)
 
 	// 单品补录
@@ -102,13 +101,13 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.PUT("/branch-cut-mappings/:id", requireBranch, h.UpdateBranchCutMapping)
 	r.DELETE("/branch-cut-mappings/:id", requireBranch, h.DeleteBranchCutMapping)
 
-	// 库存位置(2026-10-23):猪肉台 / 冷库
+	// 库存位置:猪肉台 / 冷库
 	//
 	// POST /stock/counter-load —— 开市准备:把冷库的货搬上猪肉台(可部分、可不上)。
 	// GET  /stock               —— 库存查询:默认猪肉台,scope=all 为全店。
 	//                              ⚠️ **不提供"只查冷库"**(门店明确:没有查冷库的说法)。
 	r.POST("/stock/counter-load", requireBranch, h.CounterLoad)
-	// GET /stock/counter-load —— **搬台流水**(2026-10-24):当天搬了哪些货。
+	// GET /stock/counter-load —— **搬台流水**:当天搬了哪些货。
 	//                              前端第②步(已搬台?)与休市判定都靠它。
 	r.GET("/stock/counter-load", requireBranch, h.ListCounterLoads)
 	// PUT/DELETE /stock/counter-load/:id —— 改/撤**一行**搬台。
@@ -138,7 +137,7 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/stock/bags", requireBranch, h.ListStockBags)
 	r.GET("/stock", requireBranch, h.ListStock)
 
-	// GET /business-day —— **营业日状态机**(2026-10-24):
+	// GET /business-day —— **营业日状态机**:
 	// 未进猪 → 已进猪 → 已搬台 → 已盘点(售罄|休市)。
 	// 顺带给出"前一个营业日是否已盘点"(不补录昨天就无法录今天)。
 	r.GET("/business-day", requireBranch, h.GetBusinessDay)
@@ -169,7 +168,7 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/forecast-baselines", requireBranch, h.ListForecastBaselines)
 	r.POST("/forecast-baselines/recompute", requireBranch, h.RecomputeForecastBaselines)
 
-	// 成本链逐日物化(2026-10-27):落 `cut_cost_daily` ⇒ 长期毛利变快。
+	// 成本链逐日物化:落 `cut_cost_daily` ⇒ 长期毛利变快。
 	// ⚠️ 幂等的派生数据重算,不绑盘点(绑盘点 ⇒ 零盘点门店的链每天断一次)。
 	r.POST("/cost-chain/materialize", requireBranch, h.MaterializeCostChain)
 
@@ -177,7 +176,7 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	// 走 dapr 自身 cron binding,无 JWT 无 X-Branch-ID;**不挂** requireBranch。
 	r.GET("/cron/daily-reminder", h.CronDailyReminder)
 
-	// 毛利查询(per cut + total;2026-10-01 新增)
+	// 毛利查询(per cut + total)
 	r.GET("/gross-margin", requireBranch, h.GetGrossMargin)
 }
 
@@ -185,30 +184,8 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 
 // CronDailyReminder GET /cron/daily-reminder
 //
-// dapr cron binding 配置示例(部署仓):
-//
-//	apiVersion: dapr.io/v1alpha1
-//	kind: Component
-//	metadata:
-//	  name: fresh-meat-cron
-//	spec:
-//	  type: bindings.cron
-//	version: v1
-//	metadata:
-//	  - name: schedule
-//	    value: "@daily 23:00"
-//	  - name: direction
-//	    value: "input"
-//	  - name: path
-//	    value: "cron/daily-reminder"
-//
-// 本接口逻辑:
-//   - 列出所有"今日未提交 is_complete=true 盘点"的 branch(扫描 record);
-//
-// 日终 22:00 推送仓管待办:早盘录入失败 / 销售 / 报损 / 库存不平衡等告警;
-//
-// 占位 — 真实清单生成待 BI / sales-agg 接入后实装;
-// 本阶段只返 "skipped: all branches covered" 状态(便于 dapr 校验可达)。
+// dapr cron binding 触发(无 JWT、无 X-Branch-ID ⇒ 不挂 requireBranch)。
+// 当前为占位实现:返回 ok + note,不产生告警。
 func (h *Handler) CronDailyReminder(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"ok":      true,
@@ -244,14 +221,7 @@ func mapErr(c *gin.Context, err error) {
 	case errors.Is(err, service.ErrCubeUnavailable):
 		writeError(c, http.StatusServiceUnavailable, "cube_unavailable", err.Error())
 	case errors.Is(err, service.ErrUserInfoUnavailable):
-		// ⚠️ **不透出 err.Error()**。
-		//
-		// 生产现场(2026-10-26 16:49:01)的原文是:
-		//   「userinfo: 机器身份被拒: 用服务账号换机器 token 失败(app-id=userd):
-		//     rpc error: code = Canceled desc = context canceled」
-		// ——含 gRPC 错误码 + 内部 app-id,对门店毫无意义,还会让人以为
-		// "账号被拒了"(其实只是链路抖了一下)。
-		// ⇒ 对外只说人话;细节留在服务端日志里。
+		// ⚠️ 不透出 err.Error():错误含 gRPC 码与内部 app-id,对门店无意义;细节留服务端日志。
 		writeError(c, http.StatusServiceUnavailable, "userd_unavailable",
 			"权限服务暂时不可用，请稍后重试")
 	case errors.Is(err, service.ErrBulkProductConflict):
@@ -350,11 +320,7 @@ func (h *Handler) GetWholePig(c *gin.Context) {
 
 // RegeneratePigAdvice POST /whole-pigs/:pig_id/advice
 //
-// 手动重跑分割建议(**异步**,立即返回 202 + advice_status=generating)。
-//
-// ⚠️ 为什么需要它(2026-10-26 门店反馈):
-// 建议改成异步生成后,仍可能因为"服务重启 / LLM 连续失败"而没有建议
-// ⇒ 门店需要一个**补救入口**(不然这头猪的成本就摊不出去)。
+// 手动重跑分割建议(异步,立即返回 202 + advice_status=generating)。
 //
 // 权限:freshmeat:write。
 func (h *Handler) RegeneratePigAdvice(c *gin.Context) {
@@ -386,7 +352,7 @@ func (h *Handler) RegeneratePigAdvice(c *gin.Context) {
 // 权限：freshmeat:write。
 //
 // ⚠️ 只允许删**干净**的猪：没有分割补录、没有销售归属、不在已审计期间
-//   （理由见 service/pig_delete.go）⇒ 否则 400 + 说清为什么不能删。
+// (理由见 service/pig_delete.go)⇒ 否则 400 + 说清为什么不能删。
 func (h *Handler) DeleteWholePig(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "freshmeat:write") {
@@ -450,6 +416,8 @@ func (h *Handler) RecordPigCut(c *gin.Context) {
 }
 
 // ListPigCutsByPig GET /pigs/:pig_id/cuts
+//
+// 权限:freshmeat:view(只读端点;写端点用 freshmeat:write)。
 func (h *Handler) ListPigCutsByPig(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "freshmeat:view") {
@@ -604,7 +572,8 @@ func (h *Handler) ListLineSalesByPig(c *gin.Context) {
 // ---- branch_cut_mappings ----
 
 // ListBranchCutMappings GET /branch-cut-mappings
-func (h *Handler) ListBranchCutMappings(c *gin.Context) {	branchID := middleware.SingleBranchFromCtx(c)
+func (h *Handler) ListBranchCutMappings(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "freshmeat:view") {
 		return
 	}
@@ -725,10 +694,9 @@ func (h *Handler) CounterLoad(c *gin.Context) {
 
 // ListCounterLoads GET /stock/counter-load?date=YYYY-MM-DD
 //
-// **搬台流水**(2026-10-24):某营业日搬上台的货。
+// **搬台流水**:某营业日搬上台的货。
 //
-// ⇒ 前端第②步(今天搬台了吗?)与休市判定都靠它
-//   (之前只有"按标签整袋搬"留痕,"按 SKU+kg 搬"完全没有流水 ⇒ 会误判)。
+// ⇒ 前端第②步(今天搬台了吗?)与休市判定都靠它。
 //
 // `date` 省略 = 今天(营业日界时区)。
 func (h *Handler) ListCounterLoads(c *gin.Context) {
@@ -751,7 +719,7 @@ func (h *Handler) ListCounterLoads(c *gin.Context) {
 
 // GetBusinessDay GET /business-day?date=YYYY-MM-DD
 //
-// **营业日状态机**(2026-10-24):未进猪 → 已进猪 → 已搬台 → 已盘点(售罄|休市)。
+// **营业日状态机**:未进猪 → 已进猪 → 已搬台 → 已盘点(售罄|休市)。
 //
 // 顺带给出"前一个营业日是否已盘点"(门店口径:不补录昨天就无法录今天)
 // 与"现在能不能录猪 / 搬台"。
@@ -778,7 +746,7 @@ func (h *Handler) GetBusinessDay(c *gin.Context) {
 // 改一行搬台的重量(门店口径:「可以随时修改,甚至过一天修改」)。
 //
 // ⚠️ 改出来**负库存不拦** ⇒ 在每日毛利的告警里红字显示
-//   (service.MarginAlert / code=negative_inventory)。
+// (service.MarginAlert / code=negative_inventory)。
 func (h *Handler) UpdateCounterLoad(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "freshmeat:write") {
@@ -854,13 +822,7 @@ func (h *Handler) SaveStockOpenings(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
 		return
 	}
-	// ⚠️ **别静默吞掉**。
-	//
-	// 之前这里没校验 ⇒ 客户端传 `{"items":[...]}`(字段名写错)时
-	// ⇒ 反序列化得到空列表 ⇒ **不报错、不写入**
-	// ⇒ 症状是"保存成功了,读回来却没变"——最难查的那种。
-	//
-	// ⇒ 空列表一律 400,并说清要传 `openings`。
+	// ⚠️ 空 openings 一律 400(字段名写错时反序列化会得到空列表,静默写入等于"保存成功但没变")。
 	if len(in.Openings) == 0 {
 		writeError(c, http.StatusBadRequest, "bad_request",
 			"openings 不能为空(每个部位一行:{cut_type, cold_store_kg, unit_price_yuan, biz_date?, note?})"+
@@ -986,8 +948,8 @@ func (h *Handler) ListPresale(c *gin.Context) {
 //
 // ⚠️ 冻结的是**源数据**与**成本口径快照**;预售价是「审计结转」这个**产物**的
 // 一项(审计人拍板"这批货按什么价卖掉")⇒ 改它是**修正审计结论**。
-//   每次改都留痕(cut_presale_edits)⇒ 改完自动重算毛利 / 按猪分摊 /
-//   重放截止日之后的天 / 校准当前余额。
+// 每次改都留痕(cut_presale_edits)⇒ 改完自动重算毛利 / 按猪分摊 /
+// 重放截止日之后的天 / 校准当前余额。
 func (h *Handler) UpdatePresale(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "freshmeat:write") {
@@ -1164,7 +1126,8 @@ func (h *Handler) DeleteBulkProduct(c *gin.Context) {
 }
 
 // ListBulkProductions GET /bulk-productions
-func (h *Handler) ListBulkProductions(c *gin.Context) {	branchID := middleware.SingleBranchFromCtx(c)
+func (h *Handler) ListBulkProductions(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "freshmeat:view") {
 		return
 	}
@@ -1307,16 +1270,8 @@ func (h *Handler) RecomputeForecastBaselines(c *gin.Context) {
 
 // MaterializeCostChain POST /cost-chain/materialize?from=YYYY-MM-DD
 //
-// ⚠️ 这是**派生数据**的重算(部位级成本日快照)⇒ **幂等、可重复调用**;
-//   不像审计结转那样不可逆(不改业务事实、不冻结数据)。
-//
-// # 为什么需要它
-//
-// 长期毛利(逐日链式算)在没有落库日序列时要 O(天) 地回溯
-// ⇒ 查一个月要十几秒。物化之后 ⇒ 前一日快照直接当期初 ⇒ O(1)。
-//
-// ⚠️ **不绑盘点**:盘点只是"实盘锚定",不是"链的开关"
-//   (绑盘点 ⇒ 零盘点门店的链每天断一次 ⇒ 成本塌成期初残值 ⇒ 毛利虚高)。
+// ⚠️ 派生数据重算 ⇒ **幂等、可重复调用**;不像审计结转那样不可逆(不冻结数据)。
+// ⚠️ **不绑盘点**:盘点只是"实盘锚定",不是"链的开关"(绑盘点 ⇒ 零盘点门店的链每天断一次)。
 func (h *Handler) MaterializeCostChain(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "freshmeat:write") {

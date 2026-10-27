@@ -12,7 +12,7 @@
 // # ⚠️ scope 是 `procurement:view`(**新 scope**)
 //
 // PLAN §3.6:新 scope 需要在 auth 仓的 seed 里存在,否则一律 403 fail-closed。
-// 本轮这些端点在 auth 补 seed 之前对所有人 403 —— 这是**有意的**。
+// auth 补 seed 之前这些端点对所有人 403 —— 这是**有意的**。
 //
 // # ⚠️ branch 一律走 X-Branch-ID header(路径里没有 :branch_id)。
 //
@@ -87,8 +87,8 @@ func (h *Handler) listSheets(c *gin.Context) {
 		// ⚠️ 前端已经在发 created_by(制单人)⇒ 后端必须真的过滤,
 		// 否则"点了筛选没反应"与"参数被忽略"长得一模一样。
 		CreatedBy: c.Query("created_by"),
-		Page:          1,
-		PageSize:      service.DefaultPageSize,
+		Page:      1,
+		PageSize:  service.DefaultPageSize,
 	}
 	if v := c.Query("page"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {

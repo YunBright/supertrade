@@ -196,14 +196,9 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 
 	// ---- 写端点:会员域自己的授权链路(图4 / 图5) ----
 	//
-	// ⚠️ **不挂 rbac.RequireScopeWithBranch**:它只会返 403 forbidden,
-	//   而 POS 需要区分"要弹授权框"(member_permission_required)
-	//   与"授权不通过"(member_permission_denied)。
-	//
-	// ⚠️ requireLocalSource:该门店的会员档案来自**外部系统**(富百家 / 佳乐)
-	//   ⇒ 本域只读,写操作一律拒(409)。
-	//   不拒的话:写进本域 PG 的一行,前台显示"写成功了",
-	//   而那个门店的事实源是外部 ERP ⇒ 这行数据永远没人看。
+	// ⚠️ 不挂 rbac.RequireScopeWithBranch:它只返 403 forbidden,而 POS 要区分
+	// member_permission_required(弹授权框)与 member_permission_denied(弹图5 alert)。
+	// ⚠️ requireLocalSource:该门店会员档案来自外部系统 ⇒ 本域只读,写一律 409。
 	r.POST("/members", h.requireLocalSource, h.openMember)
 	r.POST("/members/:id/points/deduct", h.requireLocalSource, h.deductPoints)
 	r.POST("/members/:id/points/grant", h.requireLocalSource, h.grantPoints)
@@ -282,6 +277,9 @@ func (c userInfoScopeChecker) HasScope(ctx context.Context, userID, branchID, sc
 // ---- 读端点 ----
 
 // getConfig GET /config
+//
+// ⚠️ 响应 = 该门店的会员设置视图(view);门店取自 SingleBranchFromCtx,
+// 不用本文件的 branchFromHeader helper。
 func (h *Handler) getConfig(c *gin.Context) {
 	view, err := h.svc.GetSettings(c.Request.Context(), middleware.SingleBranchFromCtx(c))
 	if err != nil {
@@ -293,33 +291,10 @@ func (h *Handler) getConfig(c *gin.Context) {
 
 // memberSearchKeyword 取会员查询的关键词。
 //
-// # ⚠️ **两个参数名都要认**
-//
-//	`q`       —— 服务端的规范名(本仓其它端点与运维脚本用它)
-//	`keyword` —— **Flutter POS 客户端实际发的名字**
-//	             (supertrade_pos/lib/infra/http/member_api.dart:60
-//	              `query: {'field': field, 'keyword': keyword}`)
-//
-// # 为什么不能只认一个
-//
-//	2026-10-22 生产实测(门店 10,4130 个会员):
-//
-//	?field=card_id&q=100109        → total=1     ✅
-//	?field=card_id&keyword=100109  → total=4130  ❌ **全部门店**
-//
-//	只认 `q` 时,POS 发的 `keyword` 被**静默忽略** ⇒ 过滤条件为空
-//	⇒ 端点**返 200、字段齐全** ⇒ 看起来完全正常
-//	⇒ 症状是「收银员输卡号查会员,弹出几千张卡」。
-//
-//	⚠️ 这类"参数名对不上"的缺陷,只断言"端点在、字段对"的契约测试**抓不到**
-//	—— 端点确实在、确实返 200、确实给会员对象。
-//	必须**用客户端实际发的那份查询串**打,并断言**命中数**。
-//
-// # 为什么**兼容**而不是改前端
-//
-//	改前端 ⇒ 要重新打包发布 POS 客户端(现场设备),周期长、风险大;
-//	改服务端 ⇒ 一次部署,**现场已装的客户端立刻恢复**。
-//	⇒ 服务端兼容(`q` 优先,`keyword` 兜底)。
+// ⚠️ **两个参数名都要认**,`q` 优先、`keyword` 兜底:`q` 是服务端规范名,`keyword`
+// 是 Flutter POS 客户端实际发的名字。
+// ⚠️ 只认一个 ⇒ POS 发的那个被**静默忽略** ⇒ 过滤条件为空 ⇒ 端点**返 200、字段齐全**
+// (看起来完全正常),症状是"收银员输卡号查会员,弹出几千张卡"。
 func memberSearchKeyword(c *gin.Context) string {
 	if v := strings.TrimSpace(c.Query("q")); v != "" {
 		return v
@@ -349,20 +324,10 @@ func (h *Handler) listPaymentWays(c *gin.Context) {
 
 // listMembers GET /members?field=&q=&limit=&offset=&sort=&order=
 //
-// ⚠️ 响应里**同时**给 count 与 total:
-//
-//	count = 本次返回的行数(旧语义,不变)
-//	total = 该门店 + 该查询条件下的**总命中行数**
-//
-// ⇒ 门店10 导入后有 4128 个会员,而 limit 上限是 200
-// ⇒ 只给 count 的话前端会以为"这个店就这么点会员"(静默截断)。
-//
-// ⚠️ sort / order 是**服务端排序**(不是前端排):
-//
-//	前端排只能排当前这一页 ⇒ "按积分排序"翻到第 2 页就乱序了。
-//	排序列只认白名单(model.MemberSortColumn)，非法值 ⇒ 400。
-//
-// # ⚠️ 关键词参数名:**`q` 与 `keyword` 都认**(见 memberSearchKeyword)
+// ⚠️ 响应同时给 count(本页行数)与 total(总命中数):只给 count 会让前端以为
+// "这个店就这么点会员"(静默截断)。
+// ⚠️ sort/order 是服务端排序,排序列只认白名单,非法值 ⇒ 400。
+// ⚠️ 关键词参数名:`q` 与 `keyword` 都认(见 memberSearchKeyword)。
 func (h *Handler) listMembers(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.Query("limit"))
 	offset, _ := strconv.Atoi(c.Query("offset"))

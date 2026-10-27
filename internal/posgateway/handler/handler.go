@@ -202,6 +202,9 @@ func (h *Handler) getPrices(c *gin.Context) {
 // createSale POST /sales
 //
 // ⚠️ body **原样**转发给 pos(op_id 必须一字不改 —— 离线重传靠它幂等)。
+//
+// ⚠️ 响应契约:成功时 pos 的响应体**原样**回传(不重新建模 ⇒ 零漂移),状态码恒 200;
+// 下游错误走统一错误信封 {code,message},状态按分类映射(401/403/404/… 原样,其它 ⇒ 502)。
 func (h *Handler) createSale(c *gin.Context) {
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {

@@ -22,22 +22,13 @@ import (
 	"github.com/YunBright/supertrade/internal/stocktake/model"
 )
 
-// PurgeRegistry 是 stocktake 的可清理实体清单（6 张表都要列，原因见文件头）。
+// PurgeRegistry 是 stocktake 的可清理实体清单(6 张表都要列)。
 //
-// # 顺序：不是正确性要求，是报告准确性要求
-//
-// 从表排在前面是因为 `stocktake_lines` 声明了 `constraint:OnDelete:CASCADE`：
-// 主表先删时 DB 会把从表行级联掉，轮到从表时它已经数不出任何行，于是
-// `Deleted["stocktake_lines"]` 显示 0——清理其实成功了，但那个 0 会被读成
-// "这张表没清过"。另外 3 张无 FK 的从表顺序无所谓。
-//
-// 关于 approved 状态：业务删除路径（service.DeleteHeader）对 approved 返 409，
-// 那是给**真实**盘点单的保护；sweep 不需要这道闸门——本次运行的账已经回答了
-// "哪些行是测试造的"，而生产流量压根不记账。留着 approved 的测试盘点单只会让
-// 残留持续累积，那正是这次治理要消灭的东西。
-//
-// 没有"在途状态"跳过：stocktake 的 header 由用户 API 同步读写，**没有后台
-// 流水线在写它**。需要跳过的是 settlement-auditor 的审批流水线。
+// ⚠️ 顺序不是正确性要求,是**报告准确性**要求:从表在前,否则主表先删触发
+// CASCADE 后从表 Deleted 显示 0,会被读成"这张表没清过"。
+// ⚠️ 登记的表必须有**单列主键**(复合主键进不了 purge registry)。
+// ⚠️ sweep 不做 approved 闸门(那是给真实单据的保护);本次运行的账已回答
+// "哪些行是测试造的"。
 func PurgeRegistry() *purge.Registry {
 	return purge.NewRegistry(
 		purge.Model{Table: "stocktake_lines", Model: &model.StocktakeLine{}},
@@ -45,7 +36,7 @@ func PurgeRegistry() *purge.Registry {
 		purge.Model{Table: "stocktake_plan_items", Model: &model.StocktakePlanItem{}},
 		purge.Model{Table: "stocktake_branch_defaults", Model: &model.StocktakeBranchDefault{}},
 		purge.Model{Table: "stocktake_headers", Model: &model.StocktakeHeader{}},
-		// 排除域配置（2026-10-23 新增）。
+		// 排除域配置。
 		//
 		// 登记它只是为了**兜底**：清理按“本次运行记过账的行”定位，
 		// 而 seed 装配的配置行是在**没有 run_id 的上下文**里写的

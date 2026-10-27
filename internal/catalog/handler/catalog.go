@@ -71,21 +71,10 @@ func singleBranchOf(c *gin.Context) (string, string) {
 
 // requireSingleBranch 强制"单一具体门店"。
 //
-// # 为什么必须排在 rbac 守门**之前**
-//
-// rbac.RequireScopeWithBranch 拿 branch 去 userd 查 per-branch 权限矩阵:
-// "*" 这种值在 userd 里查不到行 → 403 forbidden。于是本该是
-// 400 invalid_branch_scope 的请求被报成"没权限",排查方向完全跑偏。
-//
-// # 为什么它还要把门店写回 request.Context
-//
-// 真正决定"路由到哪家门店的 cube"的是 outgoing metadata 里的 x-branch-id,
-// 而它来自 cmd/catalog/main.go 的 forwardBearerToOutgoing —— 那里写的是
-// **header 原值**。于是 " 00 "(带空格)这种 header 会被解析成 "00" 却把
-// " 00 " 发给 cube-router,查不到源 → 404。
-//
-// 这里把**已校验过**的门店写回 request.Context,保证"我们校验的门店"与
-// "cube 收到的门店"永远是同一个值。
+// ⚠️ 必须排在 rbac 守门**之前**:"*" / "00,01" 在 userd 查不到行 ⇒ 会被报成 403,
+// 而本该是 400 invalid_branch_scope。
+// ⚠️ 它把**已校验过**的门店写回 request.Context,保证"我们校验的门店"与
+// "cube 收到的门店"永远是同一个值(header 原值可能带空格)。
 func (h *Handler) requireSingleBranch() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if isLegacyBarcodeRequest(c) {
@@ -295,19 +284,11 @@ func badRequest(c *gin.Context, message string) {
 
 // mapCatalogErr 把 catalog 查询错误映到 HTTP。
 //
-//	cube client 未配置 / 问不到数据源路由 → 503 cube_unavailable
-//	数据源被停用                        → 503 cube_source_disabled
-//	调用者缺该门店读权限                → 403 forbidden
-//	登录态失效                          → 401 unauthorized
-//	其余(cube 故障 / 查询非法)          → 502 cube_error
-//
 // ⚠️ 一律**不**把 cube 的 404 说成"没有数据":404 在这条链路上更常见的原因是
-// "该门店没配 cube 源"(cube-router 返 cube_source_not_configured),
-// 说成"空列表"会把部署缺口伪装成业务结论。
-//
-// ⚠️ 现在这条链路**先**问"门店配了数据源吗"(见 service/source.go):
-// 没配 ⇒ 走本域 PG(自营店 10 的商品在这里),
-// 问不到 ⇒ 503(**不**回落本地:回落 = 把一次链路故障显示成"该门店没有商品")。
+// "该门店没配 cube 源",说成空列表会把部署缺口伪装成业务结论。
+// ⚠️ 先问"门店配了数据源吗":没配 ⇒ 本域 PG;问不到 ⇒ 503(**不**回落本地)。
+// ⚠️ code → HTTP:路由不可用 / 源已停用 ⇒ 503,外部源只读 ⇒ 409,cube 不可用 ⇒ 503,
+// 参数非法 ⇒ 400,其余 ⇒ 502(内部细节只进服务端日志,响应里不回)。
 func (h *Handler) mapCatalogErr(c *gin.Context, err error) {
 	if h.writeSourceErr(c, err) {
 		return

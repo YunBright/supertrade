@@ -21,7 +21,37 @@
 
 ---
 
-## §1 微服务拆分(14 个 dapr app)
+## §1 微服务拆分
+
+> app 清单的真源是 `.claude/rules/00-app-catalog.md`(aud 短名 / dapr app-id / 公网前缀 三列)。
+> 本表只讲**职责与数据归属**;路由真源是各 `internal/<svc>/handler/handler.go::RegisterRoutes`。
+
+| # | cmd | dapr app-id | 职责 | 主要数据 | 关键依赖 |
+|---|---|---|---|---|---|
+| 1 | **stocktake** ⭐ | supertrade-stocktake | 盘点单 / 明细 / 差异报告 | stocktake_headers, stocktake_lines | cube-router, userd |
+| 2 | **catalog** | supertrade-catalog | 本地 suppliers/products + cube 兜底 + 商品选择控件读端点 | suppliers, products | cube-router, userd |
+| 3 | **inventory** | supertrade-inventory | 库存读(cube 转发)+ 库存流水 / 出入库单 | stock_levels, stock_moves | cube-router |
+| 4 | **cube-router** ⭐ | supertrade-cube-router | 按 X-Branch-ID 路由 POST /v1/load 到正确 cube 实例 | branch_cube_sources | dapr invoke → cube 实例, userd |
+| 5 | **master-data** | supertrade-master-data | 门店 / 员工 / 班次 | stores, employees, shifts | userd |
+| 6 | **pos** | supertrade-pos | 销售开单 / 收款 / 改价 / 退货 | sales_orders, sale_lines, payments | cube-router |
+| 7 | **pos-gateway** | supertrade-pos-gateway | BFF,前端对接,聚合调用 | 路由 | dapr invoke |
+| 8 | **member** | supertrade-member | 会员档案 / 积分 / 账户 / 门店会员配置 | members | userd |
+| 9 | **pricing** | supertrade-pricing | 售价 / 促销 / 促销方案 / 报价 | price_lists, promotions, promotion_plans | cube-router |
+| 10 | **procurement** | supertrade-procurement | 采购收货单(只读) | purchase_sheets | cube-router |
+| 11 | **transaction** | supertrade-transaction | 商品销售流水 / 收银流水查询 | — | cube-router |
+| 12 | **fresh-meat** ⭐ | supertrade-fresh-meat | 生肉整猪 + 分割 + **部位级**成本链 / 毛利 + 大宗台账 | whole_pig, pig_cuts, cut_cost_daily, bulk_settlements | cube-router, 外部 LLM |
+| 13 | **settlement-auditor** | supertrade-settlement-auditor | 结算付款审批 + 机器审核 + 附件 | approvals, approval_items | stocktake, 外部 LLM |
+| 14 | **sales-agg** | supertrade-sales-agg | 销售事实落库 + 销售报表 + 门店对比 | sales_daily, reports | cube-router |
+| 15 | **sales-insight** | supertrade-sales-insight | AI 销售日报 / 周报 / 月报 | reports | sales-agg, 外部 LLM |
+| 16 | **notification-gateway** | supertrade-notification-gateway | WebSocket 推送网关 | — | pubsub |
+
+**不经公网**(Dapr job / 内部调用):`cube-sync`(档案同步)、`cube-async`(异步 cube 作业)。
+
+**占位 cmd**(未实现,不要往里加业务):`bi-gateway`、`erp-connector`、`fresh-produce`。
+
+> **身份/权限不归本系统**:`auth` 项目的 userd 提供 JWT 签发 + 用户/角色/权限 CRUD;
+> 本系统每个 dapr app 通过 `authkit` 中间件鉴权。**不写 iam 服务**。
+
 
 ```
                       ┌──────────────────────────────────────────┐
@@ -60,28 +90,6 @@
 身份/权限:外部 YunBright/auth 项目的 userd(JWT 签发) + authkit 公开包(claims + rbac + userinfo)
 ```
 
-| # | dapr app-id | 职责 | 主要数据 | 关键依赖 |
-|---|---|---|---|---|
-| 1 | **pos-gateway** | BFF,前端对接,聚合调用 | 路由 | Dapr invoke |
-| 2 | **catalog** | **本地 suppliers/products 表(带 branch_id)+ cube 兜底**(REQUIREMENTS §7.5) | suppliers, products(本地) | cube-gateway(兜底), userd(scope) |
-| 3 | **inventory** | **代理 cube `stock` 读取,本系统不维护库存**(REQUIREMENTS §7.5) | — | cube-gateway(经 cube-router) |
-| 4 | **procurement** | 采购订单、收货、退货、账期(本系统自营) | purchase_orders, grns | cube-gateway(查 SKU/供应商) |
-| 5 | **pos** | 销售开单、收款、改价、退货、班次(本系统自营) | sales_orders, sale_lines, payments | cube-gateway(查 SKU) |
-| 6 | **pricing** | 售价/促销/会员/改价审批(本系统自营) | price_lists, promotions | cube-gateway |
-| 7 | **fresh-produce** ⭐ | 蔬果盘点驱动毛利(REQUIREMENTS §3) | produce_stocktake, waste_logs | cube-gateway, stocktake |
-| 8 | **fresh-meat** ⭐ | 生肉整猪 + LLM 分割(REQUIREMENTS §4) | whole_pig, pig_cuts, pork_cuts_stocktake | (外部 LLM 网关), cube-gateway |
-| 9 | **stocktake** ⭐ | **盘点表 + 盘点明细 CURD + 差异表生成**(REQUIREMENTS §2.1,本期重点) | stocktake_headers, stocktake_lines | cube-gateway |
-| 10 | **erp-connector** | 拉 cube /v1/load(REQUIREMENTS §5) | erp_sales_raw, sync_logs | cube-gateway |
-| 11 | **sales-agg** | 聚合 POS + erp-connector,供 BI / 跨服务拉 | sales_view | pos pub/sub, erp-connector |
-| 12 | **master-data** | 门店/员工/班次(**供应商/客户走 catalog 本地表**) | stores, employees | cube-gateway |
-| 13 | **bi-gateway** | BI 出口,调 cube-gateway + 本系统聚合 | — | cube-gateway |
-| 14 | **cube-router** ⭐ | **按 X-Branch-ID 路由 POST /v1/load 到正确 cube 实例(sixun-hbposv7 / sixun-ysx)** | branch_cube_sources | dapr invoke → cube 实例, userd(scope) |
-
-> 2026-09-29 移除占位 cmd `llm-gw`(LLM 网关)和 `notification`(企微/钉钉),由外部服务承担 — 详见 §13。`notification-gateway`(WebSocket 推送网关)保留为 #5。
-
-> **身份/权限不归本系统**:`auth` 项目的 userd 提供 JWT 签发 + 用户/角色/权限 CRUD;
-> 本系统每个 dapr app 通过 `authkit` 中间件鉴权。**不写 iam 服务**。
-
 ### 1.1 本期数据归属速查(REQUIREMENTS §7.5)
 
 | 数据 | 归属 | 服务 |
@@ -110,7 +118,7 @@ dapr init
 dapr run --app-id catalog --app-port 8080 -- go run ./cmd/catalog
 ```
 
-> 详见 `docs/RUNBOOK.md` 中的"本地启动顺序"小节(后续补;无 make 文件)。
+> 详见 `README.md` §3(无 make 文件)。
 
 ### 2.2 Dapr 组件(每 dapr app 共享 `~/.dapr/components/`)
 
@@ -606,83 +614,41 @@ fresh-meat 服务
 ## §8 仓库结构
 
 ```
-F:\go\src\github.com\YunBright\supertrade\
-├── cmd/                       # 每个 dapr app 一个 cmd 子目录
-│   ├── pos-gateway/           # BFF
-│   ├── catalog/
-│   ├── inventory/
-│   ├── procurement/
-│   ├── pos/
-│   ├── pricing/
-│   ├── fresh-produce/
-│   ├── fresh-meat/
-│   ├── stocktake/
-│   ├── erp-connector/
-│   ├── sales-agg/
-│   ├── master-data/
-│   └── bi-gateway/
+supertrade/
+├── cmd/                       # 每个 dapr app 一个 cmd 子目录(22 个:16 公网 + 2 job + 3 占位 + seed CLI)
 ├── internal/                  # 每个 cmd 同名子目录
-│   ├── catalog/
-│   │   ├── handler/  service/  repo/  model/  dto/
-│   │   └── *_test.go          # Go 测试
+│   ├── <svc>/
+│   │   ├── handler/           # RegisterRoutes + HTTP 边界(鉴权 / branch / 参数校验)
+│   │   ├── service/           # 业务规则
+│   │   ├── model/             # GORM 模型
+│   │   └── *_test.go          # Go 测试(分模块)
 │   └── ...
-├── pkg/                       # 共享库(本项目用)
-│   ├── daprclient/            # 包装 dapr service invocation / pubsub
-│   ├── eventbus/              # 事件 schema + 编解码
-│   ├── workspace/             # 分店隔离 helper(临时,后续推 authkit)
-│   ├── money/  decimal/  time/ # 通用基础
-├── migrations/                # 每个服务一个 schema 目录
-│   ├── catalog/        .../001_init.up.sql
-│   ├── inventory/      ...
-│   └── ...
-├── docs/
-│   ├── REQUIREMENTS.md        # 需求契约
-│   ├── DESIGN.md              # 本文件
-│   ├── FIELD_SPEC.md          # 字段映射契约
-│   ├── EVENT-CATALOG.md       # 事件 payload schema(后续补)
-│   └── RUNBOOK.md             # 本地启动 / 调试手册(后续补)
+├── pkg/                       # 本仓共享包
+│   ├── cmdbootstrap/          # 启动骨架:装配顺序 / 验签 / 鉴权 / 访问日志 / 优雅退出
+│   ├── eventbus/              # pub/sub 组件名(全仓唯一真相)
+│   ├── middleware/            # X-Branch-ID 中间件
+│   └── outbox/                # 发件箱(事件与业务行同事务落库)
+├── docs/                      # 规格与契约(清单见 README §6)
+├── dapr/components/           # Dapr 组件定义(pubsub / conversation)
+├── .claude/rules/             # 开发规约
 ├── go.mod
 ├── go.sum
 └── README.md
 ```
 
-> **不写**:`Makefile`、`Dockerfile`、`docker-compose.yml`、`scripts/*.ps1`、`scripts/*.py`
+> **不写**:`Makefile`、`Dockerfile`、`docker-compose.yml`、`scripts/*.ps1`、`scripts/*.py`、
+> 独立 SQL migration 文件(DB 迁移走 GORM AutoMigrate,服务启动自带)。
 
 ---
 
 ## §9 测试约定
 
-- **单元测试 / 集成测试** 全部 Go `*_test.go`,运行 `go test ./...`
-- 关键路径必须有表驱动测试 + mock(外部依赖 mock 掉,真实 dapr / cube-gateway 走 e2e test)
-- **不写** powershell / python / shell 测试脚本
-- **不写** 启动脚本(README 写命令 + dapr run 直接敲)
-
----
-
-## §10 开发顺序(3 周 Phase 0 → MVP)
-
-**Week 1:骨架 + POS 闭环**
-- dapr init + Go module + 15 个 cmd 骨架占位(每个 `main.go` 起 + `/healthz`)
-- **本期不做 SKU / 库存 / 供应商的本地 CURD** —— catalog / inventory / master-data 服务
-  只暴露 cube 转发接口(`GET /products` / `GET /stock` / `GET /suppliers`)
-- 业务 service:stocktake(本期重点,盘点表 + 差异表)/ pos / procurement / pricing
-- 能跑通"盘点表创建 → 录入实盘 → 生成差异表"(mock cube 数据)
-
-**Week 2:生鲜 + 盘点打通**
-- fresh-produce(蔬果毛利)/ fresh-meat(整猪 + LLM)
-- EVENT-CATALOG §12 的 Step 1-3(`pkg/events` + `pkg/daprpubsub` + cmdbootstrap 扩展)
-- stocktake 端到端跑通:从 cube 拉 SKU → 录入实盘 → diff_report → approved
-
-**Week 3:事件落地 + BI**
-- EVENT-CATALOG §12 Step 4(pos publish sale.completed → inventory subscribe 扣库)
-- erp-connector + sales-agg + bi-gateway
-- 整猪 → 外部 LLM 分割建议 → 日终盘点的端到端 demo(LLM 网关外部)
-
-> **约束**(USER 已确认):
-> - 步骤 1(跑单 dapr app)✅ 已验证
-> - 步骤 2(进真表业务 handler)❌ 暂不做,继续走 mock 数据
-> - 步骤 3(推 authkit tag)⏸ 等整个服务网格测试后再做
-> - 步骤 4(EVENT-CATALOG 代码落地)📝 §12 已给出具体落地方案,等业务 handler 就绪后再实施
+- **单元测试 / 集成测试** 全部 Go `*_test.go`,运行 `go test ./...`;**按模块分文件夹**。
+- 关键路径要有表驱动测试 + fake 依赖(cube 用 `internal/cubeclient/cubeclientfake`)。
+- **不写** powershell / python / shell 测试脚本。
+- **不写** 启动脚本(README 写命令 + dapr run 直接敲)。
+- **契约 / e2e 测试不进本仓** —— 走公网 nginx 入口的 contract case 在 `../deployer/tests/contract/`。
+- **不写** httptest 模拟 dapr sidecar —— SDK 走 gRPC over `:50001`,用 fake dapr.Client。
 
 ---
 
@@ -691,201 +657,13 @@ F:\go\src\github.com\YunBright\supertrade\
 | 风险 | 对策 |
 |---|---|
 | 蔬果盘点周期不一,毛利节点难对齐 | profit_periods 表按"上次盘点 → 本次盘点"切片,与周期配置解耦 |
-| LLM 慢 / 费用(外部 LLM 网关) | 异步触发 + 失败降级到历史均值(由外部 LLM 网关自维护缓存) |
-| Cube 拉数慢 / 漏数 | erp-connector 多拉 1h lookback + 哈希幂等 + 缺失告警;**catalog / inventory / stocktake 等转发服务加短期 cache** 兜底(本期不实现,后续 Phase) |
-| Cube 不可达 | stocktake 创建表时降级:book_qty 留空,前端手填,后续 cube 恢复后回填(本期不实现,记 issue) |
+| LLM 慢 / 费用(外部 LLM 网关) | 异步触发 + 失败降级到历史均值;**事实录入立即返回,派生数据异步生成** |
+| Cube 拉数慢 / 漏数 | cube-sync 增量同步(水位线 + since 透传)+ 哈希幂等 + 缺失告警 |
+| Cube 不可达 | 转发端点返 503 / 降级路径显式标注 `data_source`,不静默回落本地 |
 | 微服务多,本地起不来 | `dapr run --app-id <app>` 单跑任一服务,不影响其它 |
 | 库存销售一致性 | **最终一致**:outbox pattern,关键路径本地事务 + 异步事件 |
-| 分店隔离漏写 | handler 层强制走 `rbac.RequireBranch(...)`(authkit 已合并)+ PR review 把关 |
-| 跨服务调用 cube 性能 | `pkg/cubeclient` 内部加 batch + redis 短期缓存(本期不实现) |
-
----
-
-## §12 EVENT-CATALOG 落地说明(对 §4 第 4 点)
-
-> `docs/EVENT-CATALOG.md` 已经定义 11 个 topic 的 schema,代码侧需要 4 步把契约接上。
-> 本节是后续 Phase 的具体落地路径,**本期不做**(USER 已确认 1/2/3 已验证 / 不做 / 推 tag 后再做,
-> 第 4 点是要说明落地方案)。
-
-### 12.1 总体架构
-
-```
-publisher (e.g. pos)
-   │
-   │  dapr client.PublishEvent("pubsub", "sale.completed", envelope)
-   ▼
-dapr sidecar of pos
-   │
-   │  redis pub/sub (or kafka)
-   ▼
-dapr sidecar of subscriber (e.g. inventory)
-   │
-   │  POST http://inventory:8080/events/sale-completed  (CloudEvents envelope)
-   ▼
-inventory service handler
-   │
-   ▼
-eventsaleCompletedHandler(env data) → 业务逻辑
-```
-
-### 12.2 落地步骤(4 步)
-
-#### Step 1:`pkg/events` 包 —— envelope 编解码
-
-**目的**:统一所有 topic 的 publish / parse / validate。
-
-```go
-// pkg/events/envelope.go
-package events
-
-// Envelope is the CloudEvents 1.0 wrapper used for all dapr pub/sub events.
-// 见 docs/EVENT-CATALOG.md §0.1
-type Envelope struct {
-    SpecVersion     string          `json:"specversion"`
-    Type            string          `json:"type"`           // e.g. "com.yunbright.supertrade.sale.completed"
-    Source          string          `json:"source"`         // e.g. "pos/SO20260917001"
-    ID              string          `json:"id"`             // UUID,幂等
-    Time            string          `json:"time"`           // RFC3339 UTC
-    DataContentType string          `json:"datacontenttype"` // "application/json"
-    Subject         string          `json:"subject,omitempty"`
-    Data            json.RawMessage `json:"data"`           // topic-specific payload
-}
-
-// TypePrefix 统一前缀,降低 topic 名拼写错概率。
-const TypePrefix = "com.yunbright.supertrade."
-
-// MustMarshal envelope to JSON bytes.
-func (e Envelope) MustMarshal() []byte
-
-// Parse envelope from request body.
-//   - 校验 SpecVersion == "1.0"
-//   - 校验 Type 必填
-//   - 校验 ID 必填
-func Parse(r *http.Request) (Envelope, error)
-
-// ParseData 反序列化 data 到具体 topic 的 payload。
-//   payload 必须是非 nil 指针,反序列化失败返回 error。
-func ParseData[T any](e Envelope) (T, error)
-```
-
-#### Step 2:`pkg/daprpubsub` 包 —— dapr 客户端 + 重试 + DLQ
-
-**目的**:封装 dapr publish,失败重试,死信入 `<topic>.dlq`。
-
-```go
-// pkg/daprpubsub/publisher.go
-package daprpubsub
-
-type Publisher struct {
-    daprClient client.Client   // dapr go-sdk client
-    pubsub     string          // pubsub name, e.g. "pubsub"
-    appID      string          // 当前 app-id,用作 source 前缀
-}
-
-func NewPublisher(c client.Client, pubsub, appID string) *Publisher
-
-// Publish 序列化 envelope + 调 dapr.PublishEvent + 写 dlq。
-//   - envelope.Type 必填
-//   - envelope.ID 必填(无则生成)
-//   - 失败自动重试 3 次(指数退避)
-//   - 3 次失败后写 <topic>.dlq 并返回 error
-func (p *Publisher) Publish(ctx context.Context, topic string, data any, opts ...PublishOption) error
-
-type PublishOption func(*publishOpts)
-func WithSubject(s string) PublishOption
-func WithMetadata(k, v string) PublishOption
-```
-
-#### Step 3:`cmdbootstrap` 扩展 —— `/dapr/subscribe` 自动注册
-
-**目的**:每个 cmd 在 Options 里声明订阅列表,启动时自动暴露 `/dapr/subscribe` + 注册 topic handler。
-
-```go
-// pkg/cmdbootstrap/bootstrap.go(扩展)
-type Options struct {
-    AppID         string
-    // ... 已有字段
-    Subscriptions []Subscription   // 新增
-}
-
-type Subscription struct {
-    Topic   string                       // e.g. "sale.completed"
-    Route   string                       // e.g. "/events/sale-completed"
-    Handler func(c *gin.Context, env events.Envelope) // 业务 handler
-}
-
-// Run() 内部:
-//   r.GET("/dapr/subscribe", func(c) {
-//       c.JSON(200, []map[string]string{
-//           {"pubsubname": "pubsub", "topic": s.Topic, "route": s.Route} for s in opts.Subscriptions,
-//       })
-//   })
-//   for s in opts.Subscriptions:
-//       r.POST(s.Route, wrapHandler(s.Handler))
-```
-
-#### Step 4:每个 cmd 落地具体订阅
-
-**例**:cmd/inventory 订阅 `sale.completed`,cmd/fresh-meat 订阅 `pig.arrived`。
-
-```go
-// cmd/inventory/main.go
-func main() {
-    cmdbootstrap.Run(cmdbootstrap.Options{
-        AppID: "inventory",
-        Subscriptions: []cmdbootstrap.Subscription{
-            {
-                Topic: "sale.completed",
-                Route: "/events/sale-completed",
-                Handler: handler.OnSaleCompleted,
-            },
-        },
-    })
-}
-
-// internal/inventory/events/sale_completed.go
-func OnSaleCompleted(c *gin.Context, env events.Envelope) {
-    var data saledto.SaleCompleted
-    payload, err := events.ParseData[saledto.SaleCompleted](env)
-    if err != nil { c.AbortWithStatus(400); return }
-
-    // 幂等:按 envelope.ID 去重
-    if idempotency.AlreadyProcessed(env.ID) { c.Status(200); return }
-
-    // 业务:扣减 inventory
-    for _, line := range payload.Lines {
-        inventory.Deduct(line.SKU, line.Qty, "sale", payload.SaleID)
-    }
-    c.JSON(200, gin.H{"ok": true})
-}
-```
-
-### 12.3 落地顺序
-
-| 步骤 | 输出物 | 测试 | 阻塞依赖 |
-|---|---|---|---|
-| Step 1 | `pkg/events/envelope.go` | `pkg/events/envelope_test.go`:Parse / MustMarshal round-trip | 无 |
-| Step 2 | `pkg/daprpubsub/publisher.go` | `pkg/daprpubsub/publisher_test.go`:mock dapr server,验证 retry + DLQ | dapr go-sdk(`github.com/dapr/go-sdk/client`) |
-| Step 3 | `pkg/cmdbootstrap` 扩展 | `pkg/cmdbootstrap/subscription_test.go`:验证 `/dapr/subscribe` 返回正确 JSON | Step 1 |
-| Step 4 | 各 cmd 的具体订阅 | 单 cmd 端到端:publisher 跑 pub,subscriber 跑收,断言业务效果 | Step 1/2/3 全 |
-
-### 12.4 测试策略
-
-- **单元测试**:用 `httptest.NewServer` 模拟 dapr sidecar,验证 envelope 序列化、handler 注册。
-- **端到端**:本地 `dapr run` 起 2 个 app,一个 publish 一个 subscribe,验证事件流转。
-- **DLQ 测试**:mock 一个始终返回 5xx 的 sidecar,验证 3 次重试后写 `<topic>.dlq`。
-
-### 12.5 与现有契约的一致性
-
-- **`docs/EVENT-CATALOG.md` §1 topic 索引**:每个 topic 对应一个 Subscription 结构。
-- **`docs/EVENT-CATALOG.md` §2 payload schema**:每个 topic 对应一个 dto struct(在 `pkg/events/dto/<topic>.go`)。
-- **`pkg/events/TypePrefix` 拼接规则**:`<topic>` ↔ `com.yunbright.supertrade.<topic>` 需在 `events.go` 集中映射,避免散落。
-
-### 12.6 为什么不现在做
-
-- USER 已确认:步骤 1(跑单 app)/ 2(进真表)/ 3(推 authkit tag)都不做,4 要详细说明。
-- 当前 cmdbootstrap + 15 个 cmd 骨架已就绪,真实事件流需要在至少 2 个 cmd 有业务 handler 后才有意义。
-- **进入条件**:至少 `cmd/inventory` 与 `cmd/pos` 的业务 handler 落地后,Step 1-4 即可一次性串起来。
+| 分店隔离漏写 | handler 层强制走 `rbac.RequireBranch(...)` / `RequireScopeWithBranch(...)` + PR review 把关 |
+| 跨服务调用 cube 性能 | `internal/cubeclient` 内做 batch + 按基准日过滤时效 scope |
 
 ---
 
@@ -901,3 +679,4 @@ func OnSaleCompleted(c *gin.Context, env events.Envelope) {
 | 2026-09-17 | Mavis | 修订 5:stocktake 实时盘点(营业中、非锁库)+ §4.5.3 按需拉快照 + 盘点单不跨店 |
 | 2026-09-17 | Mavis | 修订 6:`/api/v1/products/search` 端点 + 权限过滤 + barcode 长度策略(对齐 scan.html 后端) |
 | 2026-09-29 | Tinkler | 修订 7:删除占位 cmd `llm-gw`(LLM 网关)和 `notification`(企微/钉钉);§1 微服务从 16 缩到 14;LLM 网关改为外部服务,fresh-meat 通过 `pig.arrived` / `pork.cuts.stocktaken` 事件交接;`pig.analysis.completed` topic 由外部网关负责(详见 EVENT-CATALOG §2.9);同步 .goreleaser.yaml / deploy-supertrade.ps1 / .claude/rules/00-app-catalog.md / README.md |
+| 2026-10-27 | Mavis | 修订 8:§1 app 表刷新为当前 16 个公网 app + 2 个 job app;§8 仓库结构对齐现状;§9 测试约定改为"契约 / e2e 在 deployer 仓";删 §10(已完成的 Sprint 计划)与 §12(未按此实现的事件落地方案) |

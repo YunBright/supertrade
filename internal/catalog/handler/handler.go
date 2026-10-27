@@ -22,20 +22,6 @@
 //	PUT    /categories/:id                        改分类(product:manage)
 //	DELETE /categories/:id                        软删分类(product:manage)
 //
-// # ⚠️ 旧的 /products/local、/categories/local 已删除(2026-10-22)
-//
-// 名字里的 "local" 承诺"只读本域 PG",而全域判据是**配没配数据源**
-// (internal/cubesource:配了 ⇒ 走 cube,没配 ⇒ 走本域 PG)
-// ⇒ 名字与语义两套话:门店 00(配了源)在这两个端点上拿到的是**本域旧数据**,
-// 而同一批数据的 picker 端点给的是外部系统的现值
-// ⇒ "同一个门店,两个端点两个答案",现场无从判断哪个对。
-//
-// ⇒ 承接方式(不留后门):
-//
-//	商品列表/搜索 → GET /products、/products/search(picker,已按数据源分流)
-//	分类字典      → GET /categories(picker,已按数据源分流)
-//	离线商品库    → GET /products/export(POS 在用,已按数据源分流)
-//
 // 中间件:
 //   - middleware.XBranchID() 全局挂(由 cmd/catalog/main.go::registerRoutes)
 //   - 业务端点全部走 rbac.RequireScopeWithBranch(userd per-branch)
@@ -110,8 +96,7 @@ func New(suppliers *service.SupplierService, products *service.ProductService,
 // SetSourceResolver 装配数据源解析器(「这个门店配了哪个数据源」)。
 //
 // ⚠️ 生产**必须**装配(cmd/catalog/main.go 里装 cubesource.CachedResolver):
-// 没装 ⇒ picker 的读端点一律走 cube ⇒ 自营店(门店 10)又变回
-// 2026-10-21 那个症状(cube 404,而本地明明有 27565 个商品)。
+// 没装 ⇒ picker 的读端点一律走 cube ⇒ 自营店(门店 10)拿到 404(本地明明有商品)。
 func (h *Handler) SetSourceResolver(r service.SourceResolver) {
 	h.catalog.SetSourceResolver(r)
 	h.archive.SetSourceResolver(r)
@@ -196,11 +181,8 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 
 	// 本地商品档案的写侧 + 本地列表。
 	//
-	// ⚠️ `product:manage` 这个 scope **在 auth 的 seed 里还不存在**
-	// (现有的是 product:view / supplier:manage / inventory:* 等)。
-	// ⇒ 这些端点在 auth 补上 seed 之前会对所有人返 403(fail-closed)。
-	// 这是**已知状态**:auth 的 scope seed 属于 Phase 0(见
-	// docs/ARCHITECTURE.md §7)。
+	// ⚠️ `product:manage` 在 auth 的 seed 里还不存在 ⇒ 这些端点目前对所有人 403
+	// (fail-closed)。这是**有意的**:权限点没 seed 就放行 = 任何登录用户都能改商品。
 	//
 	// ⚠️ 写侧挂 **requireLocalSource**:该门店的商品档案来自外部系统
 	// (富百家 / 佳乐)⇒ 本域只读,不写(见 source.go 的注释)。
@@ -272,10 +254,6 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	// 分类是"商品档案"域的一部分,少一组 scope 少一轮 auth 改动。
 	// `GET /categories`(cube/本域,由数据源决定)由 RegisterProductPickerRoutes
 	// 注册,不冲突。
-	//
-	// ⚠️ 旧的 `GET /categories/local`(只读本地表)已删除(2026-10-22):
-	// 它对"配了数据源的门店"给的是本域旧分类,而 picker 给的是外部系统的现值
-	// ⇒ 同一个门店两个答案。分类字典统一走 `GET /categories`。
 	//
 	// ⚠️ 写侧挂 **requireLocalSource**:分类同属商品档案域 ⇒ 同一条只读闸门。
 	r.GET("/categories/:id",

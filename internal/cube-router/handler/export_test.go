@@ -158,7 +158,7 @@ func (f *stockCapturingClient) InvokeMethodWithContent(
 //
 // TestExportValue_DecodesBase64Numeric —— MSSQL live 源的 decimal 是 **base64**。
 //
-// # 症状（2026-10-21 生产实测）
+// # 症状
 //
 // 库存快照导出来的每一行都是：
 //

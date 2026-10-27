@@ -1,23 +1,13 @@
-// 访问日志的**契约守卫**(与 accesslog_test.go 配对:那边锁字段形状,这边锁"哪些该打/哪些不该打")。
+// 访问日志 / 业务错误日志 / panic 兜底的**行为守卫**。
 //
-// # 为什么要有这个文件
+// 与 accesslog_test.go(内部包)配对:那边锁字段形状与跳过集合,这边锁**在真实装配下**
+// 的策略——状态码到日志级别的映射、c.Error 的业务错误行、panic 兜底的敏感信息与状态码。
 //
-// POS 联调时出现过:客户端报"未找到商品",而**后端日志里一条请求记录都没有**。
-// 根因是 cmdbootstrap 没装访问日志中间件 ⇒ 排障时看不到
-// "这个请求到底有没有到服务、走的哪个路径、什么状态码"。
+// ⚠️ 本仓不写契约 / e2e 测试:走公网 nginx 入口的 contract case 在 ../deployer 仓
+// (tests/contract/)。本文件是**进程内单元测试**,不启 sidecar、不连外部依赖。
 //
-// # 本文件锁的是什么
-//
-//   - 业务请求 ⇒ **恰好一条**访问日志,字段齐全;
-//   - /healthz 与 dapr 内部端点 ⇒ **一条都不打**(轮询/重注册会刷屏);
-//   - query string 被去掉、Authorization / Cookie 一个字都不进日志;
-//   - 5xx 记 Error、4xx(含 401)记 Info;
-//   - panic 被兜住 ⇒ 状态码是 500,日志里没有令牌。
-//
-// ⚠️ 捕获日志的方式:`slog.New(slog.NewJSONHandler(buf, ...))` **注入**
-//
-//	(Options.Logger),**不用 slog.SetDefault** —— 那是全局污染,
-//	会影响别的测试(并行跑时更玄学)。
+// ⚠️ 用外部测试包(package cmdbootstrap_test)而不是内部包:这里要按**调用方视角**
+// 驱动 NewRouter + MountBusiness 的真实装配,而不是直接挂未导出的中间件。
 package cmdbootstrap_test
 
 import (
@@ -36,12 +26,9 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// accessLogMsg 是访问日志的固定 message(与 cmdbootstrap 内部常量一致)。
 const accessLogMsg = "http access"
 
 // logBuffer 是并发安全的日志缓冲。
-//
-// slog 可能在别的 goroutine 写(本组用例都是同步请求,但别赌)。
 type logBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -59,10 +46,8 @@ func (b *logBuffer) String() string {
 	return b.buf.String()
 }
 
-// contractRecord 是日志行(JSON)的解析结果。
-//
-// slog 的 JSONHandler 每行一个 JSON 对象,字段名就是 attrs 的键。
-type contractRecord struct {
+// logRecord 是日志行(JSON)的解析结果。
+type logRecord struct {
 	Level      string `json:"level"`
 	Msg        string `json:"msg"`
 	Method     string `json:"method"`
@@ -77,16 +62,16 @@ type contractRecord struct {
 	Message    string `json:"message"`
 }
 
-// contractRecords 把日志缓冲解析成记录行。
-func contractRecords(t *testing.T, buf *logBuffer) []contractRecord {
+// logRecords 把日志缓冲解析成记录行。
+func logRecords(t *testing.T, buf *logBuffer) []logRecord {
 	t.Helper()
-	var out []contractRecord
+	var out []logRecord
 	for _, line := range strings.Split(buf.String(), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		var rec contractRecord
+		var rec logRecord
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
 			t.Fatalf("日志行不是 JSON: %v (line=%s)", err, line)
 		}
@@ -95,11 +80,11 @@ func contractRecords(t *testing.T, buf *logBuffer) []contractRecord {
 	return out
 }
 
-// contractAccessRecords 只挑访问日志行。
-func contractAccessRecords(t *testing.T, buf *logBuffer) []contractRecord {
+// accessRecords 只挑访问日志行。
+func accessRecords(t *testing.T, buf *logBuffer) []logRecord {
 	t.Helper()
-	var out []contractRecord
-	for _, rec := range contractRecords(t, buf) {
+	var out []logRecord
+	for _, rec := range logRecords(t, buf) {
 		if rec.Msg == accessLogMsg {
 			out = append(out, rec)
 		}
@@ -107,16 +92,14 @@ func contractAccessRecords(t *testing.T, buf *logBuffer) []contractRecord {
 	return out
 }
 
-// newContractEngine 搭一个带日志注入的 engine。
+// newPolicyEngine 搭一个带日志注入的 engine。
 //
-// ⚠️ 走**真实的 NewRouter + MountBusiness**(与 dapr_routes_test.go 同款):
-//
-//	自己重排中间件顺序的话,断言的就不是真机的装配结果了。
+// ⚠️ 走**真实的 NewRouter + MountBusiness**:自己重排中间件顺序的话,
+// 断言的就不是真机的装配结果了。
 //
 // ⚠️ AllowUnverified:本组用例断言的是**日志形状**,不需要真实验签器;
-//
-//	显式声明跳过,而不是靠"没装配就 fallback"蒙混过去。
-func newContractEngine(t *testing.T, buf *logBuffer,
+// 显式声明跳过,而不是靠"没装配就 fallback"蒙混过去。
+func newPolicyEngine(t *testing.T, buf *logBuffer,
 	register func(r *gin.Engine), registerDapr func(r *gin.Engine)) *gin.Engine {
 	t.Helper()
 	opts := cmdbootstrap.Options{
@@ -133,10 +116,10 @@ func newContractEngine(t *testing.T, buf *logBuffer,
 	return r
 }
 
-// contractFakeJWT 造一个"只解 payload 不验签"的 token(claims.GinMiddleware 能解析)。
+// fakeJWT 造一个"只解 payload 不验签"的 token(claims.GinMiddleware 能解析)。
 //
 // payload 形如 {"sub":"user-1","aud":["pos"]}。
-func contractFakeJWT(sub string, aud []string) string {
+func fakeJWT(sub string, aud []string) string {
 	enc := base64.RawURLEncoding
 	header := enc.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
 	payload, err := json.Marshal(map[string]any{"sub": sub, "aud": aud})
@@ -146,20 +129,20 @@ func contractFakeJWT(sub string, aud []string) string {
 	return header + "." + enc.EncodeToString(payload) + ".sig"
 }
 
-// TestContractAccessLog_BusinessRequestHasFullFields 锁"业务请求 ⇒ 恰好一条访问日志,字段齐全"。
+// TestPolicyAccessLog_FieldsComeFromClaims 锁"业务请求 ⇒ 恰好一条访问日志,字段齐全"。
 //
-// 这条是整个需求的正面用例:运维要能靠这一行看出
-// "谁(哪个用户/门店)调了哪个路径、什么状态码、花了多久"。
-func TestContractAccessLog_BusinessRequestHasFullFields(t *testing.T) {
+// ⚠️ sub 必须取自 claims.sub(不是自己解析 token):解析 token 意味着日志路径上
+// 多一份"读 secret"的逻辑。branch 取 header 原值。
+func TestPolicyAccessLog_FieldsComeFromClaims(t *testing.T) {
 	buf := &logBuffer{}
-	r := newContractEngine(t, buf, func(r *gin.Engine) {
+	r := newPolicyEngine(t, buf, func(r *gin.Engine) {
 		r.GET("/sales", func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"ok": true})
 		})
 	}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/sales", nil)
-	req.Header.Set("Authorization", "Bearer "+contractFakeJWT("user-1", []string{"pos"}))
+	req.Header.Set("Authorization", "Bearer "+fakeJWT("user-1", []string{"pos"}))
 	req.Header.Set("X-Branch-ID", "branch-9")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -168,7 +151,7 @@ func TestContractAccessLog_BusinessRequestHasFullFields(t *testing.T) {
 		t.Fatalf("/sales 应 200, got %d body=%s", w.Code, w.Body.String())
 	}
 
-	recs := contractAccessRecords(t, buf)
+	recs := accessRecords(t, buf)
 	if len(recs) != 1 {
 		t.Fatalf("应有且仅有 1 条访问日志,实际 %d 条:\n%s", len(recs), buf.String())
 	}
@@ -203,84 +186,27 @@ func TestContractAccessLog_BusinessRequestHasFullFields(t *testing.T) {
 	}
 }
 
-// TestContractAccessLog_HealthzIsNotLogged 锁"/healthz 不打日志"。
+// TestPolicyAccessLog_SecretsNeverLogged 锁"query string 与令牌都不进日志"。
 //
-// 健康轮询每 3 秒一次 ⇒ 打进去就是刷屏,真正的业务请求会被埋掉。
-func TestContractAccessLog_HealthzIsNotLogged(t *testing.T) {
+// ⚠️ query 里可能有 token / 口令;Authorization / Cookie 更不能打 ——
+// 访问日志经常被整份贴进工单或群聊。
+func TestPolicyAccessLog_SecretsNeverLogged(t *testing.T) {
 	buf := &logBuffer{}
-	r := newContractEngine(t, buf, nil, nil)
-
-	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("/healthz 应 200, got %d", w.Code)
-	}
-	if recs := contractAccessRecords(t, buf); len(recs) != 0 {
-		t.Fatalf("/healthz 不应打访问日志,实际 %d 条:\n%s", len(recs), buf.String())
-	}
-}
-
-// TestContractAccessLog_DaprInternalRoutesAreNotLogged 锁"dapr 内部端点不打日志"。
-//
-// /dapr/subscribe 由 sidecar 拉(还会每 10 分钟重注册 job),
-// /events/<topic> 由 sidecar 推 —— 都是机器流量,打进去只是噪音。
-func TestContractAccessLog_DaprInternalRoutesAreNotLogged(t *testing.T) {
-	buf := &logBuffer{}
-	r := newContractEngine(t, buf, nil, func(r *gin.Engine) {
-		r.GET("/dapr/subscribe", func(c *gin.Context) {
-			c.JSON(http.StatusOK, []map[string]string{})
-		})
-		r.POST("/events/stocktake.line.added", func(c *gin.Context) {
-			c.Status(http.StatusOK)
-		})
-	})
-
-	for _, tc := range []struct {
-		method string
-		path   string
-	}{
-		{http.MethodGet, "/dapr/subscribe"},
-		{http.MethodPost, "/events/stocktake.line.added"},
-	} {
-		req := httptest.NewRequest(tc.method, tc.path, nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("%s 应 200, got %d", tc.path, w.Code)
-		}
-	}
-
-	if recs := contractAccessRecords(t, buf); len(recs) != 0 {
-		t.Fatalf("dapr 内部端点不应打访问日志,实际 %d 条:\n%s", len(recs), buf.String())
-	}
-}
-
-// TestContractAccessLog_StripsQueryStringAndHidesSecrets 锁"query string 与令牌都不进日志"。
-//
-// ⚠️ query 里可能有 token / 口令;Authorization / Cookie 更不能打。
-func TestContractAccessLog_StripsQueryStringAndHidesSecrets(t *testing.T) {
-	buf := &logBuffer{}
-	r := newContractEngine(t, buf, func(r *gin.Engine) {
+	r := newPolicyEngine(t, buf, func(r *gin.Engine) {
 		r.GET("/sales", func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"ok": true})
 		})
 	}, nil)
 
 	const queryToken = "query-secret-token"
-	jwt := contractFakeJWT("user-1", []string{"pos"})
+	jwt := fakeJWT("user-1", []string{"pos"})
 	req := httptest.NewRequest(http.MethodGet, "/sales?token="+queryToken, nil)
 	req.Header.Set("Authorization", "Bearer "+jwt)
 	req.Header.Set("Cookie", "session=cookie-secret")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("/sales 应 200, got %d", w.Code)
-	}
-
-	recs := contractAccessRecords(t, buf)
+	recs := accessRecords(t, buf)
 	if len(recs) != 1 {
 		t.Fatalf("应有且仅有 1 条访问日志,实际 %d 条:\n%s", len(recs), buf.String())
 	}
@@ -299,14 +225,14 @@ func TestContractAccessLog_StripsQueryStringAndHidesSecrets(t *testing.T) {
 	}
 }
 
-// TestContractAccessLog_UnauthorizedIsLoggedAtInfo 锁"401 也有日志,且级别是 Info"。
+// TestPolicyAccessLog_UnauthorizedLoggedAtInfo 锁"401 也有日志,且级别是 Info"。
 //
 // ⚠️ 401 必须在日志里:被鉴权挡掉的请求恰恰是排障时最想看的那批
 // ("客户端说没收到数据、后端说没收到请求")。
 // ⚠️ 但级别是 Info:越权探测会刷屏,升 Warn/Error 就是噪音。
-func TestContractAccessLog_UnauthorizedIsLoggedAtInfo(t *testing.T) {
+func TestPolicyAccessLog_UnauthorizedLoggedAtInfo(t *testing.T) {
 	buf := &logBuffer{}
-	r := newContractEngine(t, buf, func(r *gin.Engine) {
+	r := newPolicyEngine(t, buf, func(r *gin.Engine) {
 		r.GET("/sales", func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{"ok": true})
 		})
@@ -320,7 +246,7 @@ func TestContractAccessLog_UnauthorizedIsLoggedAtInfo(t *testing.T) {
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("无 token 应 401, got %d body=%s", w.Code, w.Body.String())
 	}
-	recs := contractAccessRecords(t, buf)
+	recs := accessRecords(t, buf)
 	if len(recs) != 1 {
 		t.Fatalf("应有且仅有 1 条访问日志,实际 %d 条:\n%s", len(recs), buf.String())
 	}
@@ -332,10 +258,10 @@ func TestContractAccessLog_UnauthorizedIsLoggedAtInfo(t *testing.T) {
 	}
 }
 
-// TestContractAccessLog_ServerErrorIsLoggedAtError 锁"5xx 记 Error"。
-func TestContractAccessLog_ServerErrorIsLoggedAtError(t *testing.T) {
+// TestPolicyAccessLog_ServerErrorLoggedAtError 锁"5xx 记 Error"。
+func TestPolicyAccessLog_ServerErrorLoggedAtError(t *testing.T) {
 	buf := &logBuffer{}
-	r := newContractEngine(t, buf, func(r *gin.Engine) {
+	r := newPolicyEngine(t, buf, func(r *gin.Engine) {
 		r.GET("/boom", func(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error"})
 		})
@@ -344,14 +270,14 @@ func TestContractAccessLog_ServerErrorIsLoggedAtError(t *testing.T) {
 	// ⚠️ 必须带 token:鉴权中间件在业务路由**之前**,
 	// 没 token 会被 RequireAudience 挡成 401,handler 根本不会被执行。
 	req := httptest.NewRequest(http.MethodGet, "/boom", nil)
-	req.Header.Set("Authorization", "Bearer "+contractFakeJWT("user-1", []string{"pos"}))
+	req.Header.Set("Authorization", "Bearer "+fakeJWT("user-1", []string{"pos"}))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("/boom 应 500, got %d", w.Code)
 	}
-	recs := contractAccessRecords(t, buf)
+	recs := accessRecords(t, buf)
 	if len(recs) != 1 {
 		t.Fatalf("应有且仅有 1 条访问日志,实际 %d 条:\n%s", len(recs), buf.String())
 	}
@@ -363,12 +289,12 @@ func TestContractAccessLog_ServerErrorIsLoggedAtError(t *testing.T) {
 	}
 }
 
-// TestContractErrorLog_BusinessErrorIsLogged 锁"业务错误 ⇒ 一条 ERROR,带 code / message / path / method"。
+// TestPolicyErrorLog_BusinessErrorLogged 锁"业务错误 ⇒ 一条 ERROR,带 code / message / path / method"。
 //
 // 触发方式是 gin 的标准做法:handler 调 c.Error(err)。
-func TestContractErrorLog_BusinessErrorIsLogged(t *testing.T) {
+func TestPolicyErrorLog_BusinessErrorLogged(t *testing.T) {
 	buf := &logBuffer{}
-	r := newContractEngine(t, buf, func(r *gin.Engine) {
+	r := newPolicyEngine(t, buf, func(r *gin.Engine) {
 		r.GET("/products/:id", func(c *gin.Context) {
 			_ = c.Error(errors.New("商品不存在"))
 			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
@@ -379,7 +305,7 @@ func TestContractErrorLog_BusinessErrorIsLogged(t *testing.T) {
 	}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/products/P1", nil)
-	req.Header.Set("Authorization", "Bearer "+contractFakeJWT("user-1", []string{"pos"}))
+	req.Header.Set("Authorization", "Bearer "+fakeJWT("user-1", []string{"pos"}))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -387,8 +313,8 @@ func TestContractErrorLog_BusinessErrorIsLogged(t *testing.T) {
 		t.Fatalf("/products/P1 应 404, got %d", w.Code)
 	}
 
-	var biz *contractRecord
-	for _, rec := range contractRecords(t, buf) {
+	var biz *logRecord
+	for _, rec := range logRecords(t, buf) {
 		if rec.Msg == "business error" {
 			biz = &rec
 			break
@@ -415,15 +341,14 @@ func TestContractErrorLog_BusinessErrorIsLogged(t *testing.T) {
 	}
 }
 
-// TestContractRecovery_PanicDoesNotLeakSecrets 锁"panic 兜底不打令牌 / Cookie,且状态码是 500"。
+// TestPolicyRecovery_PanicDoesNotLeakSecrets 锁"panic 兜底不打令牌 / Cookie,且状态码是 500"。
 //
 // ⚠️ gin 自带的 Recovery 会把请求头打到 stderr(DebugMode),
-//
-//	Authorization 被它 mask 掉,但 **Cookie 没有** —— 那是真实的会话凭据。
-//	⇒ 这里断言日志里既没有 Authorization 的值,也没有 Cookie 的值。
-func TestContractRecovery_PanicDoesNotLeakSecrets(t *testing.T) {
+// Authorization 被它 mask 掉,但 **Cookie 没有** —— 那是真实的会话凭据。
+// ⇒ 这里断言日志里既没有 Authorization 的值,也没有 Cookie 的值。
+func TestPolicyRecovery_PanicDoesNotLeakSecrets(t *testing.T) {
 	buf := &logBuffer{}
-	r := newContractEngine(t, buf, func(r *gin.Engine) {
+	r := newPolicyEngine(t, buf, func(r *gin.Engine) {
 		r.GET("/panic", func(c *gin.Context) {
 			panic("boom")
 		})
@@ -431,7 +356,7 @@ func TestContractRecovery_PanicDoesNotLeakSecrets(t *testing.T) {
 
 	// ⚠️ 必须带 token:鉴权中间件在业务路由**之前**,
 	// 没 token 会被 RequireAudience 挡成 401,panic 压根不会发生。
-	jwt := contractFakeJWT("user-1", []string{"pos"})
+	jwt := fakeJWT("user-1", []string{"pos"})
 	req := httptest.NewRequest(http.MethodGet, "/panic", nil)
 	req.Header.Set("Authorization", "Bearer "+jwt)
 	req.Header.Set("Cookie", "session=panic-cookie-secret")
@@ -439,7 +364,7 @@ func TestContractRecovery_PanicDoesNotLeakSecrets(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("panic 应 500, got %d body=%s", w.Code, w.Body.String())
+		t.Fatalf("/panic 应 500, got %d body=%s", w.Code, w.Body.String())
 	}
 
 	out := buf.String()
@@ -451,7 +376,7 @@ func TestContractRecovery_PanicDoesNotLeakSecrets(t *testing.T) {
 
 	// panic 必须被记录(否则又是一条"后端说没收到请求")。
 	found := false
-	for _, rec := range contractRecords(t, buf) {
+	for _, rec := range logRecords(t, buf) {
 		if rec.Msg == "panic recovered" {
 			found = true
 			if rec.Level != "ERROR" {
@@ -468,8 +393,8 @@ func TestContractRecovery_PanicDoesNotLeakSecrets(t *testing.T) {
 
 	// 访问日志要记到 **500**(不是 panic 之前的 200)——
 	// 否则"状态码"这一栏在最需要的时候是错的。
-	var access *contractRecord
-	for _, rec := range contractAccessRecords(t, buf) {
+	var access *logRecord
+	for _, rec := range accessRecords(t, buf) {
 		if rec.Path == "/panic" {
 			access = &rec
 			break

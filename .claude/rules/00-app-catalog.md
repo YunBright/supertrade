@@ -1,51 +1,85 @@
 ---
-paths: ["**/*.go", "**/*.yaml", "**/*.conf"]
+paths: ["cmd/**/*.go", "dapr/**/*.yaml", "deploy/**/*.yaml"]
 ---
 
 # App ↔ URL 快查表
 
-每个 `cmd/<name>/main.go` 的 `AppID` = 公网 URL 里的 `<app>` 段。
+## 三个名字,三个命名空间(别混)
 
-## 本仓 14 个 dapr app
-
-> 2026-09 新增 `cube-router`(按 X-Branch-ID 路由到不同 cube 实例)。
-> 10 个占位 cmd(pos-gateway / pos / pricing / procurement / sales-agg / fresh-produce /
-> fresh-meat / erp-connector / bi-gateway / master-data)作为后续 Sprint 入口保留。
-> `notification`(企微/钉钉占位)与 `llm-gw`(LLM 网关占位)已于 2026-09-29 删除 —
-> 占位 cmd 不再保留,这两个能力由外部服务承担。
-
-| cmd 目录 | AppID | 公网前缀 |
+| 名字 | 定义在哪 | 例 |
 |---|---|---|
-| `cmd/pos-gateway` | `pos-gateway` | `/api/v1/pos-gateway/` |
-| `cmd/pos` | `pos` | `/api/v1/pos/` |
-| `cmd/stocktake` | `stocktake` | `/api/v1/stocktake/` |
-| `cmd/catalog` | `catalog` | `/api/v1/catalog/` |
-| `cmd/inventory` | `inventory` | `/api/v1/inventory/` |
-| `cmd/cube-router` | `cube-router` | `/api/v1/cube-router/` |
-| `cmd/master-data` | `master-data` | `/api/v1/master-data/` |
-| `cmd/pricing` | `pricing` | `/api/v1/pricing/` |
-| `cmd/procurement` | `procurement` | `/api/v1/procurement/` |
-| `cmd/sales-agg` | `sales-agg` | `/api/v1/sales-agg/` |
-| `cmd/fresh-produce` | `fresh-produce` | `/api/v1/fresh-produce/` |
-| `cmd/fresh-meat` | `fresh-meat` | `/api/v1/fresh-meat/` |
-| `cmd/erp-connector` | `erp-connector` | `/api/v1/erp-connector/` |
-| `cmd/bi-gateway` | `bi-gateway` | `/api/v1/bi-gateway/` |
-| `cmd/notification-gateway` | `notification-gateway` | `/api/v1/notification-gateway/` |
+| **aud 短名** | `cmdbootstrap.Options.AppID`(缺省即 `Audience`);authd `JWT_AUDIENCE` 收录它 | `pricing` |
+| **dapr app-id** | `dapr run --app-id`;deployer nginx map 的**值** | `supertrade-pricing` |
+| **公网前缀** | nginx map 的 **key**(URL 段) | `/api/v1/pricing/` |
 
-## 外部仓的 app（不归本仓管，但本仓业务会调）
+链路:`公网前缀` →(nginx map)→ `dapr app-id` →(sidecar 找进程)→ 应用层校验 `aud`。
 
-| AppID | 在哪 | 本仓调用入口 |
+⚠️ aud 与 dapr app-id 混用 ⇒ **401 `invalid_audience`**(不是 403,极易误判成"登录过期")。
+真源:`../deployer/docs/service-accounts.md` §接入步骤 3 —— aud 用短名,不是 dapr app-id。
+
+## 本仓 dapr app(公网可达)
+
+| cmd | aud 短名 | dapr app-id | 公网前缀 |
+|---|---|---|---|
+| `cmd/catalog` | `catalog` | `supertrade-catalog` | `/api/v1/catalog/` |
+| `cmd/stocktake` | `stocktake` | `supertrade-stocktake` | `/api/v1/stocktake/` |
+| `cmd/inventory` | `inventory` | `supertrade-inventory` | `/api/v1/inventory/` |
+| `cmd/cube-router` | `cube-router` | `supertrade-cube-router` | `/api/v1/cube-router/` |
+| `cmd/master-data` | `master-data` | `supertrade-master-data` | `/api/v1/suppliers/` ⚠ |
+| `cmd/notification-gateway` | `notification-gateway` | `supertrade-notification-gateway` | `/api/v1/notification/` ⚠ |
+| `cmd/fresh-meat` | `fresh-meat` | `supertrade-fresh-meat` | `/api/v1/fresh-meat/` |
+| `cmd/settlement-auditor` | `settlement-auditor` | `supertrade-settlement-auditor` | `/api/v1/settlement-auditor/` |
+| `cmd/sales-agg` | `sales-agg` | `supertrade-sales-agg` | `/api/v1/sales-agg/` |
+| `cmd/pricing` | `supertrade-pricing` ⚠ | `supertrade-pricing` | `/api/v1/pricing/` |
+| `cmd/sales-insight` | `sales-insight` | `supertrade-sales-insight` | `/api/v1/sales-insight/` |
+| `cmd/member` | `pos` ⚠ | `supertrade-member` | `/api/v1/member/` |
+| `cmd/pos` | `pos` | `supertrade-pos` | `/api/v1/pos/` |
+| `cmd/pos-gateway` | `pos` ⚠ | `supertrade-pos-gateway` | `/api/v1/pos-gateway/` |
+| `cmd/transaction` | `transaction` | `supertrade-transaction` | `/api/v1/transaction/` |
+| `cmd/procurement` | `procurement` | `supertrade-procurement` | `/api/v1/procurement/` |
+
+⚠ = 与其它行不同,原因已查清,改动前先读下面两行注:
+
+- **`cmd/pricing`**:aud 写成了 dapr app-id(`supertrade-pricing`),与"aud 用短名"的约定相反
+  ⇒ 若 authd `JWT_AUDIENCE` 收录的是 `pricing`,pricing 端点会 401 `invalid_audience`。
+  修法:`cmd/pricing/main.go` 的 `AppID` 改成 `pricing`(`Audience` 显式写 `pricing`),
+  同时确认生产 `JWT_AUDIENCE` 里有 `pricing`。
+- **`cmd/member` / `cmd/pos-gateway`**:显式 `Audience: "pos"` —— 这两个服务的 aud 是 `pos`,
+  不是自己的名字。改 aud 前先确认调用方 token 的 `aud` 里有没有 `pos`。
+
+## 本仓 dapr app(不经公网)
+
+| cmd | 用途 | 路由 |
 |---|---|---|
-| `userd` | `../auth` | nginx `/api/v1/userd/*` → `proxy_set_header dapr-app-id userd` → sidecar `:3500` proxy → userd:8082（header-based proxy mode,dapr 现代路径） |
-| `login` | `../auth`（不走 dapr，nginx 旁路） | 不在库内直连；前端走 nginx |
-| `cube-gateway` | `../cube` | `internal/cubehttp` / `internal/cubeclient` |
+| `cmd/cube-sync` | 定时全量/增量档案同步 | 仅 Dapr 内部路由(`RegisterDapr`) |
+| `cmd/cube-async` | 异步 cube 作业 | 仅 Dapr 内部路由(`RegisterDapr`) |
 
-## URL 形式
+## 占位 cmd(未实现,不要往里加业务)
 
-```
-/api/v1/<app>/<rest>
-```
+| cmd | 占位内容 |
+|---|---|
+| `cmd/bi-gateway` | `/dashboard/daily` 返回 placeholder |
+| `cmd/erp-connector` | `/pull` `/sync-logs` 返回 placeholder |
+| `cmd/fresh-produce` | 蔬果盘点端点返回 placeholder |
 
-nginx `map $uri $dapr_appid` 把 `<app>` 段映成 dapr app-id，`rewrite` 剥前缀把 `<rest>` 转给 dapr-sidecar。
+## 一次性 CLI(不是 dapr app,没有 AppID / 没有 HTTP 路由)
 
-加新 app：只动 deployer/nginx/yun-bright.conf map 加一行；其它不动。
+| cmd | 用途 |
+|---|---|
+| `cmd/stocktake-seed` | 一次性灌种子数据 |
+| `cmd/fresh-meat-seed` | 一次性灌种子数据 |
+
+## 外部仓的 app(不在本仓,但本仓会调)
+
+| dapr app-id | 在哪 | 本仓调用入口 |
+|---|---|---|
+| `userd` | `../auth` | `authkit/userinfo`(`userinfo.New("userd")`) |
+| `login` | `../auth`(不走 dapr,nginx 旁路) | 前端直连 nginx `/api/v1/login/auth/...` |
+| `cube-gateway` | `../cube` | `internal/cubeclient` / `internal/cubehttp`(实际经 cube-router) |
+
+## 加新 app 的清单
+
+1. `cmd/<name>/main.go`:`AppID` 写 **aud 短名**。
+2. deployer nginx `map $uri $dapr_appid` 加一行:`~^/api/v1/<prefix>/ "<dapr-app-id>";`。
+3. authd `JWT_AUDIENCE` 加 **aud 短名**(短名!不是 dapr app-id)。
+4. 本表加一行。

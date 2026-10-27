@@ -81,7 +81,7 @@ type refundReq struct {
 	AuthorizedBy string `json:"authorized_by"`
 	// Reason 是退货原因(可空)。
 	Reason string `json:"reason"`
-	// Lines 是**要退的行子集**(2026-10-22 新增)。
+	// Lines 是**要退的行子集**。
 	//
 	// ⚠️ **空 ⇒ 整单退**(旧行为);非空 ⇒ 行级部分退货。
 	//
@@ -328,6 +328,9 @@ func (h *Handler) getSale(c *gin.Context) {
 }
 
 // refundSale POST /sales/:id/refund
+//
+// ⚠️ 契约:按 op_id 幂等(重复提交返回首次那张单);lines 非空 ⇒ 行级部分退货,
+// lines 缺省 ⇒ 整单退。
 func (h *Handler) refundSale(c *gin.Context) {
 	branchID, ok := branchFromHeader(c)
 	if !ok {
@@ -347,7 +350,7 @@ func (h *Handler) refundSale(c *gin.Context) {
 			return
 		}
 	}
-	// 行级部分退货(2026-10-22):把 lines 解析成 service 入参。
+	// 行级部分退货:把 lines 解析成 service 入参。
 	refundLines := make([]service.RefundLineInput, 0, len(req.Lines))
 	for i, l := range req.Lines {
 		li := service.RefundLineInput{LineID: strings.TrimSpace(l.LineID)}

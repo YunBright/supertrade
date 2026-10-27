@@ -56,7 +56,6 @@
 package outbox
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -206,21 +205,22 @@ func (r Recorder) Enqueue(tx *gorm.DB, e Event) error {
 		Published: false,
 		CreatedAt: time.Now(),
 	}
-	// ⚠️ DoNothing:同一个 op_id 重复入队 ⇒ 保留第一条。
+	// ⚠️ 重复 op_id 靠**唯一索引**挡住(不是 OnConflict):重复入队会返回唯一键冲突错误,
 	//   业务侧本来就有 op_id 幂等,这里再兜一层 ⇒ "重试导致重复入队"不会炸。
 	if err := tx.Create(&row).Error; err != nil {
 		return fmt.Errorf("outbox: 写入事件失败: %w", err)
 	}
-	_ = row
 	return nil
 }
 
 // EnqueueJSON 是"payload 已经是 JSON 字符串"时的便捷入口。
+//
+// Deprecated:已废弃 —— 直接用 Enqueue(tx, Event{Payload: json.RawMessage(payloadJSON)})。
+// json.RawMessage 实现了 json.Marshaler,Enqueue 内部的 json.Marshal 会原样输出原始字节,
+// 语义与本函数完全等价(不会二次编码)。
 func (r Recorder) EnqueueJSON(tx *gorm.DB, e Event, payloadJSON string) error {
-	e.Payload = json.RawMessage(payloadJSON)
-	return r.Enqueue(tx, e)
+	return fmt.Errorf("outbox: EnqueueJSON 已废弃,请用 Enqueue(tx, Event{Payload: json.RawMessage(payloadJSON)})")
 }
 
 // 编译期断言:Recorder 的零值可用(避免"必须 NewRecorder 才能用"的隐性依赖)。
-var _ = Recorder{}
-var _ = context.Background
+var _ Recorder

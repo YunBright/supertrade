@@ -9,9 +9,6 @@
 //	                              判据:配了数据源走 cube、没配走本地
 //	GET  /promotions?...        批量查当前生效促销(pricing:view)
 //	                              判据同上
-//	⚠️ 旧的 /prices/local、/promotions/local 已删除(2026-10-22):
-//	   名字承诺「只读本地表」,而有数据源的门店拿到的是本地快照
-//	   ⇒ 批量查与单个查(/quotes)的价不一样。
 //	GET  /prices/export?on_date=      离线价格包(pricing:view)—— 不分页,全店
 //	GET  /archive/export?scope=       归档导出(archivedto 契约)(pricing:view)
 //	POST /archive/import               导入售价/促销(pricing:manage,per branch)
@@ -35,11 +32,8 @@
 //
 //	绝大多数商品本来就没有促销,返 404 会让前端把"正常"显示成"查失败"。
 //
-// # ⚠️ `pricing:manage` 目前在 auth 的 seed 里**不存在**
-//
-// ⇒ 写侧端点目前对所有人 403(fail-closed),这是**有意的**:
-// 权限点没 seed 就放行 = 任何有 pricing:view 的人都能改价。
-// scope seed 属 Phase 0(与 catalog 的 product:manage 一起加)。
+// ⚠️ `pricing:manage` 目前在 auth 的 seed 里**不存在** ⇒ 写侧端点对所有人 403
+// (fail-closed)。权限点没 seed 就放行 = 任何有 pricing:view 的人都能改价。
 package handler
 
 import (
@@ -63,9 +57,9 @@ type Handler struct {
 	// priceLists / promos 是本地表服务(写侧 + 批量读侧用)。
 	priceLists *service.PriceListService
 	promos     *service.PromotionService
-	// plans 是促销**方案头**的读服务(图4,2026-10-22 新增)。
-	plans *service.PromotionPlanService
-	users *userinfo.Client
+	// plans 是促销**方案头**的读服务(图4)。
+	plans  *service.PromotionPlanService
+	users  *userinfo.Client
 	logger *slog.Logger
 }
 
@@ -175,7 +169,8 @@ func (h *Handler) getQuote(c *gin.Context) {
 
 // getActivePromo GET /promotions/active?barcode=
 //
-// 与 /quotes 的差别:只返促销。无促销时返 {"promo": null,**仍是 200**。
+// 与 /quotes 的差别:只返促销部分。
+// ⚠️ 无生效促销不是错误:返 200 + {"promo": null}(不是 404)。
 func (h *Handler) getActivePromo(c *gin.Context) {
 	barcode := c.Query("barcode")
 	if barcode == "" {

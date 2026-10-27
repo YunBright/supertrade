@@ -70,17 +70,11 @@ func AuthVerifier() *authn.Verifier {
 	return verifierV
 }
 
-// RevocationReloadError 返回最近一次**撤销列表**读取错误(nil = 健康),供 /healthz 上报。
+// JWKSReloadError 返回最近一次**公钥**读取错误(nil = 健康),供 /healthz 上报。
 //
-// ⚠️ 它**不**等于"鉴权不可用"：撤销列表读不到时是 fail-open(照常放行),
-// 所以它只说明"撤销暂时不生效"(登出后的 access token 仍可用到过期)。
+// ⚠️ 公钥读不到时服务是 **fail-closed**(所有请求 401)。
 //
-// 为什么要单独暴露:撤销列表**读不到**与**读到空列表**在读侧看起来一样,
-// 而后者是正常状态(还没人登出过)—— 没有这个字段,
-// "撤销静默不生效"这件事在 /healthz 上完全看不出来。
-//
-// 可观测性要求:公钥读不到时服务是**fail-closed** 的(所有请求 401),
-// 但 healthz 仍应 200(否则侧车会认为 app 挂了并反复重启,掩盖真正的故障面)。
+// 可观测性要求:healthz 仍应 200(否则侧车会认为 app 挂了并反复重启,掩盖真正的故障面)。
 // 所以要把"鉴权不可用"这件事显式放进 healthz,而不是靠 status code 表达。
 func JWKSReloadError() error {
 	verifierMu.RLock()
@@ -92,7 +86,14 @@ func JWKSReloadError() error {
 	return src.Source.LastError()
 }
 
-// RevocationReloadError 见上。
+// RevocationReloadError 返回最近一次**撤销列表**读取错误(nil = 健康),供 /healthz 上报。
+//
+// ⚠️ 它**不**等于"鉴权不可用":撤销列表读不到时是 fail-open(照常放行),
+// 所以它只说明"撤销暂时不生效"(登出后的 access token 仍可用到过期)。
+//
+// 为什么要单独暴露:撤销列表**读不到**与**读到空列表**在读侧看起来一样,
+// 而后者是正常状态(还没人登出过)—— 没有这个字段,
+// "撤销静默不生效"这件事在 /healthz 上完全看不出来。
 func RevocationReloadError() error {
 	verifierMu.RLock()
 	src := setupV

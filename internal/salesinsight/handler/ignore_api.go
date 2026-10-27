@@ -90,6 +90,9 @@ type putIgnoreReq struct {
 }
 
 // putIgnoreList PUT /insights/supplier-ignore
+//
+// ⚠️ PUT 是**全量覆盖**(destructive):请求里的 entries 取代现有名单,
+// 未列出的条目会被清掉。
 func (h *Handler) putIgnoreList(c *gin.Context) {
 	if h.ignores == nil {
 		c.JSON(http.StatusServiceUnavailable, errBody("ignore_store_not_ready",
@@ -140,6 +143,7 @@ type suggestReq struct {
 // postIgnoreSuggest POST /insights/supplier-ignore/suggest
 //
 // ⚠️ 这是**维护工具**，不是判定链路的一部分：
+// **只读**——只返回候选建议，不改名单、不写任何数据。
 //
 //	它只是把候选缩到十几条，让人复核勾选。
 //	报告生成时不会调用它 —— 那是这次改造要省掉的"每次都做的智能活"。

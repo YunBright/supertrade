@@ -12,19 +12,10 @@
 //	POST /shifts                  开班(shift:manage)
 //	PUT  /shifts/:id              交班(shift:manage)
 //
-// # ⚠️ /employees/:code/verify **不需要管理 scope**,但**需要登录态**
+// # ⚠️ /employees/:code/verify **不需要管理 scope**,但**必须**有登录态
 //
-// 它是 POS 越权授权链路的一环(图4/图5):
-// 收银员已登录(持 JWT)→ 想做没权限的事 → POS 让**另一个有权限的人**(店长)
-// 在终端上输入工号+口令 → 本端点校验口令并返回"这个人在当前门店有哪些 scope"。
-//
-// ⇒ 调用方是**已登录的收银员**,不是管理员 ⇒ 不能用 employee:manage 守门。
-//
-// ⚠️ 但它**必须**要求登录态(挂鉴权链内)——
-//
-//	它验口令 ⇒ 公开就等于给了一个口令爆破接口。
-//	方案里写的是"公开(内部)",本实现取"**对内已登录即可**"这个更严的读法:
-//	终端在 POS 场景下**总是**带着收银员的登录态,不需要匿名访问。
+// 它是 POS 越权授权链路的一环(图4/图5):已登录收银员 → POS 让有权限的人输入工号+口令。
+// 公开它等于给了一个口令爆破接口 ⇒ 只能"对内已登录即可"。
 package handler
 
 import (
@@ -61,16 +52,7 @@ type CredentialVerifier interface {
 
 // New 构造 Handler。users 为 nil 时带 scope 守门的端点一律 503。
 //
-// ⚠️ [logger] 必须传 —— **nil 会让 mapErr 的兜底分支 panic**
-// (`h.logger.Error(...)` 在 nil *slog.Logger 上 ⇒ nil pointer dereference)。
-//
-//	症状(2026-10-21 生产实测):授权框里输**错口令**
-//	⇒ auth 返 400 ⇒ dapr 折成 InvalidArgument ⇒ authkit 归成泛化 error
-//	⇒ 落到 mapErr 的 default 分支 ⇒ **panic** ⇒ 500
-//	⇒ dapr 折成 Unknown ⇒ member 归成 503「授权校验暂不可用」
-//	⇒ 图4/图5 的**时序整个错位**(该弹「你没有冲减积分的权限！」却弹了"服务不可用")。
-//
-//	⇒ logger 为 nil 时退回 slog.Default(),**任何情况下都不许 panic**。
+// ⚠️ logger 为 nil 会让 mapErr 的兜底分支 panic ⇒ New 里必须回落到 slog.Default()。
 func New(stores *service.StoreService, emps *service.EmployeeService, shifts *service.ShiftService,
 	users *userinfo.Client, verifier CredentialVerifier, logger *slog.Logger) *Handler {
 	if logger == nil {
@@ -192,17 +174,8 @@ func (h *Handler) upsertStore(c *gin.Context) {
 
 // listEmployees GET /employees?branch_id=
 //
-// ⚠️ **门店以 header(X-Branch-ID)为准,query 不能越权** ——
-//
-//	scope 守门已经按 header 的那家店判过了(用户必须**在那家店**有 employee:view)。
-//	若再让 query 里的 branch_id 覆盖它 ⇒ 一个只有 A 店权限的账号
-//	传 `?branch_id=B` 就能读到 B 店的收银员 ⇒ **越权读,且零报错**。
-//
-//	⇒ query 为空 ⇒ 用 header 的店(不再返回全部门店);
-//	⇒ query 与 header 不一致 ⇒ 403。
-//
-//	这同时满足业务语义:**收银员是门店固定的**,
-//	管理端要管别家店的收银员,就换一个 X-Branch-ID 过去。
+// ⚠️ 门店以 header(X-Branch-ID)为准:query 的 branch_id 只能与它一致,不一致 ⇒ 403。
+// 否则只有 A 店权限的账号传 ?branch_id=B 就能读 B 店收银员(越权读且零报错)。
 func (h *Handler) listEmployees(c *gin.Context) {
 	headerBranch := strings.TrimSpace(middleware.SingleBranchFromCtx(c))
 	queryBranch := strings.TrimSpace(c.Query("branch_id"))

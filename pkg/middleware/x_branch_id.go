@@ -77,7 +77,8 @@ func XBranchID() gin.HandlerFunc {
 
 // BranchFromHeader 是 XBranchID 的别名,保留兼容老 import 路径的代码可读性。
 //
-// 推荐新代码用 XBranchID()(语义更通用)。
+// Deprecated:已废弃 —— 仓内无任何调用方(仅别名等价性测试引用)。
+// 新代码用 XBranchID()(语义更通用)。本函数保留等价行为,只为不打断可能存在的外部调用。
 func BranchFromHeader() gin.HandlerFunc { return XBranchID() }
 
 // BranchFromCtx 从 ctx 取出 []string。返回:
@@ -156,6 +157,3 @@ func splitAndTrim(s, sep string) []string {
 	}
 	return out
 }
-
-// (历史保留 trimSpace / uuid import 已移除;新实现走 strings.Split + TrimSpace,
-// 简化包内 API 边界。)

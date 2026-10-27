@@ -38,8 +38,7 @@ import (
 //
 // ⚠️ **403 / 401 与 503 必须分开**:
 // 403 = "这个调用者没有该门店的读权限";503 = "数据源路由问不到"。
-// 混在一起 ⇒ 用户看到"暂不可用"就去查数据源健康度,
-// 而真正的原因是权限(2026-10-21 审计里 member 域踩过这个坑)。
+// 混在一起 ⇒ 用户看到"暂不可用"就去查数据源健康度,而真正的原因是权限。
 func (h *Handler) writeSourceErr(c *gin.Context, err error) bool {
 	switch {
 	case errors.Is(err, model.ErrCubeSourceUnavailable):
@@ -82,28 +81,12 @@ func (h *Handler) writeSourceErr(c *gin.Context, err error) bool {
 
 // requireLocalSource 拦住「该门店的商品档案来自外部系统」的写操作。
 //
-// # 为什么写侧也要有这道闸门
-//
-// 读侧已经按数据源分流(配了源 ⇒ 走那个 cube 实例),所以本域 PG 里
-// **对有源门店的行永远没人读**。
-//
-// ⇒ 写侧若不拦:写进本域 PG 的一行"没人看的商品",而前台还显示"写成功了"
-// ⇒ 现场看到的是"商品改了但查出来还是老的",排查方向完全跑偏。
-//
-// ⚠️ 与会员域(internal/member/handler.go 的同名中间件)**同一套判据**
-// (internal/cubesource):同一个门店,会员档案与商品档案必须给同一种解释。
-//
-// # 为什么复用 ArchiveService.EnsureLocalSource
-//
-// 它与归档导入路径**用的是同一个方法** ⇒ 同一个门店的"手动建档"与
-// "批量导入"给**同一个答案**。
-//
-// ⚠️ 判据要放在**写端点的第一层**(在 rbac 之后、handler 之前):
-// 不然写方法会在本域 PG 里落一行"没人看的商品"。
-//
-// ⚠️ **问不到路由时放行**(与导入路径同一处理):
-// cube-router 抖一下不该挡住自营店(门店 10)的正常建档;
-// 而真写了也没关系 —— 没配源的门店本来就读本域。
+// ⚠️ 判据要放在**写端点的第一层**(rbac 之后、handler 之前):不拦就会在本域 PG
+// 落一行"没人看的商品",前台却显示"写成功了"。
+// ⚠️ 判据与会员域同名中间件**同一套**(internal/cubesource),同一门店必须给同一种解释。
+// ⚠️ 与批量导入**同一个判据**(ArchiveService.EnsureLocalSource):手动建档与导入
+// 必须给同一个答案,否则同一个门店在两条路上一条能写一条不能。
+// ⚠️ 问不到路由时**放行**(与导入路径一致):cube-router 抖一下不该挡住自营店建档。
 func (h *Handler) requireLocalSource(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if branchID == "" {

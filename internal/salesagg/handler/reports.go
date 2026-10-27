@@ -8,17 +8,7 @@
 //	                             &brand_name=&page=1&page_size=100
 //	    按 code 取一张报表(sales:view,per branch)
 //
-// # ⚠️ 这两条端点**必须**挂 `rbac.RequireScopeWithBranch`
-//
-// 现有的 `GET /reports/sales`(`internal/salesagg/handler/handler.go`)
-// **漏挂了** scope 守门 —— 它直接 `r.GET("/reports/sales", h.Report)`。
-//
-// PLAN §3.5 明写:「所有报表端点必须挂 rbac.RequireScopeWithBranch
-// (现有 /reports/sales 漏挂了 —— 新端点不要沿用这个疏漏)」。
-//
-// ⇒ 这里的写法是"照 PLAN 来",不是"照现有代码来"。
-// 现有的疏漏**不在本轮修**(那会改变已上线端点的行为),
-// 但**新端点不复制它**。
+// ⚠️ 这两条端点必须挂 rbac.RequireScopeWithBranch(sales:view)。已有的 GET /reports/sales 未挂,不在本次改动范围(改动会变更已上线行为)。
 //
 // # ⚠️ menu-items 也要挂守门
 //

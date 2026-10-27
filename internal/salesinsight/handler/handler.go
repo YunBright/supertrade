@@ -45,7 +45,7 @@ type GenerateInput struct {
 	//   留空是**正常分支**，不是错误：prompt 会明确写"没有上一期结论记录"，
 	//   环比的数字部分由事实包的 Deltas 独立提供，不依赖这份摘要。
 	PrevSummary *insight.PrevSummary
-	// PrevSummaries 是**上期摘要候选**（每一期一份，2026-10-27 起）。
+	// PrevSummaries 是**上期摘要候选**（每一期一份）。
 	//
 	// ⚠️ 为什么由**本服务**挑而不是调用方挑：
 	//   "上一期报告"与"对比基准"是两个不同的区间
@@ -118,16 +118,10 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 
 // generateReq 是 POST /insights/generate 的请求体。
 type generateReq struct {
-	// Store 是门店（X-Branch-ID）。⚠️ 字段名是 store 不是 branch，
-	// 与 salesagg 的口径一致 —— branch 在思迅体系里被占用过
-	// （源库 branch_no 是门店区域），改名是为了让边界读得出来。
+	// Store 是门店（X-Branch-ID）。⚠️ 字段名是 store 不是 branch(与 salesagg 口径一致)。
 	//
-	// ⚠️ 这里**故意不加** `binding:"required"`：
-	//   加上之后，字段缺失会先被 gin's validator 拦下，返回
-	//   `bad_request` + "Key: 'generateReq.Store' Error:Field validation ..."——
-	//   那是把 Go 结构体字段名漏给运维看，而这条路径最可能的真实原因是
-	//   "这个自建应用没绑门店"（调用方由门店反推应用）。缺口的显式检查
-	//   在下面，两种情况都返回可操作的 store_required。
+	// ⚠️ 故意不加 binding:"required":validator 会把 Go 字段名漏给运维看。
+	// 这里显式检查,返回可操作的 store_required。
 	Store string `json:"store"`
 	// Kind 是 daily/weekly/monthly，默认 daily。
 	Kind string `json:"kind"`
@@ -137,7 +131,7 @@ type generateReq struct {
 	PrevSummary *prevSummaryReq `json:"prev_summary,omitempty"`
 	// PrevSummaries 是**上期摘要候选**（每一期一份）。
 	//
-	// ⚠️ 2026-10-27 起：调用方把该门店该周期的**全部**上期摘要都传过来，
+	// ⚠️ 调用方把该门店该周期的**全部**上期摘要都传过来，
 	//   由本服务按周期口径挑出区间匹配的那一份
 	//   （见 GenerateInput.PrevSummaries 的注释）。
 	//   两者并存是为了**滚动升级期**也能工作：
@@ -300,28 +294,10 @@ const MaxAuditFieldChars = 32 * 1024
 
 // auditView 是返回给调用方的审计视图。
 //
-// # 它同时服务两种粒度，而不是两个类型
-//
-//	full=false → 只有元信息（几百字节）
-//	full=true  → 额外带 Context / Prompt / RawOutput
-//
-// ⚠️ 做成**同一个形状**而不是 full 时换成 insight.Audit：
-//
-//	两种形状会让调用方写两套解析分支，而两套分支的测试覆盖
-//	一定会不同步 —— 于是"full 模式下少了一个字段"这种 bug
-//	能安静地活下来。omitempty 让大字段在 summary 模式下自动消失。
-//
-// # 为什么 full 是同源同步返回，而不是另开一个端点或走 pub/sub
-//
-//	(a) 另开端点重跑一次生成 → audit 属于**第二次**推理，
-//	    与已发出的报告不是同一份，run_id 对不上；
-//	    而 PRD 3.4 要的正是"同一份事实包在不同 prompt 下的输出对比"——
-//	    那要求 context / prompt / raw_output 严格来自同一次调用。
-//	(b) 走 pub/sub 另推一份 → 至少一次投递、无补偿。
-//	    丢一份审计在平时毫无征兆，偏偏在"模型升级后解析失败"
-//	    那种最需要它的时刻丢失。
-//
-// 大小不是问题：dapr invoke 的上限是 MB 级，而这里的量是几十 KB。
+// ⚠️ summary / full 两种粒度用**同一个形状**(大字段靠 omitempty 消失):
+// 两套形状会让调用方写两套解析分支,覆盖不同步 ⇒ "full 少一个字段"的 bug 能安静活着。
+// ⚠️ full 的 context/prompt/raw_output 必须来自**同一次推理**:另开端点重跑会拿到
+// 第二份推理(与已发出的报告对不上 run_id);走 pub/sub 则是至少一次投递、无补偿。
 type auditView struct {
 	RunID string `json:"run_id"`
 	// PeriodKind / From / To / BranchID 标明这是哪一期。
@@ -334,7 +310,7 @@ type auditView struct {
 	PeriodKind string `json:"period_kind"`
 	From       string `json:"from"`
 	To         string `json:"to"`
-	// PrevFrom / PrevTo / PrevLabel 是**对比基准**（2026-10-26 新增）。
+	// PrevFrom / PrevTo / PrevLabel 是**对比基准**。
 	//
 	// ⚠️ 调用方（wechat-bot）要靠它们渲染卡片上的"对比基准"那一行。
 	//	日报的对比基准是"上周同一天"，周报是"上一周"，月报是"上一月" ——

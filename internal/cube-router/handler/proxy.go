@@ -13,8 +13,7 @@
 //
 //	cube 侧 cube app 只注册了 POST /query + GET /healthz;cube-gateway 也只注册
 //	/register /unregister /v1/source/:source/load /v1/sources /healthz,并且
-//	gateway 调上游同样走 /query。整条链路上没有任何服务提供 v1/load,
-//	原先转发 v1/load 会稳定拿到 404。
+//	gateway 调上游同样走 /query。整条链路上没有任何服务提供 v1/load。
 package handler
 
 import (
@@ -87,18 +86,11 @@ func (h *Handler) rawForward(c *gin.Context, cubeSourceName string, body []byte)
 	if err != nil {
 		// dapr SDK 把 sidecar 端 HTTP 4xx/5xx 转 gRPC status error。
 		//
-		// 关键:404 必须显式区分。cube app 返回 404 = "这个 query 查不到数据"是**业务结论**,
-		// 但 "方法名写错 / source 没注册 / 路由没命中" 也是 404,且属于基础设施故障。
-		// 两者混在一起,上层就无法区分"商品不存在"和"链路坏了"——
-		// 原先的错误坍缩链就是:
-		//   cube 404 → gRPC NotFound → ErrCubeNotFound → ErrProductNotFound → 200 [] →
-		//   Flutter 显示「本门店没有条码 XXX 的商品」
-		// 把基础设施故障显示成业务结论,是比 502 更糟的失败模式。
+		// ⚠️ 404 必须显式区分:cube app 的 404 = "这个 query 查不到数据"(业务结论),
+		// 但 "方法名写错 / source 没注册 / 路由没命中" 也是 404(基础设施故障)——
+		// 混在一起,上层就无法区分"商品不存在"和"链路坏了"。
 		//
-		// ⚠️ 这条日志不是装饰。2026-10-15 排查 sales-agg 报表 503 时,
-		//   上层只看得到 gRPC 折叠后的 "Unknown: Bad Gateway" —— 目标 cube app-id、
-		//   上游真实错误、走的哪个 method 全部被 classigyInvokeError 压成一句状态文本。
-		//   没有这一行,同一个故障只能靠"逐跳 curl"来二分,每跳都要重造一遍探针。
+		// ⚠️ 这条日志不能删:目标 app-id / method / 上游真实错误会被 classifyInvokeError 压成一句状态文本。
 		h.logger.Error("cube invoke failed",
 			"target_app_id", cubeSourceName,
 			"method", cubeQueryMethod,

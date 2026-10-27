@@ -67,7 +67,6 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/settlement-approvals/:id/logs", requireBranch, h.GetLogs)
 	r.POST("/settlement-approvals/:id/retry", requireBranch, h.Retry)
 	// 物理删一次审批及其 5 张从表（数据治理 / 测试清理）。
-	// 此前本服务零 DELETE 路由，契约测试每跑一次就往生产留一整套审批残留。
 	// 流水线在途时会返 409 让调用方稍后重试 —— 详见 service.ErrApprovalInFlight。
 	r.DELETE("/settlement-approvals/:id", requireBranch, h.Delete)
 
@@ -105,6 +104,8 @@ type stocktakeNotifyGroupResp struct {
 // GetStocktakeNotifyGroup GET /stocktake-notify-group
 //
 // 未配置 ⇒ 404(前端翻成"还没设"空态),与"读失败"区分开。
+// ⚠️ 404 / 500 都**直接 c.JSON** 写 {code,message},不走 writeError ⇒ 不 abort 中间件链;
+// body 形状与 writeError 一致(都是 code + message)。
 func (h *Handler) GetStocktakeNotifyGroup(c *gin.Context) {
 	branchID := h.branchIDOf(c)
 	row, err := h.svc.GetStocktakeNotifyGroup(c.Request.Context(), branchID)
@@ -123,6 +124,9 @@ func (h *Handler) GetStocktakeNotifyGroup(c *gin.Context) {
 }
 
 // SetStocktakeNotifyGroup PUT /stocktake-notify-group
+//
+// ⚠️ **不做 per-branch scope 校验**(与本服务其它写端点不同):只按 X-Branch-ID
+// 定位门店,不查 effective scopes。
 func (h *Handler) SetStocktakeNotifyGroup(c *gin.Context) {
 	var req struct {
 		ChatID   string `json:"chat_id"`
@@ -152,6 +156,9 @@ func (h *Handler) SetStocktakeNotifyGroup(c *gin.Context) {
 }
 
 // DeleteStocktakeNotifyGroup DELETE /stocktake-notify-group
+//
+// ⚠️ **不做 per-branch scope 校验**(与本服务其它写端点不同)。
+// 幂等:未配置过也返 200 {"ok":true}(删 0 行不算错)。
 func (h *Handler) DeleteStocktakeNotifyGroup(c *gin.Context) {
 	if err := h.svc.DeleteStocktakeNotifyGroup(c.Request.Context(), h.branchIDOf(c)); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": "internal_error", "message": err.Error()})
@@ -338,9 +345,7 @@ func mapErr(c *gin.Context, err error) {
 	case errors.Is(err, service.ErrCubeUnavailable):
 		writeError(c, http.StatusServiceUnavailable, "cube_unavailable", err.Error())
 	case errors.Is(err, service.ErrUserInfoUnavailable):
-		// ⚠️ **不透出 err.Error()**(2026-10-26)。
-		// 生产原文含 gRPC 错误码 + 内部 app-id,对门店是噪音,还会让人
-		// 以为"账号被拒了"(其实只是链路抖了一下)。⇒ 对外只说人话。
+		// ⚠️ 不透出 err.Error():错误含 gRPC 码与内部 app-id,对门店无意义;细节留服务端日志。
 		writeError(c, http.StatusServiceUnavailable, "userd_unavailable",
 			"权限服务暂时不可用，请稍后重试")
 	default:
@@ -396,7 +401,7 @@ type submitReq struct {
 	// 随审批一路活到企微审批单的「附件」控件上 ⇒ 审批人直接看得到发票照片。
 	// ⚠️ base64 会让体积涨约 1/3;上限由 service 层校验(最多 3 个,单个 ≤2MB)。
 	Attachments []attachmentReq `json:"attachments"`
-	// ReceiptItems / PaymentItems 是**手工收付款明细行**(2026-10-25 用户需求)。
+	// ReceiptItems / PaymentItems 是**手工收付款明细行**。
 	//
 	// 供应商结算单不在这里 —— 它是「付款类型-货款」,由 settlement_ids 派生。
 	// 收款项冲减付款金额 ⇒ 应付金额 = 货款 + 付款项 − 收款项(不为负)。
@@ -518,21 +523,9 @@ func (h *Handler) GetApproverPreference(c *gin.Context) {
 
 // GetApprovalFlow GET /settlement-approvals/approval-flow
 //
-// 返回本次审批的**流程节点声明**(节点类型/标题/选人方式/多人办理方式/是否必填),
-// 发起页按它渲染「审批流程」组件(几行、每行单选还是多选、哪些必填)。
-//
-// # 为什么 UI 要读这个而不是写死三行
-//
-// 企微模板「付款审批」的流程是**可以随时改**的(2026-10-23 就加了「办理人」节点)。
-// UI 写死三行 ⇒ 模板加了第四个节点,发起页不知道要问谁,那个节点就**静默没有成员**
-// (企微按 app 给的 node_list 走,模板里多出来的节点没有对应的人)。
-//
-// ⚠️ 企微的**公开 API 读不到流程配置**:`oa/gettemplatedetail` 的响应只有
-// `template_content.controls`(表单控件),没有流程节点字段;`getapprovaldetail`
-// 的 `sp_record` 也没有节点类型。⇒ 这份声明由 app 侧持有
-// (Config.ApprovalFlow,deploy 用 SETTLEMENT_AUDITOR_APPROVAL_FLOW 配置),
-// 必须与企微后台的模板保持一致 —— 两边对不上 = 少一个节点。
-//
+// 返回本次审批的**流程节点声明**(类型/标题/选人方式/是否必填),发起页按它渲染。
+// ⚠️ 企微公开 API 读不到流程配置 ⇒ 这份声明由 app 侧持有(Config.ApprovalFlow,
+// deploy 用 SETTLEMENT_AUDITOR_APPROVAL_FLOW 配置),必须与企微后台模板一致。
 // ⚠️ 路由必须注册在 `/:id` 之前,否则会被当成 id="approval-flow" 走 Get → 404。
 func (h *Handler) GetApprovalFlow(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)

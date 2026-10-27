@@ -69,7 +69,7 @@ func (s *ServiceImpl) WithNow(f func() time.Time) *ServiceImpl {
 // 早班（00:00~08:00 CST）若不注入，UTC 视角会少 8 小时。
 //
 // 反证：删掉 s.now = func() ... → 早班那条路径下 daily 仍然走 time.Now()
-// 的 UTC location，2026-10-19 现场 bug 复现。
+// 的 UTC location。
 func (s *ServiceImpl) WithBizTZ(loc *time.Location) *ServiceImpl {
 	if loc == nil {
 		return s

@@ -1,51 +1,15 @@
 // Package handler / export.go —— 档案导出端点。
 //
-// # 它是"导出方"
+//	GET /v1/export?scope=&offset=&limit=&as_of=yyyy-mm-dd&since=
 //
-// 门店 → cube 实例的映射只有 cube-router 知道(`branch_cube_sources`),
-// 所以"把某门店的档案导出成结构化数据"这件事天然归它。
-//
-// 路由:
-//
-//	GET /v1/export?scope=products&offset=0&limit=5000
-//
-// # 基准日(as_of)
-//
-//	GET /v1/export?scope=promotions&as_of=yyyy-mm-dd
-//
-// ⚠️ **只有时效数据(promotions)按基准日过滤** ——
-//
-//	促销源表(t_pub_plan_flow)实测 31371 行,覆盖 2021-09-16 ~ 2026-10-21,
-//	其中对 2026-10-21 有效的只有 741 行。
-//	不过滤 ⇒ 一次同步把 3 万多条历史灌进下游库,而查价时只剩 741 条能用。
-//
-//	as_of 缺省 = 今天(服务器本地日期);**非法格式 ⇒ 400**(不静默回落)。
-//	其它 scope(products / categories / suppliers / item_barcodes / prices / stock)
-//	**不带**任何时间过滤。
-//
-//	⚠️ stock(库存快照)也**不带**:它的 model 是 `storage: live`
-//	(透传源表当前值)⇒ 导出的天然就是"导出那一刻的库存"。
-//
-// 守门:`cube:read` scope(per-branch),与 /v1/load 同一档。
-//
-// ⚠️ **为什么不用 admin 角色守门**:auth 建服务账号时是
-// "不分配任何角色(least privilege)"⇒ 服务账号过不了 `RequireRole("admin")`。
-// 而这个端点就是给同步服务账号用的 ⇒ 必须走 scope。
-//
-// # 分页由调用方负责
-//
-// 端点**无状态**:只按 offset/limit 返回一页 + total。
-// 拉全量是调用方(sync app)的循环。
-// 端点自己管分页会有两个问题:
-//   - 谁来记"已经拉到哪了"?(无状态端点记不了)
-//   - 一次拉 27565 行会把 sidecar 的内存吃满。
-//
-// # 金额零精度损失
-//
-// cube 响应里的 `product.avg_price_yuan` 是 JSON number。
-// 常规 `json.Unmarshal` 会把它变成 float64 ⇒ 9.90 变成 9.899999999999999。
-// ⇒ 这里用 `json.Decoder.UseNumber()` 解码,拿到的是**原始十进制文本**
-// ("9.900000"),导出契约里金额一律是**字符串**。
+// ⚠️ 契约:
+//   - scope 仅 promotions 是时效数据 ⇒ 按 as_of 过滤;其余 scope 不带时间过滤
+//     (误加过滤 ⇒ 永远导不出行且不报错)。
+//   - as_of 缺省 = 今天(服务器本地日期);as_of / since 非法 ⇒ 400,不静默回落。
+//   - 端点无状态:全量拉取由调用方分页循环负责。
+//   - 金额一律导出为**字符串**(json.Decoder.UseNumber,保留原始十进制文本)。
+//   - 守门 cube:read scope(per-branch),与 /v1/load 同档
+//     (服务账号不分配角色 ⇒ 过不了 RequireRole("admin") ⇒ 必须走 scope)。
 package handler
 
 import (
@@ -77,7 +41,7 @@ const exportInvokeTimeout = 120 * time.Second
 
 // ExportDefaultLimit 是导出的默认每页行数。
 //
-// ⚠️ 不是"一次拉完":门店 00 实测 27565 个商品,一次拉完会让 sidecar 内存爆。
+// ⚠️ 不是"一次拉完":单店商品量级远超一页,一次拉完会让 sidecar 内存爆。
 const ExportDefaultLimit = 5000
 
 // ExportMaxLimit 是导出的每页行数上限。
@@ -100,32 +64,18 @@ type exportScope struct {
 	// Window 是该 scope 的**时效窗口**配置;nil = 该 scope 不是时效数据。
 	//
 	// ⚠️ **时效数据必须过滤** —— 不然一次同步会把整段历史灌进下游库。
-	//   实测:促销源表(t_pub_plan_flow)31371 行、覆盖 2021-09 ~ 2026-10,
-	//   其中对基准日有效的只有 741 行;不过滤 ⇒ 库里躺着 3 万多条永远用不上的行。
 	//
 	// ⚠️ 其它 scope(商品 / 分类 / 供应商 / 条码 / 售价)**不带**时间过滤 ——
 	//   误加会让它们永远导不出行(而且不报错)。
 	Window *exportWindow
-	// ChangedMember 是该 scope 的"**最后变动时间**"成员(全限定名)。
+	// ChangedMember 是该 scope 的"最后变动时间"成员(全限定名)。
 	//
-	// ⚠️ **它与 Window 是两回事**:
-	//   - Window  = "在基准日**有效**"(促销的生效期)⇒ 用 inDateRange;
-	//   - ChangedMember = "在基准日**变过**"(库存的最后变动时间)⇒ 用 gt。
+	// ⚠️ 它与 Window 是两回事:
+	//   - Window  = "在基准日**有效**" ⇒ inDateRange
+	//   - ChangedMember = "在基准日**变过**" ⇒ gt
 	//
-	// # 为什么库存需要它(2026-10-22 生产实测)
-	//
-	//	源库 `t_im_branch_stock` 23837 行,而**一天只变 91 行**
-	//	(最近 2 小时 54 行)⇒ 全量导出 + 全量 upsert 是**两个数量级的浪费**,
-	//	而且会把本地 PG 压出长事务 ⇒ 拖慢同库的 POS 开单(实测:同步时收银上传延迟)。
-	//
-	//	⇒ 带 since 导出时,cube 查询加 `stock.updated_at gt <since>`
-	//	   ⇒ 只导"变过的那些行"(实测与源库直查**行数完全一致**)。
-	//
-	// ⚠️ 源列是 `t_im_branch_stock.oper_date`(= cube 的 stock.updated_at),
-	//   覆盖**全部**库存变动来源(销售/退货/采购入库/盘点/调拨/损耗)
-	//   —— 比"从收银流水反推商品"更准(后者会漏采购与盘点)。
-	//
-	// ⚠️ `oper_date IS NULL` 的 4191 行**库存全是 0** ⇒ 增量跳过它们无害。
+	// 源列 stock.updated_at = t_im_branch_stock.oper_date,覆盖销售/退货/采购入库/
+	// 盘点/调拨/损耗全部变动来源;oper_date IS NULL 的行库存恒为 0,跳过无害。
 	ChangedMember string
 }
 
@@ -137,19 +87,10 @@ type exportWindow struct {
 	EndMember string
 }
 
-// 时效窗口的哨兵边界。
+// 时效窗口的哨兵边界(够宽的哨兵,不是业务边界)。
 //
-// ⚠️ 只是"够宽的哨兵",不代表业务边界:
-//
-//	begin_date <= 基准日 → inDateRange ["1900-01-01", 基准日]
-//	end_date   >= 基准日 → inDateRange [基准日, "2999-12-31"]
-//
-// ⚠️ **必须用 inDateRange,不能用 gte / lte** ——
-//
-//	后者编译成 `RTRIM(col) >= ?`(字符串比较),
-//	对 datetime 恒不匹配 ⇒ 返 0 行且**不报错**。
-//	inDateRange 会 CAST 成 DATE 再比(真机实测:同表同数据 gte/lte 返 0 行、inDateRange 返 731 行)。
-//	同一个写法见 internal/cubeclient 的 GetActivePromotion。
+// ⚠️ 必须用 inDateRange,不能用 gte/lte:后者编译成 RTRIM(col) >= ? 的字符串比较,
+// 对 datetime 恒不匹配 ⇒ 返 0 行且**不报错**。同款写法见 cubeclient.GetActivePromotion。
 const (
 	exportWindowLower = "1900-01-01"
 	exportWindowUpper = "2999-12-31"
@@ -300,12 +241,8 @@ var exportScopes = map[string]exportScope{
 			"promotion.begin_day":   "begin_day",
 			"promotion.end_day":     "end_day",
 		},
-		// ⚠️ 促销是**时效数据**:导出必须按基准日过滤。
-		//
-		//   不过滤的实测代价:源表 31371 行(2021-09-16 ~ 2026-10-21),
-		//   对 2026-10-21 有效的只有 741 行 ——
-		//   全量同步会把 3 万多条历史灌进 pricing.promotions,
-		//   而查价时按基准日过滤后**只剩 741 条可用**。
+		// ⚠️ 促销是**时效数据**:导出必须按基准日过滤 ——
+		//   不过滤 ⇒ 整段历史灌进 pricing.promotions,而查价时按基准日过滤后只剩少数可用。
 		Window: &exportWindow{
 			BeginMember: "promotion.begin_date",
 			EndMember:   "promotion.end_date",
@@ -335,8 +272,8 @@ var exportScopes = map[string]exportScope{
 		//   且它同时在 SELECT 里(cube 的硬要求)。
 		RowKey: "stock.product_id",
 		// ⚠️ **变动成员**:支持"只导 since 之后变过的行"(增量)。
-		//   源列 `t_im_branch_stock.oper_date`(= cube 的 stock.updated_at)。
-		//   实测:23837 行里**一天只变 91 行** ⇒ 增量省掉 99.6% 的导出与写入。
+		//   源列 `t_im_branch_stock.oper_date`(= cube 的 stock.updated_at),
+		//   每天只有少数行变动 ⇒ 增量远小于全量。
 		//
 		//   ⚠️ 它覆盖**全部**库存变动来源(销售/退货/采购入库/盘点/调拨/损耗)
 		//   —— 比"从收银流水反推商品"更准(后者会漏采购与盘点)。
@@ -403,7 +340,7 @@ var exportScopes = map[string]exportScope{
 //
 // ⚠️ **与 archivedto.ExportColumns[ScopeMembers] 逐字对应** ——
 // 两边各写一份字面量时,改了一边不会编译报错,
-// 症状是"导出了 4128 条会员,导入后名字/手机全是空的",**且零报错**。
+// 症状是"会员行导出了,导入后名字/手机全是空的",**且零报错**。
 var memberDimensions = []string{
 	"member.id", "member.card_face_no", "member.card_type", "member.name",
 	"member.gender", "member.phone", "member.mobile", "member.birthday",
@@ -563,9 +500,9 @@ func (h *Handler) handleExport(c *gin.Context) {
 		"branch_id":   branchID,
 		"cube_source": cubeSourceName,
 		// as_of 回给调用方:让"导了哪一天的数据"从响应里就能看出来。
-		"as_of":  asOf,
+		"as_of": asOf,
 		// ⚠️ since 也要回显:增量导出时,调用方要能确认"我这次要的是哪个水位之后的数据"。
-		"since": since,
+		"since":  since,
 		"rows":   rows,
 		"count":  len(rows),
 		"total":  total,
@@ -633,18 +570,10 @@ func (h *Handler) exportFromCube(ctx context.Context, cubeSourceName, branchID s
 		Filters:    exportScopeFilters(sc, asOf, since),
 		Limit:      limit,
 		Offset:     offset,
-		// ⚠️ order 必须给:cube 的 offset>0 强制要求 order,
-		// 且 order 的 id 必须**同时在 SELECT 里**(否则 GROUP BY 查询会报 not a grouped column)。
-		//
-		// ⚠️ **按全部维度排序**,不只按主键那一个。
-		//
-		//	分页的稳定性取决于排序键是否**全序**。
-		//	只按 supplier.id 排序时,同一个 id 的多行(name 不同)之间顺序未定义
-		//	⇒ 翻页可能**重复**某行或**漏掉**某行。
-		//	而症状是"导出了 219 个供应商,导入后少了 3 个",
-		//	且**没有任何一行报错** —— 导入端点只报"成功 219 条"。
-		//
-		//	维度元组本身就是 GROUP BY 的键 ⇒ 按它排序必是全序。
+		// ⚠️ order 必须给(cube 的 offset>0 强制要求),且 order 的 id 必须**同时在 SELECT 里**
+		// (否则 GROUP BY 查询报 not a grouped column)。
+		// 按**全部维度**排序才保证全序;只排主键会让翻页重复/漏行,且零报错。
+		// 维度元组本身就是 GROUP BY 的键 ⇒ 按它排序必是全序。
 		Order: exportOrderFor(sc.Dimensions),
 		Total: true,
 	})
@@ -732,18 +661,11 @@ func isNumericField(name string) bool {
 	return isAmountField(name) || name == "qty" || numericContractFields[name]
 }
 
-// numericContractFields 是"导出值应该是**数字字符串**"的列名集合(除 `_yuan` / `qty` 之外)。
+// numericContractFields 是"导出值应该是数字字符串"的列名(除 _yuan / qty 之外)。
 //
-// ⚠️ 为什么会员的积分 / 次数列也要走数字通道:
-//  1. **精度**:JSON number 到 Dart 侧会变成 double(9.90 → 9.899999999999999)。
-//  2. **契约**:导入端的字段是 string ⇒ number 会让整批反序列化**直接失败**。
-//  3. **兼容**:思迅 live 源的 decimal 列经 MSSQL 驱动出来是 `[]byte`
-//     ⇒ `encoding/json` 序列化成 **base64** ⇒ 必须走 decodeNumeric 的兼容分支。
-//
-// ⚠️ 脏值(如 residual_amt 的 "@><:6642675")**原样带出**:
-//
-//	decodeNumeric 解析不了就返回 false ⇒ exportValue 落到字符串分支 ⇒ 保留原文
-//	⇒ 导入端能识别"这个值我读不懂"并报告它(而不是静默当 0)。
+// ⚠️ 会员积分/次数列走数字通道:JSON number 到 Dart 会变 double(精度丢),
+// 且导入端字段是 string;思迅 live 源的 decimal 列经 MSSQL 驱动出来是 []byte ⇒ base64。
+// 脏值(如 residual_amt)原样带出,交给导入端识别,不当 0。
 var numericContractFields = map[string]bool{
 	"points_accumulated": true,
 	"points_used":        true,
@@ -754,22 +676,9 @@ var numericContractFields = map[string]bool{
 
 // decodeNumeric 把 cube 的原始值转成**数字字符串**。
 //
-// # ⚠️ 为什么需要 base64 解码
-//
-// **MSSQL live 源**（思迅直查：stock / settlement / sale_day）的 decimal 列，
-// `go-mssqldb` 以 `[]byte` 返回，`encoding/json` 把 `[]byte` 序列化成 **base64**：
-//
-//	stock.total_quantity = "MC4wMDAw"      → base64 → "0.0000"
-//	settlement SUM(sheet_amt) = "NDY0OTIuMDIwMA==" → "46492.0200"
-//
-// ⇒ 而 **DuckDB 源**（product）的同一类值是**明文 number**。
-//
-// ⇒ 消费方**两种都必须收**：先按字面数字试，解析不了再试 base64 解码。
-// （与 `internal/cubeclient` 的 `ParseDecimal` 同款语义。）
-//
-// # ⚠️ 明文 number 保留**原始字面量**
-//
-// `"12.50"` 不变成 `"12.5"` —— 导出契约说金额是**原样字符串**。
+// ⚠️ MSSQL live 源的 decimal 列以 []byte 返回 ⇒ encoding/json 序列化成 base64;
+// DuckDB 源的同一类值是明文 number。消费方两种都要收:先试字面数字,再试 base64。
+// 明文 number 保留**原始字面量**("12.50" 不变 "12.5")。
 func decodeNumeric(raw json.RawMessage) (string, bool) {
 	// 明文 number：保留原始字面量。
 	var num json.Number

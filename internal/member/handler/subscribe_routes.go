@@ -11,7 +11,6 @@
 //
 //	sidecar 调它们**不带 Authorization 头**(它是 sidecar 自己,不是终端用户),
 //	带上鉴权中间件就会 401 ⇒ sidecar 永远拿不到订阅清单 ⇒ 整条 pubsub 链路静默失效。
-//	(2026-10-07 生产实测 fresh-meat / stocktake 都中招过。)
 //	⇒ 必须走 cmdbootstrap.Options.RegisterDapr。
 package handler
 

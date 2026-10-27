@@ -14,9 +14,7 @@
 // Authorization 头(它是 sidecar 自己,不是终端用户),
 // 而 RequireAudience 对缺 claims 的请求一律 401。
 //
-// ⇒ 2026-10-07 本仓真踩过:fresh-meat / stocktake 的 /dapr/subscribe 返 401,
-//
-//	整条 pubsub 链路静默失效(订阅建不起来,但 /healthz 仍 200、业务看着正常)。
+// ⇒ 整条 pubsub 链路静默失效(订阅建不起来,但 /healthz 仍 200、业务看着正常)。
 //
 // ⚠️ 开这个窗口的代价:**任何能 TCP 连到 app 端口的人都能 POST 伪造事件**。
 //
@@ -80,7 +78,7 @@ func (h *Handler) RegisterSubscribeRoutes(r *gin.Engine, logger *slog.Logger) {
 //
 //	名字与发布侧不一致 = 两条互不相通的 bus ——
 //	sidecar 照常加载 component、/dapr/subscribe 照常返 200、连接照常建立,
-//	但事件**永远送不到**,且全程零报错(2026-10-08 本仓踩过)。
+//	但事件**永远送不到**,且全程零报错。
 func (h *Handler) subscribeList(c *gin.Context) {
 	pubsub := c.Query("pubsubname")
 	if pubsub == "" {

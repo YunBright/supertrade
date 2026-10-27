@@ -53,19 +53,6 @@ func New(svc *service.Service) *Handler {
 // RegisterRoutes 把所有 stocktake 路由注册到指定 router group。
 //
 // 不接管 /healthz(由 cmdbootstrap 注入)。
-//
-// 盘点单 H5 新增端点(2026-09-19):
-//   - GET  /stocktake-headers                 列表 + 分页
-//   - GET  /stocktake-headers/:id/history      操作历史
-//   - GET  /stocktake-headers/:id/plan-items   计划盘点商品
-//   - POST /stocktake-headers/:id/plan-items   批量加计划商品
-//
-// 门店默认盘点单(2026-09-23):
-//   - GET  /default-stocktake                            查当前店默认盘点单(快速进入盘点,branch 走 X-Branch-ID header)
-//   - PUT  /default-stocktake                            设置当前店默认盘点单(需 inventory:manage,仓管;branch 走 header)
-//
-// 盘点单搜索(2026-09-23):
-//   - GET  /stocktake-headers/search                      按单号/备注搜索(仓管 view 权限,userd 校验)
 func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.POST("/stocktake-headers", h.CreateHeader)
 	r.GET("/stocktake-headers", h.ListHeaders)
@@ -79,9 +66,7 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.POST("/stocktake-headers/:id/plan-items", h.AddPlanItems)
 	r.POST("/stocktake-headers/:id/submit", h.Submit)
 	r.POST("/stocktake-headers/:id/approve", h.Approve)
-	// 删整单(数据治理 / 测试清理)。此前只有删明细行的端点,盘点单一经创建
-	// 就永久留在生产表里 —— 契约测试每跑一次多一张。详见 service.DeleteHeader
-	// 关于"为什么必须显式级联无 FK 的三张从表"的说明。
+	// 删整单(数据治理 / 测试清理)。物理删整单 + 显式级联 3 张无 FK 从表(见 service.DeleteHeader)。
 	r.DELETE("/stocktake-headers/:id", h.DeleteHeader)
 
 	r.PUT("/stocktake-lines/:id", h.UpdateLine)
@@ -101,7 +86,7 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 //
 // 权限校验走 userd 拿 effective scopes(JWT scopes 仅 4 项静态派生,见 auth/README.md)。
 //
-// branch_id 缺省 → fallback cl.BranchID;分页默认 1/20,最大 100。
+// ⚠️ branch_id 缺省 → 400 branch_required(不回退到 claims);分页默认 1/20,最大 100。
 func (h *Handler) SearchHeaders(c *gin.Context) {
 	q := strings.TrimSpace(c.Query("q"))
 	if q == "" {
@@ -137,7 +122,7 @@ func (h *Handler) SearchHeaders(c *gin.Context) {
 		return
 	}
 
-	// branchID 已在权限校验前解析(优先 ?branch_id= > X-Branch-ID header > JWT default_branch_id),
+	// branchID 已在权限校验前解析(唯一来源是 X-Branch-ID header,无 query / JWT fallback),
 	// 这里直接用。
 
 	page, _ := strconv.Atoi(c.Query("page"))
@@ -349,6 +334,9 @@ type setDefaultStocktakeReq struct {
 // ---- Handlers ----
 
 // CreateHeader POST /stocktake-headers
+//
+// ⚠️ branch 来自**请求体**(req.BranchID,binding:"required"),**不**取 X-Branch-ID —— 本域唯一。
+// ⚠️ claims.MustFromContext 在 claims 缺失时**panic**(不是 401);鉴权中间件必须先跑。
 func (h *Handler) CreateHeader(c *gin.Context) {
 	var req createHeaderReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -560,6 +548,9 @@ func (h *Handler) AddLine(c *gin.Context) {
 }
 
 // UpdateLine PUT /stocktake-lines/:id
+//
+// ⚠️ branch 有两个来源:scope 校验用 hdr(GetHeaderByLineID 取到的单据 branch),
+// 调 cube 用的是原始 X-Branch-ID header —— 与 AddLine(用 hdr.BranchID)不一致。
 func (h *Handler) UpdateLine(c *gin.Context) {
 	id := c.Param("id")
 	// 先拿 line,推出 header → branch 守门;UpdateLine 的 service 层接受 lineID 自身,
@@ -810,9 +801,9 @@ func defaultActorName(cl *claims.Claims, fallback string) string {
 //   - scope 不在该 branch 下         → 403 forbidden
 //   - 命中                            → 返 true(handler 继续)
 //
-// 与 authkit/rbac.RequireScopeWithBranch 的区别:handler 内调用,因为多数 stocktake
-// 端点的 branch 来源不固定(body 字段 / path param / header / claims 默认),中间件
-// 抽不出统一的 BranchContextFn;在 handler 内拿稳后再校验更清晰。
+// 与 authkit/rbac.RequireScopeWithBranch 的区别:handler 内调用,因为 branch 来源
+// 由端点自己拿稳后再传进来 —— 多数端点取 X-Branch-ID header(经 SingleBranchFromCtx),
+// 唯一例外是 CreateHeader 取 body 的 req.BranchID;中间件抽不出统一的 BranchContextFn。
 func (h *Handler) requireScope(c *gin.Context, branchID, scope string) bool {
 	cl, ok := claims.FromContext(c.Request.Context())
 	if !ok || cl == nil {
@@ -820,8 +811,7 @@ func (h *Handler) requireScope(c *gin.Context, branchID, scope string) bool {
 		return false
 	}
 	if branchID == "" {
-		writeError(c, http.StatusBadRequest, "branch_required",
-			"请求未指定目标 branch_id(从 X-Branch-ID / ?branch_id= / body / header 推导失败)")
+		writeError(c, http.StatusBadRequest, "branch_required", "请求未指定目标 branch_id")
 		return false
 	}
 	allowed, err := h.svc.HasEffectiveScope(c.Request.Context(), cl.Sub, branchID, scope)
@@ -836,9 +826,3 @@ func (h *Handler) requireScope(c *gin.Context, branchID, scope string) bool {
 	}
 	return true
 }
-
-// branchFromRequest 已删除(2026-09 重构):
-//   旧实现叠了 X-Branch-ID middleware + ?branch_id= + claims.DefaultBranchID 三层
-//   fallback,与 .claude/rules/02-handler-routes.md 冲突("branch 唯一来源 X-Branch-ID header")。
-//   现所有 per-branch 端点直接调 middleware.SingleBranchFromCtx(c),无 fallback。
-//   保留此 doc 块作 deprecation 提示;handler.go 不再有任何引用。

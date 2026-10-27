@@ -17,7 +17,7 @@
 // PLAN §3.6 写明:`transaction:view`(新)/ `procurement:view`(新)/
 // `sales:view`(新) 需要在 auth 仓的 seed 里存在,否则一律 403 fail-closed。
 //
-// ⇒ 本轮这些端点在 auth 补 seed 之前对所有人 403。这是**有意的**:
+// ⇒ auth 补 seed 之前这些端点对所有人 403。这是**有意的**:
 // 权限点没 seed 就放行 = 任何登录用户都能看全店流水。
 //
 // # ⚠️ branch 一律走 X-Branch-ID header
@@ -178,7 +178,7 @@ func pageArgs(c *gin.Context, page, pageSize int) (int, int) {
 //	503 = "数据源路由问不到 / 数据源被停用"
 //
 // 混在一起 ⇒ 用户看到"暂不可用"就去查数据源健康度,
-// 而真正的原因是权限(2026-10-21 审计里 member 域踩过这个坑)。
+// 而真正的原因是权限。
 func (h *Handler) fail(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, model.ErrSaleFlowNotFound):

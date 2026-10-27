@@ -8,25 +8,8 @@
 //	PUT    /products/:id                    改商品(本地表)
 //	DELETE /products/:id                    软删商品(本地表)
 //
-// searchProducts 之前在本文件里,2026-10-20 挪到 catalog.go:同一个 URL 现在
-// 同时承载"老路径(?barcode=)"与"新路径(?q=,商品选择控件)",两者的分派逻辑
-// 必须放在一起看,拆成两个文件反而更难读。
-//
-// getProduct 当前仍走 cube 兜底(本地 product CRUD 留待下一 Phase 实装)。
-//
-// # 写侧是本地的,读侧仍是 cube
-//
-// 2026-10-20 实装了本地商品的增删改,但**读端点没有切**:
-//
-//   - `GET /products` / `GET /products/search` / `GET /categories` /
-//     `GET /suppliers/summary` 是**商品选择控件**的 4 条端点,响应形状由
-//     Flutter 端(`lib/domain/product/product_models.dart`)依赖,
-//     且 tradewind_app 在用 ⇒ **本切片不动它们**。
-//   - 自营门店(门店 10)没有 cube 源 ⇒ picker 对它返 503
-//     `cube_source_not_configured`。这是**已知状态**,不是回归 ——
-//     切到"本地优先,cube 兜底"是下一个切片,必须同时改响应契约与前端。
-//
-// ⇒ 本切片只增加**写侧**能力:建档、改档、删档。导入工具靠它落数据。
+// 写侧在本域 PG;4 条 picker 读端点按「门店配没配数据源」分流;
+// `GET /products/:id` 走 cube 兜底,两条路径返回同一 DTO。
 package handler
 
 import (
@@ -116,6 +99,9 @@ func (h *Handler) createProduct(c *gin.Context) {
 }
 
 // updateProduct PUT /products/:id
+//
+// ⚠️ **局部更新**:指针字段为 nil = 该字段不传、不改。
+// ⚠️ **不复活软删行**:软删行不在查询范围内 ⇒ 命中不到就返 404。
 func (h *Handler) updateProduct(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if branchID == "" {
@@ -154,6 +140,8 @@ func (h *Handler) updateProduct(c *gin.Context) {
 }
 
 // deleteProduct DELETE /products/:id
+//
+// ⚠️ **软删**(写 deleted_at),不是物理删除:行还在表里,只是不再被查询到。
 func (h *Handler) deleteProduct(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if branchID == "" {
@@ -392,10 +380,8 @@ func rowString(row map[string]any, key string) string {
 //
 // 去重 ⇒ 同一商品的多个条码不重复出现。
 //
-// ⚠️ 2026-10-22:回落的"主条码"原本读 `products.barcode` 冗余列 ——
-//   那一列生产实测**大面积为空**(导入不赋值)⇒ 回落实际上永远是 id。
-//   而主表已不再有 barcode 列(条码只由 product_barcodes 子表表达,思迅同款)
-//   ⇒ 回落直接用 id(领域事实:"思迅 item_no 就是条码")。
+// ⚠️ 回落的主条码**直接取 id**:主表已无 barcode 列(条码只由 product_barcodes
+// 子表表达),而那条冗余列在生产**大面积为空**(导入不赋值)⇒ 回落永远等于 id。
 func buildExportProduct(p model.Product, subBarcodes []string) exportProductDTO {
 	code := p.ID
 	codes := make([]string, 0, len(subBarcodes)+1)

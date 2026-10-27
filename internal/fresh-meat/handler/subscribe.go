@@ -38,9 +38,6 @@ var SubscribeTopics = []string{
 	"sale.completed",
 	// ⚠️ **`sale.paid` 才是 POS 真正发的那条**
 	//   (internal/pos/service/events.go:TopicSalePaid)。
-	//
-	//   2026-10-24 生产实测:本服务此前只订阅 `sale.completed`
-	//   ⇒ **POS 的销售一条都没进来过**(journalctl 里零条真实 sale 事件)。
 	//   ⇒ 大宗「POS 自动采信」、零售猪肉的整猪归属,全都等在这条上。
 	//
 	//   两条都留着:`sale.completed` 是 EVENT-CATALOG 的老契约,

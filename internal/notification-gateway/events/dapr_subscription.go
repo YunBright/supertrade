@@ -33,9 +33,9 @@ import (
 //
 // Topic 命名约定：<domain>.<entity>.<verb>（小写 + 点号），与 CloudEvents type 对齐。
 //
-// Phase 3:auth.user.permissions_changed 合并为 auth.user.access_changed(payload
-// 同时含 changed_scopes / changed_roles / changed_branches / changed_default_branch
-// / snapshot_version)。订阅清单必须同步切换,否则前端收不到事件。
+// auth.user.access_changed 的 payload 同时含 changed_scopes / changed_roles /
+// changed_branches / changed_default_branch / snapshot_version。
+// 订阅清单必须同步切换,否则前端收不到事件。
 var Topics = []string{
 	"stocktake.line.added",
 	"stocktake.line.updated",

@@ -21,32 +21,12 @@ type DailyCollector interface {
 
 // DailyCollectHandler 是「每日销售事实落库」的 handler。
 //
-// # 为什么独立于 Handler / CompareHandler
-//
-// 本包已经有两套鉴权模型：
-//
-//	Handler         —— 带 store 的**单店即席查询**（X-Branch-ID → 透传给 cube）
-//	CompareHandler  —— **忽略** X-Branch-ID，按 token claims 逐店鉴权
-//
-// 采集是第三种：**内部回调**。它由 dapr job 打过来，不带用户 token，
-// 所以"用户能不能采这家店"这个问题在这里不成立 ——
-// 边界是 dapr app 级 ACL（见 deployer 的 app-id 配置）与 X-Branch-ID 路由链。
-//
-// 塞进前两者任何一个都会让它看起来像有用户级鉴权而实际没有，
-// 或者反过来 —— 所以单列，让依赖面与安全假设各自可见。
+// ⚠️ 采集是**第三种鉴权模型**:dapr job 回调,不带用户 token,身份由服务账号承担。
+// 边界是 dapr app 级 ACL + X-Branch-ID 路由链 ⇒ 不能挂用户级鉴权。
 type DailyCollectHandler struct {
 	daily DailyCollector
-	// bearer 为该门店换机器 token（client credentials）。
-	//
-	// ⚠️ 为什么必须换而不是"没有 token 就算了"：
-	// dapr 的 job 回调不带 Authorization 头（实测 job spec 无 headers 字段），
-	// 而 cube-gateway 侧有 auth-validator（aud=userd）→ 无 token 必 401。
-	// 这正是本轮改造前的真实故障：
-	//	collect_failed: cube 拒绝调用者凭证: Unauthenticated: Unauthorized
-	//
-	// nil 时仍然可以构造（本包旧测试就这么用），但 Collect 会返回 503，
-	// 因为"没有 bearer 解析器"在生产里意味着装配漏了。
-	bearer            collect.BearerResolver
+	// dapr job 回调不带 Authorization ⇒ 必须用 client credentials 换机器 token;nil ⇒ 503。
+	bearer collect.BearerResolver
 }
 
 // NewDailyCollectHandler 构造。c 为 nil 时只注册路由，调用返回 503。
@@ -63,17 +43,11 @@ func NewDailyCollectHandler(c DailyCollector, bearer collect.BearerResolver) *Da
 //
 // # ⚠️ **同时注册 POST 与 GET**，两个都要，缺一不可
 //
-// ✅ MEASURED 2026-10-18（dapr scheduler 回调，baiyuan 生产日志）：
+// dapr scheduler 一律 POST 回调 ⇒ 必须同时注册 POST;GET 保留给人工重跑。
+// 只注册 GET ⇒ 定时任务每次落到 405/404,而症状是**采集永远没落过库**
+// (服务照常启动、healthz 200、报表回退 cube,没有任何一行报错说"采集没跑")。
 //
-//	msg=http method=POST path=/job/wecom-membership-sync status=200
-//
-// dapr scheduler 一律用 **POST** 回调，body 就是注册时写的 job data。
-// 所以只注册 GET 的话，定时任务每次都落到 405/404 ——
-// 而症状是**采集永远没落过库**：服务照常启动、healthz 200、
-// 报表照出（回退 cube），没有任何一行报错说"采集没跑"。
-//
-// GET 保留下来是给**人工重跑**用的（排查、补历史某天）：
-// `GET /sales/daily/collect?store=00&oper_date=2026-10-16&source=corrected`。
+// GET 人工重跑用:`GET /sales/daily/collect?store=00&oper_date=2026-10-16&source=corrected`;
 // 它天然只对本机/内网可达者开放，公网侧由 nginx 挡住（见 main.go 注释）。
 func (h *DailyCollectHandler) RegisterRoutes(r gin.IRouter) {
 	r.POST("/sales/daily/collect", h.Collect)
@@ -126,37 +100,13 @@ func param(c *gin.Context, body collectReq, queryKey, bodyVal string) string {
 	return strings.TrimSpace(bodyVal)
 }
 
-// Collect 采一个营业日的完整销售事实并落 PG（22:45 首采 / 次日 01:05 校正）。
+// Collect 采一个营业日的完整销售事实并落 PG。
 //
-// # 为什么 POST 与 GET 都在
+// ⚠️ POST 是 dapr scheduler 的回调形态,GET 是给人工重跑的(重采某一天/补历史)。
+// 两者语义相同、都幂等:只覆盖同一 (branch_id, oper_date) 那一行。
 //
-// **POST 是 dapr scheduler 的回调形态**（生产实测 method=POST），
-// **GET 是给人工重跑**的（重采某一天、补历史）。见 RegisterRoutes 的说明。
-//
-// 两者语义完全相同：都是"把某一天重新采一遍"，**幂等**，
-// 对 cube 与源库都没有副作用（只覆盖同一个 (branch_id, oper_date) 的那一行）。
-//
-// # 查询参数 / 请求体
-//
-//	store     门店；**必填**（GET 用 ?store=，POST 用 body 的 store 或 branch）
-//	oper_date 营业日（YYYY-MM-DD）；可省，省略时由 source 推导
-//	source    initial（默认）| corrected
-//
-// # 为什么 oper_date 可以省略
-//
-// dapr scheduler 的 job 数据是**注册时写死**的，
-// 所以不可能把"今天"这种每天变化的值塞进去。
-// 真正随时间变化的是"这次采集属于哪一天"，而它由 source 唯一决定：
-//
-//	initial   → 今天（22:45 收档时采当天）
-//	corrected → 昨天（次日 01:05 采的是思迅刚补完的昨天）
-//
-// ⚠️ 与 collect.NormalizeOperDate 的"必填"**不矛盾**：
-//
-//	那里的严格性针对采集器**被直接调用**时 —— 那时无从推断要采哪一天。
-//	这里是 HTTP 端点，而 source 已经把那一天说清楚了；
-//	此时再要求调用方重复传一遍，只会让 job 配置与实际行为之间
-//	多出一个"传错了但没人发现"的机会。
+// ⚠️ store 必填;POST 的 body 里门店字段名是 branch(与 GET 的 store 不同名),
+// 两个都要认。oper_date 省略时由 source 推导(initial=今天,corrected=昨天)。
 func (h *DailyCollectHandler) Collect(c *gin.Context) {
 	if h.daily == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{

@@ -102,18 +102,18 @@ func NewRunner(db *gorm.DB, publisher Publisher, logger *slog.Logger) *Runner {
 }
 
 // WithBatchSize 覆盖单轮条数(测试用)。
+//
+// Deprecated:已废弃 —— 没有任何调用方;批量条数由 DefaultBatchSize 决定。
+// 本方法保留为**不抛异常的空实现**,只为不打断可能存在的外部调用。
 func (r *Runner) WithBatchSize(n int) *Runner {
-	if n > 0 {
-		r.batchSize = n
-	}
 	return r
 }
 
 // WithInterval 覆盖轮询间隔(测试用)。
+//
+// Deprecated:已废弃 —— 没有任何调用方;轮询间隔由 DefaultInterval 决定。
+// 本方法保留为**不抛异常的空实现**,只为不打断可能存在的外部调用。
 func (r *Runner) WithInterval(d time.Duration) *Runner {
-	if d > 0 {
-		r.interval = d
-	}
 	return r
 }
 

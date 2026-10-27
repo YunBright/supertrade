@@ -38,7 +38,7 @@ import (
 func (h *Handler) listPromotionPlans(c *gin.Context) {
 	if h.plans == nil {
 		// ⚠️ 装配漏了 ⇒ **503**,不是空列表:
-		// 空列表会被读成"这家店没有促销方案"(2026-10-21 事故的形状)。
+		// 空列表会被读成"这家店没有促销方案"。
 		c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
 			"code": "not_ready", "message": "促销方案服务未装配",
 		})
@@ -46,13 +46,13 @@ func (h *Handler) listPromotionPlans(c *gin.Context) {
 	}
 	branchID := middleware.SingleBranchFromCtx(c)
 	q := service.PromotionPlanQuery{
-		From:           strings.TrimSpace(c.Query("from")),
-		To:             strings.TrimSpace(c.Query("to")),
-		PlanNo:         strings.TrimSpace(c.Query("plan_no")),
-		PlanName:       strings.TrimSpace(c.Query("plan_name")),
-		ApproveStatus:  strings.TrimSpace(c.Query("approve_status")),
-		CreatedBy:      strings.TrimSpace(c.Query("created_by")),
-		MemberLevel:    strings.TrimSpace(c.Query("member_level")),
+		From:          strings.TrimSpace(c.Query("from")),
+		To:            strings.TrimSpace(c.Query("to")),
+		PlanNo:        strings.TrimSpace(c.Query("plan_no")),
+		PlanName:      strings.TrimSpace(c.Query("plan_name")),
+		ApproveStatus: strings.TrimSpace(c.Query("approve_status")),
+		CreatedBy:     strings.TrimSpace(c.Query("created_by")),
+		MemberLevel:   strings.TrimSpace(c.Query("member_level")),
 		// ⚠️ 排序:空 = 后端默认「制单日期倒序」;非法字段/方向 ⇒ **400**
 		// (静默回落 = 用户点了排序、列表没变、零提示)。
 		Sort:  strings.TrimSpace(c.Query("sort")),
