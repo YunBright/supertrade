@@ -1,6 +1,7 @@
 package build
 
 import (
+	"encoding/json"
 	"context"
 	"errors"
 	"os"
@@ -14,7 +15,6 @@ import (
 	"github.com/YunBright/supertrade/internal/salesinsight/fact"
 	"github.com/YunBright/supertrade/internal/salesinsight/fact/supplier"
 	"github.com/YunBright/supertrade/internal/salesinsight/ignore"
-	"github.com/YunBright/supertrade/internal/salesinsight/weather"
 )
 
 // newIgnoreStore 造一个**文件模式**的名单存储（每个用例独立目录）。
@@ -68,7 +68,7 @@ func (f *fakeSource) CategorySales(_ context.Context, _, from, _ string, _ int) 
 	if f.errCategory != nil {
 		return nil, f.errCategory
 	}
-	if from == "2026-10-15" {
+	if from == prevFromOfDaily() {
 		return f.catPrev, nil
 	}
 	return f.catCur, nil
@@ -87,12 +87,12 @@ func (f *fakeSource) TotalsSales(_ context.Context, _, from, _ string) (TotalsRo
 		return TotalsRow{}, f.errTotals
 	}
 	if f.hasTotals {
-		if from == "2026-10-15" {
+		if from == prevFromOfDaily() {
 			return f.totPrev, nil
 		}
 		return f.totCur, nil
 	}
-	if from == "2026-10-15" {
+	if from == prevFromOfDaily() {
 		return sumAsRow(f.catPrev), nil
 	}
 	return sumAsRow(f.catCur), nil
@@ -116,7 +116,7 @@ func (f *fakeSource) ProductSales(_ context.Context, _, from, _ string, _ int) (
 	if f.errProduct != nil {
 		return nil, f.errProduct
 	}
-	if from == "2026-10-15" {
+	if from == prevFromOfDaily() {
 		return f.prodPrev, nil
 	}
 	return f.prodCur, nil
@@ -126,7 +126,7 @@ func (f *fakeSource) SupplierSales(_ context.Context, _, from, _ string, _ int) 
 	if f.errSupplier != nil {
 		return nil, f.errSupplier
 	}
-	if from == "2026-10-15" {
+	if from == prevFromOfDaily() {
 		return f.supPrev, nil
 	}
 	return f.supCur, nil
@@ -174,9 +174,22 @@ func newFake() *fakeSource {
 	}
 }
 
+// prevFromOfDaily 返回 daily 期的**对比基准日**。
+//
+// ⚠️ 2026-10-26 起 daily 的对比基准是「上周同一天」而不是「昨天」，
+//
+//	所以本测试包的"上期"日期是 2026-10-16 往前 7 天 = 2026-10-09。
+//	fake 若还按 "2026-10-15" 区分本期/上期，
+//	就会把本期数据当成上期喂回去 ⇒ 环比恒为 0、归因恒为 none，
+//	而**所有测试仍然绿**（fake 的保真度决定测试的有效性）。
+func prevFromOfDaily() string {
+	return "2026-10-09"
+}
+
 func testOptions() Options {
-	// 2026-10-16 生成日报 ⇒ 本期 10-16（今日），上期 10-15（昨日）。
-	// daily 走「今日」语义（2026-10-19 现场实测后改，见 calendar.ResolvePeriod 注释）。
+	// 2026-10-16 生成日报 ⇒ 本期 10-16（今日），对比基准 10-09（上周同一天）。
+	// daily 走「今日」语义（2026-10-19 现场实测后改，见 calendar.ResolvePeriod 注释）；
+	// 对比基准改「上周同一天」是 2026-10-26 的改动（消除星期差异对环比的污染）。
 	now, _ := time.Parse("2006-01-02", "2026-10-16")
 	p, _ := calendar.ResolvePeriod(calendar.PeriodDaily, now)
 	return Options{
@@ -184,7 +197,7 @@ func testOptions() Options {
 		BranchName:    "富万家",
 		Period:        p,
 		TopN:          10,
-		Location:      weather.Location{Name: "岑溪", Lat: 24.7, Lon: 111.0},
+		Now:           now,
 	}
 }
 
@@ -212,12 +225,12 @@ func TestBuildProducesCompleteFact(t *testing.T) {
 		"B": {ItemNo: "B", Quantity: 50, MinQty: 10, HasRow: true},
 	}
 
-	f, err := NewBuilder(fs, nil).Build(context.Background(), testOptions())
+	f, err := NewBuilder(fs).Build(context.Background(), testOptions())
 	if err != nil {
 		t.Fatalf("Build 失败: %v", err)
 	}
 
-	if f.Meta.PeriodKind != "daily" || f.Meta.From != "2026-10-16" || f.Meta.PrevFrom != "2026-10-15" {
+	if f.Meta.PeriodKind != "daily" || f.Meta.From != "2026-10-16" || f.Meta.PrevFrom != prevFromOfDaily() {
 		t.Errorf("周期元信息错误: %+v", f.Meta)
 	}
 	if f.Totals.NetAmount != 13000 {
@@ -256,7 +269,7 @@ func TestMarginUnavailableWhenCoverageLow(t *testing.T) {
 	}
 	fs.catPrev = nil
 
-	f, err := NewBuilder(fs, nil).Build(context.Background(), testOptions())
+	f, err := NewBuilder(fs).Build(context.Background(), testOptions())
 	if err != nil {
 		t.Fatalf("Build 失败: %v", err)
 	}
@@ -306,7 +319,7 @@ func TestExcludesSelfUseSuppliers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f, err := NewBuilder(fs, nil).WithIgnores(ignores).
+	f, err := NewBuilder(fs).WithIgnores(ignores).
 		Build(context.Background(), testOptions())
 	if err != nil {
 		t.Fatalf("Build 失败: %v", err)
@@ -369,7 +382,7 @@ func TestUnconfiguredIgnoreListIsFlagged(t *testing.T) {
 	}
 
 	// 门店 00_1000003 从未保存过名单。
-	f, err := NewBuilder(fs, nil).WithIgnores(newIgnoreStore(t)).
+	f, err := NewBuilder(fs).WithIgnores(newIgnoreStore(t)).
 		Build(context.Background(), testOptions())
 	if err != nil {
 		t.Fatalf("Build 失败: %v", err)
@@ -403,7 +416,7 @@ func TestUnreadableIgnoreListIsFlaggedDistinctly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f, err := NewBuilder(fs, nil).WithIgnores(st).
+	f, err := NewBuilder(fs).WithIgnores(st).
 		Build(context.Background(), testOptions())
 	if err != nil {
 		t.Fatalf("Build 失败: %v", err)
@@ -436,7 +449,7 @@ func TestConfiguredEmptyListIsNotFlagged(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f, err := NewBuilder(fs, nil).WithIgnores(ignores).
+	f, err := NewBuilder(fs).WithIgnores(ignores).
 		Build(context.Background(), testOptions())
 	if err != nil {
 		t.Fatalf("Build 失败: %v", err)
@@ -487,6 +500,11 @@ func TestIgnoreListIsPerBranch(t *testing.T) {
 // ⚠️ 字典查不到时**保守保留**，并标记数据不足。
 //
 // 排除一条真供应商（丢失优质货源线索）的代价 > 多显示一条自采渠道。
+//
+// ⚠️ 2026-10-27 起，告警文案说的是**真实影响**：
+// 排除判定只认人工名单，字典挂了只影响**名称**（退化成编码占位符）。
+// 早先那句「无法识别自用渠道」与事实相反 ——
+// 会把店长和 LLM 引到"自用供应商混进榜单"这个错误的怀疑方向上。
 func TestDictFailureKeepsSuppliersButFlagsInsufficiency(t *testing.T) {
 	fs := newFake()
 	fs.catCur = []CategoryRow{{Name: "生鲜联营", Amount: 10000}}
@@ -496,7 +514,7 @@ func TestDictFailureKeepsSuppliersButFlagsInsufficiency(t *testing.T) {
 	}
 	fs.errDict = errors.New("cube 不可用")
 
-	f, err := NewBuilder(fs, nil).Build(context.Background(), testOptions())
+	f, err := NewBuilder(fs).Build(context.Background(), testOptions())
 	if err != nil {
 		t.Fatalf("字典失败不应让整体失败: %v", err)
 	}
@@ -506,8 +524,130 @@ func TestDictFailureKeepsSuppliersButFlagsInsufficiency(t *testing.T) {
 	if f.DataSufficiency.Sufficient {
 		t.Error("字典失败必须标记为数据不足")
 	}
-	if !containsSub(f.DataSufficiency.Issues, "无法识别自用") {
-		t.Errorf("必须说明无法识别自用渠道: %v", f.DataSufficiency.Issues)
+	if !containsSub(f.DataSufficiency.Issues, "名称暂用编码占位") {
+		t.Errorf("必须说明真实影响（名称占位）: %v", f.DataSufficiency.Issues)
+	}
+	// ⚠️ 字典失败**不得**声称"无法识别自用渠道" ——
+	//   排除判定只认人工名单，这句话会让店长去查错的方向。
+	if containsSub(f.DataSufficiency.Issues, "无法识别自用") {
+		t.Errorf("字典失败不影响排除判定，不得这样告警: %v", f.DataSufficiency.Issues)
+	}
+}
+
+// ⚠️ **cube 路径的供应商名必须来自字典**。
+//
+// # 2026-10-27 真实缺陷
+//
+// cube 路径的 SupplierSales **不返回名称**（supplier 是 storage: duck 模型，
+// 与 live 的 sales_report 不能 join），而 buildSuppliers 里
+// 查到的 dict **建了却从未被读** —— 于是全部退化成「供应商131」这种占位符：
+//
+//	报告写「本期已排除7个供应商（如供应商29的3587.2元）」
+//	→ 店长看不出排掉的是谁，LLM 也无法据此判断。
+//
+// 判别力：把 supplierDisplayName 里的字典分支删掉，本用例立刻失败。
+func TestSupplierNamesComeFromDict(t *testing.T) {
+	fs := newFake()
+	fs.catCur = []CategoryRow{{Name: "生鲜联营", Amount: 10000}}
+	// ⚠️ 刻意**不填 Name** —— 这就是 cube 路径的形状。
+	fs.supCur = []SupplierSalesRow{
+		{Code: "131", Amount: 5000, ProductCount: 12},
+		{Code: "038", Amount: 3000, ProductCount: 8},
+	}
+	fs.dict = []supplier.Record{
+		{Code: "131", Name: "梧州市优之粮粮油贸易有限公司", Type: "1", CustFlag: "S"},
+		{Code: "038", Name: "岑溪市泰鼎粮油食品有限公司", Type: "1", CustFlag: "S"},
+	}
+
+	f, err := NewBuilder(fs).Build(context.Background(), testOptions())
+	if err != nil {
+		t.Fatalf("Build 失败: %v", err)
+	}
+	nameByCode := map[string]string{}
+	for _, s := range f.Suppliers {
+		nameByCode[s.Code] = s.Name
+	}
+	if got := nameByCode["131"]; got != "梧州市优之粮粮油贸易有限公司" {
+		t.Errorf("供应商名必须来自字典，实际 %q（占位符 = 没读字典）", got)
+	}
+	if got := nameByCode["038"]; got != "岑溪市泰鼎粮油食品有限公司" {
+		t.Errorf("供应商名必须来自字典，实际 %q", got)
+	}
+}
+
+// ⚠️ 供应商名**不得**跨前导零串号。
+//
+// ✅ 实测（2026-10-27，门店 00）：字典表里
+//
+//	`29 猪肉自营` 与 `029 猪肉联营` 是**两个不同的供应商**，
+//	`19 同辉纸厂` 与 `019 自购蔬菜` 同理。
+//
+// 所以销售侧 `29` 只能取字典里的 `29`。
+// 若为了"命中率"去做变体匹配，`29` 就会被安上 `029 猪肉联营` 的名字 ——
+// **名字错了比没有名字更糟**：店长会按错误的供应商去谈供货。
+//
+// 判别力：把 supplierDisplayName 改成变体匹配，本用例立刻失败。
+func TestSupplierNameMustNotCrossZeroPadding(t *testing.T) {
+	fs := newFake()
+	fs.catCur = []CategoryRow{{Name: "生鲜联营", Amount: 10000}}
+	fs.supCur = []SupplierSalesRow{
+		{Code: "29", Amount: 3587.2, ProductCount: 28},
+	}
+	// 字典里**同时**存在 29 与 029 —— 两者是不同的供应商。
+	fs.dict = []supplier.Record{
+		{Code: "29", Name: "猪肉自营", Type: "1", CustFlag: "S"},
+		{Code: "029", Name: "猪肉联营", Type: "1", CustFlag: "S"},
+	}
+
+	f, err := NewBuilder(fs).Build(context.Background(), testOptions())
+	if err != nil {
+		t.Fatalf("Build 失败: %v", err)
+	}
+	if len(f.Suppliers) != 1 {
+		t.Fatalf("应有 1 个供应商，实际 %d", len(f.Suppliers))
+	}
+	if got := f.Suppliers[0].Name; got != "猪肉自营" {
+		t.Errorf("销售编码 29 必须取字典里的 29（猪肉自营），实际 %q"+
+			"（取到 029 是跨前导零串号，会把销量安到另一家供应商头上）", got)
+	}
+}
+
+// ⚠️ 排除项的名字也必须有名字，且字典查不到时回落到**名单条目名**。
+//
+// 名单条目上的名字是人工填的，可能是唯一可读的名字 ——
+// 比「供应商29」这种占位符有用得多。
+func TestExcludedSupplierNameFallsBackToIgnoreListName(t *testing.T) {
+	fs := newFake()
+	fs.catCur = []CategoryRow{{Name: "生鲜联营", Amount: 10000}}
+	fs.supCur = []SupplierSalesRow{
+		{Code: "029", Amount: 2000, ProductCount: 5}, // 字典里没有这条
+		{Code: "131", Amount: 5000, ProductCount: 12},
+	}
+	fs.dict = []supplier.Record{
+		{Code: "131", Name: "梧州市优之粮粮油贸易有限公司", Type: "1", CustFlag: "S"},
+	}
+
+	ignores := newIgnoreStore(t)
+	if _, err := ignores.Save("00_1000003", []ignore.Entry{
+		{Code: "029", Name: "干货自营", Reason: "门店自营"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := NewBuilder(fs).WithIgnores(ignores).
+		Build(context.Background(), testOptions())
+	if err != nil {
+		t.Fatalf("Build 失败: %v", err)
+	}
+	if len(f.ExcludedSuppliers) != 1 {
+		t.Fatalf("应有 1 条排除记录，实际 %d", len(f.ExcludedSuppliers))
+	}
+	e := f.ExcludedSuppliers[0]
+	if e.Name != "干货自营" {
+		t.Errorf("排除项应回落到名单条目名，实际 %q", e.Name)
+	}
+	if e.Amount != 2000 {
+		t.Errorf("排除项必须保留金额，实际 %v", e.Amount)
 	}
 }
 
@@ -518,7 +658,7 @@ func TestStockFailureDegradesButDoesNotAbort(t *testing.T) {
 	fs.prodCur = []ProductRow{{ItemNo: "A", Name: "西红柿", Amount: 300}}
 	fs.errStock = errors.New("库存服务不可用")
 
-	f, err := NewBuilder(fs, nil).Build(context.Background(), testOptions())
+	f, err := NewBuilder(fs).Build(context.Background(), testOptions())
 	if err != nil {
 		t.Fatalf("库存失败不应让整体失败: %v", err)
 	}
@@ -551,7 +691,7 @@ func TestStockQueryIsLimitedToTopProducts(t *testing.T) {
 	fs.prodCur = many
 	fs.stocks = map[string]fact.StockRecord{}
 
-	if _, err := NewBuilder(fs, nil).Build(context.Background(), testOptions()); err != nil {
+	if _, err := NewBuilder(fs).Build(context.Background(), testOptions()); err != nil {
 		t.Fatalf("Build 失败: %v", err)
 	}
 	if len(fs.stockAsked) > 60 {
@@ -567,13 +707,13 @@ func TestStockQueryIsLimitedToTopProducts(t *testing.T) {
 //	而"整个推送停掉"是最难排查的失败形态
 //	（排查起点变成"它到底跑没跑"，而 dapr 不提供 job 执行历史）。
 //
-// 用 prevOnlyFailSource：只在查上期（from=2026-10-15）时报错。
+// 用 prevOnlyFailSource：只在查上期（from=上周同一天）时报错。
 func TestPrevPeriodFailureStillProducesReport(t *testing.T) {
 	fs := &prevOnlyFailSource{fakeSource: newFake()}
 	fs.catCur = []CategoryRow{{Name: "生鲜联营", Amount: 8000, CostedRow: 100, TotalRow: 100}}
 	fs.catPrev = []CategoryRow{{Name: "生鲜联营", Amount: 10000}}
 
-	f, err := NewBuilder(fs, nil).Build(context.Background(), testOptions())
+	f, err := NewBuilder(fs).Build(context.Background(), testOptions())
 	if err != nil {
 		t.Fatalf("上期失败不应让整体失败: %v", err)
 	}
@@ -597,7 +737,7 @@ type prevOnlyFailSource struct {
 }
 
 func (p *prevOnlyFailSource) CategorySales(ctx context.Context, b, from, to string, n int) ([]CategoryRow, error) {
-	if from == "2026-10-15" {
+	if from == prevFromOfDaily() {
 		return nil, errors.New("上期数据不可用")
 	}
 	return p.fakeSource.CategorySales(ctx, b, from, to, n)
@@ -608,7 +748,7 @@ func TestBuildRequiresStoreBranch(t *testing.T) {
 	fs := newFake()
 	opt := testOptions()
 	opt.StoreBranchID = ""
-	_, err := NewBuilder(fs, nil).Build(context.Background(), opt)
+	_, err := NewBuilder(fs).Build(context.Background(), opt)
 	if err == nil {
 		t.Fatal("缺少门店必须报错，否则会返回全部分店的数据")
 	}
@@ -618,7 +758,7 @@ func TestBuildRequiresStoreBranch(t *testing.T) {
 func TestNoSalesDataFlagsInsufficiency(t *testing.T) {
 	fs := newFake()
 	fs.catCur = nil
-	f, err := NewBuilder(fs, nil).Build(context.Background(), testOptions())
+	f, err := NewBuilder(fs).Build(context.Background(), testOptions())
 	if err != nil {
 		t.Fatalf("Build 失败: %v", err)
 	}
@@ -630,25 +770,60 @@ func TestNoSalesDataFlagsInsufficiency(t *testing.T) {
 	}
 }
 
-// 天气失败**不**标记为数据不足 —— 它是增强项，不是结论前提。
-func TestWeatherFailureIsNotInsufficiency(t *testing.T) {
+// ⚠️ 事实包必须带**未来两天**的日历性质（2026-10-26）。
+//
+// 日报 22:50 生成，店长要的是"明天"的动作 ——
+// 而"明天是周六/后天是法定假日"这种判断只有日历知道。
+// 没有它，模型只能给"多备点货"这类没有依据的建议。
+func TestBuildCarriesTomorrowAndDayAfter(t *testing.T) {
 	fs := newFake()
 	fs.catCur = []CategoryRow{{Name: "生鲜联营", Amount: 8000}}
-	wx := weather.NewUnavailableProvider("天气服务未配置")
-	f, err := NewBuilder(fs, wx).Build(context.Background(), testOptions())
+
+	now := time.Date(2026, 10, 26, 22, 50, 0, 0, time.UTC)
+	p, _ := calendar.ResolvePeriod(calendar.PeriodDaily, now)
+	opt := testOptions()
+	opt.Period = p
+	opt.Now = now
+
+	f, err := NewBuilder(fs).Build(context.Background(), opt)
 	if err != nil {
 		t.Fatalf("Build 失败: %v", err)
 	}
-	if f.Context.Weather.Available {
-		t.Error("未配置天气源时 Available 应为 false")
+	if f.Context.Tomorrow.Date != "2026-10-27" {
+		t.Errorf("明天应是 2026-10-27，实际 %q", f.Context.Tomorrow.Date)
 	}
-	if f.Context.Weather.Summary != "" {
-		t.Errorf("不可用时 Summary 必须为空（否则 LLM 会当事实用），实际 %q", f.Context.Weather.Summary)
+	if f.Context.DayAfter.Date != "2026-10-28" {
+		t.Errorf("后天应是 2026-10-28，实际 %q", f.Context.DayAfter.Date)
 	}
-	if !f.DataSufficiency.Sufficient {
-		t.Errorf("天气缺失不应把报告标成数据不足: %v", f.DataSufficiency.Issues)
+	if f.Context.Tomorrow.Weekday == "" {
+		t.Error("明天必须有星期，否则模型不知道客流基准")
+	}
+	if f.Meta.Today != "2026-10-26" {
+		t.Errorf("Meta.Today 应是生成日 2026-10-26，实际 %q", f.Meta.Today)
 	}
 }
+
+// ⚠️ 事实包**不再**带天气（2026-10-26）。
+//
+// 天气改成模型按需调用的工具。
+// 保留它会让模型在每份报告里都看到天气 ——
+// 而那份"未来两小时开始下雨"曾被写进日报正文。
+func TestBuildDoesNotCarryWeatherAnymore(t *testing.T) {
+	fs := newFake()
+	fs.catCur = []CategoryRow{{Name: "生鲜联营", Amount: 8000}}
+	f, err := NewBuilder(fs).Build(context.Background(), testOptions())
+	if err != nil {
+		t.Fatalf("Build 失败: %v", err)
+	}
+	raw, err := json.Marshal(f)
+	if err != nil {
+		t.Fatalf("序列化失败: %v", err)
+	}
+	if strings.Contains(string(raw), "weather") {
+		t.Errorf("事实包不应再包含天气字段（天气已改为工具）: %s", raw)
+	}
+}
+
 
 // containsSub 是**子串**匹配。
 //
@@ -699,7 +874,7 @@ func itoa(n int) string {
 //	这条用例守住另一半：builder 必须真的把 Options.StoreBranchID 传下去。
 func TestSupplierDictReceivesStoreBranch(t *testing.T) {
 	f := &fakeSource{calls: map[string]int{}}
-	b := NewBuilder(f, nil)
+	b := NewBuilder(f)
 
 	_, err := b.Build(context.Background(), Options{
 		StoreBranchID: "store-9",

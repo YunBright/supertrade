@@ -2,15 +2,24 @@
 //
 // # 组装顺序不可调换
 //
-//  1. 品类（本期 + 上期）→ 大盘、环比、可比性
-//  2. 商品（本期 + 上期）→ 排行、环比
-//  3. 库存（只查排行商品的）→ 缺货判定
-//  4. 供应商（本期 + 上期 + 字典）→ 自用排除、单品分析
-//  5. 归因（需要品类与库存都在场）
-//  6. 规则摘要
+//  1. 日历上下文（本期 / 对比基准 / 未来两天）
+//  2. 品类（本期 + 上期）→ 大盘、环比、可比性
+//  3. 商品（本期 + 上期）→ 排行、环比
+//  4. 库存（只查排行商品的）→ 缺货判定
+//  5. 供应商（本期 + 上期 + 字典）→ 自用排除、单品分析
+//  6. 归因（需要品类与库存都在场）
+//  7. 规则摘要
 //
 // 归因必须最后做：它需要"这个商品所属品类跌了多少"和"当前库存多少"，
-// 而后者又依赖第 3 步先确定"哪些商品值得查库存"（TopN，而不是全量）。
+// 而后者又依赖第 4 步先确定"哪些商品值得查库存"（TopN，而不是全量）。
+//
+// # ⚠️ 天气**不在**这里（2026-10-26）
+//
+// 天气从"事实包的一段上下文"改成了"模型按需调用的工具"：
+// 组装阶段无条件取天气，会把"未来两小时开始下雨"这种
+// 与报告期无关的事实塞进 prompt，生产日报实际出现过
+//「当前晴，22℃，北风3级；80分钟后开始下小雨」。
+// ⇒ 取数改在**推理时**由模型决定要不要调（见 insight 包的工具层）。
 package build
 
 import (
@@ -23,7 +32,6 @@ import (
 	"github.com/YunBright/supertrade/internal/salesinsight/calendar"
 	"github.com/YunBright/supertrade/internal/salesinsight/fact"
 	"github.com/YunBright/supertrade/internal/salesinsight/ignore"
-	"github.com/YunBright/supertrade/internal/salesinsight/weather"
 )
 
 // Options 是组装参数。
@@ -40,8 +48,12 @@ type Options struct {
 	Period calendar.Period
 	// TopN 是排行条数（会被 fact.TopN 夹住）。
 	TopN int
-	// Location 是门店位置（天气用）。
-	Location weather.Location
+	// Now 是"此刻"，**必须带营业时区**（Asia/Shanghai）。
+	//
+	// ⚠️ 它决定三件事：事实包的生成时刻、报告期当天的日期、
+	//   以及"明天/后天"是哪两天。
+	//   零值时回退到 Builder 自己的时钟（仅测试）。
+	Now time.Time
 	// SelfUseKeywords 可选覆盖自用关键词（nil = 用默认）。
 	SelfUseKeywords []string
 }
@@ -49,7 +61,6 @@ type Options struct {
 // Builder 组装事实包。
 type Builder struct {
 	src DataSource
-	wx  weather.Provider
 	// ignores 是本门店的人工忽略名单存储（按门店分文件）。
 	//
 	// ⚠️ 它是**唯一**的供应商排除依据；为 nil 时所有自用供应商
@@ -64,11 +75,12 @@ type Builder struct {
 }
 
 // NewBuilder 构造组装器。
-func NewBuilder(src DataSource, wx weather.Provider) *Builder {
-	if wx == nil {
-		wx = weather.NewUnavailableProvider("")
-	}
-	return &Builder{src: src, wx: wx, now: time.Now}
+//
+// ⚠️ 它**不再**接受天气数据源（2026-10-26）：
+//   天气从"报告期的一段上下文"改成了"模型按需调用的工具"，
+//   取数发生在**推理时**而不是组装时 —— 天气源因此归 insight 的工具层。
+func NewBuilder(src DataSource) *Builder {
+	return &Builder{src: src, now: time.Now}
 }
 
 // WithRangeLoader 注入"已定稿销售事实"的读通道（PG）。
@@ -146,6 +158,11 @@ func (b *Builder) Build(ctx context.Context, opt Options) (*fact.Fact, error) {
 	//   （见 routedSource 的注释）。未装配时它就是 b.src 本身。
 	src := b.route()
 
+	now := opt.Now
+	if now.IsZero() {
+		now = b.now()
+	}
+
 	topN := fact.TopN(opt.TopN)
 	if opt.SelfUseKeywords != nil {
 		fact.SetSelfUseKeywords(opt.SelfUseKeywords)
@@ -159,9 +176,12 @@ func (b *Builder) Build(ctx context.Context, opt Options) (*fact.Fact, error) {
 			To:                  opt.Period.Cur.End.Format(calendar.DateLayout),
 			PrevFrom:            opt.Period.Prev.Start.Format(calendar.DateLayout),
 			PrevTo:              opt.Period.Prev.End.Format(calendar.DateLayout),
+			PrevLabel:           opt.Period.PrevLabel(),
+			PrevReportFrom:      opt.Period.PrevReport.Start.Format(calendar.DateLayout),
+			PrevReportTo:        opt.Period.PrevReport.End.Format(calendar.DateLayout),
 			BranchID:            opt.StoreBranchID,
 			BranchName:          opt.BranchName,
-			GeneratedAt:         b.now().Format(time.RFC3339),
+			GeneratedAt:         now.Format(time.RFC3339),
 			CalendarDataVersion: calendar.DataVersion,
 		},
 	}
@@ -183,28 +203,31 @@ func (b *Builder) Build(ctx context.Context, opt Options) (*fact.Fact, error) {
 	f.Context.PrevFrom = prevDay
 	f.Context.Comparability = calendar.Compare(opt.Period.Cur, opt.Period.Prev)
 
-	// ---- 2. 天气（失败降级，不影响主链路）----
+	// ---- 1b. 未来两天（"明天/后天"建议的事实依据）----
 	//
-	// ⚠️ 这里对"日历与天气"取的是**本期首日**。
-	//   周报/月报取首日而不是每天取，是因为后者意味着 30 次外部调用 ——
-	//   而天气对周报结论的影响是"这周整体什么天气"，
-	//   取首日是成本与价值的合理折中。
-	if wx, err := b.wx.Fetch(ctx, f.Meta.From, opt.Location); err == nil {
-		f.Context.Weather = wx
-	} else {
-		f.Context.Weather = weather.Info{
-			Available:      false,
-			DegradedReason: "天气查询失败：" + err.Error(),
+	// ⚠️ 为什么在这里算而不是让模型自己推：
+	//	模型不知道"明天是周六"—— 节假日与调休表在本地，
+	//	而"明天要不要多备货"恰恰取决于这个。
+	//	没有它，建议只能是"多备点货"这种没有依据的话（= 建议滞后）。
+	//
+	// ⚠️ 以"生成时刻"为基准而不是报告期末日：
+	//	日报的报告期就是生成当天，两者一致；
+	//	周报/月报的报告期是上一周/上个月，但"明天"仍然是真实的明天。
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	f.Meta.Today = calendar.Format(today)
+	for i, dst := range []*calendar.Day{&f.Context.Tomorrow, &f.Context.DayAfter} {
+		d, err := calendar.Describe(calendar.Format(today.AddDate(0, 0, i+1)))
+		if err != nil {
+			// 日历判定失败**不**让整份报告失败：它只是"未来两天"的补充信息。
+			sufficiency.Sufficient = false
+			sufficiency.Issues = append(sufficiency.Issues,
+				"解析未来日期失败，明/后天建议缺少日历依据")
+			continue
 		}
-	}
-	if !f.Context.Weather.Available && f.Context.Weather.DegradedReason != "" {
-		// 天气缺失**不**标记为数据不足 ——
-		// 它是增强项，不影响结论成立。记进 sufficiency 会让
-		// "每天都有天气缺失"的门店误以为数据有问题。
-		_ = f.Context.Weather.DegradedReason
+		*dst = d
 	}
 
-	// ---- 3. 品类（本期 + 上期）----
+	// ---- 2. 品类（本期 + 上期）----
 	catCur, err := src.CategorySales(ctx, opt.StoreBranchID, f.Meta.From, f.Meta.To, topN)
 	if err != nil {
 		return nil, fmt.Errorf("build: 取本期品类销售: %w", err)
@@ -287,7 +310,7 @@ func (b *Builder) Build(ctx context.Context, opt Options) (*fact.Fact, error) {
 		sufficiency.Issues = append(sufficiency.Issues, "本期无销售数据")
 	}
 
-	// ---- 4. 商品（本期 + 上期）----
+	// ---- 3. 商品（本期 + 上期）----
 	prodCur, err := src.ProductSales(ctx, opt.StoreBranchID, f.Meta.From, f.Meta.To, topN)
 	if err != nil {
 		return nil, fmt.Errorf("build: 取本期商品销售: %w", err)
@@ -298,7 +321,7 @@ func (b *Builder) Build(ctx context.Context, opt Options) (*fact.Fact, error) {
 		sufficiency.Issues = append(sufficiency.Issues, "上期商品数据获取失败，商品环比不可用")
 	}
 
-	// ---- 5. 库存（只查 TopN 商品，这是成本控制的关键）----
+	// ---- 4. 库存（只查 TopN 商品，这是成本控制的关键）----
 	//
 	// ⚠️ 绝不能"查所有商品的库存"：那是 2.7 万行的量级，
 	//   既慢又会把事实包撑爆。而缺货判断只需要看排行商品 ——
@@ -325,17 +348,17 @@ func (b *Builder) Build(ctx context.Context, opt Options) (*fact.Fact, error) {
 		stocks = s
 	}
 
-	// ---- 6. 供应商 ----
+	// ---- 5. 供应商 ----
 	f.Suppliers, f.ExcludedSuppliers = b.buildSuppliers(ctx, opt, f, topN, &sufficiency, src)
 
-	// ---- 7. 商品排行 + 归因（依赖品类与库存）----
+	// ---- 6. 商品排行 + 归因（依赖品类与库存）----
 	f.TopProducts = buildProducts(prodCur, prodPrev, f.Categories, stocks)
 	f.Stockouts = fact.BuildStockouts(f.TopProducts, stocks)
 
-	// ---- 8. 规则摘要 ----
+	// ---- 7. 规则摘要 ----
 	f.RuleInsights = buildRuleInsights(f, stocks)
 
-	// ---- 9. 取数来源说明 ----
+	// ---- 8. 取数来源说明 ----
 	//
 	// ⚠️ 装配了 PG 读通道时，这里会写清"哪一段没走已定稿数据、为什么"。
 	//

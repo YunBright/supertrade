@@ -45,6 +45,18 @@ type GenerateInput struct {
 	//   留空是**正常分支**，不是错误：prompt 会明确写"没有上一期结论记录"，
 	//   环比的数字部分由事实包的 Deltas 独立提供，不依赖这份摘要。
 	PrevSummary *insight.PrevSummary
+	// PrevSummaries 是**上期摘要候选**（每一期一份，2026-10-27 起）。
+	//
+	// ⚠️ 为什么由**本服务**挑而不是调用方挑：
+	//   "上一期报告"与"对比基准"是两个不同的区间
+	//   （日报：上一期=昨天，对比基准=上周同一天），
+	//   而那个口径只有本服务一处真相（calendar.ResolvePeriod）。
+	//   调用方自己挑 ⇒ 两份口径迟早分叉 ⇒
+	//   症状是"某一期报告突然不接上期的话"，且没有任何报错。
+	//
+	//   本仓于是把"该门店该周期的全部上期摘要"都传过来，
+	//   由本服务按区间匹配挑出该用的那一份。
+	PrevSummaries []*insight.PrevSummary
 }
 
 // Handler 是 HTTP handler。
@@ -123,6 +135,14 @@ type generateReq struct {
 	TopN int `json:"top_n"`
 	// PrevSummary 是上一期结论摘要（可选）。
 	PrevSummary *prevSummaryReq `json:"prev_summary,omitempty"`
+	// PrevSummaries 是**上期摘要候选**（每一期一份）。
+	//
+	// ⚠️ 2026-10-27 起：调用方把该门店该周期的**全部**上期摘要都传过来，
+	//   由本服务按周期口径挑出区间匹配的那一份
+	//   （见 GenerateInput.PrevSummaries 的注释）。
+	//   两者并存是为了**滚动升级期**也能工作：
+	//   老调用方只给 prev_summary，新调用方给 prev_summaries。
+	PrevSummaries []prevSummaryReq `json:"prev_summaries,omitempty"`
 	// IncludeAudit 是审计回传粒度："summary"（默认）或 "full"。
 	IncludeAudit string `json:"include_audit,omitempty"`
 }
@@ -186,6 +206,7 @@ func (h *Handler) generate(c *gin.Context) {
 		Kind:          kind,
 		TopN:          req.TopN,
 		PrevSummary:   prevSummaryOf(req.PrevSummary, kind),
+		PrevSummaries: prevSummariesOf(req.PrevSummaries, kind),
 	})
 	if err != nil {
 		// 取数类错误（源库不可达）才是 503；
@@ -237,6 +258,33 @@ func prevSummaryOf(p *prevSummaryReq, kind calendar.PeriodKind) *insight.PrevSum
 	}
 }
 
+// prevSummariesOf 把请求里的**候选列表**转成引擎用的形状。
+//
+// ⚠️ 逐条过滤掉"没有结论"的：一条空摘要既匹配不上任何区间，
+//
+//	又会在审计里留下"上期结论是空的"的错觉。
+//
+// ⚠️ 不在这里挑"哪一份才是上一期" —— 那是引擎的事（它才知道
+//
+//	本期的"上一期报告"区间，见 insight.PickPrevSummary）。
+func prevSummariesOf(list []prevSummaryReq, kind calendar.PeriodKind) []*insight.PrevSummary {
+	out := make([]*insight.PrevSummary, 0, len(list))
+	for i := range list {
+		p := list[i]
+		if strings.TrimSpace(p.Summary) == "" && len(p.Highlights) == 0 {
+			continue
+		}
+		out = append(out, &insight.PrevSummary{
+			PeriodKind: string(kind),
+			From:       strings.TrimSpace(p.From),
+			To:         strings.TrimSpace(p.To),
+			Summary:    p.Summary,
+			Highlights: p.Highlights,
+		})
+	}
+	return out
+}
+
 // MaxAuditFieldChars 是单个审计大字段（context/prompt/raw_output）的字符上限。
 //
 // ⚠️ 审计数据要落 state store，无界增长会把它写满 ——
@@ -283,9 +331,17 @@ type auditView struct {
 	//   缺了它们，调用方只能靠自己再解析一次周期 ——
 	//   而两处解析用不同代码路径时，key 会不一致，
 	//   症状是"报告存进去了但历史列表里查不到"。
-	PeriodKind     string `json:"period_kind"`
-	From           string `json:"from"`
-	To             string `json:"to"`
+	PeriodKind string `json:"period_kind"`
+	From       string `json:"from"`
+	To         string `json:"to"`
+	// PrevFrom / PrevTo / PrevLabel 是**对比基准**（2026-10-26 新增）。
+	//
+	// ⚠️ 调用方（wechat-bot）要靠它们渲染卡片上的"对比基准"那一行。
+	//	日报的对比基准是"上周同一天"，周报是"上一周"，月报是"上一月" ——
+	//	三种口径三套算法，必须由本服务给出，调用方自己推断会漂移。
+	PrevFrom       string `json:"prev_from,omitempty"`
+	PrevTo         string `json:"prev_to,omitempty"`
+	PrevLabel      string `json:"prev_label,omitempty"`
 	BranchID       string `json:"branch_id"`
 	PromptVersion  string `json:"prompt_version,omitempty"`
 	Degraded       bool   `json:"degraded"`
@@ -316,6 +372,9 @@ func auditViewOf(a insight.Audit, full bool) auditView {
 		PeriodKind:       a.PeriodKind,
 		From:             a.From,
 		To:               a.To,
+		PrevFrom:         a.PrevFrom,
+		PrevTo:           a.PrevTo,
+		PrevLabel:        a.PrevLabel,
 		BranchID:         a.BranchID,
 		PromptVersion:    a.PromptVersion,
 		Degraded:         a.Degraded,

@@ -92,7 +92,7 @@ func initApp() error {
 	//	而报告里没有任何异常信号（见 ignore 包的 package 注释）。
 	ignores := newIgnoreStore()
 	src := build.NewDaprSource(cube)
-	builder := build.NewBuilder(src, weatherProvider(daprCli)).
+	builder := build.NewBuilder(src).
 		WithIgnores(ignores)
 
 	// ---- 已定稿销售事实（PG 只读）----
@@ -139,6 +139,24 @@ func initApp() error {
 
 	timeout := time.Duration(envInt("SALESINSIGHT_LLM_TIMEOUT_SEC", 45)) * time.Second
 	engine := insight.NewEngine(enableAI && conv != nil, timeout, conv)
+
+	// ---- 天气工具（模型按需调用）----
+	//
+	// ⚠️ 天气**不再**无条件进 prompt（2026-10-26）：
+	//   原实现把"未来两小时"的降水摘要塞进事实包，
+	//   生产日报因此写出过「当前晴，22℃，北风3级；80分钟后开始下小雨」——
+	//   那段话描述的是营业结束之后的天气，与"今天卖得怎么样"无关。
+	//
+	//	现在天气是**工具**：模型判断要不要查（今天为什么销量低 / 明天要不要改备货），
+	//	查到的事实带绝对日期，不会被读成别的日子。
+	//
+	//	⚠️ 工具**不装配**时也要能跑：模型看不到工具就直接回答，
+	//	  报告只是少一个解释维度，不会失败。
+	weatherTools := insight.WeatherTools{
+		Provider: weatherProvider(daprCli),
+		Location: locationFromEnv(),
+	}
+	engine.WithTools(weatherTools.Specs(), weatherTools)
 
 	appSvc = handler.NewServiceImpl(builder, engine)
 	appH = handler.New(appSvc).WithIgnores(ignores).WithDict(src).
@@ -291,11 +309,7 @@ func forwardBearerToOutgoing() gin.HandlerFunc {
 //	而报告里会写"晴，26℃"，没有任何异常信号。
 //	门店位置配错是这个功能最可能的配置错误，必须让它显形。
 func weatherProvider(daprCli dapr.Client) weather.Provider {
-	loc := weather.Location{
-		Name: strings.TrimSpace(os.Getenv("STORE_CITY")),
-		Lat:  envFloat("STORE_LAT"),
-		Lon:  envFloat("STORE_LON"),
-	}
+	loc := locationFromEnv()
 	if !loc.Valid() {
 		return weather.NewUnavailableProvider(
 			"门店位置未配置或超出中国境内范围（STORE_CITY/STORE_LAT/STORE_LON），" +
@@ -316,6 +330,22 @@ func weatherProvider(daprCli dapr.Client) weather.Provider {
 	qw = qw.WithBaseURL(os.Getenv(weather.EnvQWeatherBaseURL))
 	qw.Quota = newQuotaGuard(daprCli)
 	return qw
+}
+
+// locationFromEnv 从环境变量读门店位置。
+//
+// ⚠️ 没有默认坐标 —— 0/0 在几内亚湾，天气 API 会返回那里的天气
+//
+//	且**不报错**。所以坐标缺失时返回零值 Location，
+//	weather.Location.Valid() 会判为无效，下游据此降级。
+func locationFromEnv() weather.Location {
+	lat, _ := strconv.ParseFloat(strings.TrimSpace(os.Getenv("STORE_LAT")), 64)
+	lon, _ := strconv.ParseFloat(strings.TrimSpace(os.Getenv("STORE_LON")), 64)
+	return weather.Location{
+		Name: strings.TrimSpace(os.Getenv("STORE_CITY")),
+		Lat:  lat,
+		Lon:  lon,
+	}
 }
 
 // newQuotaGuard 装配每日调用配额守卫。

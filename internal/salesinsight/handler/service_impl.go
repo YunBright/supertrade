@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -12,7 +11,6 @@ import (
 	"github.com/YunBright/supertrade/internal/salesinsight/calendar"
 	"github.com/YunBright/supertrade/internal/salesinsight/fact"
 	"github.com/YunBright/supertrade/internal/salesinsight/insight"
-	"github.com/YunBright/supertrade/internal/salesinsight/weather"
 )
 
 // BranchNamer 把门店 ID 解析成名称。
@@ -114,11 +112,13 @@ func (s *ServiceImpl) Generate(ctx context.Context, in GenerateInput) (insight.I
 	}
 
 	opt := build.Options{
-		StoreBranchID:   in.StoreBranchID,
-		BranchName:      branchName,
-		Period:          period,
-		TopN:            in.TopN,
-		Location:        locationFromEnv(),
+		StoreBranchID: in.StoreBranchID,
+		BranchName:    branchName,
+		Period:        period,
+		TopN:          in.TopN,
+		// ⚠️ Now 必须带营业时区：它决定事实包的生成时刻与"今天/明天"是哪两天。
+		//   s.now() 在 WithBizTZ 之后就是营业时区的时间。
+		Now:             s.now(),
 		SelfUseKeywords: selfUseKeywordsFromEnv(),
 	}
 
@@ -143,10 +143,14 @@ func (s *ServiceImpl) Generate(ctx context.Context, in GenerateInput) (insight.I
 	// ⚠ 区间是否与本期"上期"一致，由引擎判定（insight.PrevSummaryMatches）——
 	//   只有引擎同时握着事实包与最终 prompt，才能保证
 	//   "注入的摘要"与"审计里记录的摘要"是同一个东西。
-
+	//
+	// ⚠️ 候选列表（每一期一份）也原样交给引擎：
+	//   挑哪一份是**口径问题**，而口径只有本服务一处真相
+	//   （calendar.ResolvePeriod 里的 PrevReport）。
 	ins, audit := s.engine.Analyze(ctx, insight.AnalyzeInput{
-		Fact:        *f,
-		PrevSummary: prevSummary,
+		Fact:          *f,
+		PrevSummary:   prevSummary,
+		PrevSummaries: in.PrevSummaries,
 	})
 	// ⚠️ 无论降级与否都返回 nil error：
 	//   "生成成功但用了规则模式"是一个**成功**的结果，
@@ -157,22 +161,6 @@ func (s *ServiceImpl) Generate(ctx context.Context, in GenerateInput) (insight.I
 
 // FactDigest 暴露事实包文本（调试与契约测试用）。
 func (s *ServiceImpl) FactDigest(f *fact.Fact) string { return insight.FactDigest(*f) }
-
-// locationFromEnv 从环境变量读门店位置。
-//
-// ⚠️ 没有默认坐标 —— 0/0 在几内亚湾，天气 API 会返回那里的天气
-//
-//	且**不报错**。所以坐标缺失时返回零值 Location，
-//	weather.Location.Valid() 会判为无效，下游据此降级。
-func locationFromEnv() weather.Location {
-	lat, _ := strconv.ParseFloat(strings.TrimSpace(os.Getenv("STORE_LAT")), 64)
-	lon, _ := strconv.ParseFloat(strings.TrimSpace(os.Getenv("STORE_LON")), 64)
-	return weather.Location{
-		Name: strings.TrimSpace(os.Getenv("STORE_CITY")),
-		Lat:  lat,
-		Lon:  lon,
-	}
-}
 
 // selfUseKeywordsFromEnv 读自用关键词覆盖。
 //

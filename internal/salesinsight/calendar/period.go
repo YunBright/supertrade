@@ -49,10 +49,23 @@ const (
 )
 
 // Period 是一个报表周期及其上期（同期口径）。
+//
+// # ⚠️ Cur / Prev / PrevReport 三者的区别（2026-10-26 新增 PrevReport）
+//
+//	Cur       = 本期（日报=今天；周报=上周；月报=上月）
+//	Prev      = **对比基准**：本期拿它做环比
+//	PrevReport= **上一期报告**：它产出的那份结论，用于"延续性叙述"
+//
+//	对周报/月报，Prev == PrevReport（上一期报告正好就是对比基准）。
+//	对日报，Prev = 上周同一天，而 PrevReport = 昨天 ——
+//	因为日报 22:50 发，对比基准必须避开"昨天 vs 今天"的星期差异，
+//	但"上一期报告说了什么"仍然是昨天的结论（店长是连着读的）。
 type Period struct {
 	Kind PeriodKind
 	Cur  Range
 	Prev Range
+	// PrevReport 是上一期**报告**的区间。
+	PrevReport Range
 }
 
 // Label 是给店长看的周期名。
@@ -68,11 +81,29 @@ func (p Period) Label() string {
 	return string(p.Kind)
 }
 
-// ResolvePeriod 按周期解析本期与上期区间。
+// PrevLabel 是对比基准的人话标签（给店长看，写在卡片上）。
+//
+// ⚠️ 它必须与 Prev 区间**一起**给出来，光有日期看不出"为什么是这一天"。
+//	日报的"上周同期"与周报的"上一周同期"含义完全不同：
+//	前者是"同一个星期几"（避免周末/工作日的客流差异），
+//	后者是"紧邻的上一周"。
+func (p Period) PrevLabel() string {
+	switch p.Kind {
+	case PeriodDaily:
+		return "上周同期"
+	case PeriodWeekly:
+		return "上一周同期"
+	case PeriodMonthly:
+		return "上一月同期"
+	}
+	return "上期"
+}
+
+// ResolvePeriod 按周期解析本期、对比基准与上一期报告区间。
 //
 // # 三种周期各自的锚点（**互不相同**，这是有意的）
 //
-//	日报：今日 vs 昨日
+//	日报：今天 vs **上周同一天**（对比基准）/ 昨天（上一期报告）
 //	周报：上周一~上周日 vs 上上周一~上上周日
 //	月报：上月1号~上月末 vs 上上月1号~上上月月末
 //
@@ -99,6 +130,26 @@ func (p Period) Label() string {
 // 这个错误极其常见且极具误导性：它每次都"看起来像一个坏消息"，
 // 而实际上只是口径错了。店长会照着它砍品。
 //
+// # ⚠️ 为什么日报的对比基准是"上周同一天"而不是"昨天"（2026-10-26）
+//
+//	日报在 **22:50** 生成，也就是营业日**刚结束时**。此时拿"今天 vs 昨天"
+//	做环比，星期差异会系统性地污染结论 ——
+//
+//	生产日报自己就打出了这个警告 ——
+//	「本期周日对比上期周六，日环比受星期差异影响」
+//	「2026-10-24 是周末，2026-10-23 是普通工作日，两天客流基础不同」
+//
+//	而商超的周末客流通常是工作日的 1.5~2 倍 ——
+//	拿周六和周五比，结论会系统性地偏负，店长会据此砍掉正在增长的品。
+//
+//	⇒ 对比基准改成**同一个星期几**（7 天前）：
+//	   客流基准一致，涨跌才反映经营变化；节假日/调休造成的差异
+//	   仍由 Compare 判成 limited 并在卡片上说明。
+//
+//	⚠️ 但"上一期报告"仍然是**昨天**的结论（PrevReport）——
+//	  店长是连着读的，延续性叙述（昨天说了什么、今天要不要接着做）
+//	  要的是昨天，不是 7 天前。两者的区别见 Period 的注释。
+//
 // # ⚠️ **now 必须带营业时区（Asia/Shanghai）**，否则早期早班（0:00~08:00 CST）
 //
 //	会被 time.Now 默认的 UTC 误算成前一天 —— 例如 0:30 CST = 16:30 UTC，
@@ -110,10 +161,15 @@ func ResolvePeriod(kind PeriodKind, now time.Time) (Period, error) {
 	d := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	switch kind {
 	case PeriodDaily:
-		// today vs yesterday（当日实况：22:50 是营业日中段）
+		// 今天（当日实况：22:50 是营业日中段）
 		cur := Range{Start: d, End: d}
-		prev := Range{Start: d.AddDate(0, 0, -1), End: d.AddDate(0, 0, -1)}
-		return Period{Kind: kind, Cur: cur, Prev: prev}, nil
+		// 对比基准：上周同一天（同一个星期几 ⇒ 客流基准一致）
+		lastSame := d.AddDate(0, 0, -7)
+		prev := Range{Start: lastSame, End: lastSame}
+		// 上一期报告：昨天（店长连着读，延续性叙述用）
+		yesterday := d.AddDate(0, 0, -1)
+		prevReport := Range{Start: yesterday, End: yesterday}
+		return Period{Kind: kind, Cur: cur, Prev: prev, PrevReport: prevReport}, nil
 
 	case PeriodWeekly:
 		// 上周日~上周六（**完整周**），而不是"本周日到今天"。
@@ -135,7 +191,7 @@ func ResolvePeriod(kind PeriodKind, now time.Time) (Period, error) {
 			Start: lastSunday.AddDate(0, 0, -7),
 			End:   lastSunday.AddDate(0, 0, -1),
 		}
-		return Period{Kind: kind, Cur: cur, Prev: prev}, nil
+		return Period{Kind: kind, Cur: cur, Prev: prev, PrevReport: prev}, nil
 
 	case PeriodMonthly:
 		// 上月1号~上月末（**完整月**）。
@@ -158,7 +214,7 @@ func ResolvePeriod(kind PeriodKind, now time.Time) (Period, error) {
 		prevEnd := lastFirst.AddDate(0, 0, -1)
 		cur := Range{Start: lastFirst, End: lastEnd}
 		prev := Range{Start: prevFirst, End: prevEnd}
-		return Period{Kind: kind, Cur: cur, Prev: prev}, nil
+		return Period{Kind: kind, Cur: cur, Prev: prev, PrevReport: prev}, nil
 	}
 	return Period{}, fmt.Errorf("calendar: 不支持的周期 %q", kind)
 }

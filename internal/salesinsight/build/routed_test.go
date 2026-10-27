@@ -284,7 +284,7 @@ func TestRoutedWithoutLoaderGoesStraightToCube(t *testing.T) {
 //	否则每次改路由都在赌线上那套没回归。
 func TestBuilderRouteIsIdentityWithoutLoader(t *testing.T) {
 	cube := &countingCube{}
-	b := NewBuilder(cube, nil)
+	b := NewBuilder(cube)
 	if got := b.route(); got != DataSource(cube) {
 		t.Error("未装配 loader 时 route() 应原样返回数据源")
 	}

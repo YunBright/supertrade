@@ -1,23 +1,37 @@
-// Package weather 提供天气上下文，供日报解释客流波动。
+// Package weather 提供**按日**天气上下文，供日报解释客流波动。
 //
-// # 设计原则：**天气是增强项，永远不是必需项**
+// # 设计原则：天气是增强项，永远不是必需项
 //
 // 天气影响零售是真的（下雨客流降、生鲜受损；高温利好冷饮），
 // 但它绝不能成为日报能否生成的前置条件。所以本包的契约是：
 //
 //	拿不到天气 ⇒ 报告照出，只是少一段解释。
 //
-// # 为什么用 dapr binding 而不是直接 HTTP
+// # ⚠️ 2026-10-26 的口径变更：为什么只剩"按日"这一种查询
 //
-// dapr 提供 bindings 抽象（`weather` 绑定），可以在不改代码的前提下
-// 切换供应商、接自建代理、甚至换成本地气象站数据。
-// 但本环境**尚未配置**该绑定，因此默认实现是"不可用"——
-// 见 unavailableProvider 的注释：它返回一个明确的降级原因，
-// 而不是假装天气是"晴"。
+//	原实现有两条查询：
+//	  - /v7/weather/now   → "现在晴，26℃"（实况）
+//	  - /v7/minutely/5m   → "未来两小时无降水" / "80分钟后开始下小雨"
 //
-// ⚠️ 那个区别很重要：如果降级时返回"晴朗"，LLM 会拿它当真实事实去
+//	第二条是**报告里出现过假事实的根源**。日报在 22:50 生成，
+//	而分钟级降水的窗口恒为"从现在起未来 2 小时"（即 22:50~00:50）——
+//	它描述的是**今天营业结束之后**的天气，与"今天卖得怎么样"毫无关系，
+//	却会被 LLM 当成今天的实况写进结论（生产日报实际出现过
+//	"当前晴，22℃，北风3级；80分钟后开始下小雨"）。
 //
-//	解释"为什么生鲜涨了"，产出看似合理的假因果。
+//	⇒ 现在只保留**按日**查询（/v7/weather/7d）：
+//	  - 某一天的天气现象与日降水量（今天用来看"今天为什么销量低"，
+//	    明天用来看"明天要不要多进雨具/少进生鲜"）。
+//	  - 每条结果都带**绝对日期**，不可能被读成别的一天。
+//
+// # 最重要的不变量（不要破坏）
+//
+//	**任何失败、超时、配额不足、解析异常，都必须返回 Available=false
+//	 且 Summary 为空串。**
+//
+// 绝不返回"默认晴天"。理由见本文件顶部的 package 注释：
+// 假的"晴"会被 LLM 当作事实，产出"因为天气好所以生鲜卖得好"
+// 这类无法证伪的因果叙述 —— 那比不解释危害大得多。
 package weather
 
 import (
@@ -25,32 +39,54 @@ import (
 	"strings"
 )
 
-// Info 是某一天的天气上下文。
-type Info struct {
+// Daily 是某一天的天气。
+type Daily struct {
 	// Available 表示这份天气是否可信。
 	//
 	// ⚠️ 它必须与 Summary 分开：Available=false 时 Summary **必须为空串**。
 	//   两者都填、或降级时填个"晴"，下游（尤其是 LLM）会把它当事实用。
 	Available bool `json:"available"`
-	// Summary 是给店长/LLM 看的一句话（如 "中雨，全天 6 小时降水"）。
+	// Date 是这一天（YYYY-MM-DD）。
+	//
+	// ⚠️ 它**必须**带上：天气一旦脱离日期就会被读成"今天"，
+	//   而"明天有雨"被写成"今天有雨"会让店长做出完全相反的备货决策。
+	Date string `json:"date,omitempty"`
+	// Text 是天气现象（如 "小雨"、"晴"）。
+	Text string `json:"text,omitempty"`
+	// PrecipMM 是当日降水量（毫米）。
+	//
+	// ⚠️ 判定"有没有雨"**只能**看它，不能看 Text：
+	//   "阴" 的降水量可能是 0，也可能是 8 毫米；量级才是店长要的信息
+	//   （1mm 和 30mm 是两回事）。
+	PrecipMM float64 `json:"precip_mm,omitempty"`
+	// TempMinC / TempMaxC 是当日最低/最高气温（摄氏度）。
+	TempMinC float64 `json:"temp_min_c,omitempty"`
+	TempMaxC float64 `json:"temp_max_c,omitempty"`
+	// Summary 是给店长/LLM 看的一句话，**必带日期**。
+	//
+	// 例："2026-10-27 晴，日降水量 0 毫米，气温 19~30℃"
 	Summary string `json:"summary,omitempty"`
 	// DegradedReason 说明为什么拿不到，是**给运维看的**，
 	// 不直接展示给店长。
 	DegradedReason string `json:"degraded_reason,omitempty"`
 }
 
-// unavailable 是"拿不到天气"时的 Info。
-func unavailable(reason string) Info {
-	return Info{Available: false, DegradedReason: reason}
+// IsRainy 判断这一天是否有可观测降水。
+//
+// ⚠️ 判据是**降水量**，不是天气现象：
+// "阴"/"多云" 的降水量可以是 0，而"小雨"在数值上也可能极小。
+// 阈值取 0.1mm —— 小于它等于没有可感知的雨。
+func (d Daily) IsRainy() bool {
+	return d.Available && d.PrecipMM >= 0.1
 }
 
 // Provider 是天气数据源。
 type Provider interface {
-	// Fetch 取某天的天气。date 为 YYYY-MM-DD。
+	// Daily 取某一天的天气。date 为 YYYY-MM-DD。
 	//
-	// ⚠️ 返回的 Info.Available=false 时，Summary 必须是空串 ——
+	// ⚠️ 返回的 Daily.Available=false 时，Summary 必须是空串 ——
 	//   这是本接口最重要的不变量，见 package 注释。
-	Fetch(ctx context.Context, date string, location Location) (Info, error)
+	Daily(ctx context.Context, date string, location Location) (Daily, error)
 }
 
 // Location 是门店位置。
@@ -101,11 +137,11 @@ type unavailableProvider struct {
 // 长期状态（值得去配）还是偶发。
 func NewUnavailableProvider(reason string) Provider {
 	if strings.TrimSpace(reason) == "" {
-		reason = "未配置天气数据源（本环境无 weather binding）"
+		reason = "未配置天气数据源"
 	}
 	return unavailableProvider{reason: reason}
 }
 
-func (p unavailableProvider) Fetch(context.Context, string, Location) (Info, error) {
-	return unavailable(p.reason), nil
+func (p unavailableProvider) Daily(context.Context, string, Location) (Daily, error) {
+	return Daily{Available: false, DegradedReason: p.reason}, nil
 }

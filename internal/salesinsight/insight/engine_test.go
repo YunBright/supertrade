@@ -11,18 +11,31 @@ import (
 )
 
 // sampleFact 造一份覆盖各种状态的事实包。
+//
+// ⚠️ 区间口径与生产一致（2026-10-26 起）：
+//
+//	From/To          = 2026-10-15（今天）
+//	PrevFrom/PrevTo  = 2026-10-08（**上周同一天**，对比基准）
+//	PrevReport*      = 2026-10-14（**昨天**，上一期报告）
+//
+// 两者刻意不同：前者用来算涨跌，后者用来延续叙述。
 func sampleFact() fact.Fact {
 	return fact.Fact{
 		Meta: fact.Meta{
 			PeriodKind: "daily", PeriodLabel: "日报",
 			From: "2026-10-15", To: "2026-10-15",
-			PrevFrom: "2026-10-14", PrevTo: "2026-10-14",
+			PrevFrom: "2026-10-08", PrevTo: "2026-10-08",
+			PrevLabel:      "上周同期",
+			PrevReportFrom: "2026-10-14", PrevReportTo: "2026-10-14",
 			BranchID: "00_1000003", GeneratedAt: "2026-10-16T10:45:00+08:00",
+			Today: "2026-10-15",
 			CalendarDataVersion: calendar.DataVersion,
 		},
 		Context: fact.Context{
 			From:        calendar.Day{Date: "2026-10-15", Weekday: "周四", Kind: calendar.KindWorkday},
-			PrevFrom:    calendar.Day{Date: "2026-10-14", Weekday: "周三", Kind: calendar.KindWorkday},
+			PrevFrom:    calendar.Day{Date: "2026-10-08", Weekday: "周四", Kind: calendar.KindWorkday},
+			Tomorrow:    calendar.Day{Date: "2026-10-16", Weekday: "周五", Kind: calendar.KindWorkday},
+			DayAfter:    calendar.Day{Date: "2026-10-17", Weekday: "周六", Kind: calendar.KindWeekend},
 			Comparability: calendar.Comparability{
 				Kind: calendar.ComparableGood, Reason: "本期与上期均为同类日期",
 			},
@@ -77,12 +90,12 @@ func sampleFact() fact.Fact {
 // 正常路径：解析成功即采信，并打上版本号。
 func TestAnalyzeSuccessfulLLMPath(t *testing.T) {
 	called := 0
-	e := NewEngine(true, 0, func(ctx context.Context, sys, user string) (string, int, int, error) {
+	e := NewEngine(true, 0, func(ctx context.Context, c Conversation) (ConversationResult, error) {
 		called++
-		if !strings.Contains(sys, "不要重新计算") {
+		if !strings.Contains(c.System, "不要重新计算") {
 			t.Error("system prompt 必须包含禁止改数字的硬约束")
 		}
-		return `{"summary":"西红柿缺货拖累生鲜","highlights":["西红柿缺货","生鲜联营增长"],"actions":["今日补货西红柿"],"warnings":[]}`, 0, 0, nil
+		return ConversationResult{Content: `{"summary":"西红柿缺货拖累生鲜","highlights":["西红柿缺货","生鲜联营增长"],"actions":["今日补货西红柿"],"warnings":[]}`}, nil
 	})
 
 	in, audit := e.Analyze(context.Background(), AnalyzeInput{Fact: sampleFact()})
@@ -210,36 +223,36 @@ func TestAnalyzeDegradesGracefully(t *testing.T) {
 		},
 		{
 			name: "超时",
-			engine: NewEngine(true, 0, func(ctx context.Context, s, u string) (string, int, int, error) {
-				return "", 0, 0, context.DeadlineExceeded
+			engine: NewEngine(true, 0, func(ctx context.Context, c Conversation) (ConversationResult, error) {
+				return ConversationResult{}, context.DeadlineExceeded
 			}),
 			wantWhy: ReasonTimeout,
 		},
 		{
 			name: "调用失败",
-			engine: NewEngine(true, 0, func(ctx context.Context, s, u string) (string, int, int, error) {
-				return "", 0, 0, errors.New("boom")
+			engine: NewEngine(true, 0, func(ctx context.Context, c Conversation) (ConversationResult, error) {
+				return ConversationResult{}, errors.New("boom")
 			}),
 			wantWhy: ReasonCallError,
 		},
 		{
 			name: "返回空",
-			engine: NewEngine(true, 0, func(ctx context.Context, s, u string) (string, int, int, error) {
-				return "   ", 0, 0, nil
+			engine: NewEngine(true, 0, func(ctx context.Context, c Conversation) (ConversationResult, error) {
+				return ConversationResult{Content: "   "}, nil
 			}),
 			wantWhy: ReasonEmptyOutput,
 		},
 		{
 			name: "返回非 JSON",
-			engine: NewEngine(true, 0, func(ctx context.Context, s, u string) (string, int, int, error) {
-				return "抱歉，我无法完成这个任务", 0, 0, nil
+			engine: NewEngine(true, 0, func(ctx context.Context, c Conversation) (ConversationResult, error) {
+				return ConversationResult{Content: "抱歉，我无法完成这个任务"}, nil
 			}),
 			wantWhy: ReasonParseFailed,
 		},
 		{
 			name: "返回空对象",
-			engine: NewEngine(true, 0, func(ctx context.Context, s, u string) (string, int, int, error) {
-				return `{"summary":"","highlights":[],"actions":[]}`, 0, 0, nil
+			engine: NewEngine(true, 0, func(ctx context.Context, c Conversation) (ConversationResult, error) {
+				return ConversationResult{Content: `{"summary":"","highlights":[],"actions":[]}`}, nil
 			}),
 			wantWhy: ReasonParseFailed,
 		},
@@ -272,9 +285,9 @@ func TestAnalyzeDegradesGracefully(t *testing.T) {
 // ⚠️ prompt 超长时**不调用** LLM —— 那是一次注定超预算的付费调用。
 func TestAnalyzeSkipsLLMWhenPromptTooLong(t *testing.T) {
 	called := 0
-	e := NewEngine(true, 0, func(ctx context.Context, s, u string) (string, int, int, error) {
+	e := NewEngine(true, 0, func(ctx context.Context, c Conversation) (ConversationResult, error) {
 		called++
-		return `{"summary":"x"}`, 0, 0, nil
+		return ConversationResult{Content: `{"summary":"x"}`}, nil
 	})
 	f := sampleFact()
 	// 塞一个超长商品名
@@ -367,8 +380,8 @@ func TestSanitizeEnforcesTotalLimit(t *testing.T) {
 
 // 审计里必须保留原始输出 —— 模型升级后解析失败时它是唯一证据。
 func TestAuditKeepsRawOutputOnParseFailure(t *testing.T) {
-	e := NewEngine(true, 0, func(ctx context.Context, s, u string) (string, int, int, error) {
-		return "The model responded with plain text, not JSON", 0, 0, nil
+	e := NewEngine(true, 0, func(ctx context.Context, c Conversation) (ConversationResult, error) {
+		return ConversationResult{Content: "The model responded with plain text, not JSON"}, nil
 	})
 	_, audit := e.Analyze(context.Background(), AnalyzeInput{Fact: sampleFact()})
 	if audit.RawOutput == "" {
@@ -384,8 +397,8 @@ func TestAuditKeepsRawOutputOnParseFailure(t *testing.T) {
 
 // 审计必须带上期摘要，否则后台看到的"上下文"是不完整的。
 func TestAuditContextIncludesPrevSummary(t *testing.T) {
-	e := NewEngine(true, 0, func(ctx context.Context, s, u string) (string, int, int, error) {
-		return `{"summary":"x"}`, 0, 0, nil
+	e := NewEngine(true, 0, func(ctx context.Context, c Conversation) (ConversationResult, error) {
+		return ConversationResult{Content: `{"summary":"x"}`}, nil
 	})
 	prev := FromInsight("daily", "2026-10-14", "2026-10-14", Insight{Summary: "上期缺货"})
 	_, audit := e.Analyze(context.Background(), AnalyzeInput{Fact: sampleFact(), PrevSummary: prev})

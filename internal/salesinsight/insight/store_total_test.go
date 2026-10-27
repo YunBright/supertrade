@@ -53,8 +53,14 @@ func TestFactDigestHasNoStoreTotals(t *testing.T) {
 		}
 	}
 	// 百分比必须**保留** —— 它才是店长要的东西。
-	if !strings.Contains(d, "销售额环比 -8.5%") {
-		t.Errorf("digest 必须保留销售额环比百分比:\n%s", d)
+	//
+	// ⚠️ 措辞跟着对比基准走（2026-10-26）：
+	//   日报的对比基准是"上周同一天"，说"环比"会让店长以为比的是昨天。
+	if !strings.Contains(d, "-8.5%") {
+		t.Errorf("digest 必须保留销售额对比百分比:\n%s", d)
+	}
+	if !strings.Contains(d, "上周同期") {
+		t.Errorf("digest 必须点明对比基准的口径（上周同期）:\n%s", d)
 	}
 	if !strings.Contains(d, "参考毛利率 15.6%") {
 		t.Errorf("digest 必须保留毛利率百分比:\n%s", d)
@@ -199,9 +205,9 @@ func TestRuleInsightsHaveNoStoreTotal(t *testing.T) {
 // ⚠️ LLM 路径也必须过清洗闸 —— prompt 里已经没有全店金额了，
 // 但模型仍可能自己凑一个出来。
 func TestAnalyzeRedactsStoreTotalsFromLLM(t *testing.T) {
-	e := NewEngine(true, 0, func(ctx context.Context, s, u string) (string, int, int, error) {
-		return `{"summary":"销售额108626.17元，环比-8.5%",` +
-			`"highlights":["蛋类4162.4元居首"],"actions":[],"warnings":[]}`, 0, 0, nil
+	e := NewEngine(true, 0, func(ctx context.Context, c Conversation) (ConversationResult, error) {
+		return ConversationResult{Content: `{"summary":"销售额108626.17元，环比-8.5%",` +
+			`"highlights":["蛋类4162.4元居首"],"actions":[],"warnings":[]}`}, nil
 	})
 	in, _ := e.Analyze(context.Background(), AnalyzeInput{Fact: storeFact()})
 	if strings.Contains(in.Summary, "108626.17") {

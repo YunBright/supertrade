@@ -35,7 +35,7 @@ func TestTotals_大盘必须取自独立总额查询而非品类求和(t *testin
 	fs.catPrev = []CategoryRow{{Name: "蛋类", Amount: 600}}
 	fs.totPrev = TotalsRow{Amount: 11000, Qty: 1200, CostedRow: 1200, TotalRow: 1200}
 
-	f, err := NewBuilder(fs, nil).Build(context.Background(), testOptions())
+	f, err := NewBuilder(fs).Build(context.Background(), testOptions())
 	if err != nil {
 		t.Fatalf("Build 失败: %v", err)
 	}

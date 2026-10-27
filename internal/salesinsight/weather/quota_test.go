@@ -65,9 +65,9 @@ func TestQuotaBlocksRequestsWhenExhausted(t *testing.T) {
 	}
 
 	before := hits
-	got, err := p.Fetch(t.Context(), "2026-10-16", validLoc())
+	got, err := p.Daily(t.Context(), "2026-10-26", validLoc())
 	if err != nil {
-		t.Fatalf("配额耗尽应降级为 Info 而非 error: %v", err)
+		t.Fatalf("配额耗尽应降级为 Daily 而非 error: %v", err)
 	}
 	if hits != before {
 		t.Errorf("配额耗尽后仍发出了 %d 次请求 —— 配额保护形同虚设", hits-before)

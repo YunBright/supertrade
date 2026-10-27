@@ -63,18 +63,28 @@ func (b *Builder) buildSuppliers(
 	// ---- 字典：一次性补齐所有编码的名称与类型 ----
 	//
 	// ⚠️ 不能按需逐个查：那是 N 次调用，而一次 in 查询就能拿全部。
+	//
+	// ⚠️ 这份字典**唯一**的用途是补供应商名称
+	// （见 supplierDisplayName）—— 排除判定只认人工名单，与字典无关。
+	// 2026-10-27 修复前，这里建了 dict 却**从未被读**，
+	// 于是 cube 路径（Name 恒为空）全部退化成「供应商131」这种占位符。
 	codes := make([]string, 0, len(cur))
 	for _, c := range cur {
 		codes = append(codes, c.Code)
 	}
 	dict := map[string]supplier.Record{}
 	if recs, err := b.src.SupplierDict(ctx, opt.StoreBranchID, codes); err != nil {
-		// ⚠️ 字典拿不到**不**降级为规则版 —— 而是把这些供应商标成"未知"。
-		//   降级为规则模式会丢掉整个 LLM 解读，而代价仅仅是
-		//   无法排除自用（此时我们选择**保守保留**它们，见下）。
+		// ⚠️ 字典拿不到**不**降级为规则版 —— 降级会丢掉整个 LLM 解读，
+		//   而此时我们只是**不知道名字**（用编码占位即可）。
+		//
+		// ⚠️ 告警文案必须说清**真实影响**：
+		//   2026-10-17 起排除判定只认人工名单（ignore.IndexForSales），
+		//   与字典**完全无关**。所以字典挂了并不会让自用供应商混进榜单 ——
+		//   早先那句「无法识别自用渠道（供应商榜单可能包含内部采购）」
+		//   与事实相反，会把店长和 LLM 引到错误的怀疑方向上。
 		sufficiency.Sufficient = false
 		sufficiency.Issues = append(sufficiency.Issues,
-			"供应商字典获取失败，本次无法识别自用渠道（供应商榜单可能包含内部采购）")
+			"供应商字典获取失败，供应商名称暂用编码占位（不影响排除判定）")
 	} else {
 		for _, r := range recs {
 			dict[r.Code] = r
@@ -130,18 +140,31 @@ func (b *Builder) buildSuppliers(
 	}
 
 	for _, c := range cur {
-		name := strings.TrimSpace(c.Name)
+		// ⚠️ 名称必须**逐级回落**（见 supplierDisplayName）：
+		//   cube 路径的销售行 Name 恒为空，早期实现直接落到
+		//   "供应商"+编码 的占位符 —— 于是整份报告的供应商全是
+		//   「供应商131」「供应商29」，店长和 LLM 都无从判断。
+		name := supplierDisplayName(c.Name, dict, c.Code)
+
+		e, isIgnored := ignoredByCode[c.Code]
+		reason := ""
+		if isIgnored {
+			reason = strings.TrimSpace(e.Reason)
+			if reason == "" {
+				reason = "已加入本门店的供应商忽略名单"
+			}
+			if name == "" {
+				// 名单条目上的名字是人工填的，可能是**唯一**可读的名字。
+				name = strings.TrimSpace(e.Name)
+			}
+		}
 		if name == "" {
 			// 字典里没有记录时用编码占位，而不是丢弃 ——
 			// 丢弃会让这家供应商的销量凭空从大盘里消失。
 			name = "供应商" + c.Code
 		}
 
-		if e, isIgnored := ignoredByCode[c.Code]; isIgnored {
-			reason := strings.TrimSpace(e.Reason)
-			if reason == "" {
-				reason = "已加入本门店的供应商忽略名单"
-			}
+		if isIgnored {
 			excluded = append(excluded, fact.ExcludedSupplier{
 				Code:   c.Code,
 				Name:   name,
@@ -173,6 +196,45 @@ func (b *Builder) buildSuppliers(
 		kept = kept[:topN]
 	}
 	return kept, excluded
+}
+
+// supplierDisplayName 取供应商的展示名。
+//
+// # 取名顺序（为什么是这个顺序）
+//
+//  1. **销售行自带名**：PG 路径在采集时补过一次字典，权威；
+//  2. **字典精确命中**：cube 路径的 Name 恒为空 —— supplier 是
+//     storage: duck 模型，与 live 的 sales_report **不能 join**
+//     （cube 的 join checkStorage 在查询构造期就拒绝 live→duck），
+//     所以必须另查一次字典来补名。
+//
+// ⚠️ **第 2 步必须精确匹配，不能补零/去零。**
+//
+// ✅ 实测（2026-10-27，门店 00）：字典表里
+//
+//	`29 猪肉自营` 与 `029 猪肉联营` 是**两个不同的供应商**，
+//	`19 同辉纸厂` 与 `019 自购蔬菜` 同理。
+//
+// 而销售侧（t_rm_daysum.supcust_no）与字典侧（t_bd_supcust_info.supcust_no）
+// 都是同一个源库里的 RTRIM 结果 ⇒ **同一供应商的编码逐字相同**，
+// 精确匹配就能对上（实测 60 个销售编码 100% 命中字典）。
+//
+// 反过来，若在这里做"变体匹配"，销售侧 `29` 就可能被安上
+// `029 猪肉联营` 的名字 —— **名字错了比没有名字更糟**：
+// 没有名字店长知道要去查，错了名字会让店长按错误的供应商
+// 去谈供货。
+//
+// 取不到时返回空串，由调用方决定回落（名单条目名 / 编码占位符）。
+func supplierDisplayName(rowName string, dict map[string]supplier.Record, code string) string {
+	if n := strings.TrimSpace(rowName); n != "" {
+		return n
+	}
+	if rec, ok := dict[code]; ok {
+		if n := strings.TrimSpace(rec.Name); n != "" {
+			return n
+		}
+	}
+	return ""
 }
 
 // ignoredSuppliers 读该门店的人工忽略名单。

@@ -22,7 +22,7 @@ func TestDeltas_上期有数据时必须给出环比(t *testing.T) {
 		{Name: "百货", Amount: 4000},
 	}
 
-	f, err := NewBuilder(fs, nil).Build(context.Background(), testOptions())
+	f, err := NewBuilder(fs).Build(context.Background(), testOptions())
 	if err != nil {
 		t.Fatalf("Build 失败: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestDeltas_上期取不到时保守不环比(t *testing.T) {
 	fs.catCur = []CategoryRow{{Name: "蛋类", Amount: 8000}}
 	fs.catPrev = nil
 
-	f, err := NewBuilder(fs, nil).Build(context.Background(), testOptions())
+	f, err := NewBuilder(fs).Build(context.Background(), testOptions())
 	if err != nil {
 		t.Fatalf("Build 失败: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestDeltas_上期品类失败时大盘环比仍可用(t *testing.T) {
 	fs.catCur = []CategoryRow{{Name: "蛋类", Amount: 8000, CostedRow: 100, TotalRow: 100}}
 	fs.catPrev = []CategoryRow{{Name: "蛋类", Amount: 10000}}
 
-	f, err := NewBuilder(fs, nil).Build(context.Background(), testOptions())
+	f, err := NewBuilder(fs).Build(context.Background(), testOptions())
 	if err != nil {
 		t.Fatalf("上期品类失败不应让整体失败: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestDeltas_上期总额失败时大盘环比不可用(t *testing.T) {
 	// 说明它用的是降级求和值而不是"承认上期不可用"。
 	fs.catPrev = []CategoryRow{{Name: "蛋类", Amount: 10000, CostedRow: 100, TotalRow: 100}}
 
-	f, err := NewBuilder(fs, nil).Build(context.Background(), testOptions())
+	f, err := NewBuilder(fs).Build(context.Background(), testOptions())
 	if err != nil {
 		t.Fatalf("Build 不应中止: %v", err)
 	}
@@ -128,7 +128,7 @@ type prevTotalsFailSource struct {
 }
 
 func (p *prevTotalsFailSource) TotalsSales(ctx context.Context, b, from, to string) (TotalsRow, error) {
-	if from == "2026-10-15" {
+	if from == prevFromOfDaily() {
 		return TotalsRow{}, errors.New("上期总额不可用")
 	}
 	return p.fakeSource.TotalsSales(ctx, b, from, to)
@@ -143,7 +143,7 @@ func TestDeltas_上期有行但金额为0时不硬算环比(t *testing.T) {
 	fs.catCur = []CategoryRow{{Name: "蛋类", Amount: 8000}}
 	fs.catPrev = []CategoryRow{{Name: "蛋类", Amount: 0}}
 
-	f, err := NewBuilder(fs, nil).Build(context.Background(), testOptions())
+	f, err := NewBuilder(fs).Build(context.Background(), testOptions())
 	if err != nil {
 		t.Fatalf("Build 失败: %v", err)
 	}

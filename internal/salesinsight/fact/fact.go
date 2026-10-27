@@ -26,7 +26,6 @@ package fact
 
 import (
 	"github.com/YunBright/supertrade/internal/salesinsight/calendar"
-	"github.com/YunBright/supertrade/internal/salesinsight/weather"
 )
 
 // MinCostCoverage 是"成本覆盖率低于此值就不展示毛利"的阈值。
@@ -80,10 +79,30 @@ type Meta struct {
 	To          string `json:"to"`
 	PrevFrom    string `json:"prev_from"`
 	PrevTo      string `json:"prev_to"`
+	// PrevLabel 是对比基准的人话标签（如 "上周同期"）。
+	//
+	// ⚠️ 它必须随区间一起给出来：光有 "2026-10-19" 这个日期，
+	//	店长无法判断那是"上周同一天"还是"昨天"。
+	PrevLabel string `json:"prev_label,omitempty"`
+	// PrevReportFrom / PrevReportTo 是**上一期报告**的区间。
+	//
+	// ⚠️ 它与 PrevFrom/PrevTo **不是一回事**：
+	//	日报的对比基准是上周同一天（避星期差异），
+	//	而"上一期报告"是昨天那份（店长连着读）。
+	//	两者混为一谈会让模型拿昨天的百分比去解释今天的对比基准。
+	PrevReportFrom string `json:"prev_report_from,omitempty"`
+	PrevReportTo   string `json:"prev_report_to,omitempty"`
 	BranchID    string `json:"branch_id"`
 	BranchName  string `json:"branch_name,omitempty"`
 	// GeneratedAt 是本事实包的生成时刻（RFC3339）。
 	GeneratedAt string `json:"generated_at"`
+	// Today 是生成时刻所在的**营业日**（YYYY-MM-DD）。
+	//
+	// ⚠️ 它与 From **不一定相同**：日报的 From 就是今天，
+	//   但周报/月报的 From 是上一周/上个月。
+	//   天气工具问的是"今天/明天"，必须按这个日期算，
+	//   否则周报会拿"上周一的天气"去回答"今天"。
+	Today string `json:"today,omitempty"`
 	// CalendarDataVersion 让后台能看出节假日表是否需要更新。
 	CalendarDataVersion string `json:"calendar_data_version"`
 }
@@ -95,7 +114,17 @@ type Context struct {
 	// PrevFrom 是上期首日的性质（用于环比叙述）。
 	PrevFrom     calendar.Day `json:"prev_from"`
 	Comparability calendar.Comparability `json:"comparability"`
-	Weather      weather.Info `json:"weather"`
+
+	// Tomorrow / DayAfter 是**报告期之后**两天的日历性质。
+	//
+	// ⚠️ 为什么必须给"未来两天"（2026-10-26 新增）：
+	//	日报在 22:50 生成，今天已经结束 —— 店长读这份简报
+	//	是为了决定**明天**（以及后天）补什么货。
+	//	没有这两天的日历事实（明天是周末？后天是法定假日？），
+	//	模型只能给出"多备点货"这类没有依据的建议 ——
+	//	那正是"建议滞后"的技术原因。
+	Tomorrow calendar.Day `json:"tomorrow"`
+	DayAfter calendar.Day `json:"day_after"`
 }
 
 // Totals 是本期大盘。

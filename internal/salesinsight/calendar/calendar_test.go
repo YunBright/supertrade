@@ -110,10 +110,12 @@ func TestResolvePeriodUsesSameLengthComparison(t *testing.T) {
 	}{
 		{
 			// 22:50 推送 = 当日营业中段，「今日」反映当下实况。
-			// 上期是「完整昨日」，口径是「部分 vs 完整」，是产品取舍。
-			name: "日报今日(22:50推送) vs 昨日", kind: PeriodDaily, now: "2026-10-16",
+			// 对比基准是「上周同一天」（2026-10-26 改）：
+			// 同一个星期几 ⇒ 客流基准一致，涨跌才反映经营变化。
+			// 生产日报自己就打出了警告「本期周日对比上期周六，日环比受星期差异影响」。
+			name: "日报今日(22:50推送) vs 上周同一天", kind: PeriodDaily, now: "2026-10-16",
 			wantCur:  [2]string{"2026-10-16", "2026-10-16"},
-			wantPrev: [2]string{"2026-10-15", "2026-10-15"},
+			wantPrev: [2]string{"2026-10-09", "2026-10-09"},
 		},
 		{
 			// 2026-10-16 是周五 ⇒ 本周日 10-11，上周日 10-04。
@@ -327,8 +329,19 @@ func TestDailyCurIsTodayNotYesterday(t *testing.T) {
 	if got := Format(p.Cur.End); got != "2026-10-16" {
 		t.Errorf("daily cur.End = %q, 期望 2026-10-16", got)
 	}
-	if got := Format(p.Prev.Start); got != "2026-10-15" {
-		t.Errorf("daily prev = %q, 期望 2026-10-15（昨日）", got)
+	if got := Format(p.Prev.Start); got != "2026-10-09" {
+		t.Errorf("daily prev = %q, 期望 2026-10-09（上周同一天）", got)
+	}
+	// ⚠️ 「上一期报告」仍然是**昨天**（2026-10-15），不是对比基准。
+	//
+	//	日报的对比基准是 7 天前（避星期差异），
+	//	而"上一期报告说了什么"是店长连着读的那一份 —— 必须是昨天。
+	//	两者混为一谈 ⇒ 延续性叙述的区间校验会每期失配（静默失效）。
+	if got := Format(p.PrevReport.Start); got != "2026-10-15" {
+		t.Errorf("daily prevReport = %q, 期望 2026-10-15（昨天）", got)
+	}
+	if got := p.PrevLabel(); got != "上周同期" {
+		t.Errorf("daily PrevLabel = %q, 期望 上周同期", got)
 	}
 }
 

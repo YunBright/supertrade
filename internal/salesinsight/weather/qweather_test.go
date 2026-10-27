@@ -22,32 +22,51 @@ func newServer(t *testing.T, handler func(w http.ResponseWriter, r *http.Request
 
 func validLoc() Location { return Location{Name: "岑溪", Lat: 24.7, Lon: 111.0} }
 
-// 正常路径：实况可用。
-func TestQWeatherNowSummary(t *testing.T) {
+// ok7d 造一份"7 天预报"的响应体（只关心给定的几天）。
+func ok7d(days ...string) string {
+	return `{"code":"200","daily":[` + strings.Join(days, ",") + `]}`
+}
+
+// 正常路径：按日预报可用。
+func TestQWeatherDailySummary(t *testing.T) {
 	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.URL.Path, "/now") {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		w.Write([]byte(`{"code":"200","now":{"text":"小雨","temp":"18","windDir":"东北","windScale":"3","humidity":"90","precip":"0.2"}}`))
+		w.Write([]byte(ok7d(
+			`{"fxDate":"2026-10-26","textDay":"小雨","textNight":"阴","precip":"3.2","tempMax":"26","tempMin":"19"}`,
+			`{"fxDate":"2026-10-27","textDay":"晴","textNight":"晴","precip":"0.0","tempMax":"31","tempMin":"19"}`,
+		)))
 	})
 
 	p := &QWeatherProvider{BaseURL: srv.URL, Key: "k", HTTP: srv.Client()}
-	got, err := p.Fetch(context.Background(), "2026-10-16", validLoc())
+	got, err := p.Daily(context.Background(), "2026-10-26", validLoc())
 	if err != nil {
 		t.Fatalf("不应返回 error（失败应降级而不是报错）: %v", err)
 	}
 	if !got.Available {
-		t.Fatal("实况可用时应 Available=true")
+		t.Fatal("按日预报可用时应 Available=true")
 	}
-	if !strings.Contains(got.Summary, "小雨") || !strings.Contains(got.Summary, "18℃") {
-		t.Errorf("摘要应含天气现象与温度: %q", got.Summary)
+	if got.Date != "2026-10-26" {
+		t.Errorf("Date = %q，期望 2026-10-26", got.Date)
+	}
+	if got.Text != "小雨" {
+		t.Errorf("Text = %q，期望 小雨（应优先取白天现象）", got.Text)
+	}
+	if got.PrecipMM != 3.2 {
+		t.Errorf("PrecipMM = %v，期望 3.2", got.PrecipMM)
+	}
+	if !got.IsRainy() {
+		t.Error("3.2 毫米应判为有雨")
+	}
+	if !strings.Contains(got.Summary, "2026-10-26") {
+		t.Errorf("摘要必须带绝对日期，否则会被读成别的日子: %q", got.Summary)
+	}
+	if !strings.Contains(got.Summary, "小雨") || !strings.Contains(got.Summary, "3.2 毫米") {
+		t.Errorf("摘要应含天气现象与降水量: %q", got.Summary)
 	}
 }
 
 // ⚠️ 核心不变量：**任何失败都必须降级，且 Summary 必须为空**。
 //
-// 逐条覆盖：HTTP 错误 / code 非 200 / 非法 JSON / 空文本 / key 缺失 /
+// 逐条覆盖：HTTP 错误 / code 非 200 / 非法 JSON / 空列表 / key 缺失 /
 // 位置无效。它们的共同点是"如果返回了一个假的晴天，
 // LLM 就会拿它当事实编出无法证伪的因果"。
 func TestEveryFailureDegradesWithEmptySummary(t *testing.T) {
@@ -71,7 +90,7 @@ func TestEveryFailureDegradesWithEmptySummary(t *testing.T) {
 			name: "code 非 200（配额不足 402）",
 			srv: func(t *testing.T) *httptest.Server {
 				return newServer(t, func(w http.ResponseWriter, r *http.Request) {
-					w.Write([]byte(`{"code":"402","now":{}}`))
+					w.Write([]byte(`{"code":"402","daily":[]}`))
 				})
 			},
 			loc: validLoc(), key: "k",
@@ -86,10 +105,10 @@ func TestEveryFailureDegradesWithEmptySummary(t *testing.T) {
 			loc: validLoc(), key: "k",
 		},
 		{
-			name: "code=200 但天气现象为空",
+			name: "code=200 但 daily 为空",
 			srv: func(t *testing.T) *httptest.Server {
 				return newServer(t, func(w http.ResponseWriter, r *http.Request) {
-					w.Write([]byte(`{"code":"200","now":{"text":"","temp":"18"}}`))
+					w.Write([]byte(`{"code":"200","daily":[]}`))
 				})
 			},
 			loc: validLoc(), key: "k",
@@ -127,10 +146,10 @@ func TestEveryFailureDegradesWithEmptySummary(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			srv := c.srv(t)
 			p := &QWeatherProvider{BaseURL: srv.URL, Key: c.key, HTTP: srv.Client()}
-			got, err := p.Fetch(context.Background(), "2026-10-16", c.loc)
+			got, err := p.Daily(context.Background(), "2026-10-26", c.loc)
 
 			if err != nil {
-				t.Fatalf("失败必须降级为 Info，不该返回 error: %v", err)
+				t.Fatalf("失败必须降级为 Daily，不该返回 error: %v", err)
 			}
 			if got.Available {
 				t.Error("失败时 Available 必须为 false")
@@ -145,203 +164,82 @@ func TestEveryFailureDegradesWithEmptySummary(t *testing.T) {
 	}
 }
 
-// 分钟降水失败**不让整份天气作废** —— 实况仍然有用，
-// 且失败原因必须落在 DegradedReason（运维）而不是 Summary（店长/LLM）。
-func TestMinutelyFailureKeepsNowSummary(t *testing.T) {
+// ⚠️ 找不到那一天时**必须降级**，绝不能回退到"最近的一天"。
+//
+// 这是本包最不能犯的错：回退会让"明天的天气"变成"今天的天气"——
+// 店长会照着错误的天气改备货。
+func TestDateNotInForecastDegradesInsteadOfFallingBack(t *testing.T) {
 	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "minutely") {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.Write([]byte(`{"code":"200","now":{"text":"多云","temp":"22"}}`))
-	})
-
-	p := &QWeatherProvider{BaseURL: srv.URL, Key: "k", HTTP: srv.Client()}
-	got, err := p.Fetch(context.Background(), "2026-10-16", validLoc())
-	if err != nil || !got.Available {
-		t.Fatalf("分钟降水失败不应让整份天气作废: available=%v err=%v", got.Available, err)
-	}
-	if !strings.Contains(got.Summary, "多云") {
-		t.Errorf("实况信息应保留: %q", got.Summary)
-	}
-	if strings.Contains(got.Summary, "降水") {
-		t.Errorf("没有降水数据时不应凭空提降水: %q", got.Summary)
-	}
-	// ⚠️ 失败原因必须可观测，否则"降水长期缺失"会被当成"一直晴天"。
-	if !strings.Contains(got.DegradedReason, "分钟级降水") {
-		t.Errorf("分钟降水失败原因应进 DegradedReason 供运维判断: %q", got.DegradedReason)
-	}
-}
-
-// ⚠️ 判定降水**只能**用 precip，不能用 type。
-//
-// 2026-10-17 实测：无降水的 24 条 minutely 里，`type` **全部是 "rain"**。
-//
-// 这条测试直接打 describeMinutely 并断言**具体输出**（而不是"包含某子串"），
-// 因为判别力只存在于 summary 为空的那一行：
-//
-//	summary 非空 + 全 0 → 两种实现都返回 summary 原文，输出完全相同，
-//	所以端到端写法在这个分支上**没有判别力**（曾因此写出一条永不失败的"反证"用例）。
-//	summary 为空 + 全 0 → 正确实现返回 ""；若用 type 判雨则返回"未来两小时有降水"。
-//	  这才是那句谎称"有降水"的唯一入口，也是本用例真正的防线。
-//
-// 反证：把 `if p := parseFloat(it.Precip); p > 0` 改成
-//
-//	`if it.Type == "rain" || p > 0`
-//
-//	则下面 "summary 为空 + type=rain + 全 0" 与 "summary 缺失 + 全 0" 两行立刻变红。
-//
-// minutelyItem 是 minutelyResponse.Minutely 的元素类型别名，
-// 让下面的表驱动用例不必重复三遍匿名结构体。
-type minutelyItem = struct {
-	FXTime string `json:"fxTime"`
-	Precip string `json:"precip"`
-	Type   string `json:"type"`
-}
-
-func TestDescribeMinutely_判定降水只能用Precip(t *testing.T) {
-	cases := []struct {
-		name string
-		resp minutelyResponse
-		want string
-	}{
-		{
-			// 无降水但 type 恒为 rain（生产实测形态）→ 用官方 summary 原文。
-			name: "无降水但 type 恒为 rain",
-			resp: minutelyResponse{
-				Summary: "未来两小时无降水",
-				Minutely: []minutelyItem{
-					{Precip: "0.00", Type: "rain"},
-					{Precip: "0.00", Type: "rain"},
-					{Precip: "0.00", Type: "rain"},
-				},
-			},
-			want: "未来两小时无降水",
-		},
-		{
-			// ⚠️ 关键行：summary 空 + type=rain + precip 全 0。
-			//    正确 = 不确定就不说；用 type 判 = 谎称"有降水"。
-			name: "summary 为空且 type=rain 全 0 绝不能说有降水",
-			resp: minutelyResponse{
-				Minutely: []minutelyItem{
-					{Precip: "0.0", Type: "rain"},
-					{Precip: "0.0", Type: "rain"},
-				},
-			},
-			want: "",
-		},
-		{
-			// summary 缺失 + 全 0（订阅不含/字段改名/解析异常）→ 同样不能断言无降水。
-			name: "summary 缺失且全 0",
-			resp: minutelyResponse{
-				Minutely: []minutelyItem{{Precip: "0.0", Type: "rain"}},
-			},
-			want: "",
-		},
-		{
-			// summary 为空但数据确有降水 → 必须按数据说话。
-			name: "summary 为空但有降水必须说出来",
-			resp: minutelyResponse{
-				Minutely: []minutelyItem{{Precip: "1.2", Type: "rain"}},
-			},
-			want: "未来两小时有降水（预计累计约 1.2 毫米）",
-		},
-		{
-			// 官方措辞 + 我们补的量级。
-			name: "有降水时补累计量级",
-			resp: minutelyResponse{
-				Summary:  "95分钟后雨就停了",
-				Minutely: []minutelyItem{{Precip: "0.15"}, {Precip: "0.23"}},
-			},
-			want: "95分钟后雨就停了（未来两小时预计累计降水约 0.4 毫米）",
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := describeMinutely(c.resp); got != c.want {
-				t.Errorf("describeMinutely()\n got = %q\nwant = %q", got, c.want)
-			}
-		})
-	}
-}
-
-// ⚠️ **时间口径**:摘要必须带时间锚点，绝不能让 LLM
-// 把"未来 2 小时"读成报告期（昨天）的实况。
-//
-// 这条测试钉住"当前"与"未来"两个锚点同时存在。
-// 反证：去掉 Fetch 里的 "当前" 前缀，本用例变红。
-func TestSummaryCarriesExplicitTimeAnchor(t *testing.T) {
-	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "minutely") {
-			w.Write([]byte(`{"code":"200","summary":"95分钟后雨就停了","minutely":[
-				{"fxTime":"2026-10-17T09:10+08:00","precip":"0.15","type":"rain"},
-				{"fxTime":"2026-10-17T09:15+08:00","precip":"0.23","type":"rain"},
-				{"fxTime":"2026-10-17T09:20+08:00","precip":"0.00","type":"rain"}
-			]}`))
-			return
-		}
-		w.Write([]byte(`{"code":"200","now":{"text":"小雨","temp":"18"}}`))
+		w.Write([]byte(ok7d(
+			`{"fxDate":"2026-10-26","textDay":"晴","precip":"0.0"}`,
+			`{"fxDate":"2026-10-27","textDay":"晴","precip":"0.0"}`,
+		)))
 	})
 	p := &QWeatherProvider{BaseURL: srv.URL, Key: "k", HTTP: srv.Client()}
-	got, _ := p.Fetch(context.Background(), "2026-10-16", validLoc())
-
-	if !strings.Contains(got.Summary, "当前") {
-		t.Errorf("实况部分必须带「当前」锚点，否则会被当成报告期天气: %q", got.Summary)
+	got, err := p.Daily(context.Background(), "2026-11-30", validLoc())
+	if err != nil {
+		t.Fatalf("不应返回 error: %v", err)
 	}
-	// ⚠️ 报告期是 2026-10-16，而降水窗口是 10-17 —— 绝不能出现"昨天下了"。
-	for _, forbidden := range []string{"昨天", "营业时段", "当日", "2026-10-16 有降水"} {
-		if strings.Contains(got.Summary, forbidden) {
-			t.Errorf("摘要不应出现把未来说成过去/报告期的措辞 %q: %q", forbidden, got.Summary)
-		}
+	if got.Available {
+		t.Fatal("预报里没有这一天时必须不可用，绝不能回退到别的日子")
 	}
-	// 有降水时必须补累计量级：1mm 和 30mm 对店长是两回事。
-	if !strings.Contains(got.Summary, "0.4 毫米") {
-		t.Errorf("有降水时应补累计量级（0.15+0.23）: %q", got.Summary)
+	if got.Summary != "" {
+		t.Errorf("不可用时 Summary 必须为空串，实际 %q", got.Summary)
+	}
+	if !strings.Contains(got.DegradedReason, "2026-11-30") {
+		t.Errorf("降级原因应点名缺的是哪一天: %q", got.DegradedReason)
 	}
 }
 
-// ⚠️ summary 缺失**不等于**无降水。
+// ⚠️ 无降水与"有降水"的判定**只能**看 precip。
 //
-// 这是本次迁移最危险的一条分支：订阅不含该端点、解析失败、
-// 或字段改名，都会让 summary 为空 —— 若此时回落成"无降水"，
-// 就会对着一个完全没有数据的情况**谎称天气晴朗**。
-// 正确行为是：要么按数据说话，要么什么都不说。
-func TestEmptySummaryMustNotFakeNoRain(t *testing.T) {
+// "阴"的降水量可以是 0；而量级（1mm 与 30mm）是两回事。
+func TestPrecipDrivesRainJudgment(t *testing.T) {
 	cases := []struct {
-		name string
-		body string
+		name      string
+		day       string
+		wantRain  bool
+		wantMM    float64
 	}{
-		{"summary 空 + 有降水数据", `{"code":"200","summary":"","minutely":[
-			{"fxTime":"2026-10-17T09:10+08:00","precip":"1.2","type":"rain"}]}`},
-		{"summary 空 + minutely 空数组", `{"code":"200","summary":"","minutely":[]}`},
-		{"summary 缺失字段 + 全 0", `{"code":"200","minutely":[
-			{"fxTime":"2026-10-17T09:10+08:00","precip":"0.0","type":"rain"}]}`},
+		{"晴且 0 毫米", `{"fxDate":"2026-10-26","textDay":"晴","precip":"0.0"}`, false, 0},
+		{"阴但 0 毫米", `{"fxDate":"2026-10-26","textDay":"阴","precip":"0.0"}`, false, 0},
+		{"小雨 1.5 毫米", `{"fxDate":"2026-10-26","textDay":"小雨","precip":"1.5"}`, true, 1.5},
+		{"大雨 28.0 毫米", `{"fxDate":"2026-10-26","textDay":"大雨","precip":"28.0"}`, true, 28},
+		{"precip 字段缺失", `{"fxDate":"2026-10-26","textDay":"晴"}`, false, 0},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
-				if strings.Contains(r.URL.Path, "minutely") {
-					w.Write([]byte(c.body))
-					return
-				}
-				w.Write([]byte(`{"code":"200","now":{"text":"晴","temp":"30"}}`))
+				w.Write([]byte(ok7d(c.day)))
 			})
 			p := &QWeatherProvider{BaseURL: srv.URL, Key: "k", HTTP: srv.Client()}
-			got, _ := p.Fetch(context.Background(), "2026-10-16", validLoc())
-
-			// 唯一禁止的输出：把"不知道"说成"没有雨"。
-			if strings.Contains(got.Summary, "无降水") || strings.Contains(got.Summary, "晴朗") {
-				t.Fatalf("summary 缺失时绝不能断言无降水（会把不确定说成确定）: %q", got.Summary)
+			got, _ := p.Daily(context.Background(), "2026-10-26", validLoc())
+			if !got.Available {
+				t.Fatalf("应可用，实际不可用: %q", got.DegradedReason)
 			}
-			// 有数据时必须按数据说话
-			if strings.Contains(c.body, `"1.2"`) && !strings.Contains(got.Summary, "1.2 毫米") {
-				t.Errorf("数据有降水就必须说出来: %q", got.Summary)
+			if got.IsRainy() != c.wantRain {
+				t.Errorf("IsRainy() = %v，期望 %v（precip=%v）", got.IsRainy(), c.wantRain, got.PrecipMM)
 			}
-			// 无数据时必须完全不提降水
-			if !strings.Contains(c.body, `"1.2"`) && strings.Contains(got.Summary, "降水") {
-				t.Errorf("无任何降水数据时摘要不应提降水: %q", got.Summary)
+			if got.PrecipMM != c.wantMM {
+				t.Errorf("PrecipMM = %v，期望 %v", got.PrecipMM, c.wantMM)
 			}
 		})
+	}
+}
+
+// ⚠️ 夜间现象不能顶替白天现象。
+//
+// 备货决策发生在白天营业时段，"晴转多云"的夜间对店长基本无用。
+func TestPrefersDaytimeText(t *testing.T) {
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(ok7d(
+			`{"fxDate":"2026-10-26","textDay":"","textNight":"雷阵雨","precip":"5.0"}`,
+		)))
+	})
+	p := &QWeatherProvider{BaseURL: srv.URL, Key: "k", HTTP: srv.Client()}
+	got, _ := p.Daily(context.Background(), "2026-10-26", validLoc())
+	if got.Text != "雷阵雨" {
+		t.Errorf("白天现象为空时应回落到夜间现象，实际 %q", got.Text)
 	}
 }
 
@@ -354,11 +252,11 @@ func TestCoordinateOrderIsLonLat(t *testing.T) {
 	var gotLoc string
 	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
 		gotLoc = r.URL.Query().Get("location")
-		w.Write([]byte(`{"code":"200","now":{"text":"晴","temp":"20"}}`))
+		w.Write([]byte(ok7d(`{"fxDate":"2026-10-26","textDay":"晴","precip":"0.0"}`)))
 	})
 	p := &QWeatherProvider{BaseURL: srv.URL, Key: "k", HTTP: srv.Client()}
-	if _, err := p.Fetch(context.Background(), "2026-10-16", Location{Name: "岑溪", Lat: 24.7, Lon: 111.0}); err != nil {
-		t.Fatalf("Fetch 失败: %v", err)
+	if _, err := p.Daily(context.Background(), "2026-10-26", Location{Name: "岑溪", Lat: 24.7, Lon: 111.0}); err != nil {
+		t.Fatalf("Daily 失败: %v", err)
 	}
 	if !strings.HasPrefix(gotLoc, "111.0") {
 		t.Fatalf("location 应以**经度**开头（实际 %q）。写反不报错，只会取到几百公里外的天气",
@@ -376,7 +274,7 @@ func TestKeyNotLeakedInDegradedReason(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	})
 	p := &QWeatherProvider{BaseURL: srv.URL, Key: secretKey, HTTP: srv.Client()}
-	got, _ := p.Fetch(context.Background(), "2026-10-16", validLoc())
+	got, _ := p.Daily(context.Background(), "2026-10-26", validLoc())
 	if strings.Contains(got.DegradedReason, secretKey) {
 		t.Fatalf("降级原因泄露了 API key: %q", got.DegradedReason)
 	}
@@ -400,7 +298,7 @@ func TestParseFloatLenient(t *testing.T) {
 		{"", 0},      // 空串 = 无数据，不是"很大"
 		{"  ", 0},    // 空白同理
 		{"abc", 0},   // 非数字
-		{"-1.0", -1}, // 负值原样返回（由调用方的 p > 0 过滤）
+		{"-1.0", -1}, // 负值原样返回（由调用方的阈值过滤）
 	}
 	for _, c := range cases {
 		if got := parseFloat(c.in); got != c.want {
@@ -475,4 +373,22 @@ func TestWithBaseURL_链式生效(t *testing.T) {
 	}
 	// nil 接收者不得 panic：weatherProvider() 可能在装配顺序变化时先于构造调用。
 	(*QWeatherProvider)(nil).WithBaseURL("x")
+}
+
+// ⚠️ 不可用 provider 也必须守住"Available=false + Summary 空"的不变量。
+func TestUnavailableProviderKeepsInvariant(t *testing.T) {
+	p := NewUnavailableProvider("测试原因")
+	got, err := p.Daily(context.Background(), "2026-10-26", validLoc())
+	if err != nil {
+		t.Fatalf("不应返回 error: %v", err)
+	}
+	if got.Available {
+		t.Error("不可用时 Available 必须为 false")
+	}
+	if got.Summary != "" {
+		t.Errorf("不可用时 Summary 必须为空串，实际 %q", got.Summary)
+	}
+	if got.DegradedReason == "" {
+		t.Error("不可用时必须给出降级原因")
+	}
 }

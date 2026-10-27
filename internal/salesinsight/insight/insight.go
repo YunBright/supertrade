@@ -24,8 +24,10 @@ package insight
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 
+	"github.com/YunBright/supertrade/internal/salesinsight/calendar"
 	"github.com/YunBright/supertrade/internal/salesinsight/fact"
 )
 
@@ -45,7 +47,15 @@ import (
 // ⚠️ 2026-10-23 从 v1.0.0 升到 v1.1.0：
 //   事实包不再下发全店销售总额/总毛利的绝对金额（只给百分比），
 //   并新增硬约束 6「不要报告全店总数」。
-const PromptVersion = "v1.1.0"
+//
+// ⚠️ 2026-10-26 从 v1.1.0 升到 v1.2.0：
+//  1. 天气从"事实包里的一段文本"改成**模型按需调用的工具**
+//     （原实现把"未来两小时开始下雨"无条件塞进 prompt，
+//      生产日报因此写出过「80分钟后开始下小雨」这种与报告期无关的句子）。
+//  2. 建议改为指向**明天/后天**（日报 22:50 发，"今天可执行的动作"已经过时）。
+//  3. 日报对比基准改为**上周同一天**（消除星期差异对环比的污染），
+//     措辞随之从"环比"改成"较上周同期"。
+const PromptVersion = "v1.2.0"
 
 // GeneratedBy 标识这份结论由谁产出。
 type GeneratedBy string
@@ -93,7 +103,11 @@ const (
 	// MaxHighlightChars 是单条要点的上限。
 	MaxHighlightChars = 80
 	// MaxItemChars 是单条动作的上限。
-	MaxItemChars = 60
+	//
+	// ⚠️ 取 90 而不是 60（2026-10-26）：宽松解析会把
+	//	"日期 + 主题 + 具体动作"拍平成一条，那样的句子天然更长；
+	//	60 会把它砍成半句，读起来像坏掉的数据。
+	MaxItemChars = 90
 	// MaxItems 是列表类字段的最大条数。
 	MaxItems = 5
 	// MaxTotalChars 是整份结论的字符上限。
@@ -203,7 +217,19 @@ type Audit struct {
 	PeriodKind string `json:"period_kind"`
 	From       string `json:"from"`
 	To         string `json:"to"`
-	BranchID   string `json:"branch_id"`
+	// PrevFrom / PrevTo / PrevLabel 是**对比基准**（2026-10-26 新增）。
+	//
+	// ⚠️ 为什么必须由生成端给出，而不由调用方自己算：
+	//	日报的对比基准是"上周同一天"（2026-10-26 起），
+	//	周报是"上一周"，月报是"上一月" —— 三个口径三套算法。
+	//	卡片上要写"对比基准：上周同期（2026-10-19）"，
+	//	若由卡片端自己按 kind 推断，两处就会漂移：
+	//	卡片说"上一营业日"而正文写的是"较上周同期 -6.5%"，
+	//	店长会以为系统在拿两个不同的口径跟自己说话。
+	PrevFrom  string `json:"prev_from,omitempty"`
+	PrevTo    string `json:"prev_to,omitempty"`
+	PrevLabel string `json:"prev_label,omitempty"`
+	BranchID  string `json:"branch_id"`
 	// PromptVersion 记录 prompt 版本。
 	PromptVersion string `json:"prompt_version,omitempty"`
 	// Insight 是解析后的结构化结论。
@@ -229,12 +255,32 @@ type Audit struct {
 	// PromptTokens / CompletionTokens 是 token 用量（供应商返回，可能为 0）。
 	PromptTokens     int `json:"prompt_tokens,omitempty"`
 	CompletionTokens int `json:"completion_tokens,omitempty"`
+	// ToolCalls 是本次推理里模型发起过的工具调用（2026-10-26 新增）。
+	//
+	// ⚠️ 它是"天气到底有没有被用上"的**唯一证据**：
+	//   模型说"因为下雨"却没调过天气工具 ⇒ 它在编；
+	//   模型调了工具但结论里没提 ⇒ 天气与本期无关。
+	//   后台一眼就能判断，不必再翻 prompt 全文。
+	ToolCalls []ToolCallTrace `json:"tool_calls,omitempty"`
 	// LatencyMS 是端到端耗时。
 	LatencyMS int64 `json:"latency_ms,omitempty"`
 	// Error 是失败原因（成功时为空）。
 	Error string `json:"error,omitempty"`
 	// CreatedAt 是记录时间。
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// ToolCallTrace 是一次工具调用的痕迹。
+type ToolCallTrace struct {
+	// Name 是工具名。
+	Name string `json:"name"`
+	// Args 是模型给出的参数（本仓的工具都无参，是空串）。
+	Args string `json:"args,omitempty"`
+	// Result 是回灌给模型的文本结果。
+	//
+	// ⚠️ 它必须**原样**存：里面带日期与降水量，
+	//   后台要能核对"结论里引用的天气"是不是这里查到的。
+	Result string `json:"result,omitempty"`
 }
 
 // MaxAuditFieldChars 是审计各字段的存储上限。
@@ -286,7 +332,22 @@ func ParseInsight(raw string) (*Insight, error) {
 	}
 	var in Insight
 	if err := json.Unmarshal([]byte(candidate), &in); err != nil {
-		return nil, errUnparseable
+		// ⚠️ 严格解析失败时再试一次**宽松**解析。
+		//
+		//	2026-10-26 生产实测踩到过：模型（带工具的 thinking 模式）
+		//	自己写了一份 {"headline","key_points","category_analysis",
+		//	"actions":[{"date","theme","items"}],...} 的报告 ——
+		//	而我们的 actions 是 []string，于是 json.Unmarshal 直接报
+		//	"cannot unmarshal object into Go struct field ... of type string"，
+		//	整份 AI 报告**降级成规则版**（卡片只剩"销售额环比 -4.4%"）。
+		//
+		//	那份分析其实很好（甚至比规则版好得多），却因为一个字段形状
+		//	被整个丢弃。⇒ 形状有出入时，尽量**取用**而不是**扔掉**。
+		alt, aerr := parseInsightLenient(candidate)
+		if aerr != nil {
+			return nil, errUnparseable
+		}
+		in = alt
 	}
 	if trimSpace(in.Summary) == "" && len(in.Highlights) == 0 && len(in.Actions) == 0 {
 		// 全空 = 等价于没解析出任何东西。放行会让卡片变成一张空卡，
@@ -294,6 +355,89 @@ func ParseInsight(raw string) (*Insight, error) {
 		return nil, errEmptyInsight
 	}
 	return &in, nil
+}
+
+// parseInsightLenient 是宽松解析：字段名或形状与契约不一致时尽量取用。
+//
+// # 为什么需要它
+//
+//	严格解析遇到**类型**不符就整份失败（json.Unmarshal 的行为），
+//	而模型偶尔会自己发明字段名（"headline" 而不是 "summary"）
+//	或把列表写成对象数组（actions: [{date, theme, items}]）。
+//	那种情况下整份 AI 解读会被丢掉，店长拿到的是规则版 ———
+//	而模型的输出往往比规则版更有价值。
+//
+// # 它**不会**做的事
+//
+//	- 不会凭空造内容：每个字段都只从模型给过的内容里取。
+//	- 不会放宽"内容全空 ⇒ 失败"这条判据（那在 ParseInsight 里统一判）。
+type lenientInsight struct {
+	Summary    string   `json:"summary"`
+	Headline   string   `json:"headline"`
+	Highlights []string `json:"highlights"`
+	KeyPoints  []string `json:"key_points"`
+	Actions    []struct {
+		Date  string   `json:"date"`
+		Theme string   `json:"theme"`
+		Items []string `json:"items"`
+		Text  string   `json:"text"`
+	} `json:"actions"`
+	ActionTexts []string `json:"action_texts"`
+	Warnings    []string `json:"warnings"`
+	Risks       []string `json:"risks"`
+}
+
+func parseInsightLenient(candidate string) (Insight, error) {
+	var li lenientInsight
+	if err := json.Unmarshal([]byte(candidate), &li); err != nil {
+		return Insight{}, err
+	}
+	out := Insight{
+		Summary:    trimSpace(li.Summary),
+		Highlights: append(append([]string{}, li.Highlights...), li.KeyPoints...),
+		Warnings:   append(append([]string{}, li.Warnings...), li.Risks...),
+		Actions:    append([]string{}, li.ActionTexts...),
+	}
+	if out.Summary == "" {
+		out.Summary = trimSpace(li.Headline)
+	}
+	for _, a := range li.Actions {
+		switch {
+		case len(a.Items) > 0:
+			// 带日期与主题的动作对象 ⇒ 拍平成一条条可读的建议。
+			//
+			// ⚠️ 日期必须留下：读者要能分清"明天"与"后天"，
+			// 而"明天/后天"这种相对词在跨天阅读历史报告时会失效。
+			//
+			// ⚠️ 每个日期**最多留 3 条**：模型可能给出十几条，
+			//   而 Insight.Actions 的条数上限（MaxItems）会从尾部截断 ——
+			//   若不分组，最后一组的"后天"建议会被整段截掉，
+			//   而那正是用户明确要看到的那部分。
+			prefix := strings.TrimSpace(a.Date)
+			if prefix != "" {
+				prefix += " "
+			}
+			if t := trimSpace(a.Theme); t != "" {
+				prefix += t + "："
+			}
+			kept := 0
+			for _, it := range a.Items {
+				if kept >= 3 {
+					break
+				}
+				if t := trimSpace(it); t != "" {
+					out.Actions = append(out.Actions, prefix+t)
+					kept++
+				}
+			}
+		case a.Text != "":
+			out.Actions = append(out.Actions, trimSpace(a.Text))
+		}
+	}
+	if trimSpace(out.Summary) == "" && len(out.Highlights) == 0 && len(out.Actions) == 0 {
+		return Insight{}, errEmptyInsight
+	}
+	return out, nil
 }
 
 // extractJSONObject 从杂乱的 LLM 输出里取出 JSON 对象。
@@ -346,8 +490,20 @@ func FactDigest(f fact.Fact) string {
 	}
 	b = append(b, "（"...)
 	b = append(b, f.Meta.PeriodLabel...)
-	b = append(b, "，对比上期 "...)
+	// ⚠️ 对比基准**必须**带上它的口径标签（"上周同期"）：
+	//   光给一个日期，模型会按"上一期"理解，
+	//   而日报的对比基准是 7 天前 —— 两者的百分比含义完全不同。
+	b = append(b, "，对比基准 "...)
 	b = append(b, f.Meta.PrevFrom...)
+	if f.Meta.PrevFrom != f.Meta.PrevTo {
+		b = append(b, " ~ "...)
+		b = append(b, f.Meta.PrevTo...)
+	}
+	if f.Meta.PrevLabel != "" {
+		b = append(b, "（"...)
+		b = append(b, f.Meta.PrevLabel...)
+		b = append(b, "）"...)
+	}
 	b = append(b, "）\n"...)
 
 	b = append(b, "\n【日期背景】\n"...)
@@ -355,7 +511,7 @@ func FactDigest(f fact.Fact) string {
 	if f.Context.From.Name != "" {
 		b = append(b, "（"+f.Context.From.Name+"）"...)
 	}
-	b = append(b, "，上期 "+f.Context.PrevFrom.Weekday...)
+	b = append(b, "，对比基准 "+f.Context.PrevFrom.Weekday...)
 	if f.Context.PrevFrom.Name != "" {
 		b = append(b, "（"+f.Context.PrevFrom.Name+"）"...)
 	}
@@ -363,9 +519,19 @@ func FactDigest(f fact.Fact) string {
 	if f.Context.Comparability.Kind == "limited" {
 		b = append(b, "⚠️ "+f.Context.Comparability.Reason+"\n"...)
 	}
-	if f.Context.Weather.Available {
-		b = append(b, "天气："+f.Context.Weather.Summary+"\n"...)
-	}
+
+	// ---- 未来两天（"明天/后天"建议的事实依据）----
+	//
+	// ⚠️ 这一段是 2026-10-26 新增的，也是"建议不滞后"的技术前提：
+	//   日报 22:50 生成，店长要的是**明天**的动作，
+	//   而"明天是周六/后天是法定假日"这种判断只有日历知道。
+	//   没有它，模型只能写"多备点货"这类没有依据的话。
+	b = append(b, "\n【未来两天（建议要落在这两天上）】\n"...)
+	b = append(b, digestDay("明天", f.Context.Tomorrow)...)
+	b = append(b, digestDay("后天", f.Context.DayAfter)...)
+	// ⚠️ 天气**不在**这里：它是模型按需调用的工具（见 tools.go）。
+	//   无条件塞进 prompt 曾让日报写出"80分钟后开始下小雨"——
+	//   那段话描述的是营业结束之后的天气，与本期无关。
 
 	b = append(b, "\n【本期业绩】\n"...)
 	// ⚠ 这里**只给百分比，不给全店销售总额与总毛利的具体金额**。
@@ -378,9 +544,16 @@ func FactDigest(f fact.Fact) string {
 	//	模型看不到的数字，它写不出来。
 	//	残留风险由 RedactStoreTotals 兜底。
 	if f.Deltas.HasPrev {
-		b = append(b, "销售额环比 "+fmtPct(f.Deltas.AmountPct)+"\n"...)
+		// ⚠️ 措辞必须跟着**对比基准**走（"较上周同期"而不是"环比"）：
+		//   日报的基准是 7 天前，说"环比"会让店长以为比的是昨天。
+		//   ——而昨天 vs 今天的环比恰恰是这个口径最不该用的那个。
+		label := f.Meta.PrevLabel
+		if label == "" {
+			label = "上期"
+		}
+		b = append(b, "销售额较"+label+" "+fmtPct(f.Deltas.AmountPct)+"\n"...)
 	} else {
-		b = append(b, "销售额（无上期数据，不做环比）\n"...)
+		b = append(b, "销售额（无对比基准数据，不做环比）\n"...)
 	}
 	if f.Totals.MarginAvailable {
 		b = append(b, "参考毛利率 "+fmtPct(f.Totals.RefMarginPct*100)+"\n"...)
@@ -470,4 +643,33 @@ func FactDigest(f fact.Fact) string {
 	}
 
 	return string(b)
+}
+
+// digestDay 把"明天/后天"的日历性质写进事实包。
+//
+// ⚠️ 必须带**客流含义**，而不只是星期几：
+//   "周六"本身不构成建议依据，"周六（周末，客流通常更高）"才是。
+//   但客流高低属于经验判断，写死在这里会变成对所有门店都成立的断言，
+//   所以这里只给**客观性质**（周末/工作日/法定假日/调休上班），
+//   由模型自己把它翻译成客流含义。
+func digestDay(label string, d calendar.Day) string {
+	if d.Date == "" {
+		return ""
+	}
+	out := label + " " + d.Date + "（" + d.Weekday
+	switch d.Kind {
+	case calendar.KindWorkday:
+		out += "，普通工作日"
+	case calendar.KindMakeupWorkday:
+		out += "，调休上班日"
+	case calendar.KindWeekend:
+		out += "，周末"
+	case calendar.KindHoliday:
+		out += "，法定假日"
+	}
+	if d.Name != "" {
+		out += "·" + d.Name
+	}
+	out += "）\n"
+	return out
 }
