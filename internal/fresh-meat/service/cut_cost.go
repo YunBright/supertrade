@@ -91,6 +91,45 @@ type CutDailyCost struct {
 
 	// DataSource:actual | partial | estimated
 	DataSource string
+
+	// CostUncomputable = true ⇒ 该部位当期**成本算不出来**(既没有期初库存、
+	// 当天也没有进货,且没有任何可用单价)⇒ 销售成本必然是 0。
+	//
+	// ⚠️ **这不是"成本为 0",是"不知道成本"** —— 两者必须分开:
+	//   报成 0 ⇒ 门店看到"毛利 100%" ⇒ 会以为赚疯了。
+	//   (2026-10-27 生产实测:店 00 从 9 月起没有任何期初结转、也没有进货,
+	//    整月成本恒 0 ⇒ 期间毛利看起来 = 期间营收。)
+	//
+	// ⇒ 报表层要**显式标注**这种天/部位,别让"算不出来"伪装成"成本是 0"。
+	CostUncomputable bool
+}
+
+// cutOpeningOverride 期初覆盖(链式接续用)。
+//
+// # 为什么需要它
+//
+// 成本链的权威载体是 `cut_cost_daily`(上一营业日的部位结余)。
+// 但那张表**只在审计结转时被固化** ⇒ 日常没有快照 ⇒
+// 如果每天各自从"门店期初结转"起算,链就**每天断一次** ⇒
+// 成本塌成"期初那点残值" ⇒ 毛利虚高(2026-10-27 生产实测:10-03 起成本 ≈ 100 元)。
+//
+// ⇒ 实时计算时,把**上一天算出来的期末**直接喂给下一天当期初
+//   ⇒ 链接续 ⇒ 数字自洽(不依赖任何落库快照)。
+//
+// ⚠️ amount 用的是**结转口径**的期末金额(与 cut_cost_daily.ClosingAmount 同义):
+//   成本口径期末金额 + 预售重估 ⇒ 下一期的期初单价自动 = 预期销售单价。
+type cutOpeningOverride struct {
+	kg     map[string]decimal.Decimal
+	amount map[string]decimal.Decimal
+}
+
+// has 某个部位有没有覆盖值。
+func (o *cutOpeningOverride) has(cut string) bool {
+	if o == nil || o.kg == nil {
+		return false
+	}
+	_, ok := o.kg[cut]
+	return ok
 }
 
 // cutAmounts 部位的量与金额(内部累加用)。
@@ -151,9 +190,16 @@ func (s *Service) loadStocktakeFlags(ctx context.Context, branchID string, start
 //
 // ⚠️ 第 ③ 步是这次改造的关键:旧引擎把它落到"主 SKU"上 ⇒ 另一个货号账面恒为 0
 //   ⇒ 卖出零成本 ⇒ 毛利率 100%。
+//
+// # override(链式接续,2026-10-27)
+//
+//	override 命中时**kg 与金额都直接取**(与快照同语义:金额可以是负数 = 账面短卖)。
+//	它排在最前 ⇒ 实时算一条链时,上一天的期末直接接成今天的期初,
+//	**不依赖 cut_cost_daily 里有没有落库快照**。
 func (s *Service) loadCutOpening(ctx context.Context, branchID string, bizDate time.Time,
 	producedKg, producedAmount map[string]decimal.Decimal,
 	histUnit map[string]decimal.Decimal,
+	override *cutOpeningOverride,
 ) (kg map[string]decimal.Decimal, amount map[string]decimal.Decimal, err error) {
 	kg = map[string]decimal.Decimal{}
 	amount = map[string]decimal.Decimal{}
@@ -225,7 +271,29 @@ func (s *Service) loadCutOpening(ctx context.Context, branchID string, bizDate t
 		if hasOp && op.dateKey > key {
 			hasOp = false
 		}
+		// ⚠️ **期初结转生效日 = 链的起点**(2026-10-27 链式接续后必须显式处理)。
+		//
+		//	门店在生效日**重新定义了**这个部位的库存与进价 ⇒ 这一天的期初
+		//	必须用**门店录的值**,不能接昨天的结余。
+		//	否则门店录了 100kg、报表写 95kg(昨天卖剩的量)⇒ 门店会以为系统算错了。
+		//
+		//	⇒ 生效日当天:快照 / 链式接续 / 实时结余链 **一律让位**给门店录的值。
+		baselineDay := hasOp && op.dateKey == key
 		switch {
+		case baselineDay:
+			// 落到下面的定价(门店给的进价优先)。
+			kg[c] = op.kg
+		case override.has(c):
+			// 链式接续:上一天的期末直接接成今天的期初(与快照同语义)。
+			kg[c] = override.kg[c]
+			amount[c] = override.amount[c]
+			// ⚠️ **有量无价**(2026-10-27 链式接续后暴露):上一批货没定价
+			//   (基线日门店只录了 kg、没填进价)⇒ 金额 0 会**一路传下去**
+			//   ⇒ 那批货永远零成本 ⇒ 毛利虚高。
+			//   ⇒ 不直接用 0,落到下面的定价兜底(今日产出单价等)重新估。
+			if !amount[c].IsZero() || !kg[c].IsPositive() {
+				continue
+			}
 		case hasSnap[c]:
 			// 快照是链的权威 ⇒ kg 与金额都直接用(金额可能是负数 = 账面短卖)。
 			kg[c] = snapKg[c]
@@ -239,8 +307,13 @@ func (s *Service) loadCutOpening(ctx context.Context, branchID string, bizDate t
 			continue
 		}
 		// 定价:历史部位单价 → 门店给的进价 → 今日产出单价。
+		//
+		// ⚠️ **基线日**(期初结转生效日)上,**门店给的进价优先于历史单价** ——
+		//   否则历史单价会覆盖门店刚录的价格 ⇒ 门店录的价白录了。
 		unit := decimal.Zero
 		switch {
+		case baselineDay && op.unitPrice.IsPositive():
+			unit = op.unitPrice
 		case histUnit[c].IsPositive():
 			unit = histUnit[c]
 		case hasOp && op.unitPrice.IsPositive():
@@ -272,6 +345,19 @@ func (s *Service) loadCutOpening(ctx context.Context, branchID string, bizDate t
 //   ⇒ 这正是门店要的口径(2026-10-27):
 //   「以部位为主(分割仍然是部位的重量),销售、营收等和 SKU 有关的数据分列」。
 func (s *Service) computeCutDailyCosts(ctx context.Context, branchID string, day time.Time) (
+	[]CutDailyCost, []SkuDailyCost, *ReconciliationRow, *LossSummary, error,
+) {
+	return s.computeCutDailyCostsChained(ctx, branchID, day, nil)
+}
+
+// computeCutDailyCostsChained 算某店某营业日的**部位级**移动加权成本,
+// 并允许把**上一天的期末**接成今天的期初(链式接续)。
+//
+// ⚠️ override 只影响"期初"这一步;其余口径与 computeCutDailyCosts 完全一致
+//   ⇒ 单日毛利与长期毛利用同一个引擎,不会算出两套数。
+func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID string, day time.Time,
+	override *cutOpeningOverride,
+) (
 	[]CutDailyCost, []SkuDailyCost, *ReconciliationRow, *LossSummary, error,
 ) {
 	startOfDay, endOfDay := s.businessDayBounds(day)
@@ -400,7 +486,7 @@ func (s *Service) computeCutDailyCosts(ctx context.Context, branchID string, day
 		histUnit[string(st.CutType)] = st.MovingAvgUnitCost
 	}
 	openKg, openAmount, err := s.loadCutOpening(ctx, branchID, bizDate,
-		partProducedKg, partProducedAmount, histUnit)
+		partProducedKg, partProducedAmount, histUnit, override)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -509,6 +595,17 @@ func (s *Service) computeCutDailyCosts(ctx context.Context, branchID string, day
 			//   但"短卖"的那部分货**仍要有成本**(否则虚高毛利)⇒ 用兜底单价。
 			movingAvg = fallbackUnit(c)
 		}
+		// ⚠️ **成本算不出来** ≠ **成本为 0**(2026-10-27 加)。
+		//
+		//	当期既没有库存(期初)也没有进货(产出)、又没有任何可用单价
+		//	⇒ 卖出去的那部分货只能是 0 成本 ⇒ 毛利虚高到 100%。
+		//	⇒ 显式标记,让报表层能说"这天的**成本不知道**",
+		//	  而不是把 0 当成成本报给门店。
+		costUncomputable := false
+		soldTotal := partSoldKg[c].Add(partBulkKg[c]).Add(partWasteKg[c])
+		if !movingAvg.IsPositive() && soldTotal.IsPositive() {
+			costUncomputable = true
+		}
 		expectedCloseKg := availKg.
 			Sub(partSoldKg[c]).Sub(partBulkKg[c]).Sub(partWasteKg[c])
 		// ⚠️ **不裁 0**:负数 = 账面短卖 ⇒ 必须看得见。
@@ -575,7 +672,8 @@ func (s *Service) computeCutDailyCosts(ctx context.Context, branchID string, day
 			PresaleMarginYuan:          revaluation,
 			PresaleExpectedRevenueYuan: presaleRevenue,
 			PresaleExpectedUnitYuan:    presaleUnit,
-			DataSource:        dataSource,
+			DataSource:                 dataSource,
+			CostUncomputable:           costUncomputable,
 		})
 		recon.OpeningInventoryCostYuan = recon.OpeningInventoryCostYuan.Add(openA)
 		recon.ProducedCostYuan = recon.ProducedCostYuan.Add(prodA)

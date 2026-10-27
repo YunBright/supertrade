@@ -563,6 +563,10 @@ func (s *Service) recomputeCostSnapshots(ctx context.Context, branchID string, f
 				"branch_id", branchID, "biz_date", d, "err", err)
 		}
 	}
+	// ⚠️ **链是逐日接续的** ⇒ 变更会向下传播(今天的产出变了 ⇒ 明天的期初也变)。
+	//   上面的快路径只重算"有盘点单"的天 ⇒ **后面的天会过期**。
+	//   ⇒ 后台把整条链物化一遍(不绑盘点),让门店看到的成本是新的。
+	s.ScheduleChainMaterialize(ctx, branchID, fromDate)
 	return nil
 }
 

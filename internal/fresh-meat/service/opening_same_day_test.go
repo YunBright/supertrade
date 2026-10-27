@@ -138,9 +138,18 @@ func TestOpeningBaselineDay_FirstBusinessDayCostChainIsConsistent(t *testing.T) 
 		t.Errorf("★ 10-03 的期初 kg 应接上 10-02 的期末 140, got %s —— "+
 			"链断了(期初/产出在次日丢了)", row2.OpeningKg)
 	}
-	if !rep2.Reconciliation.OpeningInventoryCostYuan.Equal(d("2600")) {
+	// ⚠️ **不能断言精确等于 2600**:移动加权单价 = 金额 ÷ kg 是除法结果(16 位有效数字)
+	//   ⇒ 期末金额 = kg × 单价 有 1e-16 级尾数(2599.999999999999996)。
+	//   这个尾数是**故意留着**的:盘盈/盘亏正是靠"期末按 kg×单价估值、
+	//   差额落进对账行"来暴露的 ⇒ 改成残差法会把盘盈吃掉(见 cut_cost.go 的说明)。
+	if rep2.Reconciliation.OpeningInventoryCostYuan.Sub(d("2600")).Abs().GreaterThan(d("0.000001")) {
 		t.Errorf("★ 10-03 的期初金额应接上 2600(1800+800), got %s",
 			rep2.Reconciliation.OpeningInventoryCostYuan)
+	}
+	// ★ **真正的不变量**:次日期初金额 == 上日期末金额(**精确相等**,链没丢一分钱)。
+	if !rep2.Reconciliation.OpeningInventoryCostYuan.Equal(rep1.Reconciliation.ClosingInventoryCostYuan) {
+		t.Errorf("★ 链必须精确接上:10-03 期初金额 %s 应等于 10-02 期末金额 %s",
+			rep2.Reconciliation.OpeningInventoryCostYuan, rep1.Reconciliation.ClosingInventoryCostYuan)
 	}
 }
 

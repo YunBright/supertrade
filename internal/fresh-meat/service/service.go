@@ -75,6 +75,18 @@ type Service struct {
 	//
 	// ⚠️ 生产必须保持异步(录猪不等 LLM)—— 见 RecordWholePig 的说明。
 	adviceRunner func(func())
+	// chainMaterializer 执行"成本链物化"这个后台任务(默认 go f())。
+	//
+	// ⚠️ 生产必须保持异步:物化是 O(天) 的全链重算 ⇒ 同步跑会让录猪等好几秒。
+	//   (见 cut_chain.go 的 ScheduleChainMaterialize。)
+	// ⚠️ 单测注入**禁用**执行器(否则后台任务会在断言之后落库 ⇒ 竞态);
+	//   要验证"物化确实发生了"⇒ 单独用例注入**同步**执行器。
+	chainMaterializer func(func())
+	// chainMaterializeGuard 保证**同一门店同时只跑一个**物化任务,并把期间的多次触发合并。
+	//
+	// ⚠️ 放在 Service 上(不是包级变量)⇒ 每个 Service 一个 ⇒ 单测之间不串味
+	//   (包级变量会让"上一个测试里被标记为正在跑"的状态泄漏到下一个测试)。
+	chainMaterializeGuard sync.Map // branchID => *chainJob
 	// scopeStaleTTL 是过期缓存仍可兜底的时间窗(stale-while-error)。
 	//
 	// ⚠️ 0 = 关闭兜底(过期即失效,userd 失败直接 503)。
@@ -146,6 +158,7 @@ func New(db *gorm.DB) *Service {
 		predictFn:  defaultPredictFn, // 默认 history_avg 降级路径
 		bizTZ:      time.FixedZone("Asia/Shanghai", 8*3600),
 		adviceRunner: func(f func()) { go f() },
+		chainMaterializer: func(f func()) { go f() },
 	}
 }
 
@@ -161,6 +174,20 @@ func (s *Service) SetAdviceRunner(fn func(func())) {
 		return
 	}
 	s.adviceRunner = fn
+}
+
+// SetChainMaterializer 注入"成本链物化"后台任务的执行方式(**仅测试用**)。
+//
+// ⚠️ 生产**不要**注入同步版本:物化是 O(天) 的全链重算
+//   ⇒ 同步跑会让录猪/盘点等写操作等好几秒 ⇒ 门店体验不可接受。
+//
+// 单测注入**禁用**执行器(默认)⇒ 后台任务不会在断言之后落库(避免竞态);
+// 要验证"物化确实发生了"⇒ 注入同步执行器。
+func (s *Service) SetChainMaterializer(fn func(func())) {
+	if fn == nil {
+		return
+	}
+	s.chainMaterializer = fn
 }
 
 // SetBizTZ 注入营业日界时区(nil = 保持当前)。

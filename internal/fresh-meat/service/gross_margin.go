@@ -228,10 +228,19 @@ func (s *Service) ComputeGrossMargin(ctx context.Context, branchID string, day t
 	if branchID == "" {
 		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
 	}
-	cutRows, skuRows, recon, losses, err := s.computeCutDailyCosts(ctx, branchID, day)
+	// ⚠️ **走同一条链**(2026-10-27):期初 = 昨天的期末(链式接续)⇒
+	//   与长期毛利同口径 ⇒ 「长期毛利 = 每日毛利之和」这个不变量成立。
+	//   有已物化快照时直接用前一日快照当期初 ⇒ O(1);没有就回溯到链起点。
+	chainDays, err := s.computeCutChainDays(ctx, branchID, day, day)
 	if err != nil {
 		return nil, err
 	}
+	if len(chainDays) == 0 {
+		return nil, fmt.Errorf("%w: 该营业日无数据", ErrInvalidInput)
+	}
+	cd := chainDays[len(chainDays)-1]
+	cutRows, skuRows := cd.cutRows, cd.skuRows
+	recon, losses := cd.recon, cd.losses
 	promoAlloc := allocatePromo(promoRowsOf(cutRows))
 
 	perCut, total := rollUpPerCutCuts(cutRows, promoAlloc)

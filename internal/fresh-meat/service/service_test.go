@@ -132,6 +132,11 @@ func setupTestServiceMode(t *testing.T, syncAdvice bool) (*service.Service, *rec
 	if syncAdvice {
 		svc.SetAdviceRunner(func(f func()) { f() })
 	}
+	// ⚠️ 成本链物化默认**禁用**(2026-10-27):物化是后台任务,
+	//   若开着,它在断言之后才落库 ⇒ 后面的用例会看到脏数据(竞态)。
+	//   要验证"物化确实发生了"⇒ 单独用例注入**同步**执行器
+	//   (见 cut_chain_test.go 的 TestCutChain_WritePathMaterializesChain)。
+	svc.SetChainMaterializer(func(f func()) {})
 	// 把 db 挂到 testDBSingleton,Stage 4 测试需要直接写 llm_advice_json 模拟。
 	testDBSingleton = db
 	return svc, pub

@@ -65,8 +65,15 @@ func fmSetupSales(t *testing.T, cubeRows []map[string]any) (*service.Service, *c
 	mustNoErr(t, err, "CreateBranchCutMapping trotter")
 
 	cube := &cubereadfake.Client{}
-	cube.Handler = func(model string, _ cubeclient.CubeQuery) ([]map[string]any, int, error) {
+	cube.Handler = func(model string, q cubeclient.CubeQuery) ([]map[string]any, int, error) {
 		if model != "sales_report" {
+			return nil, 0, nil
+		}
+		// ⚠️ **必须按 oper_date 过滤**(2026-10-27 链式接续后暴露):
+		//   成本链现在逐日回溯(基线日 → 今天),每一天都会问一次 cube。
+		//   假身若对任何日期都返回同一批销售 ⇒ 销售被重复计入每一天
+		//   ⇒ 期初被算成"卖了两遍"的残值 ⇒ 账面应有/成本全错。
+		if d := fmCubeOperDate(q); d != "" && d != fmDay2Key {
 			return nil, 0, nil
 		}
 		return cubeRows, len(cubeRows), nil
