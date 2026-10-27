@@ -114,6 +114,8 @@ func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation) ([]Pe
 			PresaleMarginYuan: r.PresaleMarginYuan,
 			PresaleExpectedRevenueYuan: r.PresaleExpectedRevenueYuan,
 			MovingAvgUnitCost: r.MovingAvgUnitCost,
+			// ⚠️ 该部位当天成本**算不出来**(不是成本为 0)⇒ 行级标注。
+			CostIncomplete: r.CostUncomputable,
 		}
 		// ⚠️ 「实盘剩余」**只在有真实盘点时才有值**。
 		// 无盘点 ⇒ 留空(指针 nil ⇒ JSON 里**没有这个键**)⇒ 前端显示「—」,

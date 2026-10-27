@@ -121,6 +121,20 @@ type CutDailyCost struct {
 type cutOpeningOverride struct {
 	kg     map[string]decimal.Decimal
 	amount map[string]decimal.Decimal
+	// unit 是上一天算出来的**移动加权单价**(元/kg)—— 链式接续的第三根支柱。
+	//
+	// ⚠️ **为什么必须有它**(2026-10-27 生产实测):
+	//
+	//	链接上之后,某部位的**账面结余可能是负的**(短卖)⇒
+	//	今天的"可售数量" = 期初(负) + 产出 ⇒ **分母 ≤ 0**
+	//	⇒ 移动加权单价算不出来(除以非正数)
+	//	⇒ 若没有兜底价 ⇒ 单价 0 ⇒ **卖出去的货零成本 ⇒ 毛利 100%(虚高)**。
+	//
+	//	实测:店 00 的 10-03 起销售成本恒 0、毛利率 100%、对账差额 −335.70。
+	//
+	// ⇒ 链必须把**上期的加权成本**一起传下去 ⇒ 短卖那部分照上期成本结转
+	//   (与"短卖按当期移动加权成本计入成本"的口径一致)。
+	unit map[string]decimal.Decimal
 }
 
 // has 某个部位有没有覆盖值。
@@ -484,6 +498,19 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 			continue
 		}
 		histUnit[string(st.CutType)] = st.MovingAvgUnitCost
+	}
+	// ⚠️ **链式接续的上期单价优先于 cut_cost_states**(2026-10-27 生产实测)。
+	//
+	//	`cut_cost_states` 只在**盘点**时刷新 ⇒ 零盘点门店它是空的
+	//	⇒ 短卖导致"可售数量 ≤ 0"时,兜底价 = 0 ⇒ **销售成本 0 ⇒ 毛利 100%**。
+	//
+	//	⇒ 链把上一天算出来的移动加权单价带下来 ⇒ 短卖那部分照上期成本结转。
+	if override != nil {
+		for cut, u := range override.unit {
+			if u.IsPositive() {
+				histUnit[cut] = u
+			}
+		}
 	}
 	openKg, openAmount, err := s.loadCutOpening(ctx, branchID, bizDate,
 		partProducedKg, partProducedAmount, histUnit, override)

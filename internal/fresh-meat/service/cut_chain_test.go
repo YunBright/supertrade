@@ -193,6 +193,85 @@ func TestCutChain_WritePathMaterializesChain(t *testing.T) {
 	}
 }
 
+// TestCutChain_ShortSell_UnitCarriesOverSoCostNotZero 锁"短卖之后成本不能塌成 0"。
+//
+// # 场景(2026-10-27 生产实测的症状)
+//
+//	基线 belly 10kg @ 18;10-02 卖 20kg ⇒ 账面应有 −10kg(**账面短卖**)。
+//	10-03 再卖 5kg ⇒ "可售数量" = 期初(−15) + 产出(0) = **负数**
+//	⇒ 移动加权单价算不出来(除以非正数)。
+//
+// # 期望
+//
+//	① 10-03 的**销售成本 > 0** —— 链必须把上期的移动加权单价带下来
+//	   ⇒ 短卖那部分照上期成本结转。
+//	② 对账差额 = 0。
+//
+// ⚠️ 旧行为(链不带单价):10-03 起销售成本恒 0 ⇒ **毛利率 100%**(虚高)
+//   且对账差额 −335.70(生产实测)。
+func TestCutChain_ShortSell_UnitCarriesOverSoCostNotZero(t *testing.T) {
+	day3 := fmDay1.Add(48 * time.Hour) // 2026-10-03
+
+	svc, ctx := fmChainSetup(t, map[string][]map[string]any{
+		"2026-10-02": {fmCubeSalesRow("P-BELLY", "20", "360")},
+		"2026-10-03": {fmCubeSalesRow("P-BELLY", "5", "90")},
+	})
+	if _, err := svc.SaveStockOpenings(ctx, "S001", []service.StockOpeningInput{
+		{CutType: model.CutBelly, BizDate: "2026-10-01",
+			ColdStoreKg: d("10"), UnitPriceYuan: d("18")},
+	}); err != nil {
+		t.Fatalf("SaveStockOpenings: %v", err)
+	}
+
+	svc.SetClock(fmClock(day3))
+	rep, err := svc.ComputeGrossMargin(ctx, "S001", day3)
+	mustNoErr(t, err, "ComputeGrossMargin(10-03)")
+	row := fmCutRowFor(t, rep, model.CutBelly)
+
+	// ① ★ 成本必须 > 0(不能塌成 0 ⇒ 不能是 100% 毛利)。
+	if !row.SalesCostYuan.IsPositive() {
+		t.Errorf("★ 10-03 的销售成本应 > 0(短卖照上期成本结转), got %s —— "+
+			"0 ⇒ 卖超的部分白送 ⇒ 毛利 100%%(虚高)", row.SalesCostYuan)
+	}
+	// 短卖 10kg 之后的账面应有仍是负数(不许裁 0)。
+	if !row.ExpectedRemainKg.IsNegative() {
+		t.Errorf("★ 账面应是负数(短卖), got %s", row.ExpectedRemainKg)
+	}
+	// ② 对账差额 = 0。
+	if rep.Reconciliation.DiffYuan.Abs().GreaterThan(d("0.01")) {
+		t.Errorf("★ 对账差额应是 0, got %s", rep.Reconciliation.DiffYuan)
+	}
+}
+
+// TestGrossMargin_CostIncompleteMarked 锁"每日毛利也要标出'成本算不出来'"。
+//
+// ⚠️ 生产实测(店 00 的 10-01):当期只有 9.23kg 有价、其余部位卖了很多却没基线
+//   ⇒ 销售成本 120.41 元、毛利率 96.84% ⇒ 店长会以为赚疯了。
+//   ⇒ 每日毛利接口必须**显式标注**,不能只靠"成本是 0"让人自己猜。
+func TestGrossMargin_CostIncompleteMarked(t *testing.T) {
+	day2 := fmDay1.Add(24 * time.Hour) // 2026-10-02
+	// ⚠️ **不录期初结转** ⇒ 没有基线 ⇒ 成本算不出来。
+	svc, ctx := fmChainSetup(t, map[string][]map[string]any{
+		"2026-10-02": {fmCubeSalesRow("P-BELLY", "10", "180")},
+	})
+	svc.SetClock(fmClock(day2))
+
+	rep, err := svc.ComputeGrossMargin(ctx, "S001", day2)
+	mustNoErr(t, err, "ComputeGrossMargin")
+
+	if !rep.CostIncomplete {
+		t.Errorf("★ 没有基线时每日毛利必须标 cost_incomplete=true, got false —— "+
+			"店长会看到「毛利 100%%」却没有任何提示")
+	}
+	if rep.CostIncompleteNote == "" {
+		t.Error("★ 必须给出人话说明(cost_incomplete_note),否则门店不知道为什么")
+	}
+	row := fmCutRowFor(t, rep, model.CutBelly)
+	if !row.CostIncomplete {
+		t.Errorf("★ 部位行也要标 cost_incomplete, got false: %+v", row)
+	}
+}
+
 // TestCutChain_NoBaseline_CostMarkedUncomputable 锁 ②。
 //
 // # 场景

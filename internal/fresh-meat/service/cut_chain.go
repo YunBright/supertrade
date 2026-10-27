@@ -103,6 +103,7 @@ func (r *cutChainRunner) day(ctx context.Context, d time.Time) (cutChainDay, err
 	next := &cutOpeningOverride{
 		kg:     map[string]decimal.Decimal{},
 		amount: map[string]decimal.Decimal{},
+		unit:   map[string]decimal.Decimal{},
 	}
 	for _, row := range cutRows {
 		cut := string(row.CutType)
@@ -121,6 +122,11 @@ func (r *cutChainRunner) day(ctx context.Context, d time.Time) (cutChainDay, err
 		// 结转口径的期末金额(成本口径 + 预售重估)—— 与 cut_cost_daily.ClosingAmount 同义。
 		next.kg[cut] = row.ClosingKg
 		next.amount[cut] = row.ClosingAmount.Add(row.PresaleMarginYuan)
+		// ★ 上期的移动加权单价也要传下去:短卖时"可售数量 ≤ 0" ⇒ 单价算不出来
+		//   ⇒ 没有它,卖超的部分会变成**零成本** ⇒ 毛利 100%(虚高)。
+		if row.MovingAvgUnitCost.IsPositive() {
+			next.unit[cut] = row.MovingAvgUnitCost
+		}
 	}
 	r.prev = next
 	return out, nil
@@ -190,10 +196,15 @@ func (s *Service) cutChainAnchor(ctx context.Context, branchID string,
 	prev := &cutOpeningOverride{
 		kg:     map[string]decimal.Decimal{},
 		amount: map[string]decimal.Decimal{},
+		unit:   map[string]decimal.Decimal{},
 	}
 	for _, r := range rows {
 		prev.kg[string(r.CutType)] = r.ClosingKg
 		prev.amount[string(r.CutType)] = r.ClosingAmount
+		// ★ 锚点也要带上移动加权单价(短卖时的兜底价)。
+		if r.MovingAvgUnitCost.IsPositive() {
+			prev.unit[string(r.CutType)] = r.MovingAvgUnitCost
+		}
 	}
 	anchorDate, err := time.ParseInLocation("2006-01-02", anchorDay, loc)
 	if err != nil {

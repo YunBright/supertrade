@@ -46,6 +46,8 @@ package service
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/YunBright/supertrade/internal/fresh-meat/model"
@@ -92,6 +94,18 @@ type GrossMarginReport struct {
 	//   ⇒ 门店要看成本看部位行,货号行只回答"这个货号卖了多少、卖了多少钱"。
 	PerSku []PerSkuGrossMargin `json:"per_sku"`
 	Total  TotalGrossMargin   `json:"total"`
+	// CostIncomplete = true ⇒ 当天**有部位的成本算不出来**(既没有期初库存、
+	// 当天也没有进货、又没有任何可用单价)⇒ 那部分销售成本必然是 0。
+	//
+	// ⚠️ **这不是"成本为 0",是"不知道成本"** —— 两者必须分开:
+	//   报成 0 ⇒ 门店看到"毛利 96%"⇒ 会以为赚疯了。
+	//   (2026-10-27 生产实测:店 00 从 9 月起没有期初结转也没有进货,
+	//    那些天的成本恒 0 ⇒ 毛利看起来 100%。)
+	//
+	// ⇒ 前端要**显式提示**,别让"算不出来"伪装成"成本是 0"。
+	CostIncomplete bool `json:"cost_incomplete,omitempty"`
+	// CostIncompleteNote 是给门店看的**人话**说明(前端直接显示)。
+	CostIncompleteNote string `json:"cost_incomplete_note,omitempty"`
 	// Reconciliation 成本对账行。
 	Reconciliation ReconciliationRow `json:"reconciliation"`
 	// Losses 显式化的损耗(以前这些 kg 完全不在任何表里,成本凭空消失)。
@@ -195,6 +209,12 @@ type PerCutGrossMargin struct {
 	WasteCostYuan    decimal.Decimal `json:"waste_cost_yuan"`
 	GrossMarginYuan   decimal.Decimal `json:"gross_margin_yuan"`
 	GrossMarginPct    float64         `json:"gross_margin_pct"`
+	// CostIncomplete = true ⇒ 该部位当天**成本算不出来**
+	// (既没有期初库存、当天也没有进货、又没有任何可用单价)
+	// ⇒ 那部分销售成本必然是 0 ⇒ **毛利被高估**。
+	//
+	// ⚠️ 这是"不知道成本",不是"成本为 0" ⇒ 前端必须显式提示。
+	CostIncomplete bool `json:"cost_incomplete,omitempty"`
 	// PresaleMarginYuan 是该部位的**预期毛利(预售结转)**金额。
 	//
 	// ⚠️ 它**已经含在 GrossMarginYuan 里**(审计日的结余按预期售价重估),
@@ -281,6 +301,31 @@ func (s *Service) ComputeGrossMargin(ctx context.Context, branchID string, day t
 		return nil, err
 	}
 
+	// ⚠️ "成本算不出来"(≠"成本为 0")要显式告诉门店。
+	//
+	//	某部位既没有期初库存、当天也没有进货、又没有任何可用单价
+	//	⇒ 那部分销售成本必然是 0 ⇒ **毛利被高估**
+	//	⇒ 若不提示,店长看到"毛利 96%"会以为赚疯了(生产实测:店 00 的 10-01)。
+	costIncomplete := false
+	var incompleteCuts []string
+	for _, r := range cutRows {
+		if r.CostUncomputable {
+			costIncomplete = true
+			incompleteCuts = append(incompleteCuts, string(r.CutType))
+		}
+	}
+	costIncompleteNote := ""
+	if costIncomplete {
+		sort.Strings(incompleteCuts)
+		shown := incompleteCuts
+		if len(shown) > 6 {
+			shown = shown[:6]
+		}
+		costIncompleteNote = fmt.Sprintf(
+			"有 %d 个部位的成本**算不出来**(既没有期初库存、当天也没有进货)⇒ 这部分成本按 0 计,毛利被高估;补录期初结转或当天进货后才准。部位:%s",
+			len(incompleteCuts), strings.Join(shown, "、"))
+	}
+
 	return &GrossMarginReport{
 		BranchID:            branchID,
 		Date:                day.In(s.bizTZOrUTC()).Format("2006-01-02"),
@@ -291,8 +336,10 @@ func (s *Service) ComputeGrossMargin(ctx context.Context, branchID string, day t
 		PerCut:              perCut,
 		// ⚠️ SKU 明细**只承载销售 / 营收 / 分割产出**(2026-10-27 口径):
 		//   库存 / 成本 / 毛利是**部位口径** ⇒ SKU 行里**不返**(键缺失)。
-		PerSku: perSkuGrossMarginsOf(skuRows),
+		PerSku:              perSkuGrossMarginsOf(skuRows),
 		Total:               total,
+		CostIncomplete:      costIncomplete,
+		CostIncompleteNote:  costIncompleteNote,
 		Reconciliation:      *recon,
 		Losses:              *losses,
 		PromoAllocation:     promoAlloc,
