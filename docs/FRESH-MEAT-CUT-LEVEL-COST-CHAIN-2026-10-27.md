@@ -163,3 +163,69 @@
 | 审计冻结与新口径并存 | R1：当前生产无冻结；代码里保留「审计日之前读冻结快照」的分支不变 |
 | 大宗成本单价改按部位 | 大宗本就按部位记（`bulk_settlement_allocations.cut_type`）⇒ 口径更一致 |
 | 盘点页 SKU 清单变化 | 门店第一次盘会看到不同清单 ⇒ 上线前告知 |
+
+---
+
+## 9. 链式接续改造（2026-10-27 第二轮）
+
+> 起因：用户判断「长期毛利不能依赖快照表，日终盘点就快照的方式不可取」。
+> 物化点决议：**只靠审计结转**（不新增定时任务）。
+
+### 9.1 根因（生产实测，店 00）
+
+`cut_cost_daily`（部位级成本日快照）**只在有盘点单的日子落** ⇒ 零盘点门店的链**每天断一次**
+⇒ 每天的期初都回落成「门店期初结转」那点残值 ⇒ 成本塌陷、毛利虚高：
+
+| 营业日 | 销售成本 | 毛利率 | 现象 |
+|---|---|---|---|
+| 09-01 ~ 09-30 | 恒 0 | 100% | 期间毛利看起来 = 期间营收 |
+| 10-01 | 120.41 | 96.84% | 只剩期初结转那 9.23kg 的残值 |
+| 10-02 | 3072.17 | 11.73% | 碰巧当天有整猪入库（3169.66） |
+| 10-03 ~ 10-27 | ~100 | 97% | 链又断回期初残值 |
+
+⇒ 这不是「延迟」，是**数字系统性失真**。
+
+### 9.2 改法
+
+1. **链逐日接续**（`service/cut_chain.go` 新增）：今天的期初 = 昨天的期末（**算出来的，不必落库**）。
+   - 链**按部位独立**接续；没入链的部位（既无期初结转也无进货）**不接续**
+     ⇒ 无基线期间卖出的货不会变成负库存污染后面的日子。
+   - 起点 = 最早有基线的营业日（期初结转 / 已落库快照）；基线之前 = 「成本算不出来」。
+   - 锚点 = from 之前最近一个已落库快照 ⇒ 命中时 O(1) 快路径。
+2. **链带三根支柱**：kg、金额、**移动加权单价**。
+   ⚠️ 单价是必需的：短卖时「可售数量 ≤ 0」⇒ 加权单价算不出来 ⇒ 没有它 ⇒ 成本塌成 0 ⇒ 毛利率 100%（第二轮生产实测抓到）。
+3. **物化不绑盘点**（`materializeCostChain`）：逐日重算 `fromDate → 今天` 并落 `cut_cost_daily`。
+   - 写路径（录猪 / 删猪 / 大宗 / 搬上台 / 期初结转）触发：**后台跑 + 不继承请求 ctx** + 同门店合并（pending）。
+   - **审计结转**（物化点）本来就逐日物化整条链：审计前置条件 = 区间内每天都有完整日终盘点 ⇒ 每天都会落 ⇒ 审计过的区间秒回。
+4. **「成本算不出来」 ≠ 「成本为 0」**：
+   - 引擎：`CutDailyCost.CostUncomputable`。
+   - 期间毛利：行级 `cost_incomplete` + 报告级 `days_without_cost_baseline` + Note。
+   - 每日毛利：报告级 `cost_incomplete` + `cost_incomplete_note` + 部位行 `cost_incomplete`。
+5. **期初结转生效日 = 链的起点**：门店在那一天重新定义了库存与进价 ⇒ 那天的期初用门店录的值
+   （不再被「昨天卖剩的量」覆盖），且门店给的进价优先于历史单价。
+
+### 9.3 新增不变量（已用单测锁住）
+
+| 不变量 | 用例 |
+|---|---|
+| 次日期初 == 上日期末（kg 与金额**精确相等**） | `TestCutChain_ConsecutiveDays_CarryOpeningExactly` |
+| 短卖后成本**不得塌成 0**、对账差额 = 0 | `TestCutChain_ShortSell_UnitCarriesOverSoCostNotZero` |
+| 无基线的天必须标注（不算成成本 0） | `TestCutChain_NoBaseline_CostMarkedUncomputable` / `TestGrossMargin_CostIncompleteMarked` |
+| 写路径会物化（不绑盘点） | `TestCutChain_WritePathMaterializesChain` |
+| 长期毛利 = 每日毛利之和 | `TestCutChain_PeriodMarginEqualsSumOfDaily` / `TestPeriodMargin_AuditMaterializesEveryDay` |
+
+> ⚠️ **判别力**：摘掉链式接续 ⇒ 链测试立即变红（症状「链断了」）。
+> ⚠️ **cube 假身必须按 `oper_date` 返回**：链现在逐日回溯，假身若对任何日期返回同一批销售 ⇒ 销售被重复计入每一天。
+
+### 9.4 契约变化
+
+`GET /fresh-meat/gross-margin/period`：
+- 行新增 `cost_incomplete`（bool）
+- 报告新增 `days_without_cost_baseline`（int）—— 口径是「成本**完全**算不出来」的天数（部分算不出来只影响行级 `cost_incomplete`）
+- Note 追加「成本算不出来」的说明
+
+`GET /fresh-meat/gross-margin`：
+- 报告新增 `cost_incomplete`（bool）、`cost_incomplete_note`（string）
+- 部位行新增 `cost_incomplete`（bool）
+
+⇒ 键名不变、都是**可缺省** ⇒ 老客户端不受影响。

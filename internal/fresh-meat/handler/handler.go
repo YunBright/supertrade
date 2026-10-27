@@ -169,6 +169,10 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/forecast-baselines", requireBranch, h.ListForecastBaselines)
 	r.POST("/forecast-baselines/recompute", requireBranch, h.RecomputeForecastBaselines)
 
+	// 成本链逐日物化(2026-10-27):落 `cut_cost_daily` ⇒ 长期毛利变快。
+	// ⚠️ 幂等的派生数据重算,不绑盘点(绑盘点 ⇒ 零盘点门店的链每天断一次)。
+	r.POST("/cost-chain/materialize", requireBranch, h.MaterializeCostChain)
+
 	// dapr cron binding 触发(deployer 仓加 bindings.cron.yaml)—
 	// 走 dapr 自身 cron binding,无 JWT 无 X-Branch-ID;**不挂** requireBranch。
 	r.GET("/cron/daily-reminder", h.CronDailyReminder)
@@ -1299,4 +1303,30 @@ func (h *Handler) RecomputeForecastBaselines(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"baselines": n})
+}
+
+// MaterializeCostChain POST /cost-chain/materialize?from=YYYY-MM-DD
+//
+// ⚠️ 这是**派生数据**的重算(部位级成本日快照)⇒ **幂等、可重复调用**;
+//   不像审计结转那样不可逆(不改业务事实、不冻结数据)。
+//
+// # 为什么需要它
+//
+// 长期毛利(逐日链式算)在没有落库日序列时要 O(天) 地回溯
+// ⇒ 查一个月要十几秒。物化之后 ⇒ 前一日快照直接当期初 ⇒ O(1)。
+//
+// ⚠️ **不绑盘点**:盘点只是"实盘锚定",不是"链的开关"
+//   (绑盘点 ⇒ 零盘点门店的链每天断一次 ⇒ 成本塌成期初残值 ⇒ 毛利虚高)。
+func (h *Handler) MaterializeCostChain(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	from := c.Query("from")
+	n, err := h.svc.MaterializeCostChain(c.Request.Context(), branchID, from)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"rows": n})
 }

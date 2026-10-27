@@ -95,9 +95,15 @@ type PeriodMarginReport struct {
 	Rows     []PeriodMarginRow `json:"rows"`
 	Total    TotalGrossMargin  `json:"total"`
 	Days     int               `json:"days"`
-	// DaysWithoutCostBaseline 是"成本**算不出来**"的天数
-	// (链起算点之前 / 那天既没有期初库存也没有进货)。
+	// DaysWithoutCostBaseline 是"成本**完全算不出来**"的天数
+	// (既无期初库存、当天也没有进货 ⇒ 整天的成本都是"不知道")。
+	//
+	// ⚠️ 口径必须是"**完全**算不出来",不是"有一部分算不出来" ——
+	//   否则每天只差 1 个部位也会被算成"整天缺基线"(实测:26 天里 26 天被误报)。
 	DaysWithoutCostBaseline int `json:"days_without_cost_baseline,omitempty"`
+	// CostIncomplete = true ⇒ 区间里有**成本算不出来**的天
+	// (部分或全部)⇒ **期间毛利被高估** ⇒ 前端必须提示,别让店长把"毛利 100%"当真。
+	CostIncomplete bool `json:"cost_incomplete,omitempty"`
 	// Note 说明口径(尤其是"期初存货成本在售出时结转")。
 	Note string `json:"note,omitempty"`
 }
@@ -157,12 +163,16 @@ func (s *Service) ComputePeriodMargin(ctx context.Context, branchID, from, to, g
 	cutOf := map[string]model.CutType{}
 	days := 0
 	daysWithoutBaseline := 0
+	costIncomplete := false
 	for _, cd := range chainDays {
 		if cd.day.Before(fromT) {
 			continue // 只为链接基线,不计入区间。
 		}
 		days++
 		if cd.costIncomplete {
+			costIncomplete = true
+		}
+		if cd.costUncomputableAll {
 			daysWithoutBaseline++
 		}
 		// 部位级数据 → 聚合键。
@@ -234,8 +244,8 @@ func (s *Service) ComputePeriodMargin(ctx context.Context, branchID, from, to, g
 		note = "SKU 粒度:营收/销量按货号(销售流水口径);" +
 			"成本按**当日该部位**的移动加权单价分摊(库存是部位的 ⇒ 货号级成本只能近似)。"
 	}
-	if daysWithoutBaseline > 0 {
-		note += fmt.Sprintf(";其中 %d 天的成本**算不出来**(链起算点之前:既没有期初库存也没有进货)"+
+	if costIncomplete {
+		note += fmt.Sprintf(";其中 %d 天成本**算不出来**(链起算点之前:既没有期初库存也没有进货)"+
 			"⇒ 这部分成本被低估、毛利被高估(cost_incomplete=true 的行)", daysWithoutBaseline)
 	}
 	return &PeriodMarginReport{
@@ -247,6 +257,7 @@ func (s *Service) ComputePeriodMargin(ctx context.Context, branchID, from, to, g
 		Total:                   tot,
 		Days:                    days,
 		DaysWithoutCostBaseline: daysWithoutBaseline,
+		CostIncomplete:          costIncomplete,
 		Note:                    note,
 	}, nil
 }

@@ -298,6 +298,10 @@ func TestCutChain_NoBaseline_CostMarkedUncomputable(t *testing.T) {
 		t.Errorf("★ 没有基线的那天必须被标出来(days_without_cost_baseline ≥ 1), got %d",
 			rep.DaysWithoutCostBaseline)
 	}
+	if !rep.CostIncomplete {
+		t.Errorf("★ 区间里有成本算不出来 ⇒ 必须标 cost_incomplete=true, got false —— "+
+			"店长会把「毛利 100%%」当真")
+	}
 	if len(rep.Rows) == 0 {
 		t.Fatalf("期间毛利应至少有一行: %+v", rep)
 	}

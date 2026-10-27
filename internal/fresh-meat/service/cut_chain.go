@@ -61,6 +61,14 @@ type cutChainDay struct {
 	closing *cutOpeningOverride
 	// costIncomplete = true ⇒ 当天有部位的成本**算不出来**(不是成本为 0)。
 	costIncomplete bool
+	// costUncomputableAll = true ⇒ 当天**所有**部位的成本都算不出来
+	// (既无期初库存也无进货、又没有可用单价)⇒ 这天的成本**完全算不出来**。
+	//
+	// ⚠️ 与 costIncomplete 的区别很重要:
+	//   costIncomplete   ⇒ 有一部分算不出来(成本被低估)
+	//   costUncomputableAll ⇒ 整天的成本都算不出来(那一行是纯营收)
+	// ⇒ 报告级"多少天算不出成本"要用**后者**,否则每天只差 1 个部位也会被算成"整天缺基线"。
+	costUncomputableAll bool
 }
 
 // cutChainRunner 逐日推进一条成本链(内存链)。
@@ -105,10 +113,14 @@ func (r *cutChainRunner) day(ctx context.Context, d time.Time) (cutChainDay, err
 		amount: map[string]decimal.Decimal{},
 		unit:   map[string]decimal.Decimal{},
 	}
+	totalCuts := 0
+	uncomputableCuts := 0
 	for _, row := range cutRows {
 		cut := string(row.CutType)
+		totalCuts++
 		if row.CostUncomputable {
 			out.costIncomplete = true
+			uncomputableCuts++
 		}
 		if !r.inChain[cut] {
 			// 该部位今天才第一次有货(期初或进货)⇒ 从今天起入链。
@@ -129,6 +141,8 @@ func (r *cutChainRunner) day(ctx context.Context, d time.Time) (cutChainDay, err
 		}
 	}
 	r.prev = next
+	// 当天**所有**部位都算不出来 ⇒ 这天的成本完全算不出来。
+	out.costUncomputableAll = totalCuts > 0 && uncomputableCuts == totalCuts
 	return out, nil
 }
 
@@ -301,6 +315,39 @@ func (s *Service) materializeCostChain(ctx context.Context, branchID string, fro
 		total += n
 	}
 	return total, nil
+}
+
+// MaterializeCostChain 逐日物化成本链(对外入口)。
+//
+// # 干什么
+//
+// 把 fromDate → 今天每一天的**部位级成本日快照**重算并落库(`cut_cost_daily`),
+// **不要求当天有盘点单** —— 盘点只是"实盘锚定",不是"链的开关"。
+//
+// # 为什么需要它
+//
+// 长期毛利要快 ⇒ 得有现成的日序列可读。
+// 链式回溯是 O(天) 的 ⇒ 没物化时,查 26 天要 ~9s、查一个月更久。
+// 物化之后 ⇒ 前一日快照直接当期初 ⇒ O(1)。
+//
+// # 幂等
+//
+// 逐日 upsert(`cut_cost_daily` 的唯一键 = branch_id + biz_date + cut_type)
+// ⇒ 重复调用安全;它是**派生数据**,不改业务事实(不像审计那样不可逆)。
+func (s *Service) MaterializeCostChain(ctx context.Context, branchID, fromDate string) (int, error) {
+	if branchID == "" {
+		return 0, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
+	}
+	loc := s.bizTZOrUTC()
+	from := s.now().In(loc)
+	if fromDate != "" {
+		parsed, err := time.ParseInLocation("2006-01-02", fromDate, loc)
+		if err != nil {
+			return 0, fmt.Errorf("%w: from 格式应为 YYYY-MM-DD", ErrInvalidInput)
+		}
+		from = parsed
+	}
+	return s.materializeCostChain(ctx, branchID, from)
 }
 
 // chainJob 一个门店的物化任务状态。
