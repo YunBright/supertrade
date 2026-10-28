@@ -42,6 +42,17 @@ const (
 const (
 	VerdictSourceLLM          = "llm"
 	VerdictSourceRuleFallback = "rule_fallback"
+	// VerdictSourceFlowConfig 是**流程定制**的结论来源（2026-10-28 用户口径）。
+	//
+	// ⚠️ 它表示"这一单没问机器人，结论由管理员配置的流程定制规则给出" ——
+	//    页面上必须能一眼看出这单**没经过 LLM 研判**，否则店长会以为
+	//    "机器人审过了"，而实际上是被配置直接放行的。
+	VerdictSourceFlowConfig = "flow_config"
+	// VerdictSourceAdminOverride 是**管理员人工放行**的结论来源（2026-10-28 用户口径）。
+	//
+	// ⚠️ 它表示"机器拒了，人放行的" ⇒ 页面必须显示成「人工放行」，
+	//    不能显示成"通过" —— 否则店长看到的是一台机器放了这单。
+	VerdictSourceAdminOverride = "admin_override"
 )
 
 // ApprovalInstance 一次付款审批的机器审核实例(审批单快照)。

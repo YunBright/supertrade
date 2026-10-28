@@ -71,8 +71,15 @@ type VerdictResult struct {
 	SuggestStocktake *StocktakeSuggestion `json:"suggest_stocktake,omitempty"`
 	// RawJSON 原始输出(落 llm_verdicts.raw_json)。
 	RawJSON []byte `json:"-"`
-	// Source = llm / rule_fallback。
+	// Source = llm / rule_fallback / flow_config / admin_override。
 	Source string `json:"-"`
+	// AIConclusionPrefix 是「AI审核结论」控件文案的**首行**（可选）。
+	//
+	// 2026-10-28 用户口径：管理员人工放行时，控件**第一行**插
+	// 「已转人工审核并通过」⇒ 审批人一眼看出这单**没经机器人**，是人放行的。
+	//
+	// ⚠️ 空 ⇒ 控件文案与改造前完全一致（机器通过 = "机器审核通过:…"）。
+	AIConclusionPrefix string `json:"-"`
 }
 
 // VerdictFn 是 Service.verdictFn 的签名(单测注入 fake)。

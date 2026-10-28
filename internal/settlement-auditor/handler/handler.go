@@ -66,6 +66,11 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/settlement-approvals/:id", requireBranch, h.Get)
 	r.GET("/settlement-approvals/:id/logs", requireBranch, h.GetLogs)
 	r.POST("/settlement-approvals/:id/retry", requireBranch, h.Retry)
+	// 管理员人工放行(2026-10-28 用户口径):只对"机器拒绝"的单,
+	// 让它重新进人工终审,企微「AI审核结论」控件首行插"已转人工审核并通过"。
+	// ⚠️ 端点内部**双重守门**(scope settlement:audit + 角色 admin)——
+	// merchant 持有 settlement:audit ⇒ 只守 scope 的话店长能自己放行自己的单。
+	r.POST("/settlement-approvals/:id/admin-approve", requireBranch, h.AdminApprove)
 	// 物理删一次审批及其 5 张从表（数据治理 / 测试清理）。
 	// 流水线在途时会返 409 让调用方稍后重试 —— 详见 service.ErrApprovalInFlight。
 	r.DELETE("/settlement-approvals/:id", requireBranch, h.Delete)
@@ -79,6 +84,30 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.POST("/settlement-init/preview", requireBranch, h.PreviewInit)
 	r.POST("/settlement-init/apply", requireBranch, h.ApplyInit)
 	r.POST("/settlement-init/revert", requireBranch, h.RevertInit)
+
+	// ---- 机器审核「流程定制」配置(2026-10-28 用户口径) ----
+	//
+	// ⚠️ 权限**不用** settlement:audit:merchant(店长)持有它 ⇒ 店长能配「直接通过」
+	//    ⇒ 等于自己给自己开自动放行。读走 supplier:view、写走 supplier:manage,
+	//    这两个 merchant 都没有(auth 迁移 001 的 merchant 清单里没有它们)。
+	//
+	// ⚠️ 正则试跑挂在 /audit-flows/regex-test(独立前缀),不放在
+	//    /audit-flows/regex-patterns/ 下面 —— 那个前缀下有 :id 通配段,
+	//    再挂静态子路径 gin 会 panic。
+	r.GET("/audit-flows/suppliers", requireBranch, h.ListSupplierFlows)
+	r.POST("/audit-flows/suppliers", requireBranch, h.CreateSupplierFlow)
+	r.PUT("/audit-flows/suppliers/:id", requireBranch, h.UpdateSupplierFlow)
+	r.DELETE("/audit-flows/suppliers/:id", requireBranch, h.DeleteSupplierFlow)
+	r.GET("/audit-flows/payment-items", requireBranch, h.ListItemFlows)
+	r.POST("/audit-flows/payment-items", requireBranch, h.CreateItemFlow)
+	r.PUT("/audit-flows/payment-items/:id", requireBranch, h.UpdateItemFlow)
+	r.DELETE("/audit-flows/payment-items/:id", requireBranch, h.DeleteItemFlow)
+	r.GET("/audit-flows/regex-patterns", requireBranch, h.ListRegexPatterns)
+	r.POST("/audit-flows/regex-patterns", requireBranch, h.CreateRegexPattern)
+	r.PUT("/audit-flows/regex-patterns/:id", requireBranch, h.UpdateRegexPattern)
+	r.DELETE("/audit-flows/regex-patterns/:id", requireBranch, h.DeleteRegexPattern)
+	r.POST("/audit-flows/regex-test", requireBranch, h.TestRegex)
+	r.GET("/audit-flows/supplier-dict", requireBranch, h.SupplierDict)
 
 	// ---- 门店级「盘点计划推送群」配置 ----
 	//

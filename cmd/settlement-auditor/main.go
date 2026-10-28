@@ -104,6 +104,13 @@ func initApp() error {
 		// AuditInput.Approval 是 ApprovalInstance 整体,账号信息混进去
 		// 就等于进了 LLM 输入面(见 internal/settlement-auditor/service/payee_account.go)。
 		&model.ApprovalPayeeAccount{},
+		// 机器审核「流程定制」配置(2026-10-28 用户口径):
+		// 供应商流程 / 付款项流程 / 正则表达式维护。
+		//
+		// ⚠️ 这三张表的内容**不进 AuditInput** ⇒ 不进 LLM 输入面。
+		&model.AuditSupplierFlow{},
+		&model.AuditPaymentItemFlow{},
+		&model.AuditRegexPattern{},
 	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
 	}

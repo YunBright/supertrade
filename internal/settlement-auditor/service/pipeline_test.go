@@ -240,6 +240,7 @@ func newTestService(t *testing.T) (*Service, *gorm.DB, *fakeCube, *fakePublisher
 		&model.SettlementPayState{}, &model.StocktakeNotifyGroup{},
 		&model.ApprovalItem{},
 		&model.ApprovalPayeeAccount{},
+		&model.AuditSupplierFlow{}, &model.AuditPaymentItemFlow{}, &model.AuditRegexPattern{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

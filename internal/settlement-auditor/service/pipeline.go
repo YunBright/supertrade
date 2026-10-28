@@ -40,6 +40,13 @@ const (
 	StepCheckAmounts     = "check_amounts"
 	StepCheckQuantity    = "check_quantity"
 	StepLLMVerdict       = "llm_verdict"
+	// StepFlowDecision 是**流程定制**的结论步骤（2026-10-28 用户口径）。
+	//
+	// ⚠️ 与 StepLLMVerdict 分开记：审批详情页的时间线上必须能看出
+	//    "这一单没问机器人，是配置放行的"，否则店长会误以为机器人审过了。
+	StepFlowDecision    = "flow_decision"
+	// StepAdminApprove 是**管理员人工放行**的审计步骤（2026-10-28 用户口径）。
+	StepAdminApprove    = "admin_approve"
 	StepStocktake        = "stocktake"
 	StepFinish           = "finish"
 )
@@ -338,8 +345,8 @@ func (s *Service) runAudit(ctx context.Context, approvalID string) {
 		return
 	}
 
-	// step 6: LLM 综合研判(失败降级规则)
-	verdict, err := s.stepLLMVerdict(ctx, ap, settlements, linesBySettlement, sheets, signals, &amountCheck, items, allowance)
+	// step 6: 出结论 —— 命中流程定制配置 ⇒ 用流程结论；没命中 ⇒ 现有机器人(LLM)研判
+	verdict, err := s.decideVerdict(ctx, ap, settlements, linesBySettlement, sheets, signals, &amountCheck, items, allowance)
 	if err != nil {
 		s.markFailed(ctx, ap, err.Error())
 		return
@@ -763,10 +770,23 @@ func (s *Service) stepLLMVerdict(ctx context.Context, ap *model.ApprovalInstance
 			return nil, fmt.Errorf("rule fallback verdict: %w", err)
 		}
 	}
+	if err := s.saveVerdict(ctx, ap, verdict, trace, StepLLMVerdict, len(signals),
+		time.Since(start).Milliseconds()); err != nil {
+		return nil, err
+	}
+	return verdict, nil
+}
+
+// saveVerdict 落 llm_verdicts（一审批一条，重跑先删旧）+ 记一条 step 日志。
+//
+// ⚠️ **流程定制与 LLM 研判共用这张表**：靠 source 区分（llm / rule_fallback /
+//    flow_config）。这样"这一单当时是怎么得出结论的"在审批详情页只有一个出处，
+//    不会出现"详情页显示 LLM 结论、但实际是配置放行"这种对不上的情况。
+func (s *Service) saveVerdict(ctx context.Context, ap *model.ApprovalInstance, verdict *VerdictResult, trace, step string, signalCount int, durMs int64) error {
 	// 一审批一条:重跑先删旧。
 	if err := s.db.WithContext(ctx).
 		Where("approval_id = ?", ap.ID).Delete(&model.LLMVerdict{}).Error; err != nil {
-		return nil, fmt.Errorf("clear old verdict: %w", err)
+		return fmt.Errorf("clear old verdict: %w", err)
 	}
 	var stJSON []byte
 	if verdict.SuggestStocktake != nil {
@@ -783,14 +803,14 @@ func (s *Service) stepLLMVerdict(ctx context.Context, ap *model.ApprovalInstance
 		Source:           verdict.Source,
 	}
 	if err := s.db.WithContext(ctx).Create(row).Error; err != nil {
-		return nil, fmt.Errorf("insert verdict: %w", err)
+		return fmt.Errorf("insert verdict: %w", err)
 	}
-	s.logStep(ctx, ap, StepLLMVerdict,
-		fmt.Sprintf("信号 %d 条", len(signals)),
+	s.logStep(ctx, ap, step,
+		fmt.Sprintf("信号 %d 条", signalCount),
 		fmt.Sprintf("结论=%s 来源=%s 置信度=%s 原因=%s",
 			verdict.Conclusion, verdict.Source, verdict.Confidence.StringFixed(3), truncate(verdict.Reason, 200)),
-		trace, time.Since(start).Milliseconds())
-	return verdict, nil
+		trace, durMs)
+	return nil
 }
 
 // stepStocktake 按 LLM 建议建针对性盘点计划 + 绑定 + taskcard 待办。
@@ -952,43 +972,9 @@ func (s *Service) stepFinish(ctx context.Context, ap *model.ApprovalInstance, ve
 	//
 	// ⚠️ 收款账号快照在**这里**读出来(而不是从 AuditInput 拿):
 	// 它必须待在 LLM 输入面之外(见 service/payee_account.go 的结构隔离说明)。
-	payee, err := s.loadPayeeAccount(ctx, ap.ID)
+	cmdID, err := s.publishApplyEvent(ctx, ap, verdict, signals, settlements, items)
 	if err != nil {
-		s.markFailed(ctx, ap, "load payee account: "+err.Error())
-		return
-	}
-	applyData, summaryList := s.buildApplyData(ctx, ap, verdict, signals, settlements, items, payee)
-	// 按**模板的流程配置**组装 process.node_list(审批人 / 办理人 / 抄送人)。
-	//
-	// ⚠️ 必须是 mode=0(自带 process):这个模板的三个节点全是「申请人自选」,
-	// 成员由发起人在 H5 选。mode=1 时企微会忽略 app 给的成员 ⇒ 节点空 ⇒ 没人办。
-	selections, err := s.snapshotFlowSelections(ap)
-	if err != nil {
-		s.markFailed(ctx, ap, "build process: "+err.Error())
-		return
-	}
-	process, err := s.buildProcess(selections)
-	if err != nil {
-		s.markFailed(ctx, ap, "build process: "+err.Error())
-		return
-	}
-	payload := ApplyEventPayload{
-		CreatorUserID:       ap.ApplicantWecomID,
-		TemplateID:          s.cfg.TemplateID,
-		UseTemplateApprover: 0,
-		Process:             process,
-		NotifyType:          1,
-		ApplyData:           applyData,
-		SummaryList:         summaryList,
-		// 「附件」:自动生成的结算单明细清单 + 发起人自己上传的文件。
-		// (素材上传与控件组装在 wechat-bot 侧 —— 它持有 OA token。)
-		AttachmentControlID:   s.cfg.AttachmentControlID,
-		AttachmentControlType: s.cfg.AttachmentControlType,
-		Attachments:           s.loadApprovalAttachments(ctx, ap, settlements, items),
-	}
-	cmdID, err := s.publishCommand(ctx, CmdApplyEvent, payload)
-	if err != nil {
-		s.markFailed(ctx, ap, "publish apply_event: "+err.Error())
+		s.markFailed(ctx, ap, err.Error())
 		return
 	}
 	if err := s.db.WithContext(ctx).Model(&model.ApprovalInstance{}).
@@ -1007,6 +993,53 @@ func (s *Service) stepFinish(ctx context.Context, ap *model.ApprovalInstance, ve
 	s.logStep(ctx, ap, StepFinish, "",
 		fmt.Sprintf("机器审核通过,已提交企微审批(command_id=%s),等待人工终审", cmdID),
 		"", time.Since(start).Milliseconds())
+}
+
+// publishApplyEvent 组装并下发企微 apply_event 命令。
+//
+// ⚠️ **机器通过**与**管理员人工放行**共用这一段 ——
+//    两者的企微单长得一样（同样的控件、同样的流程人），
+//    差别只在「AI审核结论」控件的**首行**（放行时是"已转人工审核并通过"）。
+//    ⇒ 拆成两段就会漂移：改了一处忘了另一处 ⇒ 两类单的企微单长得不一样。
+func (s *Service) publishApplyEvent(ctx context.Context, ap *model.ApprovalInstance, verdict *VerdictResult, signals []signalDraft, settlements []SettlementRow, items []model.ApprovalItem) (string, error) {
+	// ⚠️ 收款账号快照在**这里**读出来(而不是从 AuditInput 拿):
+	// 它必须待在 LLM 输入面之外(见 service/payee_account.go 的结构隔离说明)。
+	payee, err := s.loadPayeeAccount(ctx, ap.ID)
+	if err != nil {
+		return "", fmt.Errorf("load payee account: %w", err)
+	}
+	applyData, summaryList := s.buildApplyData(ctx, ap, verdict, signals, settlements, items, payee)
+	// 按**模板的流程配置**组装 process.node_list(审批人 / 办理人 / 抄送人)。
+	//
+	// ⚠️ 必须是 mode=0(自带 process):这个模板的三个节点全是「申请人自选」,
+	// 成员由发起人在 H5 选。mode=1 时企微会忽略 app 给的成员 ⇒ 节点空 ⇒ 没人办。
+	selections, err := s.snapshotFlowSelections(ap)
+	if err != nil {
+		return "", fmt.Errorf("build process: %w", err)
+	}
+	process, err := s.buildProcess(selections)
+	if err != nil {
+		return "", fmt.Errorf("build process: %w", err)
+	}
+	payload := ApplyEventPayload{
+		CreatorUserID:       ap.ApplicantWecomID,
+		TemplateID:          s.cfg.TemplateID,
+		UseTemplateApprover: 0,
+		Process:             process,
+		NotifyType:          1,
+		ApplyData:           applyData,
+		SummaryList:         summaryList,
+		// 「附件」:自动生成的结算单明细清单 + 发起人自己上传的文件。
+		// (素材上传与控件组装在 wechat-bot 侧 —— 它持有 OA token。)
+		AttachmentControlID:   s.cfg.AttachmentControlID,
+		AttachmentControlType: s.cfg.AttachmentControlType,
+		Attachments:           s.loadApprovalAttachments(ctx, ap, settlements, items),
+	}
+	cmdID, err := s.publishCommand(ctx, CmdApplyEvent, payload)
+	if err != nil {
+		return "", fmt.Errorf("publish apply_event: %w", err)
+	}
+	return cmdID, nil
 }
 
 // snapshotFlowSelections 从审批单快照里读回各节点成员。
@@ -1138,19 +1171,38 @@ func (s *Service) buildApplyData(ctx context.Context, ap *model.ApprovalInstance
 //	拒绝 → 理论上不会走到 applyevent(reject 分支在 stepFinish 提前返回);
 //	       防御性兜底:取首条 block 信号(≤40 字),无 block 则空(跳过控件)。
 //	verdict 缺失 → 空(跳过控件,不阻塞提交)。
+//
+//	**管理员人工放行**(2026-10-28 用户口径):
+//	控件**第一行**是「已转人工审核并通过」，其后跟机器原来的结论。
+//	⇒ 审批人看到的是"人放行的 + 机器当初为什么拒"，而不是一句含糊的"机器审核通过"。
 func aiConclusionText(verdict *VerdictResult, signals []signalDraft) string {
 	if verdict == nil {
 		return ""
 	}
-	if verdict.Conclusion == ConclusionPass {
-		return truncateRunes("机器审核通过:"+verdict.Reason, 200)
-	}
-	for _, d := range signals {
-		if d.Level == model.SignalBlock {
-			return truncateRunes(d.Message, 40)
+	var base string
+	switch {
+	case verdict.Source == model.VerdictSourceAdminOverride:
+		// ⚠️ **不能**写"机器审核通过" —— 机器人审的是"拒绝"，
+		//    是人放行的。写成"机器审核通过"会让审批人以为机器审过了。
+		base = strings.TrimSpace(verdict.Reason)
+	case verdict.Conclusion == ConclusionPass:
+		base = truncateRunes("机器审核通过:"+verdict.Reason, 200)
+	default:
+		for _, d := range signals {
+			if d.Level == model.SignalBlock {
+				base = truncateRunes(d.Message, 40)
+				break
+			}
 		}
 	}
-	return ""
+	prefix := strings.TrimSpace(verdict.AIConclusionPrefix)
+	if prefix == "" {
+		return base
+	}
+	if base == "" {
+		return prefix
+	}
+	return prefix + "\n" + truncateRunes(base, 200)
 }
 
 // truncateRunes 按 rune 数截断(中文安全)。

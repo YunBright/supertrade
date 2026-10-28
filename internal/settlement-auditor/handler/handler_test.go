@@ -133,8 +133,14 @@ func fakeUserD(t *testing.T) *httptest.Server {
 			return
 		}
 		var scopes []string
-		if strings.Contains(r.URL.Path, "u-admin") {
-			scopes = []string{"settlement:view", "settlement:audit"}
+		switch {
+		case strings.Contains(r.URL.Path, "u-viewonly"):
+			// 只有读权限：能看流程配置，但**改不了**（写端点守 supplier:manage）。
+			scopes = []string{"settlement:view", "settlement:audit", "supplier:view"}
+		case strings.Contains(r.URL.Path, "u-admin"):
+			// ⚠️ supplier:* 是**流程定制配置端点**的 scope（读 supplier:view /
+			//    写 supplier:manage）—— merchant 两者都没有 ⇒ 店长配不了"直接通过"。
+			scopes = []string{"settlement:view", "settlement:audit", "supplier:view", "supplier:manage"}
 		}
 		resp := userinfo.BranchPermissions{
 			Branches: []userinfo.BranchPermissionsRow{{BranchID: bid, Scopes: scopes}},
@@ -203,6 +209,7 @@ func buildTestHandler(t *testing.T, withCube bool) (*gin.Engine, *gorm.DB, *fake
 		&model.AuditLog{}, &model.LLMVerdict{}, &model.ApprovalStocktakeLink{},
 		&model.SettlementPayState{}, &model.ApprovalItem{},
 		&model.ApprovalPayeeAccount{},
+		&model.AuditSupplierFlow{}, &model.AuditPaymentItemFlow{}, &model.AuditRegexPattern{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
