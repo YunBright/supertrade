@@ -2,7 +2,7 @@
 #
 # 生产部署由 F:\go\src\github.com\YunBright\deployer\deploy-supertrade.ps1 驱动。
 # 该脚本的契约(必须严格满足):
-#   - 必须在 <SupertradeDir>/dist/ 下产出 18 个 .tar.gz 归档(每个二进制一个)
+#   - 必须在 <SupertradeDir>/dist/ 下产出 22 个 .tar.gz 归档(每个二进制一个)
 #   - 归档文件名 = <project>_<version>_<OS>_<arch>.tar.gz(被脚本当 leaf 传到 ssh tar -xzf)
 #   - 解压必须能在 <RemoteDir>/apps/<name>/ 下完成,extract 步骤是
 #     `cd <归档所在父目录> && tar -xzf <leaf>`,所以归档内部结构 = 生产 cwd 的内容
@@ -41,9 +41,11 @@
 #         settlement-auditor
 #         components/{pubsub,conversation}.yaml
 #
-# 端口约定:catalog :8101, inventory :8102, master-data :8103, cube-router :8116,
+# 端口约定:catalog :8101, inventory :8102, master-data :8103, cube-router :8107,
 # stocktake :8106, fresh-meat :8108, settlement-auditor :8109, sales-agg :8110,
-# pricing :8111, sales-insight :8112;
+# pricing :8111, sales-insight :8112, member :8113, pos :8114, pos-gateway :8115,
+# cube-sync :8116, bank-account :8117, cube-async :8118, transaction :8119,
+# procurement :8120;
 # 其它 binary 默认监听 :8080(其中 pos/pricing/procurement/sales-agg/
 # fresh-produce/fresh-meat/erp-connector/bi-gateway/master-data 当前
 # 只响应 /healthz placeholder;stocktake 需要 POSTGRES_DSN,真正使用 PG;
@@ -80,7 +82,7 @@ before:
     - go mod tidy
 
 builds:
-  # 18 个 binary,每个 build 的 id == binary 名。这样 `goreleaser --id stocktake`
+  # 22 个 binary,每个 build 的 id == binary 名。这样 `goreleaser --id stocktake`
   # 会只构建 stocktake 一个并产出 dist/apps/stocktake/stocktake_<ver>_Linux_x86_64.tar.gz,
   # 是 deploy-supertrade.ps1 -Service <name> 单服务部署的根基。
   - main: ./cmd/catalog
@@ -216,7 +218,7 @@ builds:
   # 2026-10-22 新增:transaction(商品销售流水 + 收银流水)。
   #
   # ⚠️ 端口 8119:8110~8118 已占(sales-agg 8110 / pricing 8111 / sales-insight 8112 /
-  #    member 8113 / pos 8114 / pos-gateway 8115 / cube-sync 8116 / cube-sync-member 8117 /
+  #    member 8113 / pos 8114 / pos-gateway 8115 / cube-sync 8116 / bank-account 8117 /
   #    cube-async 8118)。
   #
   # ⚠️ 它**需要** POSTGRES_DSN:没配数据源的门店(自营店 10)读本域的
@@ -357,7 +359,7 @@ builds:
   #                 ⇒ 搬运方不需要知道 cube 的存在。
   #
   # ⚠️ 它同样**不连任何数据库** —— 只做编排。
-  # ⚠️ 端口 8118:8110~8117 已占(cube-sync 8116 / cube-sync-member 8117)。
+  # ⚠️ 端口 8118:8110~8117 已占(cube-sync 8116 / bank-account 8117)。
   - main: ./cmd/cube-async
     id: "cube-async"
     binary: "cube-async"
@@ -389,8 +391,33 @@ builds:
       - goos: linux
         goarch: 386
 
+  # 2026-10-28 新增:bank-account(供应商收款银行账号维护)。
+  #
+  # ⚠️ 端口 8117:cube-sync-member 曾占 8117,但它的 unit 已于 2026-10-22
+  #    **退役**(systemd/supertrade-cube-sync-member.service.retired)⇒ 8117 空出。
+  #    8110~8116 / 8118~8120 均已占(sales-agg 8110 / pricing 8111 /
+  #    sales-insight 8112 / member 8113 / pos 8114 / pos-gateway 8115 /
+  #    cube-sync 8116 / cube-async 8118 / transaction 8119 / procurement 8120)。
+  #
+  # ⚠️ 它**需要** POSTGRES_DSN:拥有 supplier_bank_accounts 表(本地 PG 原生,
+  #    不是 cube 镜像 —— 不管门店有没有 cube 源,账号数据一律查本地)。
+  #    缺 DSN ⇒ 服务 fail-fast 退出(缺库却照常起来 ⇒ 查询恒空,
+  #    门店看到的是"这家供应商没有收款账号",真因不在任何日志里)。
+  - main: ./cmd/bank-account
+    id: "bank-account"
+    binary: "bank-account"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
 archives:
-  # 18 个 archive,每个 binary 一份,name_template 用 apps/<name>/ 前缀,这样
+  # 22 个 archive,每个 binary 一份,name_template 用 apps/<name>/ 前缀,这样
   # deploy-supertrade.ps1 自动在远端 <RemoteDir>/apps/<name>/ 下建子目录 + scp + 解压,
   # 镜像 cube 的 semantic-layers/<family>/ 模式 —— 不同 binary 不互相覆盖同名二进制。
   # wrap_in_directory: false —— 避免 tarball 内多套一层同名目录,确保解压后
@@ -640,6 +667,17 @@ archives:
       - cube-async
     wrap_in_directory: false
     name_template: 'apps/cube-async/cube-async_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  # 2026-10-28 新增:bank-account(供应商收款银行账号维护)。
+  # 没有 files 块 —— 它不订阅任何 topic,也不带 dapr Component
+  # (只用共享的 authkey 组件读 JWKS,那是 --resources-path 指的
+  #  /opt/YunBright/.dapr/shared-components,不属于本归档)。
+  - id: "bank-account"
+    format: tar.gz
+    builds:
+      - bank-account
+    wrap_in_directory: false
+    name_template: 'apps/bank-account/bank-account_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
 
 checksum:
   name_template: 'checksums.txt'

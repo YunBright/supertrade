@@ -27,9 +27,26 @@
 | 备注 | `item-1494251203122` | Textarea | 否 | 本服务（`ApplyControlIDs[2]`） |
 | **附件** | **`item-1494251220825`** | **File** | 否 | **附件链路**（本文档） |
 | AI审核结论 | `Textarea-1791692081606` | Textarea | 否 | 本服务（`AIConclusionControlID`） |
+| **付款信息** | **`Textarea-1793115001651`** | **Textarea** | 否 | 本服务（`PaymentInfoControlID`，2026-10-28 实测） |
 
-⚠️ **模板改了要同步两处**：`ApplyControlIDs`/`ApplyControlTypes`（前三个控件）与
-`SETTLEMENT_AUDITOR_ATTACHMENT_CONTROL_ID`（附件控件）。企微的控件 id 随模板走。
+⚠️ **模板改了要同步三处**：`ApplyControlIDs`/`ApplyControlTypes`（前三个控件）、
+`SETTLEMENT_AUDITOR_ATTACHMENT_CONTROL_ID`（附件控件）与
+`SETTLEMENT_AUDITOR_PAYMENT_INFO_CONTROL_ID`（付款信息控件）。企微的控件 id 随模板走。
+
+### 「付款信息」控件写什么（2026-10-28）
+
+选中供应商收款账号后，按**行**写入开户行 / 账号 / 户名：
+
+```
+开户行：中国银行南宁分行
+账号：6222xxxxxxxxxxxx
+户名：南宁XX贸易有限公司
+```
+
+⚠️ **账号信息不进 LLM 输入面**（机器人审核只看到结算单本身的信号）。
+快照存在**独立表** `approval_payee_accounts`，`AuditInput.Approval`
+（= `ApprovalInstance` 整体）里没有账号字段 ⇒ 结构上不可能被送进 prompt。
+详见 `internal/settlement-auditor/service/payee_account.go`。
 
 ### ⚠️ 读控件表要用 **POST + JSON body**
 

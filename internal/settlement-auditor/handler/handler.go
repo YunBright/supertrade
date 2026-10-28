@@ -407,6 +407,15 @@ type submitReq struct {
 	// 收款项冲减付款金额 ⇒ 应付金额 = 货款 + 付款项 − 收款项(不为负)。
 	ReceiptItems []itemReq `json:"receipt_items"`
 	PaymentItems []itemReq `json:"payment_items"`
+	// BankAccountID 是发起人选中的**供应商收款账号 id**(可选)。
+	//
+	// 用户口径(2026-10-28):H5 选了收款账号后,后端把它按行写进企微
+	// 模板的「付款信息」控件(开户行/账号/户名)。
+	//
+	// ⚠️ **前端只传 id**:开户行/账号/户名由服务端按 id 回查取得。
+	// 前端传账号文本 = 客户端可以伪造付款目标 ⇒ 审批人看到假的收款账号。
+	// 空 ⇒ 本次审批不带「付款信息」。
+	BankAccountID string `json:"bank_account_id"`
 }
 
 // itemReq 是提交请求里的一行收付款明细。
@@ -496,6 +505,7 @@ func (h *Handler) Submit(c *gin.Context) {
 		Attachments:      attachments,
 		ReceiptItems:     receiptItems,
 		PaymentItems:     paymentItems,
+		BankAccountID:    req.BankAccountID,
 	})
 	if err != nil {
 		mapErr(c, err)

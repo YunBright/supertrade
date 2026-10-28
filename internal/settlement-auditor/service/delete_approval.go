@@ -92,6 +92,9 @@ func (s *Service) DeleteApproval(ctx context.Context, id string) error {
 			&model.AuditLog{},
 			&model.LLMVerdict{},
 			&model.ApprovalStocktakeLink{},
+			// 收款账号快照(2026-10-28):独立表 ⇒ 删审批时要一起删,
+			// 否则留下一行指向已不存在的审批的孤儿快照。
+			&model.ApprovalPayeeAccount{},
 		} {
 			if err := tx.Delete(child, "approval_id = ?", id).Error; err != nil {
 				return fmt.Errorf("delete children of approval %s: %w", id, err)

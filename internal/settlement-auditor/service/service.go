@@ -93,6 +93,17 @@ type Config struct {
 	AttachmentControlID string
 	// AttachmentControlType 是该附件控件的类型(默认 File)。
 	AttachmentControlType string
+	// PaymentInfoControlID 是模板「付款信息」多行文本控件的 id(可选)。
+	//
+	// 用户口径(2026-10-28):「结算付款」模板新增了「付款信息」多行文本控件,
+	// 选中供应商收款账号时**分行**填写开户行/账号/户名。
+	//
+	// ⚠️ id **不给默认值**:控件 id 随企微后台那张模板走
+	// ⇒ 猜一个错 id 只会让企微报"控件不存在"(同 AttachmentControlID 的理由)。
+	// 空 ⇒ 不写这个控件(退回旧行为:只有四个文本控件)。
+	PaymentInfoControlID string
+	// PaymentInfoControlType 是该控件的类型(默认 Textarea —— 多行文本)。
+	PaymentInfoControlType string
 }
 
 func (c *Config) withDefaults() {
@@ -125,6 +136,12 @@ func (c *Config) withDefaults() {
 	if c.AttachmentControlType == "" {
 		c.AttachmentControlType = "File"
 	}
+	// 「付款信息」控件类型默认 Textarea(多行文本)。
+	//
+	// ⚠️ id 同样**不给默认值**(理由同附件控件 id)。
+	if c.PaymentInfoControlType == "" {
+		c.PaymentInfoControlType = "Textarea"
+	}
 }
 
 // Service 持有 settlement-auditor 全部业务逻辑。
@@ -135,9 +152,14 @@ type Service struct {
 	publisher Publisher       // nil = 禁用 pub/sub(单测)
 	verdictFn VerdictFn       // 默认规则降级;SetVerdictFn 注入 LLM
 	stocktake StocktakeClient // 可 nil(跳过盘点建单)
-	userInfo  *userinfo.Client
-	logger    *slog.Logger
-	now       func() time.Time
+	// bankAccount 是按 id 取供应商收款账号的客户端(可 nil ⇒ 不支持选收款账号)。
+	//
+	// ⚠️ 取回的账号信息**只写 approval_payee_accounts**,
+	//    **绝不进 AuditInput**(见 service/payee_account.go 的结构隔离说明)。
+	bankAccount BankAccountClient
+	userInfo    *userinfo.Client
+	logger      *slog.Logger
+	now         func() time.Time
 
 	scopeMu    sync.RWMutex
 	scopeCache map[string]scopeCacheEntry
@@ -204,6 +226,16 @@ func (s *Service) SetVerdictFn(fn VerdictFn) {
 func (s *Service) SetStocktake(c StocktakeClient) {
 	if c != nil {
 		s.stocktake = c
+	}
+}
+
+// SetBankAccount 注入收款账号查询客户端。
+//
+// ⚠️ 取回的账号信息**只落 approval_payee_accounts**,不进 LLM 输入面
+// (见 service/payee_account.go 的结构隔离说明)。
+func (s *Service) SetBankAccount(c BankAccountClient) {
+	if c != nil {
+		s.bankAccount = c
 	}
 }
 

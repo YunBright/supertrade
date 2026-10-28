@@ -21,6 +21,9 @@
 //	SETTLEMENT_AUDITOR_WXH5_BASE_URL          wx-h5 基础地址(taskcard url)
 //	SETTLEMENT_AUDITOR_APPLY_CONTROL_IDS      模板三个 Text 控件 id(逗号分隔,默认 Text-1,Text-2,Text-3)
 //	SETTLEMENT_AUDITOR_AI_CONCLUSION_CONTROL_ID 模板「AI审核结论」多行文本控件 id(可选;非空时 apply_data 写入 LLM 结论)
+//	SETTLEMENT_AUDITOR_PAYMENT_INFO_CONTROL_ID 模板「付款信息」多行文本控件 id(可选;2026-10-28 新增)
+//	SETTLEMENT_AUDITOR_PAYMENT_INFO_CONTROL_TYPE 该控件类型(默认 Textarea)
+//	SETTLEMENT_AUDITOR_BANK_ACCOUNT_APP_ID      bank-account 服务的 dapr app-id(默认 supertrade-bank-account)
 //	SETTLEMENT_AUDITOR_CONVERSATION           dapr conversation component(默认 conversation)
 //	SETTLEMENT_AUDITOR_LLM_TIMEOUT            LLM 超时(默认 30s)
 package main
@@ -95,6 +98,12 @@ func initApp() error {
 		&model.ApprovalApproverPreference{},
 		&model.SettlementPayState{},
 		&model.StocktakeNotifyGroup{},
+		// 收款账号快照(2026-10-28 用户口径:选中收款账号后按行写进企微「付款信息」控件)。
+		//
+		// ⚠️ **独立表**,刻意不放进 ApprovalInstance ——
+		// AuditInput.Approval 是 ApprovalInstance 整体,账号信息混进去
+		// 就等于进了 LLM 输入面(见 internal/settlement-auditor/service/payee_account.go)。
+		&model.ApprovalPayeeAccount{},
 	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
 	}
@@ -123,6 +132,13 @@ func initApp() error {
 	//    只会让企微报"控件不存在"。空 ⇒ 不带附件(退回旧行为:只写四个文本控件)。
 	cfg.AttachmentControlID = os.Getenv("SETTLEMENT_AUDITOR_ATTACHMENT_CONTROL_ID")
 	cfg.AttachmentControlType = os.Getenv("SETTLEMENT_AUDITOR_ATTACHMENT_CONTROL_TYPE")
+	// 「付款信息」多行文本控件(2026-10-28 用户口径)。
+	//
+	// ⚠️ id **不设默认值**:它是企微后台那张模板里的控件,id 随模板走
+	// ⇒ 猜错 id 只会让企微报"控件不存在"。
+	// 空 ⇒ 不写这个控件(退回旧行为,提交不受影响)。
+	cfg.PaymentInfoControlID = os.Getenv("SETTLEMENT_AUDITOR_PAYMENT_INFO_CONTROL_ID")
+	cfg.PaymentInfoControlType = os.Getenv("SETTLEMENT_AUDITOR_PAYMENT_INFO_CONTROL_TYPE")
 	// 审批流程节点声明(与企微管理后台里「付款审批」模板的流程设置对应)。
 	//
 	// ⚠️ 企微的公开 API 读不到流程配置(gettemplatedetail 只给表单控件),
@@ -189,6 +205,23 @@ func initApp() error {
 
 	// stocktake 盘点建单客户端(内部端点,任务 1c 提供)。
 	appSvc.SetStocktake(service.NewDaprStocktakeClient(daprCli, appSvc.Config().StocktakeAppID))
+
+	// 供应商收款账号客户端(2026-10-28):按 id 回查开户行/账号/户名。
+	//
+	// ⚠️ 取回的账号信息**只落 approval_payee_accounts**,不进 LLM 输入面
+	// (见 internal/settlement-auditor/service/payee_account.go)。
+	//
+	// ⚠️ 调的是 bank-account 服务的**公开读端点**(不是内部端点):
+	// 公开端点有 per-branch scope 守门 ⇒ 调用者身份被校验。
+	// ⇒ 申请人的 JWT 必须透传 ⇒ 用 daprclient.New() 而非 dapr.NewClient()
+	// (go-sdk 的 api-token 拦截器会整块替换 outgoing metadata,把
+	//  authorization 抹掉 —— 2026-10-20 全网加 DAPR_API_TOKEN 后暴露的)。
+	bankAccountAppID := os.Getenv("SETTLEMENT_AUDITOR_BANK_ACCOUNT_APP_ID")
+	if bankAccountAppID == "" {
+		bankAccountAppID = "supertrade-bank-account"
+	}
+	appSvc.SetBankAccount(service.NewDaprBankAccountClient(daprCli, bankAccountAppID))
+	slog.Info("bank-account client enabled", "app_id", bankAccountAppID)
 
 	// userinfo(userd,per-branch scopes;同 fresh-meat 链路)。
 	// 2026-10-12:auth-internal 已合并进 userd,调用方统一打 app-id=userd。

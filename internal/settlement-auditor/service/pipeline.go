@@ -79,6 +79,17 @@ type SubmitInput struct {
 	// 收款项冲减付款金额 ⇒ 应付金额 = 货款 + 付款项 − 收款项(不为负)。
 	ReceiptItems []ItemInput
 	PaymentItems []ItemInput
+	// BankAccountID 是发起人选中的**供应商收款账号 id**(可选)。
+	//
+	// 用户口径(2026-10-28):H5「申请付款审批」页选供应商收款账号,
+	// 选中后按行写进企微模板的「付款信息」控件(开户行/账号/户名)。
+	//
+	// ⚠️ **前端只传 id,不传账号文本** —— 账号信息由**服务端**按 id 回查
+	// bank-account 服务取得(见 service/payee_account.go)。
+	// 否则客户端可以伪造收款账号,让审批人看到假的付款目标。
+	//
+	// 空 ⇒ 本次审批不带「付款信息」(选了结算单但没选账号是允许的)。
+	BankAccountID string
 }
 
 // maxSettlementsPerApproval 单次审批勾选上限(防 LLM prompt 爆炸)。
@@ -200,6 +211,17 @@ func (s *Service) SubmitApproval(ctx context.Context, branchID string, in Submit
 	// 落手工收付款明细(机器审核异步 ⇒ 审核时要读得到它们)。
 	if err := s.storeItems(ctx, ap, receiptItems, paymentItems); err != nil {
 		return nil, err
+	}
+	// 落收款账号快照(2026-10-28 用户口径:选中收款账号后按行写进企微「付款信息」控件)。
+	//
+	// ⚠️ **同步取号**(提交那一刻就查 bank-account),而不是等流水线里再取:
+	//   流水线是异步的(可能几分钟后才走到 applyevent),那时账号可能已被改/删
+	//   ⇒ 审批单上会显示一个"当时不存在的账号",或者干脆取不到。
+	//
+	// ⚠️ 取不到**不阻断提交**:没选账号是合法的;选了但取不到是异常,
+	//   记 warn 让审批人自己去银行核对 —— 比"整个提交失败"更可用。
+	if err := s.resolveAndStorePayeeAccount(ctx, ap, in.BankAccountID); err != nil {
+		logPayeeFetchError(s.logger, ap.ID, err)
 	}
 
 	// 后台异步审核(detach ctx:请求返回后流水线继续)。
@@ -927,7 +949,15 @@ func (s *Service) stepFinish(ctx context.Context, ap *model.ApprovalInstance, ve
 	}
 
 	// pass → 代提交企微审批
-	applyData, summaryList := s.buildApplyData(ctx, ap, verdict, signals, settlements, items)
+	//
+	// ⚠️ 收款账号快照在**这里**读出来(而不是从 AuditInput 拿):
+	// 它必须待在 LLM 输入面之外(见 service/payee_account.go 的结构隔离说明)。
+	payee, err := s.loadPayeeAccount(ctx, ap.ID)
+	if err != nil {
+		s.markFailed(ctx, ap, "load payee account: "+err.Error())
+		return
+	}
+	applyData, summaryList := s.buildApplyData(ctx, ap, verdict, signals, settlements, items, payee)
 	// 按**模板的流程配置**组装 process.node_list(审批人 / 办理人 / 抄送人)。
 	//
 	// ⚠️ 必须是 mode=0(自带 process):这个模板的三个节点全是「申请人自选」,
@@ -1015,7 +1045,12 @@ func (s *Service) snapshotFlowSelections(ap *model.ApprovalInstance) (FlowSelect
 //
 // 另可选追加「AI审核结论」多行文本控件(cfg.AIConclusionControlID 非空时):
 // 写入 LLM 研判结论精简文案(aiConclusionText);模板未配/结论为空则跳过。
-func (s *Service) buildApplyData(ctx context.Context, ap *model.ApprovalInstance, verdict *VerdictResult, signals []signalDraft, settlements []SettlementRow, items []model.ApprovalItem) (applyData, summaryList json.RawMessage) {
+//
+// 另可选追加「付款信息」多行文本控件(cfg.PaymentInfoControlID 非空时):
+// 写入 payee 的开户行/账号/户名(分行)。payee 为 nil(没选收款账号)则跳过。
+//
+// ⚠️ payee 是**独立表**的快照,**不进 AuditInput** ⇒ 账号信息不会发给 LLM。
+func (s *Service) buildApplyData(ctx context.Context, ap *model.ApprovalInstance, verdict *VerdictResult, signals []signalDraft, settlements []SettlementRow, items []model.ApprovalItem, payee *model.ApprovalPayeeAccount) (applyData, summaryList json.RawMessage) {
 	ids := s.settlementIDsOf(ctx, ap.ID)
 	type textValue struct {
 		Text string `json:"text"`
@@ -1061,6 +1096,22 @@ func (s *Service) buildApplyData(ctx context.Context, ap *model.ApprovalInstance
 	if s.cfg.AIConclusionControlID != "" {
 		if txt := aiConclusionText(verdict, signals); txt != "" {
 			contents = append(contents, content{Control: "Textarea", ID: s.cfg.AIConclusionControlID, Value: textValue{Text: txt}})
+		}
+	}
+	// 「付款信息」控件(2026-10-28 用户口径):多行文本,按行写开户行/账号/户名。
+	//
+	// ⚠️ 账号信息**只到这里为止** —— 它不进 AuditInput、不进 LLM prompt
+	// (结构隔离见 service/payee_account.go 的包注释)。
+	//
+	// ⚠️ 控件 id 没配 ⇒ 跳过(不阻塞提交):控件 id 随企微后台那张模板走,
+	// 猜错 id 只会让企微报"控件不存在" ⇒ 宁可这次不带,也不能让整单提交失败。
+	if s.cfg.PaymentInfoControlID != "" {
+		if txt := payeeAccountLines(payee); txt != "" {
+			ctl := s.cfg.PaymentInfoControlType
+			if ctl == "" {
+				ctl = "Textarea"
+			}
+			contents = append(contents, content{Control: ctl, ID: s.cfg.PaymentInfoControlID, Value: textValue{Text: txt}})
 		}
 	}
 	applyData, _ = json.Marshal(map[string]any{"contents": contents})
@@ -1173,6 +1224,12 @@ type ApprovalDetail struct {
 	Signals []model.AuditSignal           `json:"signals"`
 	Verdict *model.LLMVerdict             `json:"verdict,omitempty"`
 	Links   []model.ApprovalStocktakeLink `json:"stocktake_links"`
+	// Payee 是本次付款的**收款账号快照**(2026-10-28)。
+	//
+	// ⚠️ 它**不在** `Approval`(ApprovalInstance)里 ⇒ 不在 LLM 输入面内
+	// (见 service/payee_account.go 的结构隔离说明)。
+	// 没选收款账号时为 nil。
+	Payee *model.ApprovalPayeeAccount `json:"payee_account,omitempty"`
 }
 
 // ListApprovals 按 branch + 条件分页(created_at 降序)。
@@ -1233,6 +1290,11 @@ func (s *Service) GetApprovalDetail(ctx context.Context, branchID, id string) (*
 		d.Verdict = &verdict
 	}
 	s.db.WithContext(ctx).Where("approval_id = ?", id).Find(&d.Links)
+	// 收款账号快照(2026-10-28):独立表,**不混进 d.Approval** ——
+	// d.Approval 会进 AuditInput ⇒ 账号信息混进去就等于发给 LLM 了。
+	if payee, err := s.loadPayeeAccount(ctx, id); err == nil {
+		d.Payee = payee
+	}
 	return d, nil
 }
 
