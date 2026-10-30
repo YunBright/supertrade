@@ -40,3 +40,17 @@ func ClosingByCutForTest(ctx context.Context, s *Service, branchID string, day t
 func ClampNonNegativeForTest(kg, amount decimal.Decimal) (decimal.Decimal, decimal.Decimal) {
 	return clampNonNegative(kg, amount)
 }
+
+// ForecastSplitSampleGapForTest 暴露 [forecastSplitSampleGap](分割样本缺口的判定)。
+//
+// ⚠️ 为什么它值得单独暴露:
+//
+//	「两个样本池都空 ⇒ 报缺:分割样本」这条判定**在端到端场景里几乎构造不出来**——
+//	引擎很会把销售归到"无名桶"里,倒推值仍为正 ⇒ 总是有样本。
+//	⇒ 而判据本身有个**容易写错**的地方:是"**都**空"才算缺,不是"任一为空"。
+//	⇒ 把它抽成小函数 + 直接锁,比硬造场景可靠。
+//
+// 返回:空串 = 不缺;非空 = 缺口文案(门店看到的原话)。
+func ForecastSplitSampleGapForTest(recordedN, estimatedN int) string {
+	return forecastSplitSampleGap(recordedN, estimatedN)
+}

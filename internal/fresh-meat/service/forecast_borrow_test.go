@@ -130,11 +130,15 @@ func TestForecastBorrow_SameScopeTakesMostSamples(t *testing.T) {
 
 // TestForecastBorrow_SourceNotUsable_NoBorrow 锁「被借店也不可用 ⇒ 不借用」。
 //
-// ⚠️ 不能拿别家**不够样本**的数字当基线 —— 那是把噪声喂进建议分割。
+// ⚠️ 不能拿别家**没有样本**的数字当基线 —— 那是把噪声喂进建议分割。
+//
+// ⚠️ 2026-10-30:门槛改成 **n ≥ 1** ⇒ "不可用"只剩一种：**一个样本都没有**
+//
+//	(sample_count = 0)⇒ 那正是"被借店那个分层没有样本"的样子。
 func TestForecastBorrow_SourceNotUsable_NoBorrow(t *testing.T) {
 	svc, ctx, _ := splitSetup(t)
-	// S002 只有 2 个样本 ⇒ 不可用。
-	fmBorrowSeed(t, "S002", "200-249", model.CutBelly, 2, "12")
+	// S002 那一层**一个样本都没有** ⇒ 不可用。
+	fmBorrowSeed(t, "S002", "200-249", model.CutBelly, 0, "12")
 	fmBorrowCfg(t, svc, ctx, "S001", "S002", "", "", true)
 
 	_, err := svc.RecomputeForecastBaselines(ctx, "S001")
@@ -172,12 +176,22 @@ func TestForecastBorrow_OwnSamplesEnough_NoBorrow(t *testing.T) {
 	}
 }
 
-// ---- ⑤ 手动生成的行不被借用覆盖 ----
+// ---- ⑤ 手动生成过的行**照样**被重算覆盖(但留痕) ----
 
-// TestForecastBorrow_ManualRowNotOverwritten 锁「手动生成的行不被借用覆盖」。
+// TestForecastBorrow_ManualRowIsOverwrittenButKeptAsTrace 锁⑤。
 //
-// 管理员显式指定的基线(manual_generated=true)⇒ 重算与借用都**不许**动它。
-func TestForecastBorrow_ManualRowNotOverwritten(t *testing.T) {
+// # ⚠️ 这是 2026-10-30 **故意**改掉的行为（owner 重新定义模型）
+//
+//	旧口径：「管理员手动生成的行整层跳过」——manual_generated 保护它不被重算/借用覆盖。
+//	新口径：**基线是派生结果**（样本库才是底座）
+//	         ⇒ 重算就该把它算回去 ⇒ `manual_generated` 退化成
+//	           「**曾手工触发过**」的**留痕**，不再保护任何东西。
+//
+// # 期望
+//
+//	① 数字被重算/借用覆盖（不再钉死 99）；
+//	② `manual_generated` 标记**保留**（可追溯："这一层曾经被人工设过"）。
+func TestForecastBorrow_ManualRowIsOverwrittenButKeptAsTrace(t *testing.T) {
 	svc, ctx, _ := splitSetup(t)
 	fmBorrowSeed(t, "S002", "200-249", model.CutBelly, 5, "12")
 	// 本店有一行**手动生成**的基线(p50 99)。
@@ -194,13 +208,19 @@ func TestForecastBorrow_ManualRowNotOverwritten(t *testing.T) {
 	mustNoErr(t, err, "RecomputeForecastBaselines")
 	row, ok := estBaseline(t, "S001", "200-249", model.CutBelly)
 	if !ok {
-		t.Fatalf("★ 本店应仍有一行基线")
+		t.Fatalf("★ 本店应有一行基线")
 	}
-	if !row.P50Kg.Equal(d("99")) {
-		t.Errorf("★ 手动生成的行不许被借用覆盖(应仍是 99),got %s", row.P50Kg)
+	if row.P50Kg.Equal(d("99")) {
+		t.Errorf("★ 基线是派生物 ⇒ 重算/借用应覆盖它(不该钉死在 99),got %s", row.P50Kg)
+	}
+	if !row.P50Kg.Equal(d("12")) {
+		t.Errorf("★ 本店自己没样本 ⇒ 该借 S002 的 12,got %s", row.P50Kg)
 	}
 	if !row.ManualGenerated {
-		t.Errorf("★ manual_generated 不该被抹掉")
+		t.Errorf("★ manual_generated 应保留为「曾手工触发」的留痕")
+	}
+	if row.GeneratedFromDate != "2026-10-29" {
+		t.Errorf("★ generated_from_date 应保留,got %q", row.GeneratedFromDate)
 	}
 }
 

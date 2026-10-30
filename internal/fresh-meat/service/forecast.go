@@ -33,8 +33,21 @@ import (
 
 // MinForecastSamples 基线可用的最小样本数。
 //
-// 低于它就不信这个分层(样本太少,均值方差都不可靠)⇒ 回退 LLM。
-const MinForecastSamples = 5
+// # ⚠️ 2026-10-30 owner 拍板：**有样本就算用（n ≥ 1）**
+//
+//	owner：「如果每天有两头猪，那么就有两个重量样本」
+//	⇒ 样本库是一等公民，基线是派生结果 ⇒ 门槛的唯一作用是"有没有样本"，
+//	  而不是"样本够不够稳"（样本稳不稳由**删样本**这个动作管）。
+//
+// ⇒ 之前是 5（样本不够就回退 LLM）；现在改成 1：
+//
+//	① 「每段两头猪 = n=2」这个模型**必须**有门槛 < 2 才成立
+//	  （门槛 5 ⇒ 新店永远不够 ⇒ 永远回退 LLM ⇒ 死锁）；
+//	② `manual_generated` 的**豁免机制随之退役**（见 [ForecastBaseline.Usable]）。
+//
+// ⚠️ 代价（有意）：只要有 1 条样本，该分层就用基线、不再回退 LLM
+// ⇒ 样本质量的责任落到「删除不准确的样本」这个动作上。
+const MinForecastSamples = 1
 
 // weightBandSizeKg 体重段的段宽(kg)。
 const weightBandSizeKg = 50
@@ -84,64 +97,65 @@ type forecastBucketKey struct {
 
 // RecomputeForecastBaselines 重算某店的分割重量统计基线。
 //
-// 幂等:按 (branch_id, weight_band, cut_type) 落一行。
+// # 幂等:按 (branch_id, weight_band, cut_type) 落一行。
 // 返回写入了多少行。
 //
-// # 两个样本池(2026-10-30 owner 选的 A 方案)
+// # 口径（2026-10-30 owner 拍板：样本库是一等公民,基线是派生结果）
 //
-//	① **实录池** = `pig_cuts`(门店手工补录的分割)—— 最准;
-//	② **估计池** = `pig_cut_estimates`(由日终倒推值按毛重比例摊到每头猪)—— 近似。
+//	① **样本** = 合并观察（实录 ∪ 估计，按 (猪, 部位) 去重、实录优先）
+//	② **分层** = 体重段 × 部位
+//	③ **可用门槛** = n ≥ 1（有样本就算用,见 [MinForecastSamples]）
 //
-// ⇒ 口径:**实录样本够(≥ MinForecastSamples)就用实录**,不够才用估计。
-//
-//	两个池子都不够 ⇒ 这条分层不可用 ⇒ 回退 LLM。
-//
-// ⚠️ **每个店只用自己的样本**(owner 2026-10-30:「每个门店样本要单独」)
-//
-//	⇒ 两个池子的查询**都按 branch_id 过滤** ⇒ 互不影响。
+//	⇒ **覆盖所有分层**：不再跳过 `manual_generated` 的行
+//	  （基线是**派生物** ⇒ 重算就该把它算回去）。
+//	  `manual_generated` 列保留为"曾手工触发"的可追溯标记（重算时不清零）。
 //
 // # 跨店借用(owner 2026-10-30 第 2 条)
 //
-//	本店某个分层**自己不可用**(!Usable())且有**启用中**的借用配置
-//	⇒ 采用**被借店同一 (体重段, 部位)**那一行的数字,并把 source_branch_id 记成被借方。
+//	本店某个分层**自己一个样本都没有** ⇒ 采用**被借店**同一 (体重段, 部位)那一行的数字,
+//	并把 source_branch_id 记成被借方。
 //
 //	被借店那一行自己也不可用 ⇒ **不借用**(回退 LLM)。
 //
-// ⚠️ **管理员手动生成的行(manual_generated=true)整层跳过**
+// # ⚠️ 样本被删光 ⇒ 该层基线行随之删除
 //
-//	那是管理员**显式指定**的数字 ⇒ 既不被自动重算覆盖,也不被借用覆盖。
+//	否则脏数字会一直给出错建议（owner:「如果觉得它不准,分割不合理」）。
+//	判据:本次没写出来、但原来 sample_count > 0 的**自产**行 ⇒ 删。
+//	（sample_count = 0 的历史行不动 —— 那些本来不可用,留着无害。）
+//
+// # ⚠️ **每个店只用自己的样本**(owner 2026-10-30:「每个门店样本要单独」)
+//
+//	⇒ 样本查询**都按 branch_id 过滤** ⇒ 互不影响。
 func (s *Service) RecomputeForecastBaselines(ctx context.Context, branchID string) (int, error) {
 	if branchID == "" {
 		return 0, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
 	}
-	// ---- ① 实录样本(每头猪每个部位一条) ----
-	recorded, err := s.loadRecordedSplitSamples(ctx, branchID)
+	// ---- ① 样本(实录 ∪ 估计 → 合并观察) ----
+	//
+	// ⚠️ **事务外读**:SQLite 单连接库在事务里读会死锁(见 db.go 的 MaxOpenConns(1))。
+	recorded, err := s.loadRecordedForecastRows(ctx, branchID)
 	if err != nil {
 		return 0, err
 	}
-	// ---- ② 估计样本(每头猪每个部位一条) ----
-	estimated, err := s.loadEstimatedForecastSamples(ctx, branchID)
+	estimated, err := s.loadEstimatedForecastRows(ctx, branchID)
 	if err != nil {
 		return 0, err
 	}
-	// ---- ③ 跨店借用解析(在事务外读,避免 SQLite 单连接死锁) ----
+	merged := mergeForecastSampleRows(recorded, estimated)
+	buckets := bucketForecastSampleRows(merged)
+
+	// ---- ② 跨店借用解析(在事务外读,避免 SQLite 单连接死锁) ----
 	borrowed, err := s.resolveBorrowedBaselines(ctx, branchID)
 	if err != nil {
 		return 0, err
 	}
-	ownKeys := forecastBucketKeys(recorded, estimated)
 	// 本店没样本、但被借店有的分层 ⇒ 也要建行(否则整店借用没意义)。
-	keys := mergeForecastBucketKeys(ownKeys, borrowedBucketKeys(borrowed))
+	keys := mergeForecastBucketKeys(forecastBucketKeysOf(buckets), borrowedBucketKeys(borrowed))
 
-	// ---- ④ 逐桶选池 + 借用解析 ----
+	// ---- ③ 逐桶拟合 + 写库 ----
 	now := s.now()
 	written := 0
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// 已被管理员手动生成的分层 ⇒ 整层跳过。
-		manual, err := loadManualBaselineKeys(ctx, tx, branchID)
-		if err != nil {
-			return err
-		}
 		// 已有行的主键(先读后写,见 upsertForecastBaseline 的原因)。
 		existing, err := loadBaselineRows(ctx, tx, branchID)
 		if err != nil {
@@ -149,85 +163,54 @@ func (s *Service) RecomputeForecastBaselines(ctx context.Context, branchID strin
 		}
 		writtenKeys := map[forecastBucketKey]bool{}
 		for _, k := range keys {
-			if manual[k] {
-				continue
-			}
-			recList := recorded[k]
-			estList := estimated[k]
-			recN, estN := len(recList), len(estList)
-
-			// 选池:实录优先,不够才用估计;两个都不够 ⇒ 取样本多的那个留痕(但**不可用**)。
-			var useList []decimal.Decimal
-			source := SampleSourceRecorded
-			switch {
-			case recN >= MinForecastSamples:
-				useList, source = recList, SampleSourceRecorded
-			case estN >= MinForecastSamples:
-				useList, source = estList, SampleSourceEstimated
-			default:
-				if estN > recN {
-					useList, source = estList, SampleSourceEstimated
-				} else {
-					useList, source = recList, SampleSourceRecorded
-				}
-			}
-
+			samples := buckets[k]
 			var rec model.PigForecastBaseline
 			switch {
-			case recN >= MinForecastSamples || estN >= MinForecastSamples:
-				// 本店样本够 ⇒ 用自己的。
-				mean, p10, p50, p90 := statsOf(useList)
+			case len(samples) > 0:
+				// 本店有样本 ⇒ 用自己的(门槛 n ≥ 1 ⇒ 有样本就算用)。
+				fit := fitForecastSamples(samples)
 				rec = model.PigForecastBaseline{
 					ID:                   forecastBaselineID(branchID, k.band, k.cut),
 					BranchID:             branchID,
 					WeightBand:           k.band,
 					CutType:              k.cut,
-					SampleCount:          len(useList),
-					RecordedSampleCount:  recN,
-					EstimatedSampleCount: estN,
-					SampleSource:         source,
+					SampleCount:          fit.N,
+					RecordedSampleCount:  fit.RecordedN,
+					EstimatedSampleCount: fit.EstimatedN,
+					SampleSource:         fit.Source,
 					SourceBranchID:       branchID,
-					MeanKg:               mean,
-					P10Kg:                p10,
-					P50Kg:                p50,
-					P90Kg:                p90,
+					MeanKg:               fit.MeanKg,
+					P10Kg:                fit.P10Kg,
+					P50Kg:                fit.P50Kg,
+					P90Kg:                fit.P90Kg,
 					ComputedAt:           now,
+				}
+				// ⚠️ 保留"曾手工触发"标记(基线是派生物,但这行**曾经**被人工触发过 ⇒ 留痕)。
+				if prev, ok := existing[k]; ok {
+					rec.ManualGenerated = prev.ManualGenerated
+					rec.GeneratedFromDate = prev.GeneratedFromDate
 				}
 			default:
-				// 本店自己**不可用** ⇒ 看能不能借用被借店的数字。
-				if b, ok := borrowed[k]; ok {
-					rec = b
-					rec.BranchID = branchID
-					// ⚠️ **主键必须重算**:被借店那一行带的是**它自己的** id
-					//   ⇒ 直接写会撞主键(两行 id 相同)⇒ 借用永远写不进去。
-					rec.ID = forecastBaselineID(branchID, k.band, k.cut)
-					rec.ComputedAt = now
-					// ★ 标出这是**借来的**行(见 model.PigForecastBaseline.Borrowed):
-					//   借用配置一关/一改,它必须能被刷新、也能被清掉;
-					//   而管理员手动指定的行(borrowed=false)永远受保护。
-					rec.Borrowed = true
-					break
-				}
-				if len(useList) == 0 {
+				// 本店这个分层**一个样本都没有** ⇒ 看能不能借用被借店的数字。
+				b, ok := borrowed[k]
+				if !ok {
 					continue
 				}
-				// 借不到 ⇒ 留痕(样本多的那个池子),但**不可用** ⇒ 回退 LLM。
-				mean, p10, p50, p90 := statsOf(useList)
-				rec = model.PigForecastBaseline{
-					ID:                   forecastBaselineID(branchID, k.band, k.cut),
-					BranchID:             branchID,
-					WeightBand:           k.band,
-					CutType:              k.cut,
-					SampleCount:          len(useList),
-					RecordedSampleCount:  recN,
-					EstimatedSampleCount: estN,
-					SampleSource:         source,
-					SourceBranchID:       branchID,
-					MeanKg:               mean,
-					P10Kg:                p10,
-					P50Kg:                p50,
-					P90Kg:                p90,
-					ComputedAt:           now,
+				rec = b
+				rec.BranchID = branchID
+				// ⚠️ **主键必须重算**:被借店那一行带的是**它自己的** id
+				//   ⇒ 直接写会撞主键(两行 id 相同)⇒ 借用永远写不进去。
+				rec.ID = forecastBaselineID(branchID, k.band, k.cut)
+				rec.ComputedAt = now
+				// ★ 标出这是**借来的**行(见 model.PigForecastBaseline.Borrowed):
+				//   借用配置一关/一改,它必须能被刷新、也能被清掉。
+				rec.Borrowed = true
+				// ⚠️ "曾手工触发"是**本店**的留痕 ⇒ 借来的行也要保留它
+				//   (它记录的是"本店这一层曾经被人工设过",与数字来自谁无关)。
+				//   ⚠️ 但 `generated_from_date` 同理保留(可追溯)。
+				if prev, ok := existing[k]; ok {
+					rec.ManualGenerated = prev.ManualGenerated
+					rec.GeneratedFromDate = prev.GeneratedFromDate
 				}
 			}
 			if err := s.upsertForecastBaseline(ctx, tx, rec, existing); err != nil {
@@ -236,18 +219,13 @@ func (s *Service) RecomputeForecastBaselines(ctx context.Context, branchID strin
 			written++
 			writtenKeys[k] = true
 		}
-		// ---- 清理:**借来的**旧行 ----
+		// ---- 清理 ----
 		//
-		// 借用被关掉(或被借方换了)⇒ 那一行必须消失,否则本店会一直用别家的旧数字
-		// ⇒ 「关掉就回到只用本店样本」这条语义就废了。
+		// ① **借来的**旧行:借用被关掉(或被借方换了)⇒ 那一行必须消失,
+		//    否则本店会一直用别家的旧数字 ⇒「关掉就回到只用本店样本」这条语义就废了。
+		// ② **样本被删光**的自产行:原来有样本、这次没写出来 ⇒ 该层失效 ⇒ 删。
 		//
-		// ⚠️ **手动生成的行不动**(管理员显式指定的)。
-		//
-		// ⚠️ 判据的顺序很重要(2026-10-30 修):
-		//
-		//	借来的行**继承**了来源行的 manual_generated(来源可能是管理员手动生成的)
-		//	⇒ 若先判 manual_generated ⇒ 借来的行永远删不掉 ⇒ 关掉借用也没用。
-		//	⇒ 先判 `borrowed`(见 model.PigForecastBaseline.Borrowed)⇒ 借来的先删。
+		// ⚠️ sample_count = 0 的历史行**不动**(本来不可用,留着无害)。
 		for k, prev := range existing {
 			if writtenKeys[k] {
 				continue
@@ -259,15 +237,11 @@ func (s *Service) RecomputeForecastBaselines(ctx context.Context, branchID strin
 				}
 				continue
 			}
-			if prev.ManualGenerated {
-				continue // 管理员手动指定的,永不删
-			}
-			if prev.SourceBranchID == "" || prev.SourceBranchID == branchID {
-				continue // 本店自产的行(哪怕过时)也不在这里删
-			}
-			if err := tx.WithContext(ctx).Where("id = ?", prev.ID).
-				Delete(&model.PigForecastBaseline{}).Error; err != nil {
-				return fmt.Errorf("delete borrowed pig_forecast_baseline %s: %w", prev.ID, err)
+			if prev.SampleCount > 0 {
+				if err := tx.WithContext(ctx).Where("id = ?", prev.ID).
+					Delete(&model.PigForecastBaseline{}).Error; err != nil {
+					return fmt.Errorf("delete stale pig_forecast_baseline %s: %w", prev.ID, err)
+				}
 			}
 		}
 		return nil
@@ -284,27 +258,6 @@ func (s *Service) RecomputeForecastBaselines(ctx context.Context, branchID strin
 // ⇒ 同一 (店, 体重段, 部位) 永远算出同一个 id ⇒ 重算/覆盖都不会让 purge 删不到行。
 func forecastBaselineID(branchID, weightBand string, cut model.CutType) string {
 	return fmt.Sprintf("PFB%s%s%s", weightBand, strings.ReplaceAll(string(cut), "_", "-"), branchID)
-}
-
-// loadManualBaselineKeys 读本店**手动生成**的分层键(manual_generated = true)。
-//
-// ⚠️ **借来的行要排除**(borrowed = false):
-//
-//	借来的行会继承来源行的 manual_generated(来源可能是管理员手动生成的)
-//	⇒ 若把它也算成"管理员指定的"⇒ 重算时整层跳过 ⇒ 借来的数字**永远不刷新**
-//	⇒ 借用一旦配上就"冻"在那儿了(见 model.PigForecastBaseline.Borrowed 的说明)。
-func loadManualBaselineKeys(ctx context.Context, tx *gorm.DB, branchID string) (map[forecastBucketKey]bool, error) {
-	out := map[forecastBucketKey]bool{}
-	var rows []model.PigForecastBaseline
-	if err := tx.WithContext(ctx).
-		Where("branch_id = ? AND manual_generated = ? AND borrowed = ?", branchID, true, false).
-		Find(&rows).Error; err != nil {
-		return nil, fmt.Errorf("query pig_forecast_baselines(manual): %w", err)
-	}
-	for _, r := range rows {
-		out[forecastBucketKey{band: r.WeightBand, cut: r.CutType}] = true
-	}
-	return out, nil
 }
 
 // loadBaselineRows 读本店的已有基线行(索引 = 分层键)。
@@ -368,104 +321,6 @@ func (s *Service) upsertForecastBaseline(ctx context.Context, tx *gorm.DB, row m
 	}
 	existing[key] = row
 	return nil
-}
-
-// loadRecordedSplitSamples 读某店的**实录样本**,按 (体重段 × 部位) 分桶。
-//
-// # 门店隔离
-//
-//	⚠️ JOIN 时**两边都按 branch_id 过滤**(`pig_cuts.branch_id` + `whole_pigs.branch_id`)
-//	  ⇒ 就算数据脏了(某行的 branch_id 与猪不一致),也不会把别店的猪算进本店的基线。
-func (s *Service) loadRecordedSplitSamples(ctx context.Context, branchID string) (
-	map[forecastBucketKey][]decimal.Decimal, error) {
-	out := map[forecastBucketKey][]decimal.Decimal{}
-	var pigCuts []model.PigCut
-	if err := s.db.WithContext(ctx).
-		Joins("JOIN whole_pigs ON whole_pigs.id = pig_cuts.pig_id").
-		Where("pig_cuts.branch_id = ? AND whole_pigs.branch_id = ?", branchID, branchID).
-		Find(&pigCuts).Error; err != nil {
-		return nil, fmt.Errorf("query pig_cuts: %w", err)
-	}
-	if len(pigCuts) == 0 {
-		return out, nil
-	}
-	var pigs []model.WholePig
-	if err := s.db.WithContext(ctx).
-		Where("branch_id = ?", branchID).
-		Find(&pigs).Error; err != nil {
-		return nil, fmt.Errorf("query whole_pigs: %w", err)
-	}
-	bandOf := map[string]string{}
-	for _, p := range pigs {
-		bandOf[p.ID] = WeightBandOf(p.GrossWeightKg)
-	}
-	// pig+cut → kg
-	perPigCut := map[string]map[model.CutType]decimal.Decimal{}
-	for _, c := range pigCuts {
-		if perPigCut[c.PigID] == nil {
-			perPigCut[c.PigID] = map[model.CutType]decimal.Decimal{}
-		}
-		perPigCut[c.PigID][c.CutType] = perPigCut[c.PigID][c.CutType].Add(c.WeightKg)
-	}
-	for pigID, perCut := range perPigCut {
-		band, ok := bandOf[pigID]
-		if !ok {
-			continue
-		}
-		for cut, kg := range perCut {
-			k := forecastBucketKey{band: band, cut: cut}
-			out[k] = append(out[k], kg)
-		}
-	}
-	return out, nil
-}
-
-// loadEstimatedForecastSamples 读某店的**估计样本**,按 (体重段 × 部位) 分桶。
-func (s *Service) loadEstimatedForecastSamples(ctx context.Context, branchID string) (
-	map[forecastBucketKey][]decimal.Decimal, error) {
-	out := map[forecastBucketKey][]decimal.Decimal{}
-	perPigCut, bandOf, err := s.loadEstimatedSplitSamples(ctx, branchID)
-	if err != nil {
-		return nil, err
-	}
-	for pigID, perCut := range perPigCut {
-		band, ok := bandOf[pigID]
-		if !ok {
-			continue
-		}
-		for cut, kg := range perCut {
-			k := forecastBucketKey{band: band, cut: cut}
-			out[k] = append(out[k], kg)
-		}
-	}
-	return out, nil
-}
-
-// forecastBucketKeys 两个池子的**并集**分桶键(排序稳定 ⇒ 写库顺序稳定)。
-func forecastBucketKeys(recorded, estimated map[forecastBucketKey][]decimal.Decimal) []forecastBucketKey {
-	seen := map[forecastBucketKey]bool{}
-	out := make([]forecastBucketKey, 0, len(recorded)+len(estimated))
-	for k := range recorded {
-		if !seen[k] {
-			seen[k] = true
-			out = append(out, k)
-		}
-	}
-	for k := range estimated {
-		if !seen[k] {
-			seen[k] = true
-			out = append(out, k)
-		}
-	}
-	for i := 1; i < len(out); i++ {
-		j := i
-		for j > 0 && (out[j-1].band > out[j].band ||
-			(out[j-1].band == out[j].band && string(out[j-1].cut) > string(out[j].cut))) {
-			out[j-1], out[j] = out[j], out[j-1]
-			j--
-		}
-	}
-	return out
 }
 
 // mergeForecastBucketKeys 合并多组分层键并**排序**。
@@ -586,17 +441,18 @@ func (s *Service) ListForecastBaselines(ctx context.Context, branchID string) ([
 	return rows, nil
 }
 
-// ForecastFor 查某头猪某部位的预测产出(优先 p50,样本不足返零 + false)。
+// Usable 判断这条基线**能不能用**。
 //
-// # 可用性判据
+// # 判据：`sample_count >= MinForecastSamples`（= 1）
 //
-//	`sample_count >= MinForecastSamples` **或** `manual_generated = true`。
+// ⚠️ **原来的 `manual_generated` 豁免已退役**（2026-10-30 owner 拍板）：
 //
-//	后者是 owner 2026-10-30 的补充:「生成基线**不设 ≥5 门槛**,
-//	只要那天的录入/搬台/销售/盘点都全就可以生成」⇒ 手动生成的行**必须**能用,
-//	否则管理员辛苦选的那一天等于白选。
+//	基线是**派生结果** ⇒ 有样本就算用 ⇒ "手动生成"不再是"绕过门槛"的理由，
+//	它只是"这一层曾经被人工触发过"的**留痕**（见 model.PigForecastBaseline.ManualGenerated）。
+//
+//	⇒ n = 0 的行（迁移默认值）**不可用** ⇒ 回退 LLM。
 func (b ForecastBaseline) Usable() bool {
-	return b.SampleCount >= MinForecastSamples || b.ManualGenerated
+	return b.SampleCount >= MinForecastSamples
 }
 
 // ForecastForWeight 查某体重段某部位的基线预测。

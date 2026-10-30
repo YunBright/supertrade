@@ -29,6 +29,7 @@ package handler
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -168,11 +169,23 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/forecast-baselines", requireBranch, h.ListForecastBaselines)
 	// DELETE —— 删除不准确/脏基线(默认本店;可加 ?branch_id= 删别家店的)。
 	r.DELETE("/forecast-baselines", requireBranch, h.DeleteForecastBaseline)
-	// POST —— 选**数据完整的一天**生成新基线(新增或覆盖)。
-	r.POST("/forecast-baselines/generate", requireBranch, h.GenerateForecastBaselines)
+	// POST —— 从**样本库**全量拟合出新的基线(覆盖所有分层)。
 	r.POST("/forecast-baselines/recompute", requireBranch, h.RecomputeForecastBaselines)
 	// GET —— 多门店分级基线对比(按权重段 × 部位并排)。
 	r.GET("/forecast-baselines/compare", requireBranch, h.CompareForecastBaselines)
+
+	// **样本库**(2026-10-30 owner 拍板:样本库是一等公民,基线是派生结果)
+	// GET —— 列样本库(按天 × 体重段分组)。
+	r.GET("/forecast-samples", requireBranch, h.ListForecastSamples)
+	// POST —— **按一天加入样本**(跑那天的引擎落样本;不自动重算)。
+	r.POST("/forecast-samples/collect", requireBranch, h.CollectForecastSamples)
+	// DELETE —— 删除样本(打墓碑):?date=&weight_band= 整组删 / ?pig_id= 单头猪删。
+	r.DELETE("/forecast-samples", requireBranch, h.DeleteForecastSamples)
+	// POST —— 恢复被删(墓碑)的样本。
+	r.POST("/forecast-samples/restore", requireBranch, h.RestoreForecastSamples)
+	// POST —— **已下线**的「按一天生成基线」:回 **410 Gone** 并告诉客户端该用哪个端点
+	//   (404 会让人以为是 URL 写错了 ⇒ 410 + 说明才是"这条语义被换掉了")。
+	r.POST("/forecast-baselines/generate", requireBranch, h.GenerateForecastBaselines)
 
 	// 跨门店选用基线的配置(本店借用别店的基线)
 	r.GET("/forecast-baseline-borrows", requireBranch, h.ListForecastBaselineBorrows)
@@ -1310,27 +1323,134 @@ func (h *Handler) DeleteForecastBaseline(c *gin.Context) {
 
 // GenerateForecastBaselines POST /forecast-baselines/generate
 //
-// 按**数据完整的一天**生成新基线(新增或覆盖)。
+// ⚠️ **已移除**（2026-10-30 owner 重新定义模型：样本库是一等公民，基线是派生结果）。
 //
-// 入参:{"date":"2026-10-29","source_branch_id":"","overwrite":true}
+//	「按一天生成基线」把**样本采集**和**基线拟合**混成了一个动作 ⇒ 语义错、覆盖不全。
+//	⇒ 拆成两个端点：
+//	  - `POST /forecast-samples/collect` —— 按一天**加入样本**（跑引擎落样本，不重算）；
+//	  - `POST /forecast-baselines/recompute` —— 从样本库**重算**基线（覆盖所有分层）。
 //
-// ⚠️ 那天缺"录入/搬台/销售/盘点"任一项 ⇒ 400 并点名缺哪一项。
+//	保留这个函数只是为了让老客户端拿到一个**明确的 410**（而不是 404 让人猜）。
 func (h *Handler) GenerateForecastBaselines(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "freshmeat:write") {
 		return
 	}
-	var in service.ForecastBaselineGenerateInput
-	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
+	writeError(c, http.StatusGone, "endpoint_removed",
+		"「按一天生成基线」已下线：请改用「按一天加入样本」(POST /forecast-samples/collect) + 「重算」(POST /forecast-baselines/recompute)")
+}
+
+// ListForecastSamples GET /forecast-samples?date=&weight_band=&include_excluded=
+//
+// 列**样本库**(按 天 × 体重段 分组)。
+func (h *Handler) ListForecastSamples(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
 		return
 	}
-	out, err := h.svc.GenerateForecastBaselines(c.Request.Context(), branchID, in)
+	out, err := h.svc.ListForecastSamples(c.Request.Context(), branchID, service.ForecastSampleQuery{
+		Date:            c.Query("date"),
+		WeightBand:      c.Query("weight_band"),
+		IncludeExcluded: queryBool(c, "include_excluded"),
+	})
 	if err != nil {
 		mapErr(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+// CollectForecastSamples POST /forecast-samples/collect
+//
+// 「按一天加入样本」:入参 {"date":"2026-10-29","source_branch_id":""}
+//
+// ⚠️ 那天缺"录入/搬台/销售/盘点"任一项 ⇒ 400 并点名缺哪一项。
+// ⚠️ **不自动重算** —— 重算是另一个明确动作。
+func (h *Handler) CollectForecastSamples(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	var in service.ForecastSampleCollectInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
+		return
+	}
+	out, err := h.svc.CollectForecastSamples(c.Request.Context(), branchID, in)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// DeleteForecastSamples DELETE /forecast-samples?date=&weight_band=  |  ?pig_id=
+//
+// 删除样本(**打墓碑**,不物理删 —— 物理删会被引擎重跑复活)。
+func (h *Handler) DeleteForecastSamples(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	target := service.ForecastSampleTarget{
+		Date:       c.Query("date"),
+		WeightBand: c.Query("weight_band"),
+		PigID:      c.Query("pig_id"),
+	}
+	n, err := h.svc.DeleteForecastSamples(c.Request.Context(), branchID, target)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"excluded": n,
+		"message":  fmt.Sprintf("已删除 %d 条样本，点「重算」后生效", n),
+	})
+}
+
+// RestoreForecastSamples POST /forecast-samples/restore
+//
+// 恢复被删(墓碑)的样本:入参 {"date":"2026-10-29","weight_band":"","pig_id":""}
+func (h *Handler) RestoreForecastSamples(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	var target service.ForecastSampleTarget
+	// ⚠️ body 可选(空 body 也行)⇒ 解析失败不报错,改用 query 参数。
+	_ = c.ShouldBindJSON(&target)
+	if v := strings.TrimSpace(c.Query("date")); v != "" {
+		target.Date = v
+	}
+	if v := strings.TrimSpace(c.Query("weight_band")); v != "" {
+		target.WeightBand = v
+	}
+	if v := strings.TrimSpace(c.Query("pig_id")); v != "" {
+		target.PigID = v
+	}
+	n, err := h.svc.RestoreForecastSamples(c.Request.Context(), branchID, target)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"restored": n,
+		"message":  fmt.Sprintf("已恢复 %d 条样本，点「重算」后生效", n),
+	})
+}
+
+// queryBool 读一个布尔 query 参数(1/true/yes ⇒ true)。
+func queryBool(c *gin.Context, key string) bool {
+	v := strings.TrimSpace(c.Query(key))
+	if v == "" {
+		return false
+	}
+	switch strings.ToLower(v) {
+	case "1", "true", "yes", "y":
+		return true
+	default:
+		return false
+	}
 }
 
 // CompareForecastBaselines GET /forecast-baselines/compare?branches=00,01

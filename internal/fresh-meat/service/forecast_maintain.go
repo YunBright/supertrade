@@ -1,32 +1,32 @@
 // Package service / forecast_maintain.go —— **基线维护**(owner 2026-10-30 第 3 条)。
 //
-// # 要解决什么
+// # ⚠️ 2026-10-30 owner 重新定义模型：**样本库是一等公民，基线是派生结果**
 //
-//	基线是**统计拟合**出来的 ⇒ 数据脏了(补录错、搬台漏、盘点补录)基线就歪
-//	⇒ 管理员得能 ① **删掉**不准确/脏的那一行;② **按某一天**重新生成一条干净的。
+//	原来的「按一天生成基线」把**样本采集**和**基线拟合**混成了一个动作
+//	⇒ 已拆成两个动作（见 forecast_samples.go）：
+//	  ① 「**按一天加入样本**」= 跑引擎落样本（不重算）；
+//	  ② 「**重算**」= 从样本库全量拟合 ⇒ 覆盖所有分层。
 //
-// # 两条维护动作
+//	⇒ 本文件里原来的 `GenerateForecastBaselines` **已移除**。
+//
+// # 现在这里剩什么
 //
 //	① `DeleteForecastBaseline` —— 删掉 (体重段 × 部位) 那一行(只删**本店**的)。
-//	② `GenerateForecastBaselines` —— 选**数据完整的一天**生成新基线(新增或覆盖)。
-//
-// # ⚠️ 生成基线**不设 ≥5 门槛**(owner 明确要求)
-//
-//	「只要那天的录入、搬台(含 0 搬台)、销售、盘点都全就可以生成」
-//	⇒ 生成的行 `manual_generated = true`
-//	⇒ `ForecastBaseline.Usable()` 认它(见 forecast.go)。
+//	   ⚠️ 基线是派生结果 ⇒ 重算会算回来 ⇒ 只适合"临时停用一层"；
+//	     真正"剔除某层数据"要去**样本库**删样本。
+//	② `dayDataGaps` —— 那一天的数据**完整性校验**(加入样本前用)。
 //
 // # ⚠️ 前置校验:那一天的数据必须**完整**
 //
 //	缺哪一项就 400 并**点名缺哪一项** —— 门店才知道要补什么。
-//	五项:① 录入(进猪) ② 搬台(含 0 kg 的"今天不搬台"标记) ③ 销售(零售或统收)
+//	四项:① 录入(进猪) ② 搬台(含 0 kg 的"今天不搬台"标记) ③ 销售(零售或统收)
 //	     ④ 盘点(**完整**盘点单 is_complete = true)
-//	     ⑤ 分割样本(实录或估计样本 —— 否则生成结果是空的,2026-10-30 门店实测)。
+//	第 ⑤ 项(分割样本)在加入样本时判 —— 见 forecast_samples.go::CollectForecastSamples。
 //
-// # 手动跨店选用
+// # ⚠️ 销售那一项必须跟**毛利看板**走同一条读路径
 //
-//	`source_branch_id` 非空 ⇒ 用**别店那一天**的数据生成到**本店的基线表**
-//	⇒ 行的 source_branch_id 记被借方(= 手动版的"跨店借用")。
+//	有源门店的销售在**它自己的 cube 源**里 ⇒ 只查本地表 ⇒ 明明卖了一整天却报「缺:销售」
+//	⇒ 交给 [Service.hasSalesOnDay](由 `salesReadPath` 判定 cube / local)。
 package service
 
 import (
@@ -39,35 +39,15 @@ import (
 	"github.com/YunBright/supertrade/internal/cubeclient"
 	"github.com/YunBright/supertrade/internal/fresh-meat/model"
 	"github.com/shopspring/decimal"
-	"gorm.io/gorm"
 )
-
-// ForecastBaselineGenerateInput 按某一天生成基线的入参。
-type ForecastBaselineGenerateInput struct {
-	// Date 是"用哪一天的数据"(YYYY-MM-DD);**只用那一天**,不是累计。
-	Date string `json:"date"`
-	// SourceBranchID 是**样本来源门店**;空 = 本店。
-	SourceBranchID string `json:"source_branch_id"`
-	// Overwrite = true ⇒ 新增或覆盖(upsert);false ⇒ 只新增(已有分层不动)。
-	Overwrite bool `json:"overwrite"`
-}
-
-// ForecastBaselineGenerateResult 生成结果。
-type ForecastBaselineGenerateResult struct {
-	// Date 是用的那一天。
-	Date string `json:"date"`
-	// SourceBranchID 是**入参原样回显**(空 = 用本店自己的数据)。
-	SourceBranchID string `json:"source_branch_id"`
-	// Written 是写入了多少行;Skipped 是因为"已有分层"而没动的行数(overwrite=false 时)。
-	Written int `json:"written"`
-	Skipped int `json:"skipped"`
-	// Baselines 是写入的那些行(门店要看"到底生成了什么")。
-	Baselines []model.PigForecastBaseline `json:"baselines"`
-}
 
 // DeleteForecastBaseline 删掉一条基线(不准确/脏的那一行)。
 //
 // ⚠️ **只删本店那一行**:别家店的基线不该被本店删。
+//
+// ⚠️ 2026-10-30:基线是**派生结果** ⇒ 重算会把它算回来 ⇒ 这个动作只适合"临时停用一层",
+//
+//	**不删样本**的话重算即恢复。真正"剔除某层数据"要去**样本库**删样本(见 forecast_samples.go)。
 func (s *Service) DeleteForecastBaseline(ctx context.Context, branchID, weightBand, cutType string) (int, error) {
 	if branchID == "" {
 		return 0, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
@@ -89,152 +69,43 @@ func (s *Service) DeleteForecastBaseline(ctx context.Context, branchID, weightBa
 	return int(res.RowsAffected), nil
 }
 
-// GenerateForecastBaselines 按某一天生成基线(新增或覆盖到**本店**的基线表)。
+// forecastSplitSampleGap 返回"分割样本"缺口的文案(空串 = 不缺)。
 //
-// # 流程
+// # 判据:**两个池都空**才算缺
 //
-//	① 校验那一天的数据**完整**(缺哪一项点哪一项);
-//	② 取那一天的**实录池**(当天进场的猪的 pig_cuts)与**估计池**(pig_cut_estimates 那天的行);
-//	③ 按**既有的选池口径**算 stats(实录 ≥5 用实录,否则估计 ≥5 用估计,否则取多的留痕);
-//	④ 写进 pig_forecast_baselines,带 manual_generated = true 与 generated_from_date。
-func (s *Service) GenerateForecastBaselines(ctx context.Context, branchID string,
-	in ForecastBaselineGenerateInput) (*ForecastBaselineGenerateResult, error) {
-	if branchID == "" {
-		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
+//	实录池(门店手工补录)与估计池(自动倒推摊出来的)任一有样本 ⇒ 都能拟合 ⇒ 不缺。
+//	⚠️ 写成"任一为空"⇒ 有实录的那天会被误报成缺 ⇒ 门店白忙一场。
+//
+// # 为什么单独抽成函数
+//
+//	这条判定在端到端场景里**几乎构造不出来**(引擎很会把销售归到"无名桶"里,
+//	倒推值仍为正 ⇒ 总是有样本)⇒ 端到端用例锁不住它,
+//	而判据本身有个容易写错的地方 ⇒ 抽出来直接锁。
+func forecastSplitSampleGap(recordedN, estimatedN int) string {
+	if recordedN == 0 && estimatedN == 0 {
+		return "分割样本(那天的分割重量算不出来 —— 可手工补录那天的分割)"
 	}
-	dayKey := strings.TrimSpace(in.Date)
-	if dayKey == "" {
-		return nil, fmt.Errorf("%w: date 必填(用哪一天的数据生成基线)", ErrInvalidInput)
-	}
-	loc := s.bizTZOrUTC()
-	day, err := time.ParseInLocation("2006-01-02", dayKey, loc)
-	if err != nil {
-		return nil, fmt.Errorf("%w: date 必须是 YYYY-MM-DD(收到 %q)", ErrInvalidInput, in.Date)
-	}
-	source := strings.TrimSpace(in.SourceBranchID)
-	if source == "" {
-		source = branchID
-	}
+	return ""
+}
 
-	// ---- ① 样本(实录池 + 估计池) ----
-	//
-	// ⚠️ **先取样本,再校验**:完整性校验的第 ⑤ 项(分割样本)必须用
-	//   **实际会用来拟合的那一批样本**判定
-	//   ⇒ 否则会出现"校验说有样本、生成却一条都没写出来"的空成功。
-	recorded, err := s.loadRecordedSamplesForDay(ctx, source, day)
-	if err != nil {
-		return nil, err
+// countForecastSamples 数一个样本池里**样本条数**(不是分桶数)。
+func countForecastSamples(m map[forecastBucketKey][]decimal.Decimal) int {
+	n := 0
+	for _, list := range m {
+		n += len(list)
 	}
-	estimated, err := s.loadEstimatedSamplesForDay(ctx, source, day)
-	if err != nil {
-		return nil, err
-	}
-
-	// ---- ② 完整性校验 ----
-	gaps, err := s.dayDataGaps(ctx, source, day, recorded, estimated)
-	if err != nil {
-		return nil, err
-	}
-	if len(gaps) > 0 {
-		return nil, fmt.Errorf("%w: %s 这一天数据不完整,缺:%s —— 补齐后才能生成基线",
-			ErrInvalidInput, dayKey, strings.Join(gaps, "、"))
-	}
-
-	// ---- ③ 选池 + 写库 ----
-	keys := forecastBucketKeys(recorded, estimated)
-	if len(keys) == 0 {
-		return &ForecastBaselineGenerateResult{
-			Date:           dayKey,
-			SourceBranchID: in.SourceBranchID,
-			Written:        0,
-			Skipped:        0,
-			Baselines:      []model.PigForecastBaseline{},
-		}, nil
-	}
-
-	now := s.now()
-	out := &ForecastBaselineGenerateResult{
-		Date:           dayKey,
-		SourceBranchID: in.SourceBranchID,
-		Baselines:      []model.PigForecastBaseline{},
-	}
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		existing, err := loadBaselineRows(ctx, tx, branchID)
-		if err != nil {
-			return err
-		}
-		for _, k := range keys {
-			recList := recorded[k]
-			estList := estimated[k]
-			recN, estN := len(recList), len(estList)
-
-			// 选池口径与自动重算**完全一致**(同一套口径,不然手动生成的数会跟自动的对不上)。
-			var useList []decimal.Decimal
-			source2 := SampleSourceRecorded
-			switch {
-			case recN >= MinForecastSamples:
-				useList, source2 = recList, SampleSourceRecorded
-			case estN >= MinForecastSamples:
-				useList, source2 = estList, SampleSourceEstimated
-			default:
-				if estN > recN {
-					useList, source2 = estList, SampleSourceEstimated
-				} else {
-					useList, source2 = recList, SampleSourceRecorded
-				}
-			}
-			if len(useList) == 0 {
-				continue
-			}
-			// overwrite=false ⇒ 已有分层**不动**(报 skipped)。
-			if !in.Overwrite {
-				if _, ok := existing[k]; ok {
-					out.Skipped++
-					continue
-				}
-			}
-			mean, p10, p50, p90 := statsOf(useList)
-			row := model.PigForecastBaseline{
-				ID:                   forecastBaselineID(branchID, k.band, k.cut),
-				BranchID:             branchID,
-				WeightBand:           k.band,
-				CutType:              k.cut,
-				SampleCount:          len(useList),
-				RecordedSampleCount:  recN,
-				EstimatedSampleCount: estN,
-				SampleSource:         source2,
-				// 手动跨店选用时 = 被借方;用本店数据时 = 本店。
-				SourceBranchID:    source,
-				ManualGenerated:   true,
-				GeneratedFromDate: dayKey,
-				MeanKg:            mean,
-				P10Kg:             p10,
-				P50Kg:             p50,
-				P90Kg:             p90,
-				ComputedAt:        now,
-			}
-			if err := s.upsertForecastBaseline(ctx, tx, row, existing); err != nil {
-				return err
-			}
-			out.Written++
-			out.Baselines = append(out.Baselines, row)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
+	return n
 }
 
 // dayDataGaps 返回那一天**缺**的项目(空 = 数据完整)。
 //
 // ⚠️ 报给门店的文案要**点名缺哪一项** —— "数据不完整"门店没法行动。
 //
-// recorded / estimated 是**实际会用来拟合的那一批样本**
-// ⇒ 第 ⑤ 项的判据与生成口径**完全一致**(不会"校验说有、生成却 0 行")。
-func (s *Service) dayDataGaps(ctx context.Context, branchID string, day time.Time,
-	recorded, estimated map[forecastBucketKey][]decimal.Decimal) ([]string, error) {
+// ⚠️ 这里只管**四项业务动作**(录入/搬台/销售/盘点);
+//
+//	第 ⑤ 项(分割样本)在 CollectForecastSamples 里判 ——
+//	因为它要先**自动补齐**估计样本(分割本来就是自动倒推的),补完才知道到底有没有。
+func (s *Service) dayDataGaps(ctx context.Context, branchID string, day time.Time) ([]string, error) {
 	var gaps []string
 	start, end := s.businessDayBounds(day)
 	dayKey := day.In(s.bizTZOrUTC()).Format("2006-01-02")
@@ -288,24 +159,6 @@ func (s *Service) dayDataGaps(ctx context.Context, branchID string, day time.Tim
 	}
 	if stCnt == 0 {
 		gaps = append(gaps, "盘点(当天没有完整盘点单)")
-	}
-
-	// ⑤ 分割补录:那天得有**可拟合的分割重量**(实录 或 估计)。
-	//
-	// ⚠️ 为什么这一项也算"完整性"(2026-10-30 门店实测):
-	//
-	//	没有分割重量 ⇒ 生成结果是 **written=0**
-	//	⇒ 门店点「生成」只看到"已生成 0 条基线" ⇒ 以为按钮坏了,却不知道要做什么。
-	//	⇒ 宁可 400 点名"缺:分割补录",也不要给一个**空的成功**。
-	//
-	//	判据:实录 ∪ 估计 **都**空才算缺
-	//	⇒ 有估计样本(A 方案:盘点后自动倒推出的分割重量)的日子照样能生成
-	//	  —— 那正是 A 方案存在的意义。
-	//
-	//	⚠️ **没进猪的那天不报这一项**:没猪 ⇒ 天然没有分割样本
-	//	⇒ 那是"缺录入"的后果,不是另一个独立缺口(别让门店补两遍)。
-	if pigCnt > 0 && len(recorded) == 0 && len(estimated) == 0 {
-		gaps = append(gaps, "分割补录(那天没有可用于拟合的分割重量,请补录那天的分割)")
 	}
 	return gaps, nil
 }
@@ -438,6 +291,18 @@ func (s *Service) loadRecordedSamplesForDay(ctx context.Context, branchID string
 }
 
 // loadEstimatedSamplesForDay 取某店**那一天**的估计样本(pig_cut_estimates 里那天的行)。
+//
+// # ⚠️ 这里**包含墓碑行**(已删除的样本)
+//
+//	这个判据回答的是「那天的分割重量**算不出来**吗」
+//	⇒ 墓碑行的重量**确实算过、也确实存着**(只是门店把它从样本库里剔除了)
+//	⇒ 算得出来 ⇒ 不该报「缺:分割样本」。
+//
+//	⚠️ 反过来(把墓碑行排除掉)会踩一个**错引导**：
+//	门店刚删掉那天的样本 ⇒ 再点「加入样本」⇒ 报「分割重量算不出来」
+//	⇒ 门店会以为要去手工补录分割 ⇒ 而真相是"你自己删的呀"。
+//
+//	拟合路径另走 [Service.loadEstimatedForecastRows] ⇒ 那里**排除**墓碑行。
 func (s *Service) loadEstimatedSamplesForDay(ctx context.Context, branchID string, day time.Time) (
 	map[forecastBucketKey][]decimal.Decimal, error) {
 	out := map[forecastBucketKey][]decimal.Decimal{}

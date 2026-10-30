@@ -58,6 +58,19 @@ func PigCutEstimateID(branchID, pigID string, cut model.CutType) string {
 	return surrogateID("PCE", branchID, pigID, string(cut))
 }
 
+// forecastRebuildStats 重建估计样本的结果。
+type forecastRebuildStats struct {
+	// Written 是**写入/覆盖**的样本条数。
+	Written int
+	// SkippedExcluded 是**因已被删除（墓碑）而跳过**的条数。
+	//
+	// ⚠️ 墓碑行**不复活**：门店明确删掉的样本，重建时必须原样保留"已删除"状态
+	//   （否则"删除"这个动作会被引擎悄悄撤销 ⇒ 用户以为删了，其实没删）。
+	SkippedExcluded int
+	// PigCount 是当天进场的猪数。
+	PigCount int
+}
+
 // rebuildEstimatedSplitSamples 用当天**已经算好**的成本行,重建那天的估计样本。
 //
 // # 为什么复用现成的 rows(而不是自己再跑一遍引擎)
@@ -69,10 +82,13 @@ func PigCutEstimateID(branchID, pigID string, cut model.CutType) string {
 //
 //	同一天重复调用 ⇒ 同 (店, 猪, 部位) 覆盖 ⇒ 结果不变。
 //	⚠️ 还要**删掉不再产出的旧行**（例如某部位今天补了实录 ⇒ 不再是 derived ⇒ 它的估计样本要消失）。
+//
+// # ⚠️ 墓碑行既不复活、也不被删掉（2026-10-30 owner:删除 = 打墓碑）
 func (s *Service) rebuildEstimatedSplitSamples(ctx context.Context, branchID string, day time.Time,
-	rows []CutDailyCost) (int, error) {
+	rows []CutDailyCost) (forecastRebuildStats, error) {
+	stats := forecastRebuildStats{}
 	if branchID == "" {
-		return 0, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
+		return stats, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
 	}
 	start, end := s.businessDayBounds(day)
 
@@ -81,8 +97,9 @@ func (s *Service) rebuildEstimatedSplitSamples(ctx context.Context, branchID str
 	if err := s.db.WithContext(ctx).
 		Where("branch_id = ? AND arrived_at >= ? AND arrived_at < ?", branchID, start, end).
 		Find(&pigs).Error; err != nil {
-		return 0, fmt.Errorf("query whole_pigs(estimates): %w", err)
+		return stats, fmt.Errorf("query whole_pigs(estimates): %w", err)
 	}
+	stats.PigCount = len(pigs)
 
 	// ② 从成本行里挑出"可信的倒推值"。
 	//
@@ -106,10 +123,15 @@ func (s *Service) rebuildEstimatedSplitSamples(ctx context.Context, branchID str
 		derived[r.CutType] = *r.ActualSplitKg
 	}
 
+	// ②' 已删除（墓碑）的样本 ⇒ 重建时**跳过**（不复活）。
+	excluded, err := s.excludedForecastSampleKeys(ctx, branchID, day)
+	if err != nil {
+		return stats, err
+	}
+
 	// ③ 写样本 + 清掉不再产出的旧行。
-	written := 0
 	keepIDs := map[string]bool{}
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if len(pigs) > 0 && len(derived) > 0 {
 			for _, cut := range sortedCutTypes(derived) {
 				shares := allocateByGrossWeight(derived[cut], pigs)
@@ -129,6 +151,12 @@ func (s *Service) rebuildEstimatedSplitSamples(ctx context.Context, branchID str
 						CreatedAt:  s.now(),
 						UpdatedAt:  s.now(),
 					}
+					// ⚠️ **墓碑行不复活**：门店删掉的样本，重建时原样保留"已删除"。
+					if excluded[forecastSampleKey{PigID: p.ID, Cut: cut}] {
+						stats.SkippedExcluded++
+						keepIDs[rec.ID] = true // 墓碑行**不能被 stale 清理删掉**
+						continue
+					}
 					if err := tx.Clauses(clause.OnConflict{
 						Columns: []clause.Column{{Name: "id"}},
 						DoUpdates: clause.Assignments(map[string]any{
@@ -142,24 +170,52 @@ func (s *Service) rebuildEstimatedSplitSamples(ctx context.Context, branchID str
 						return fmt.Errorf("upsert pig_cut_estimate: %w", err)
 					}
 					keepIDs[rec.ID] = true
-					written++
+					stats.Written++
 				}
 			}
 		}
 		// ⚠️ 幂等的关键:那天的旧行(不再产出的部位 / 猪)要**清掉**。
 		//   不清 ⇒ 补了实录的部位会同时留着一份旧估计 ⇒ 两个池子重复计样本。
+		//
+		//   ⚠️ 但**墓碑行不能删**：删了墓碑 ⇒ 下次重建会把它写回来（复活）。
 		return s.deleteStaleEstimates(ctx, tx, branchID, day, keepIDs)
 	})
 	if err != nil {
-		return 0, err
+		return stats, err
 	}
-	return written, nil
+	return stats, nil
+}
+
+// excludedForecastSampleKeys 读某店那一天**已删除（墓碑）**的样本键。
+func (s *Service) excludedForecastSampleKeys(ctx context.Context, branchID string, day time.Time) (
+	map[forecastSampleKey]bool, error) {
+	out := map[forecastSampleKey]bool{}
+	start, end, err := forecastSampleDateRange(day.In(s.bizTZOrUTC()).Format("2006-01-02"))
+	if err != nil {
+		return nil, err
+	}
+	var rows []model.PigCutEstimate
+	if err := s.db.WithContext(ctx).
+		Where("branch_id = ? AND excluded_at IS NOT NULL AND biz_date >= ? AND biz_date < ?",
+			branchID, start, end).
+		Find(&rows).Error; err != nil {
+		return nil, fmt.Errorf("query pig_cut_estimates(excluded): %w", err)
+	}
+	for _, r := range rows {
+		out[forecastSampleKey{PigID: r.PigID, Cut: r.CutType}] = true
+	}
+	return out, nil
 }
 
 // deleteStaleEstimates 删掉那天**不在 keepIDs 里**的估计样本行。
+//
+// ⚠️ **墓碑行不删**（excluded_at IS NULL）：墓碑是"已删除"的留痕
+//
+//	删掉墓碑 ⇒ 下次重建会把这条样本**写回来** ⇒ 门店的"删除"被引擎悄悄撤销。
 func (s *Service) deleteStaleEstimates(ctx context.Context, tx *gorm.DB, branchID string, day time.Time,
 	keepIDs map[string]bool) error {
-	q := tx.WithContext(ctx).Where("branch_id = ? AND biz_date = ?", branchID, datatypesDate(day.In(s.bizTZOrUTC())))
+	q := tx.WithContext(ctx).Where("branch_id = ? AND excluded_at IS NULL AND "+s.fmDateColEqExpr("biz_date"),
+		branchID, day.In(s.bizTZOrUTC()).Format("2006-01-02"))
 	if len(keepIDs) > 0 {
 		ids := make([]string, 0, len(keepIDs))
 		for id := range keepIDs {
@@ -177,9 +233,24 @@ func (s *Service) deleteStaleEstimates(ctx context.Context, tx *gorm.DB, branchI
 //
 // ⚠️ 代价:跑一次引擎要读 cube 的销售 ⇒ 不便宜 ⇒ 只在**重算基线**时按需调用。
 func (s *Service) RebuildEstimatedSplitSamples(ctx context.Context, branchID string, day time.Time) (int, error) {
-	rows, _, _, _, err := s.computeCutDailyCosts(ctx, branchID, day)
+	stats, err := s.rebuildForecastDaySamples(ctx, branchID, day)
 	if err != nil {
 		return 0, err
+	}
+	return stats.Written, nil
+}
+
+// rebuildForecastDaySamples 跑某天的引擎 ⇒ 重建那天的估计样本（带明细）。
+//
+// # 为什么单独一层
+//
+//	「按一天加入样本」需要知道**写了几条 / 跳过了几条（墓碑）**，
+//	而 [RebuildEstimatedSplitSamples] 只回一个条数 ⇒ 这里多跑一层拿明细。
+func (s *Service) rebuildForecastDaySamples(ctx context.Context, branchID string,
+	day time.Time) (forecastRebuildStats, error) {
+	rows, _, _, _, err := s.computeCutDailyCosts(ctx, branchID, day)
+	if err != nil {
+		return forecastRebuildStats{}, err
 	}
 	return s.rebuildEstimatedSplitSamples(ctx, branchID, day, rows)
 }

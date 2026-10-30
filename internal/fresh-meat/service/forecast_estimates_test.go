@@ -272,19 +272,25 @@ func TestForecastEstimates_DoesNotTouchPigCuts(t *testing.T) {
 	}
 }
 
-// ---- ⑤ 基线口径:实录优先 / 估计兜底 ----
+// ---- ⑤ 基线口径:**合并观察**(实录 ∪ 估计) ----
 
-// TestForecastBaselines_RecordedWinsOverEstimated 锁「实录样本够 ⇒ 用实录」。
+// TestForecastBaselines_MergedSources 锁「合并观察 + 留痕」。
 //
-// 同一个分层(200-249 × belly)里**两个池子的样本都够(各 5 条)**:
+// # 2026-10-30 owner 重新定义模型后的口径
 //
-//   - 实录 5 条(前一天 5 头猪各自补录 belly 10kg);
-//   - 估计 5 条(当天 5 头猪**不**补录 ⇒ 倒推摊出来的)。
+//	同一个分层(200-249 × belly)里两个池子都有样本:
 //
-// ⇒ 基线必须取**实录**的 p50 = 10(不是估计的 p50)。
+//	  - 实录 5 条(前一天 5 头猪各自补录 belly 10kg);
+//	  - 估计 5 条(当天 5 头猪**不**补录 ⇒ 倒推摊出来的)。
 //
-// ⚠️ 两个池子都必须 ≥ MinForecastSamples ⇒ 才可以真正区分"谁优先"。
-func TestForecastBaselines_RecordedWinsOverEstimated(t *testing.T) {
+//	⇒ **合并**成 10 条样本(不是"实录够就用实录"那种二选一)
+//	⇒ `sample_source` = **mixed**(两个池子都有贡献)
+//	⇒ `recorded_sample_count` / `estimated_sample_count` 各自留痕。
+//
+// ⚠️ 为什么不能"二选一":owner 的模型是**样本库**——
+//
+//	实录与估计是**同一件事的两种观察**(同一头猪同一部位)⇒ 混算 = 重复计样本。
+func TestForecastBaselines_MergedSources(t *testing.T) {
 	svc, ctx, sku := splitSetup(t)
 	prevDay := splitDay.AddDate(0, 0, -1)
 
@@ -318,17 +324,22 @@ func TestForecastBaselines_RecordedWinsOverEstimated(t *testing.T) {
 	if !ok {
 		t.Fatalf("应有 200-249 段的 belly 基线")
 	}
-	if row.SampleSource != service.SampleSourceRecorded {
-		t.Errorf("★ 实录样本够(≥5)⇒ 基线应取实录池, got sample_source=%q", row.SampleSource)
+	if row.SampleSource != service.SampleSourceMixed {
+		t.Errorf("★ 两个池子都有贡献 ⇒ sample_source 应是 mixed, got %q", row.SampleSource)
 	}
-	if !row.P50Kg.Equal(d("10")) {
-		t.Errorf("★ p50 应是实录的 10, got %s", row.P50Kg)
+	if row.SampleCount != 10 {
+		t.Errorf("★ 合并后样本数应是 10(实录 5 + 估计 5), got %d", row.SampleCount)
 	}
 	if row.RecordedSampleCount != 5 {
 		t.Errorf("★ recorded_sample_count 应是 5, got %d", row.RecordedSampleCount)
 	}
 	if row.EstimatedSampleCount != 5 {
 		t.Errorf("★ estimated_sample_count 应是 5(留痕), got %d", row.EstimatedSampleCount)
+	}
+	// ⚠️ 均值必须**同时**受两个池子影响(不能只算一个池子)。
+	onlyRecorded := row.MeanKg.Mul(decimal.NewFromInt(10))
+	if row.MeanKg.Equal(onlyRecorded) {
+		t.Errorf("★ 均值应把两个池子都合进来(只算实录会得到 10), got %s", row.MeanKg)
 	}
 }
 

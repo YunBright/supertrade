@@ -1226,9 +1226,25 @@ type PigCutEstimate struct {
 	// BizDate 是这条估计所属的**营业日**(倒推那天)。
 	BizDate datatypes.Date `gorm:"column:biz_date;not null;index" json:"biz_date"`
 	// Source 是估计来源(目前只有 stocktake_derived = 由日终倒推摊出来的)。
-	Source    string    `gorm:"column:source;type:varchar(32);not null;default:'stocktake_derived'" json:"source"`
-	CreatedAt time.Time `gorm:"column:created_at;not null" json:"created_at"`
-	UpdatedAt time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
+	Source string `gorm:"column:source;type:varchar(32);not null;default:'stocktake_derived'" json:"source"`
+	// ExcludedAt 是**墓碑时间**(2026-10-30 owner 拍板:删除 = 打墓碑,不是物理删)。
+	//
+	// # ⚠️ 为什么必须打墓碑
+	//
+	//	引擎重跑那天的成本链会把样本**重新写回来**
+	//	⇒ 物理删掉的样本会在下一次重建时**复活** ⇒ "删除"等于没删。
+	//
+	// ⇒ 非空 = 这条样本已被人工从样本库剔除:
+	//	  ① **不参与拟合**(读样本时过滤);
+	//	  ② **不被重建覆盖**(重建那天的样本时跳过它,也不清墓碑);
+	//	  ③ 可以**恢复**(见 service 的 restore 端点)。
+	//
+	// ⚠️ 可空列 ⇒ 老行不受影响(AutoMigrate 直接加列)。
+	ExcludedAt *time.Time `gorm:"column:excluded_at" json:"excluded_at,omitempty"`
+	// ExcludedReason 是删除原因留痕(目前只有 manual = 人工在样本库里删的)。
+	ExcludedReason string    `gorm:"column:excluded_reason;type:varchar(32);not null;default:''" json:"excluded_reason,omitempty"`
+	CreatedAt      time.Time `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt      time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
 }
 
 // TableName 显式表名。

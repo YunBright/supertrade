@@ -1,6 +1,6 @@
 package service_test
 
-// 2026-10-30:基线生成的**完整性校验**必须跟毛利看板走**同一条销售读路径**。
+// 2026-10-30:「加入样本」的**完整性校验**必须跟毛利看板走**同一条销售读路径**。
 //
 // # 门店实测的 bug(2026-10-30)
 //
@@ -28,6 +28,9 @@ package service_test
 //	④ 统收(本地表)**所有店都算**销售
 //	⑤ cube 读失败 ⇒ **上抛**(503),不回落成"这天没卖"
 //	⑥ 无源门店:本地零售算销售(别把老路改坏)
+//
+// ⚠️ 2026-10-30 owner 重新定义模型后,「按一天生成基线」已换成「按一天**加入样本**」
+// ⇒ 本文件跟着改成走 [service.Service.CollectForecastSamples]。
 
 import (
 	"context"
@@ -45,7 +48,7 @@ import (
 	"gorm.io/datatypes"
 )
 
-// fmGenSetupSourced 起一个"有源门店"的基线生成环境(cube 里有销售)。
+// fmGenSetupSourced 起一个"有源门店"的加入样本环境(cube 里有销售)。
 //
 // ⚠️ 与 fmSetupSales 的区别:那边固定用 fmDay2(10-02),这边用 fmGenDate(10-29)
 //
@@ -81,7 +84,7 @@ func fmGenSetupSourced(t *testing.T, cubeRows []map[string]any) (*service.Servic
 
 // fmGenSeedDayExceptSales 铺"录入 + 搬台 + 完整盘点"三项(**销售留给 cube**)。
 //
-// 返回猪 ID(用来补一条分割实录 ⇒ 生成时才有样本)。
+// 返回猪 ID(用来补一条分割实录 ⇒ 那一天有样本)。
 func fmGenSeedDayExceptSales(t *testing.T, svc *service.Service, ctx context.Context, sku string) string {
 	t.Helper()
 	pigID := estPig(t, svc, ctx, "S001", "EB-GEN-SRC", "200", splitDay)
@@ -97,42 +100,41 @@ func fmGenSeedDayExceptSales(t *testing.T, svc *service.Service, ctx context.Con
 
 // ---- ① ★ 核心回归:有源门店的销售在 cube 里 ⇒ 不该报「缺:销售」 ----
 
-// TestGenerateBaselines_SourcedBranch_CubeSalesCountsAsComplete 锁①。
+// TestCollectSamples_SourcedBranch_CubeSalesCountsAsComplete 锁①。
 //
 // # 判别力自检
 //
 //	把 hasSalesOnDay 退回"只查本地 line_sales_by_pigs"⇒ 本用例立刻红
 //	(本地表是空的 ⇒ 会报「缺:销售」)⇒ 这正是门店 2026-10-30 遇到的那个形状。
-func TestGenerateBaselines_SourcedBranch_CubeSalesCountsAsComplete(t *testing.T) {
+func TestCollectSamples_SourcedBranch_CubeSalesCountsAsComplete(t *testing.T) {
 	svc, ctx, sku := fmGenSetupSourced(t, []map[string]any{
 		fmCubeSalesRow("P-BELLY", "8", "160"),
 	})
 	pigID := fmGenSeedDayExceptSales(t, svc, ctx, sku)
 	estPigCut(t, svc, ctx, "S001", pigID, sku, "B-GEN-SRC", "30")
 
-	out, err := svc.GenerateForecastBaselines(ctx, "S001", service.ForecastBaselineGenerateInput{
-		Date: fmGenDate, Overwrite: true,
-	})
+	out, err := svc.CollectForecastSamples(ctx, "S001", service.ForecastSampleCollectInput{Date: fmGenDate})
 	mustNoErr(t, err, "★ 有源门店的销售在 cube 里 ⇒ 不该报「缺:销售」")
-	if out.Written != 1 {
-		t.Fatalf("★ 应写出 1 行基线,got %d: %+v", out.Written, out)
+	if out == nil {
+		t.Fatalf("★ 该返回结果而不是 nil")
+	}
+	if out.Date != fmGenDate {
+		t.Errorf("★ 返回的 date 应是 %s,got %s", fmGenDate, out.Date)
 	}
 }
 
 // ---- ② cube 里没销售 ⇒ 仍要报缺销售 ----
 
-// TestGenerateBaselines_SourcedBranch_NoSales_StillReportsGap 锁②。
+// TestCollectSamples_SourcedBranch_NoSales_StillReportsGap 锁②。
 //
 // ⚠️ 判据不能退化成"查过 cube 就算有销售"
 //
-//	⇒ 否则**任何一天**都能生成基线 ⇒ 基线就成了纯手输,失去"数据完整"的意义。
-func TestGenerateBaselines_SourcedBranch_NoSales_StillReportsGap(t *testing.T) {
+//	⇒ 否则**任何一天**都能加入样本 ⇒ 样本就成了纯手输,失去"数据完整"的意义。
+func TestCollectSamples_SourcedBranch_NoSales_StillReportsGap(t *testing.T) {
 	svc, ctx, sku := fmGenSetupSourced(t, nil) // cube 当天 0 行
 	fmGenSeedDayExceptSales(t, svc, ctx, sku)
 
-	_, err := svc.GenerateForecastBaselines(ctx, "S001", service.ForecastBaselineGenerateInput{
-		Date: fmGenDate, Overwrite: true,
-	})
+	_, err := svc.CollectForecastSamples(ctx, "S001", service.ForecastSampleCollectInput{Date: fmGenDate})
 	if err == nil {
 		t.Fatalf("★ cube 当天没销售 ⇒ 该报缺销售")
 	}
@@ -146,13 +148,13 @@ func TestGenerateBaselines_SourcedBranch_NoSales_StillReportsGap(t *testing.T) {
 
 // ---- ③ 有源门店不读本地零售事件 ----
 
-// TestGenerateBaselines_SourcedBranch_IgnoresLocalSaleEvents 锁③。
+// TestCollectSamples_SourcedBranch_IgnoresLocalSaleEvents 锁③。
 //
 // ⚠️ 本地 `line_sales_by_pigs` 只装**无源门店**(本地 POS)的事件。
 //
 //	有源门店若把它也算进去 ⇒ 别的店卖出去的东西会被算成本店"有销售"
 //	⇒ 门槛失效(看板那边已经锁过同一条,见 TestGrossMargin_SourcedBranchIgnoresLocalSales)。
-func TestGenerateBaselines_SourcedBranch_IgnoresLocalSaleEvents(t *testing.T) {
+func TestCollectSamples_SourcedBranch_IgnoresLocalSaleEvents(t *testing.T) {
 	svc, ctx, sku := fmGenSetupSourced(t, nil) // cube 当天 0 行
 	fmGenSeedDayExceptSales(t, svc, ctx, sku)
 
@@ -165,9 +167,7 @@ func TestGenerateBaselines_SourcedBranch_IgnoresLocalSaleEvents(t *testing.T) {
 		CreatedAt: time.Now(),
 	}).Error, "插本地零售行")
 
-	_, err := svc.GenerateForecastBaselines(ctx, "S001", service.ForecastBaselineGenerateInput{
-		Date: fmGenDate, Overwrite: true,
-	})
+	_, err := svc.CollectForecastSamples(ctx, "S001", service.ForecastSampleCollectInput{Date: fmGenDate})
 	if err == nil {
 		t.Fatalf("★ 有源门店不该把本地零售事件当成自己的销售")
 	}
@@ -178,13 +178,13 @@ func TestGenerateBaselines_SourcedBranch_IgnoresLocalSaleEvents(t *testing.T) {
 
 // ---- ④ 统收(本地表)所有店都算销售 ----
 
-// TestGenerateBaselines_BulkSettlementCountsAsSales 锁④。
+// TestCollectSamples_BulkSettlementCountsAsSales 锁④。
 //
 // ⚠️ 统收**永远在本地表**(bulk_settlements)——
 //
 //	即使门店有 cube 源,它的统收结算也写在本域。
 //	⇒ 有源门店"零售走 cube + 统收走本地"⇒ 完整性校验也必须两边都认。
-func TestGenerateBaselines_BulkSettlementCountsAsSales(t *testing.T) {
+func TestCollectSamples_BulkSettlementCountsAsSales(t *testing.T) {
 	svc, ctx, sku := fmGenSetupSourced(t, nil) // cube 当天 0 行零售
 	fmGenSeedDayExceptSales(t, svc, ctx, sku)
 
@@ -196,11 +196,8 @@ func TestGenerateBaselines_BulkSettlementCountsAsSales(t *testing.T) {
 		SettledAt: splitDay, OperatorID: "u-1", CreatedAt: splitDay,
 	}).Error, "插统收单")
 
-	out, err := svc.GenerateForecastBaselines(ctx, "S001", service.ForecastBaselineGenerateInput{
-		Date: fmGenDate, Overwrite: true,
-	})
+	out, err := svc.CollectForecastSamples(ctx, "S001", service.ForecastSampleCollectInput{Date: fmGenDate})
 	mustNoErr(t, err, "★ 当天有统收 ⇒ 不该报缺销售")
-	// 没有实录样本 ⇒ 写不出行,但**不该**报缺销售。
 	if out == nil {
 		t.Fatalf("★ 该返回结果而不是 nil")
 	}
@@ -208,14 +205,14 @@ func TestGenerateBaselines_BulkSettlementCountsAsSales(t *testing.T) {
 
 // ---- ⑤ cube 读失败 ⇒ 上抛,不回落成"这天没卖" ----
 
-// TestGenerateBaselines_SourcedBranch_CubeErrorFailsClosed 锁⑤。
+// TestCollectSamples_SourcedBranch_CubeErrorFailsClosed 锁⑤。
 //
 // ⚠️ **不能**把一次链路故障显示成「这家店没卖东西」
 //
 //	⇒ 那正是 2026-10-26 门店看到"毛利看板没有销售"的形状 ⇒ 不能再来一次。
 //
 // ⇒ cube 查询失败 ⇒ 503(ErrCubeUnavailable),**不是** 400「缺:销售」。
-func TestGenerateBaselines_SourcedBranch_CubeErrorFailsClosed(t *testing.T) {
+func TestCollectSamples_SourcedBranch_CubeErrorFailsClosed(t *testing.T) {
 	svc, ctx, sku := fmGenSetupSourced(t, nil)
 	fmGenSeedDayExceptSales(t, svc, ctx, sku)
 
@@ -226,9 +223,7 @@ func TestGenerateBaselines_SourcedBranch_CubeErrorFailsClosed(t *testing.T) {
 		},
 	})
 
-	_, err := svc.GenerateForecastBaselines(ctx, "S001", service.ForecastBaselineGenerateInput{
-		Date: fmGenDate, Overwrite: true,
-	})
+	_, err := svc.CollectForecastSamples(ctx, "S001", service.ForecastSampleCollectInput{Date: fmGenDate})
 	if err == nil {
 		t.Fatalf("★ cube 查询失败不该静默出结果")
 	}
@@ -245,19 +240,17 @@ func TestGenerateBaselines_SourcedBranch_CubeErrorFailsClosed(t *testing.T) {
 
 // ---- ⑥ 无源门店:本地零售算销售(别把老路改坏) ----
 
-// TestGenerateBaselines_LocalBranch_LocalSaleCountsAsComplete 锁⑥。
-func TestGenerateBaselines_LocalBranch_LocalSaleCountsAsComplete(t *testing.T) {
+// TestCollectSamples_LocalBranch_LocalSaleCountsAsComplete 锁⑥。
+func TestCollectSamples_LocalBranch_LocalSaleCountsAsComplete(t *testing.T) {
 	svc, ctx, sku := splitSetup(t)
 	pigID := fmGenSeedDayExceptSales(t, svc, ctx, sku)
 	estPigCut(t, svc, ctx, "S001", pigID, sku, "B-GEN-LOCAL", "30")
 	// 本地零售。
 	splitSell(t, svc, sku, "L-GEN-LOCAL", "10", "200")
 
-	out, err := svc.GenerateForecastBaselines(ctx, "S001", service.ForecastBaselineGenerateInput{
-		Date: fmGenDate, Overwrite: true,
-	})
+	out, err := svc.CollectForecastSamples(ctx, "S001", service.ForecastSampleCollectInput{Date: fmGenDate})
 	mustNoErr(t, err, "★ 无源门店的本地零售算销售")
-	if out.Written != 1 {
-		t.Fatalf("★ 应写出 1 行基线,got %d: %+v", out.Written, out)
+	if out == nil {
+		t.Fatalf("★ 该返回结果而不是 nil")
 	}
 }
