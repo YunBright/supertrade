@@ -705,6 +705,29 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 		}
 	}
 
+	// 盘损(2026-10-31 用户口径):同一窗口内的报损/库存调整减少量。
+	//
+	// 借用销量窗口的**同一分组**(窗口起点 = 该商品最后一次采购入库日)——
+	// 盘损只有落在"这批货进店之后"才解释得了这批货的去向。
+	//
+	// ⚠️ 读不到盘损**不失败**(只记日志继续):盘损是"解释偏离"的证据,
+	//   没有证据 ⇒ 保持原来的 block。方向是**更严**,而不是把审批卡成 failed。
+	// ⚠️ 有源门店走 cube、无源门店查本域 PG —— 分流在 LossService 里(见 loss.go)。
+	lossByProduct := make(map[string]decimal.Decimal)
+	if s.loss != nil {
+		for _, g := range groups {
+			losses, err := s.loss.SumLossByProduct(ctx, ap.BranchID, g.Products, g.From, toDate)
+			if err != nil {
+				s.logger.Warn("settlement-auditor: 取盘损失败,数量信号按无盘损判定",
+					"approval_id", ap.ID, "from", g.From, "err", err)
+				break
+			}
+			for pid, q := range losses {
+				lossByProduct[pid] = lossByProduct[pid].Add(q)
+			}
+		}
+	}
+
 	// 商品名(信号里要写「<名称>-<货号>」);查不到只回退成纯货号。
 	names, err := s.cube.ListProductNames(ctx, ap.BranchID, products)
 	if err != nil {
@@ -714,7 +737,7 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 	}
 
 	before := len(*signals)
-	*signals = append(*signals, checkQuantity(received, salesByProduct, s.cfg.QtyDeviationFactor, QuantityContext{
+	*signals = append(*signals, checkQuantity(received, salesByProduct, lossByProduct, s.cfg.QtyDeviationFactor, QuantityContext{
 		Names:      names,
 		WindowFrom: windowFromByProduct(groups),
 	})...)

@@ -294,19 +294,28 @@ type QuantityContext struct {
 	WindowFrom map[string]string
 }
 
-// checkQuantity 对每个进货商品比较窗口采购量与窗口销量:
+// checkQuantity 对每个进货商品比较窗口采购量与窗口**消耗量**:
 //
-//   - 窗口销量 == 0 且进货 > 0 → block(purchase_without_sales);
-//   - 进货 > 销量 × factor×2   → block(qty_deviation);
-//   - 进货 > 销量 × factor     → warn(qty_deviation)。
+//   - 消耗量 = 窗口销量 + 窗口盘损(报损/库存调整减少,见 aggregateLoss);
+//   - 消耗量 == 0 且进货 > 0 → block(purchase_without_sales);
+//   - 进货 > 消耗量 × factor×2 → block(qty_deviation);
+//   - 进货 > 消耗量 × factor   → warn(qty_deviation);
+//   - 原本(不扣盘损)会 block、扣掉盘损后不再 block → 降级 warn
+//     (用户 2026-10-31 口径:有盘损单解释去向,就不再阻断付款审批)。
+//
+// # 为什么盘损要并进"销量"
+//
+// 进货 10、窗口只卖 0.9,看起来"买了 10 倍卖不动";但门店同期报损 8.4,
+// 货其实有去向(破损/过期/被偷)。只拿销量做分母会把这类正常损耗当成虚进。
+// ⇒ 分母改成 销量 + 盘损。**证据必须真实存在且已审核**才计入(见 SumLossByProduct)。
+//
+// ⚠️ **消息只陈述事实**(哪个商品、进了多少、卖了多少、盘损多少),不做动机推断 ——
+// 这些文字是给**发起人**看的,推断性措辞("虚进""套取付款""风险")会让人不适,
+// 而且判断本来就不该由机器下(见 llm.go 的措辞约束)。
 //
 // received 只统计 PI(进货);RO(退货)按负量冲减由 caller 聚合时处理
 // (退货量大是另一类信号,本期不做)。
-//
-// ⚠️ **消息只陈述事实**(哪个商品、进了多少、从哪天起没卖),不做动机推断 ——
-// 这些文字是给**发起人**看的,推断性措辞("虚进""套取付款""风险")会让人不适,
-// 而且判断本来就不该由机器下(见 llm.go 的措辞约束)。
-func checkQuantity(receivedByProduct map[string]decimal.Decimal, salesByProduct map[string]SaleRow, factor float64, qc QuantityContext) []signalDraft {
+func checkQuantity(receivedByProduct map[string]decimal.Decimal, salesByProduct map[string]SaleRow, lossByProduct map[string]decimal.Decimal, factor float64, qc QuantityContext) []signalDraft {
 	var out []signalDraft
 	f := decimal.NewFromFloat(factor)
 	f2 := decimal.NewFromFloat(factor * 2)
@@ -318,7 +327,10 @@ func checkQuantity(receivedByProduct map[string]decimal.Decimal, salesByProduct 
 		from := qc.WindowFrom[pid]
 		sale := salesByProduct[pid]
 		sold := sale.NetSaleQuantity
-		if !sold.GreaterThan(decimal.Zero) {
+		loss := lossByProduct[pid]
+		covered := sold.Add(loss)
+
+		if !covered.GreaterThan(decimal.Zero) {
 			msg := fmt.Sprintf("商品 %s 自最后一次采购入库日至今无销售记录,本次进货 %s", label, recv.String())
 			if from != "" {
 				msg = fmt.Sprintf("商品 %s 自 %s 采购入库后无销售记录,本次进货 %s", label, from, recv.String())
@@ -328,19 +340,55 @@ func checkQuantity(receivedByProduct map[string]decimal.Decimal, salesByProduct 
 				map[string]any{"product_id": pid, "received": recv.String(), "sold": "0", "window_from": from}))
 			continue
 		}
-		ratio := recv.Div(sold)
+
+		ratio := recv.Div(covered)
+		params := map[string]any{
+			"product_id": pid, "received": recv.String(), "sold": sold.String(),
+			"loss": loss.String(), "covered": covered.String(), "ratio": ratio.String(),
+			"window_from": from,
+		}
 		switch {
-		case recv.GreaterThan(sold.Mul(f2)):
+		case recv.GreaterThan(covered.Mul(f2)):
 			out = append(out, newSignal(model.SignalBlock, SigQtyDeviation, "", pid,
-				fmt.Sprintf("商品 %s 本次进货 %s,为 %s 以来销量 %s 的 %s 倍", label, recv.String(), windowText(from), sold.String(), ratio.StringFixed(1)),
-				map[string]any{"product_id": pid, "received": recv.String(), "sold": sold.String(), "ratio": ratio.String(), "window_from": from}))
-		case recv.GreaterThan(sold.Mul(f)):
+				fmt.Sprintf("商品 %s 本次进货 %s,%s,约为其 %s 倍", label, recv.String(),
+					consumptionText(from, sold, loss), ratio.StringFixed(1)),
+				params))
+		case recv.GreaterThan(covered.Mul(f)):
 			out = append(out, newSignal(model.SignalWarn, SigQtyDeviation, "", pid,
-				fmt.Sprintf("商品 %s 本次进货 %s,为 %s 以来销量 %s 的 %s 倍", label, recv.String(), windowText(from), sold.String(), ratio.StringFixed(1)),
-				map[string]any{"product_id": pid, "received": recv.String(), "sold": sold.String(), "ratio": ratio.String(), "window_from": from}))
+				fmt.Sprintf("商品 %s 本次进货 %s,%s,约为其 %s 倍", label, recv.String(),
+					consumptionText(from, sold, loss), ratio.StringFixed(1)),
+				params))
+		case loss.GreaterThan(decimal.Zero) && rawQuantityBlock(recv, sold, f2):
+			// 盘损把原本的 block 消掉了 ⇒ 降级为 warn(不阻断,但留痕)。
+			out = append(out, newSignal(model.SignalWarn, SigQtyDeviation, "", pid,
+				fmt.Sprintf("商品 %s 本次进货 %s,%s,约为其 %s 倍;已核对盘损单,偏离降至可接受范围",
+					label, recv.String(), consumptionText(from, sold, loss), ratio.StringFixed(1)),
+				params))
 		}
 	}
 	return out
+}
+
+// consumptionText 把"窗口消耗量"渲染成一句话里的片段(带盘损时写出合计)。
+//
+// 不带盘损: "<from> 以来销量 10"
+// 带盘损:   "<from> 以来销量 0.91 加盘损 8.43(合计 9.34)"
+func consumptionText(from string, sold, loss decimal.Decimal) string {
+	if loss.GreaterThan(decimal.Zero) {
+		return fmt.Sprintf("%s 以来销量 %s 加盘损 %s(合计 %s)",
+			windowText(from), sold.String(), loss.String(), sold.Add(loss).String())
+	}
+	return fmt.Sprintf("%s 以来销量 %s", windowText(from), sold.String())
+}
+
+// rawQuantityBlock 判断"只看销量(不扣盘损)时是否已经构成 block"。
+//
+// 无销量 → 纯"进货无销售"本身就是 block;否则按 ×factor×2 的阈值判。
+func rawQuantityBlock(recv, sold, f2 decimal.Decimal) bool {
+	if !sold.GreaterThan(decimal.Zero) {
+		return true
+	}
+	return recv.GreaterThan(sold.Mul(f2))
 }
 
 // windowText 把窗口起点渲染成一句话里的片段。

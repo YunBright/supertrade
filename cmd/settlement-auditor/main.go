@@ -182,8 +182,22 @@ func initApp() error {
 	// cube 查询客户端(cube-router live 查询)。
 	cubeCli := cubeclient.NewDaprCubeClient(
 		daprCli, cubeclient.DefaultCubeAppID(), cubeclient.DefaultCubeQueryPath())
-	appSvc.SetCube(service.NewDaprCubeQuerier(cubeCli))
+	cubeQuerier := service.NewDaprCubeQuerier(cubeCli)
+	appSvc.SetCube(cubeQuerier)
 	slog.Info("cube client enabled")
+
+	// 「这个门店配了哪个数据源」解析器(60s 缓存 + stale-on-error)。
+	//
+	// ⚠️ 归档导出与盘损读取**共用同一个解析器**:同一门店的判据必须只有一个,
+	//   两处各建一个只会在运维排查时多出一份"看起来都合理"的答案。
+	srcResolver := cubesource.NewCachedResolver(cubeCli, cubesource.DefaultTTL, slog.Default())
+
+	// 盘损读取(2026-10-31):有源门店走 cube stock_loss,无源门店查本域 PG 的盘亏行。
+	//
+	// ⚠️ 用**同一个** cubeQuerier 与 srcResolver(见 service/loss.go 包注释)。
+	lossSvc := service.NewLossService(srcResolver, cubeQuerier, appDB)
+	appSvc.SetLoss(lossSvc)
+	slog.Info("settlement-auditor: 盘损读取已启用")
 
 	// ---- 归档导出/导入的「这个门店配了哪个数据源」解析器 ----
 	//
@@ -193,7 +207,7 @@ func initApp() error {
 	// ⚠️ 解析器带 60s 缓存 + stale-on-error:每次导出都打一次 dapr 往返不划算,
 	//   而一次网络抖动不该让整个门店的导出挂掉。
 	appArchive = service.NewArchiveService(appDB)
-	appArchive.SetSourceResolver(cubesource.NewCachedResolver(cubeCli, cubesource.DefaultTTL, slog.Default()))
+	appArchive.SetSourceResolver(srcResolver)
 	slog.Info("settlement-auditor: 归档导出/导入已启用", "app_id", cubeclient.DefaultCubeAppID())
 
 	// LLM 研判(同步调 Dapr Conversation API,仿 fresh-meat)。

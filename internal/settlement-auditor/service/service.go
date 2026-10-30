@@ -152,6 +152,10 @@ type Service struct {
 	publisher Publisher       // nil = 禁用 pub/sub(单测)
 	verdictFn VerdictFn       // 默认规则降级;SetVerdictFn 注入 LLM
 	stocktake StocktakeClient // 可 nil(跳过盘点建单)
+	// loss 是盘损读取(数量信号的分母见 checks.go checkQuantity)。
+	//
+	// 可 nil ⇒ 数量信号按"无盘损"判定(更严,不会误放行)。
+	loss LossReader
 	// bankAccount 是按 id 取供应商收款账号的客户端(可 nil ⇒ 不支持选收款账号)。
 	//
 	// ⚠️ 取回的账号信息**只写 approval_payee_accounts**,
@@ -230,6 +234,15 @@ func (s *Service) SetVerdictFn(fn VerdictFn) {
 func (s *Service) SetStocktake(c StocktakeClient) {
 	if c != nil {
 		s.stocktake = c
+	}
+}
+
+// SetLoss 注入盘损读取端(有源门店走 cube / 无源门店查本域 PG,见 loss.go)。
+//
+// ⚠️ 不注入 ⇒ 数量信号按"无盘损"判定:该 block 的仍然 block(更严)。
+func (s *Service) SetLoss(l LossReader) {
+	if l != nil {
+		s.loss = l
 	}
 }
 

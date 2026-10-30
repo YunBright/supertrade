@@ -45,6 +45,14 @@ type CubeQuerier interface {
 	ListSheetLines(ctx context.Context, branchID string, sheetIDs []string) ([]SheetLineRow, error)
 	// SumSalesByProduct 拉商品 [fromDate, toDate) 销售汇总(net 销量/销额)。
 	SumSalesByProduct(ctx context.Context, branchID string, productIDs []string, fromDate, toDate string) ([]SaleRow, error)
+	// SumLossByProduct 拉商品 [fromDate, toDate) 的**库存单据损耗**分组行。
+	//
+	// ⚠️ 返回的是**未开口径的原始分组行**(按商品 + 单据类型 + 方向),
+	//   口径由 aggregateLoss 收敛:JO(报损单)全部算损耗;OO(库存调整单)只算
+	//   direction='-' 的那些('+' 是盘盈/补录,算成损耗会把偏离"解释"掉)。
+	//
+	// 读源按门店数据源分流,见 LossService(有源走本方法,无源查本域 PG)。
+	SumLossByProduct(ctx context.Context, branchID string, productIDs []string, fromDate, toDate string) ([]LossRow, error)
 	// ListProductNames 取商品名(货号 → 名称),给信号/拒绝理由用。
 	ListProductNames(ctx context.Context, branchID string, productIDs []string) (map[string]string, error)
 	// GetStocks 拉商品当前库存。
@@ -113,6 +121,17 @@ type SaleRow struct {
 	ProductID         string
 	NetSaleQuantity   decimal.Decimal
 	NetSaleAmountYuan decimal.Decimal
+}
+
+// LossRow 是库存单据损耗的**分组行**(商品 × 单据类型 × 方向)。
+//
+// Quantity 恒为正(cube 侧取 ABS);方向由 Direction 表达('+' 增加库存 / '-' 减少库存)。
+// 口径收敛见 aggregateLoss。
+type LossRow struct {
+	ProductID    string
+	DocumentType string // JO 报损单 / OO 库存调整单
+	Direction    string // '+' / '-'
+	Quantity     decimal.Decimal
 }
 
 // StockRow 商品库存快照。
@@ -570,6 +589,91 @@ func (q *DaprCubeQuerier) SumSalesByProduct(ctx context.Context, branchID string
 		})
 	}
 	return out, nil
+}
+
+// SumLossByProduct 拉商品 [fromDate, toDate) 的库存单据损耗(JO 报损 / OO 库存调整)。
+//
+// # 查询为什么这样写(性能与正确性都压在这三条上)
+//
+//  1. **从明细侧驱动**:商品货号在明细表 t_im_sheet_detail 上有单列索引
+//     (i_im_sheet_detail_1 item_no) ⇒ `product_id IN (...)` 走索引,
+//     不会全表扫 1 万行明细。
+//  2. **按单据类型/方向/审核状态/日期筛头表**:明细表**没有** trans_no,
+//     这些列全在头表 t_im_sheet_master ⇒ 必须 join stock_loss(回表走主键 sheet_no)。
+//     日期打 created_at(源列 oper_date 有单列索引)。
+//  3. **只要已审核**(approve_status='1'):未审核的报损单还没有生效,
+//     拿它解释偏离等于用一张废单放行。
+//
+// ⚠️ 不按 branch_id 过滤(理由同 settlement:思迅 branch_no 与本系统 branch_id 无关,
+//   门店隔离靠 X-Branch-ID 路由链)。
+//
+// ⚠️ 返回**未开口径**的分组行:JO 全部 / OO 仅 direction='-' 的收敛在 aggregateLoss。
+func (q *DaprCubeQuerier) SumLossByProduct(ctx context.Context, branchID string, productIDs []string, fromDate, toDate string) ([]LossRow, error) {
+	if len(productIDs) == 0 {
+		return nil, nil
+	}
+	vals := make([]any, 0, len(productIDs))
+	for _, id := range productIDs {
+		vals = append(vals, id)
+	}
+	data, err := q.c.LoadCubeQuery(ctxWithBranch(ctx, branchID), "stock_loss_line", cubeclient.CubeQuery{
+		Measures: []string{"stock_loss_line.total_loss_quantity"},
+		Dimensions: []string{
+			"stock_loss_line.product_id",
+			"stock_loss.document_type",
+			"stock_loss.direction",
+		},
+		Filters: []cubeclient.CubeFilter{
+			{Member: "stock_loss_line.product_id", Operator: "in", Values: vals},
+			{Member: "stock_loss.document_type", Operator: "in", Values: []any{"JO", "OO"}},
+			{Member: "stock_loss.approve_status", Operator: "equals", Values: []any{"1"}},
+			{Member: "stock_loss.created_at", Operator: "gte", Values: []any{fromDate}},
+			{Member: "stock_loss.created_at", Operator: "lt", Values: []any{toDate}},
+		},
+		Limit: 5000,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cube stock_loss query: %w", err)
+	}
+	out := make([]LossRow, 0, len(data))
+	for _, r := range data {
+		out = append(out, LossRow{
+			ProductID:    rowStr(r, "stock_loss_line.product_id"),
+			DocumentType: rowStr(r, "stock_loss.document_type"),
+			Direction:    rowStr(r, "stock_loss.direction"),
+			Quantity:     rowDec(r, "stock_loss_line.total_loss_quantity"),
+		})
+	}
+	return out, nil
+}
+
+// aggregateLoss 把 cube 的分组行按**盘损口径**收敛成 商品 → 损耗数量。
+//
+// 口径(2026-10-31 用户拍板,生产库实测支撑):
+//   - JO 报损单:全部计入(实测 ysx 427 张 / hbposv7 315 张,db_no **恒为 '-'**);
+//   - OO 库存调整单:只计 direction='-'(实测 ysx 698 '-' + 471 '+',
+//     hbposv7 178 '-' + 271 '+');'+' 是盘盈/补录,算进损耗反而会把偏离"解释"掉;
+//   - 其它单据类型(KB 扣补 / KO 领用)不计入。
+func aggregateLoss(rows []LossRow) map[string]decimal.Decimal {
+	out := make(map[string]decimal.Decimal)
+	for _, r := range rows {
+		pid := strings.TrimSpace(r.ProductID)
+		if pid == "" || !r.Quantity.GreaterThan(decimal.Zero) {
+			continue
+		}
+		switch strings.TrimSpace(r.DocumentType) {
+		case "JO":
+			// 报损单全部计入(实测方向恒为 '-')。
+		case "OO":
+			if strings.TrimSpace(r.Direction) != "-" {
+				continue
+			}
+		default:
+			continue
+		}
+		out[pid] = out[pid].Add(r.Quantity.Abs())
+	}
+	return out
 }
 
 // GetStocks 拉商品库存快照。

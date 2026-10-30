@@ -95,6 +95,11 @@ func (f *fakeCube) SumSalesByProduct(_ context.Context, _ string, _ []string, _,
 	return []service.SaleRow{{ProductID: "PR1", NetSaleQuantity: decimal.NewFromInt(10)}}, nil
 }
 
+// SumLossByProduct handler 用例不涉及盘损 ⇒ 恒返回空(无盘损证据)。
+func (f *fakeCube) SumLossByProduct(_ context.Context, _ string, _ []string, _, _ string) ([]service.LossRow, error) {
+	return nil, nil
+}
+
 func (f *fakeCube) GetStocks(_ context.Context, _ string, _ []string) ([]service.StockRow, error) {
 	return nil, nil
 }

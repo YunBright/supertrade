@@ -37,6 +37,8 @@ type fakeCube struct {
 	sheets         []PurchaseSheetRow
 	sheetLines     []SheetLineRow
 	sales          []SaleRow
+	losses         []LossRow         // 盘损分组行(默认空 = 无盘损)
+	lossErr        error             // 非 nil ⇒ 盘损查询失败(测降级)
 	productNames   map[string]string // 货号 → 商品名
 }
 
@@ -133,6 +135,37 @@ func (f *fakeCube) SumSalesByProduct(_ context.Context, _ string, productIDs []s
 		}
 	}
 	return out, nil
+}
+
+// SumLossByProduct 返回预置的盘损分组行(默认空 = 无盘损证据)。
+func (f *fakeCube) SumLossByProduct(_ context.Context, _ string, productIDs []string, _, _ string) ([]LossRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lossErr != nil {
+		return nil, f.lossErr
+	}
+	want := make(map[string]bool, len(productIDs))
+	for _, id := range productIDs {
+		want[id] = true
+	}
+	var out []LossRow
+	for _, r := range f.losses {
+		if want[r.ProductID] {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+// fakeLoss 把 fakeCube 的盘损分组行按**口径**收敛后返回(与线上 aggregateLoss 同一函数)。
+type fakeLoss struct{ cube *fakeCube }
+
+func (l *fakeLoss) SumLossByProduct(ctx context.Context, branchID string, productIDs []string, from, to string) (map[string]decimal.Decimal, error) {
+	rows, err := l.cube.SumLossByProduct(ctx, branchID, productIDs, from, to)
+	if err != nil {
+		return nil, err
+	}
+	return aggregateLoss(rows), nil
 }
 
 func (f *fakeCube) GetStocks(_ context.Context, _ string, _ []string) ([]StockRow, error) {
@@ -291,6 +324,7 @@ func newTestService(t *testing.T) (*Service, *gorm.DB, *fakeCube, *fakePublisher
 		WxH5BaseURL:          "https://h5.example.com",
 	})
 	svc.SetCube(cube)
+	svc.SetLoss(&fakeLoss{cube: cube})
 	svc.SetPublisher(pub)
 	svc.SetStocktake(st)
 	svc.SetClock(func() time.Time { return fixedNow })
@@ -590,6 +624,100 @@ func TestRunAudit_ProductionCase_20261022(t *testing.T) {
 	}
 	if !strings.Contains(ap.RejectReason, "02000116") {
 		t.Errorf("拒绝理由应引用数量信号: %q", ap.RejectReason)
+	}
+}
+
+// passAllVerdict 是"规则无 block ⇒ 通过"的最简 LLM 替身。
+func passAllVerdict() VerdictFn {
+	return func(_ context.Context, _ *AuditInput) (*VerdictResult, error) {
+		return &VerdictResult{
+			Conclusion: ConclusionPass,
+			Reason:     "审核通过",
+			Confidence: dec("0.9"),
+			Source:     model.VerdictSourceLLM,
+		}, nil
+	}
+}
+
+// setQuantityCase 灌"进货 10 / 窗口销量 0.91"这一组制造 block 的数据。
+//
+// 不扣盘损时 ratio ≈ 11 ⇒ block;盘损 8.43 后 ratio ≈ 1.07 ⇒ warn。
+func setQuantityCase(cube *fakeCube, losses []LossRow, lossErr error) {
+	cube.mu.Lock()
+	defer cube.mu.Unlock()
+	cube.sales = []SaleRow{{ProductID: "PR1", NetSaleQuantity: dec("0.91")}}
+	cube.losses = losses
+	cube.lossErr = lossErr
+}
+
+// TestRunAudit_LossEvidenceDowngradesBlock 是本需求(2026-10-31)的端到端回归锁:
+// **盘损单存在且能把偏离解释到可接受范围 ⇒ block 降 warn ⇒ 全部 block 消除 ⇒ 放行**。
+func TestRunAudit_LossEvidenceDowngradesBlock(t *testing.T) {
+	svc, db, cube, pub, _ := newTestService(t)
+	seedPassData(cube)
+	setQuantityCase(cube, []LossRow{
+		{ProductID: "PR1", DocumentType: "JO", Direction: "-", Quantity: dec("8.43")},
+	}, nil)
+	svc.SetVerdictFn(passAllVerdict())
+
+	ap := submitOK(t, svc, "100")
+	ap = waitTerminalPtr(t, db, ap.ID)
+
+	if ap.Status != model.StatusApproved {
+		t.Fatalf("status = %s, want approved(盘损已解释偏离, block 应降级)", ap.Status)
+	}
+	if len(pub.commands(CmdApplyEvent)) != 1 {
+		t.Errorf("放行后应代提交付款审批(apply_event 命令数 = %d)",
+			len(pub.commands(CmdApplyEvent)))
+	}
+	// 降级后仍留一条 warn(不静默),且没有任何 block 信号。
+	var sig model.AuditSignal
+	if err := db.First(&sig, "approval_id = ? AND signal_type = ?", ap.ID, SigQtyDeviation).Error; err != nil {
+		t.Fatalf("应有 qty_deviation 信号(降级留痕): %v", err)
+	}
+	if sig.Level != model.SignalWarn {
+		t.Errorf("信号级别 = %s, want warn", sig.Level)
+	}
+	if !strings.Contains(sig.Message, "盘损 8.43") {
+		t.Errorf("降级信号应写明盘损数量: %s", sig.Message)
+	}
+	var blocks int64
+	db.Model(&model.AuditSignal{}).Where("approval_id = ? AND level = ?", ap.ID, model.SignalBlock).Count(&blocks)
+	if blocks != 0 {
+		t.Errorf("block 信号数 = %d, want 0", blocks)
+	}
+}
+
+// TestRunAudit_LossInsufficientStillRejected 是对照组:盘损不足以解释偏离 ⇒ 仍然拒绝。
+func TestRunAudit_LossInsufficientStillRejected(t *testing.T) {
+	svc, db, cube, _, _ := newTestService(t)
+	seedPassData(cube)
+	setQuantityCase(cube, []LossRow{
+		{ProductID: "PR1", DocumentType: "JO", Direction: "-", Quantity: dec("0.5")},
+	}, nil)
+
+	ap := submitOK(t, svc, "100")
+	ap = waitTerminalPtr(t, db, ap.ID)
+	if ap.Status != model.StatusRejected {
+		t.Fatalf("status = %s, want rejected(盘损不足)", ap.Status)
+	}
+}
+
+// TestRunAudit_LossQueryErrorKeepsBlock 锁"读不到盘损 ⇒ 保持原 block,而不是把审批卡成 failed"。
+//
+// 盘损是"解释偏离"的证据:没有证据就按最严判定(仍需人工/LLM 审)。
+func TestRunAudit_LossQueryErrorKeepsBlock(t *testing.T) {
+	svc, db, cube, _, _ := newTestService(t)
+	seedPassData(cube)
+	setQuantityCase(cube, nil, errors.New("cube 不可用"))
+
+	ap := submitOK(t, svc, "100")
+	ap = waitTerminalPtr(t, db, ap.ID)
+	if ap.Status != model.StatusRejected {
+		t.Fatalf("status = %s, want rejected(盘损查询失败应保持 block)", ap.Status)
+	}
+	if ap.Status == model.StatusFailed {
+		t.Errorf("盘损查询失败不应把审批卡成 failed")
 	}
 }
 

@@ -278,7 +278,7 @@ func TestCheckQuantity(t *testing.T) {
 			if tt.sold != "" {
 				sales["PR1"] = SaleRow{ProductID: "PR1", NetSaleQuantity: dec(tt.sold)}
 			}
-			sigs := checkQuantity(receivedByProduct, sales, 3, QuantityContext{})
+			sigs := checkQuantity(receivedByProduct, sales, nil, 3, QuantityContext{})
 			if tt.wantType == "" {
 				if len(sigs) != 0 {
 					t.Fatalf("应无信号, got %v", sigs)
@@ -300,8 +300,82 @@ func TestCheckQuantity(t *testing.T) {
 
 func TestCheckQuantity_ZeroReceivedSkip(t *testing.T) {
 	received := map[string]decimal.Decimal{"PR1": dec("0")}
-	if sigs := checkQuantity(received, nil, 3, QuantityContext{}); len(sigs) != 0 {
+	if sigs := checkQuantity(received, nil, nil, 3, QuantityContext{}); len(sigs) != 0 {
 		t.Errorf("进货 0 应跳过, got %d", len(sigs))
+	}
+}
+
+// TestCheckQuantity_LossDowngradesBlock 锁 2026-10-31 用户口径:
+// 盘损单把"原本会 block"的数量偏离解释到可接受范围 ⇒ **block 降 warn**(不阻断放行)。
+//
+// 生产实况:进货 10、窗口销量 0.91(ratio ≈ 11 倍 ⇒ block),
+// 但同一窗口报损 8.43 ⇒ 消耗 9.34,偏离回到 ×1~×2 的 warn 区间。
+func TestCheckQuantity_LossDowngradesBlock(t *testing.T) {
+	received := map[string]decimal.Decimal{"PR1": dec("10")}
+	sales := map[string]SaleRow{"PR1": {ProductID: "PR1", NetSaleQuantity: dec("0.91")}}
+	loss := map[string]decimal.Decimal{"PR1": dec("8.43")}
+
+	sigs := checkQuantity(received, sales, loss, 3, QuantityContext{
+		WindowFrom: map[string]string{"PR1": "2026-08-25"},
+	})
+	if len(sigs) != 1 {
+		t.Fatalf("信号数 = %d, want 1", len(sigs))
+	}
+	if sigs[0].Level != model.SignalWarn || sigs[0].SignalType != SigQtyDeviation {
+		t.Fatalf("level=%s type=%s, want warn/qty_deviation(盘损降级)", sigs[0].Level, sigs[0].SignalType)
+	}
+	// 消息里要写出盘损与合计,否则发起人看不懂"为什么 11 倍还在可接受范围"。
+	for _, want := range []string{"盘损 8.43", "合计 9.34"} {
+		if !strings.Contains(sigs[0].Message, want) {
+			t.Errorf("降级消息应含 %q: %s", want, sigs[0].Message)
+		}
+	}
+}
+
+// TestCheckQuantity_LossInsufficientStillBlock 锁"证据不够就还是 block"。
+//
+// 报损 0.5 解释不了 10 倍的偏离 ⇒ 仍按 ×factor×2 判 block。
+func TestCheckQuantity_LossInsufficientStillBlock(t *testing.T) {
+	received := map[string]decimal.Decimal{"PR1": dec("10")}
+	sales := map[string]SaleRow{"PR1": {ProductID: "PR1", NetSaleQuantity: dec("0.91")}}
+	loss := map[string]decimal.Decimal{"PR1": dec("0.5")}
+
+	sigs := checkQuantity(received, sales, loss, 3, QuantityContext{})
+	if len(sigs) != 1 {
+		t.Fatalf("信号数 = %d, want 1", len(sigs))
+	}
+	if sigs[0].Level != model.SignalBlock {
+		t.Errorf("level = %s, want block(盘损不足)", sigs[0].Level)
+	}
+}
+
+// TestCheckQuantity_LossOnly_NoSales 锁"零销量但有盘损"的边界:
+//
+// 分母 = 销量 0 + 盘损 > 0 ⇒ 不再是 purchase_without_sales 的 block;
+// 但"不扣盘损会 block"这件事仍然成立 ⇒ 留一条 warn(降级但不静默)。
+func TestCheckQuantity_LossOnly_NoSales(t *testing.T) {
+	received := map[string]decimal.Decimal{"PR1": dec("8")}
+	loss := map[string]decimal.Decimal{"PR1": dec("8")}
+
+	sigs := checkQuantity(received, map[string]SaleRow{}, loss, 3, QuantityContext{})
+	if len(sigs) != 1 {
+		t.Fatalf("信号数 = %d, want 1", len(sigs))
+	}
+	if sigs[0].Level != model.SignalWarn || sigs[0].SignalType != SigQtyDeviation {
+		t.Errorf("level=%s type=%s, want warn/qty_deviation(盘损解释掉无销量)", sigs[0].Level, sigs[0].SignalType)
+	}
+}
+
+// TestCheckQuantity_LossWidensConsumption 锁"盘损把分母撑大后**不该再误拦**"。
+//
+// 进货 10、销量 10、盘损 30 ⇒ ratio = 0.25,本来就不该有信号
+// (分母大是"店里损耗本来就多",不是本次进货的疑点)。
+func TestCheckQuantity_LossWidensConsumption(t *testing.T) {
+	received := map[string]decimal.Decimal{"PR1": dec("10")}
+	sales := map[string]SaleRow{"PR1": {ProductID: "PR1", NetSaleQuantity: dec("10")}}
+	loss := map[string]decimal.Decimal{"PR1": dec("30")}
+	if sigs := checkQuantity(received, sales, loss, 3, QuantityContext{}); len(sigs) != 0 {
+		t.Errorf("盘损撑大分母后应无数量信号, got %d: %v", len(sigs), sigs)
 	}
 }
 
@@ -384,7 +458,7 @@ func TestProductLabel(t *testing.T) {
 // 这类推断性结论 —— 判断本来就不该由机器下。
 func TestCheckQuantity_NeutralWording(t *testing.T) {
 	received := map[string]decimal.Decimal{"02000116": dec("18")}
-	sigs := checkQuantity(received, map[string]SaleRow{}, 3, QuantityContext{
+	sigs := checkQuantity(received, map[string]SaleRow{}, nil, 3, QuantityContext{
 		Names:      map[string]string{"02000116": "16.8升琅悦泉水桶装水"},
 		WindowFrom: map[string]string{"02000116": "2026-08-25"},
 	})
