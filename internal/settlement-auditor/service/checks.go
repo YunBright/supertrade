@@ -371,6 +371,27 @@ type saleWindowGroup struct {
 // 合并方向是**放宽**:窗口更早 ⇒ 统计到的销量更多 ⇒ 只会少拦、不会多拦。
 const maxSaleWindowGroups = 8
 
+// windowStartPick 决定每个商品的窗口起点取「最早」还是「最晚」的采购日期。
+//
+// 两个口径**都真实存在**，别混用：
+//
+//   - [windowStartLatest] —— **窗口毛利**（预期毛利）用：起点取**最晚**的
+//     采购入库日，回答"被审的这次进货进到今天为止，卖了多少"。
+//   - [windowStartEarliest] —— **实现毛利**用：起点取该商品在**本单采购单**里
+//     **最早**的采购日，回答"这批货从进店那天起一共卖了多少钱/多少量"
+//     （2026-10-29 用户口径）。
+//
+// ⚠️ 起点不同 ⇒ 销量不同 ⇒ 毛利结论可能相反，这是**两个问题的两个答案**，
+//    不是同一个信号的两种写法。
+type windowStartPick int
+
+const (
+	// windowStartEarliest 取最早采购日。
+	windowStartEarliest windowStartPick = iota
+	// windowStartLatest 取最晚采购日。
+	windowStartLatest
+)
+
 // buildSaleWindowGroups 按"最后一次采购的采购入库单日期"给商品分组。
 //
 // # 口径(2026-10-22 用户口径)
@@ -396,10 +417,22 @@ const maxSaleWindowGroups = 8
 //   - fallback:取不到日期时的回退起点(今天 - SaleWindowDays)
 //   - maxGroups:分组数上限(≤0 ⇒ 用 maxSaleWindowGroups)
 func buildSaleWindowGroups(sheetDates map[string]string, productSheets map[string][]string, today, fallback string, maxGroups int) []saleWindowGroup {
+	return buildSaleWindowGroupsByDate(
+		sheetDates, productSheets, today, fallback, maxGroups, windowStartLatest)
+}
+
+// buildSaleWindowGroupsByDate 是 buildSaleWindowGroups 的通用版：
+// 窗口起点按 [pick] 取「最早」或「最晚」的采购日期。
+//
+// ⚠️ 合并超限分组时的方向：**取更早的起点**（放宽方向）。
+//   - 对窗口毛利（最晚起点）⇒ 放宽 = 窗口更长 = 统计到更多销量；
+//   - 对实现毛利（最早起点）⇒ 放宽 = 窗口更长 = 销售均价更平滑。
+//   两种口径下"放宽"都只会让结论更接近"整体水平",不会凭空造出亏损。
+func buildSaleWindowGroupsByDate(sheetDates map[string]string, productSheets map[string][]string, today, fallback string, maxGroups int, pick windowStartPick) []saleWindowGroup {
 	if maxGroups <= 0 {
 		maxGroups = maxSaleWindowGroups
 	}
-	// 每个商品 → 窗口起点(它出现过的采购单里**最晚**的制单日期)。
+	// 每个商品 → 窗口起点(它出现过的采购单里最晚/最早的制单日期)。
 	fromByProduct := make(map[string]string, len(productSheets))
 	for pid, sheetIDs := range productSheets {
 		from := ""
@@ -408,7 +441,12 @@ func buildSaleWindowGroups(sheetDates map[string]string, productSheets map[strin
 			if !ok || d == "" {
 				continue
 			}
-			if from == "" || d > from {
+			if from == "" {
+				from = d
+				continue
+			}
+			if (pick == windowStartLatest && d > from) ||
+				(pick == windowStartEarliest && d < from) {
 				from = d
 			}
 		}

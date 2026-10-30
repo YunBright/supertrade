@@ -462,3 +462,51 @@ func TestDedupeStrings(t *testing.T) {
 		t.Errorf("dedupe = %v, want [S1 S2]", got)
 	}
 }
+
+// TestBuildSaleWindowGroupsByDate_Earliest 锁「实现毛利」的窗口起点口径。
+//
+// 2026-10-29 用户口径：「结算单的采购订单里该sku**最早**采购日期起
+// 至发起'付款审批'止日期段」。
+//
+// ⚠️ 与窗口毛利的**最晚**口径不同 —— 两个窗口不同 ⇒ 销量不同 ⇒
+//    两个毛利结论可能相反（这正是要同时出两个信号的原因）。
+func TestBuildSaleWindowGroupsByDate_Earliest(t *testing.T) {
+	sheetDates := map[string]string{
+		"PI-A": "2026-08-23",
+		"PI-B": "2026-08-26",
+	}
+	productSheets := map[string][]string{
+		"PR1": {"PI-A"},
+		"PR2": {"PI-A", "PI-B"}, // 两次都进 ⇒ 起点取**最早**的 08-23
+		"PR3": {"PI-MISSING"},   // 取不到日期 ⇒ 回退固定窗口
+	}
+	groups := buildSaleWindowGroupsByDate(
+		sheetDates, productSheets, "2026-10-22", "2026-09-22", 0, windowStartEarliest)
+	got := map[string]string{}
+	for _, g := range groups {
+		for _, pid := range g.Products {
+			got[pid] = g.From
+		}
+	}
+	if got["PR1"] != "2026-08-23" {
+		t.Errorf("PR1 窗口起点 = %s, want 2026-08-23", got["PR1"])
+	}
+	if got["PR2"] != "2026-08-23" {
+		t.Errorf("PR2 窗口起点 = %s, want 2026-08-23(取最早那次进货)", got["PR2"])
+	}
+	if got["PR3"] != "2026-09-22" {
+		t.Errorf("PR3 取不到日期应回退 %s, got %s", "2026-09-22", got["PR3"])
+	}
+	// 最晚口径保持原样（窗口毛利不受影响）。
+	latest := buildSaleWindowGroupsByDate(
+		sheetDates, productSheets, "2026-10-22", "2026-09-22", 0, windowStartLatest)
+	gotLatest := map[string]string{}
+	for _, g := range latest {
+		for _, pid := range g.Products {
+			gotLatest[pid] = g.From
+		}
+	}
+	if gotLatest["PR2"] != "2026-08-26" {
+		t.Errorf("PR2 最晚口径起点 = %s, want 2026-08-26", gotLatest["PR2"])
+	}
+}

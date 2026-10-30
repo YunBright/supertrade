@@ -18,6 +18,7 @@ package service_test
 //	③ 改出来的**负库存不拦**,但要在每日毛利的 alert 里**红字**显示。
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -237,5 +238,79 @@ func TestCounterLoadRows_EditPastDayAndNegativeAlert(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("负库存应在每日毛利的 alerts 里显示(部位级),got %+v", rep.Alerts)
+	}
+}
+
+// TestCounterLoadRows_LineCarriesCutTypeAndProductName 锁 2026-10-29 的前端契约。
+//
+// 门店原话:「搬台无法看到已录列表,找不到修改、删除入口。」
+// ⇒ 前端要列"今日已搬台",每一行得看得见**部位**与**商品名**。
+//
+// ⚠️ json tag 就是前后端契约(不是装饰)⇒ 本域出参必须 snake_case。
+func TestCounterLoadRows_LineCarriesCutTypeAndProductName(t *testing.T) {
+	svc, ctx, sku := fmBizSetup(t)
+
+	// 10-01:盘点 5kg ⇒ 冷库 5kg。
+	_, err := svc.RecordPorkCutsStocktake(ctx, "S001", model.RecordPorkCutsStocktakeInput{
+		IsComplete: true,
+		Cuts: []model.CutInput{
+			{CutType: model.CutBelly, CubeProductID: sku, ActualRemainKg: d("5")},
+		},
+	}, "u-1")
+	mustNoErr(t, err, "10-01 盘点")
+
+	// 10-02:搬 2.5kg。
+	svc.SetClock(fmClock(fmDay2))
+	_, err = svc.CounterLoad(ctx, "S001", service.CounterLoadInput{
+		Lines: []service.CounterLoadLine{{CubeProductID: sku, QtyKg: d("2.5")}},
+	}, "u-1")
+	mustNoErr(t, err, "10-02 搬台")
+
+	view, err := svc.ListCounterLoads(ctx, "S001", fmDay2)
+	mustNoErr(t, err, "ListCounterLoads")
+	if len(view.Lines) != 1 {
+		t.Fatalf("10-02 应有 1 条流水,got %d", len(view.Lines))
+	}
+	// ⇒ 部位直接取搬台流水表那一列(落库时就记了)。
+	if view.Lines[0].CutType != model.CutBelly {
+		t.Errorf("流水行的部位应是 belly,got %q", view.Lines[0].CutType)
+	}
+
+	// ⇒ wire 形状:snake_case,且**没有名字时不出现**这个 key。
+	raw, err := json.Marshal(view.Lines[0])
+	mustNoErr(t, err, "json.Marshal")
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	for _, key := range []string{"id", "branch_id", "biz_date", "seq",
+		"cube_product_id", "qty_kg", "source", "operator_id", "created_at", "cut_type"} {
+		if _, ok := got[key]; !ok {
+			t.Errorf("搬台流水行缺少 %s 这个 wire 字段: %s", key, raw)
+		}
+	}
+	if got["cut_type"] != string(model.CutBelly) {
+		t.Errorf("cut_type 应是 belly,got %v", got["cut_type"])
+	}
+	// ⚠️ 该店没给这个货号登记商品名(名称是 seed 写的)⇒ 留空 ⇒ 不出这个 key。
+	if _, ok := got["cube_product_name"]; ok {
+		t.Errorf("查不到商品名时不该出现 cube_product_name 这个 key: %s", raw)
+	}
+
+	// ⇒ 有名字时必须带出来(前端显示"货号(商品名)")。
+	line := service.CounterLoadLineView{
+		ID: "CLD-1", BranchID: "S001", BizDate: "2026-10-02", Seq: 0,
+		CubeProductID: "01409", QtyKg: d("2.5"),
+		Source: service.CounterLoadSourceSKU, OperatorID: "u-1",
+		CreatedAt: time.Now(), CutType: model.CutBelly, CubeProductName: "五花肉",
+	}
+	raw, err = json.Marshal(line)
+	mustNoErr(t, err, "json.Marshal 2")
+	got = map[string]any{}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("json.Unmarshal 2: %v", err)
+	}
+	if got["cube_product_name"] != "五花肉" {
+		t.Errorf("cube_product_name 应是 五花肉,got %v", got["cube_product_name"])
 	}
 }

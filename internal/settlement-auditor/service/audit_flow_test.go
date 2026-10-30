@@ -610,6 +610,33 @@ func TestBuildFlowVerdict_QtySignalDoesNotStop(t *testing.T) {
 	}
 }
 
+// TestBuildFlowVerdict_NoStocktakeSuggestion 锁住「流程定制不触发盘点联动」。
+//
+// 2026-10-28 用户口径：「按流程逻辑通过的不需要触发盘点联动」。
+//
+// ⚠️ 判别力自检：把 buildFlowVerdict 里的 SuggestStocktake 改回
+//    stocktakeSuggestionFromSignals(signals) ⇒ 本用例立刻红。
+//
+// 为什么：命中流程定制 ⇒ 这一单**根本没问机器人** ⇒ 「盘点联动」是机器人
+// 研判的副产物，无中生有地建一个盘点计划 = 让人去盘一台机器没怀疑过的货。
+func TestBuildFlowVerdict_NoStocktakeSuggestion(t *testing.T) {
+	svc, _, _, _ := newFlowTestService(t)
+	dec := &FlowDecision{Applied: true, Path: FlowPathSupplier, Reason: "流程定制判定通过:xxx"}
+	// 故意给一条**会**产出盘点建议的数量类信号。
+	signals := []signalDraft{
+		newSignal(model.SignalBlock, SigPurchaseWithoutSales, "", "P1",
+			"商品 P1 自 2026-09-01 采购入库后无销售记录", nil),
+	}
+	v := svc.buildFlowVerdict(dec, signals)
+	if v.SuggestStocktake != nil {
+		t.Fatalf("流程定制结论不该带盘点建议(会触发盘点联动): %+v", v.SuggestStocktake)
+	}
+	// raw JSON 里也不该再宣称 suggest_stocktake。
+	if strings.Contains(string(v.RawJSON), "suggest_stocktake") {
+		t.Errorf("raw 里不该再出现 suggest_stocktake: %s", string(v.RawJSON))
+	}
+}
+
 // ---- 配置 CRUD ----
 
 func TestSupplierFlowCRUD(t *testing.T) {

@@ -113,6 +113,9 @@ func setupTestServiceMode(t *testing.T, syncAdvice bool) (*service.Service, *rec
 		// 2026-10-27:成本链改部位级(部位级成本日快照 + 部位级成本状态)。
 		&model.CutCostDaily{},
 		&model.CutCostState{},
+		// 2026-10-30:分割基线的估计样本(A 方案)+ 跨门店选用预留表。
+		&model.PigCutEstimate{},
+		&model.PigForecastBaselineBorrow{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

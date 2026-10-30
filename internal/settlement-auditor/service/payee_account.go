@@ -233,6 +233,13 @@ func (s *Service) loadPayeeAccount(ctx context.Context, approvalID string) (*mod
 //
 // ⚠️ 格式与「AI审核结论」控件**分开**：那是给审批人看的结论，
 // 这是给审批人看的**付款目标**（审批人要照着它打款）⇒ 必须一眼能读。
+//
+// ⚠️ 账号**分段显示**（2026-10-29 用户口径）：审批人要在企微单上**照着打款**，
+// 一长串 19 位数字没法核对位数 ⇒ 与支付宝/微信绑卡、银行 App 的银行卡号
+// 显示口径一致：从左往右每 4 位一组，最后一组可以短。
+//
+// 分段只影响**显示**：落库的账号原文（approval_payee_accounts.account_no）
+// 不变，付款时用的仍是原文。
 func payeeAccountLines(row *model.ApprovalPayeeAccount) string {
 	if row == nil {
 		return ""
@@ -242,7 +249,7 @@ func payeeAccountLines(row *model.ApprovalPayeeAccount) string {
 		parts = append(parts, "开户行："+v)
 	}
 	if v := strings.TrimSpace(row.AccountNo); v != "" {
-		parts = append(parts, "账号："+v)
+		parts = append(parts, "账号："+formatBankAccountNo(v))
 	}
 	if v := strings.TrimSpace(row.AccountName); v != "" {
 		parts = append(parts, "户名："+v)
@@ -251,6 +258,44 @@ func payeeAccountLines(row *model.ApprovalPayeeAccount) string {
 		return ""
 	}
 	return strings.Join(parts, "\n")
+}
+
+// bankAccountGroupSize 是账号分段的每组位数。
+const bankAccountGroupSize = 4
+
+// formatBankAccountNo 把银行账号按 4 位一组分段（**显示用**）。
+//
+// # 规则（与 wx-h5 的 formatAccountNo 一致，2026-10-29）
+//
+//   - 先去掉已有的空白与连字符（个别历史数据自带分隔），
+//     再从左往右每 4 位一组，空格分隔；
+//   - 长度不是 4 的倍数时，**最后那组不足 4 位就照原样**
+//     （"1234567" ⇒ "1234 567"、"12345" ⇒ "1234 5"）—— 余数不补零、不丢位；
+//   - ⚠️ **余数在末组**，不是在前 —— 这与支付宝/微信绑卡、银行 App 里
+//     银行卡号的显示一致（从左往右每 4 位一组，最后一组可以短）。
+//     审批人是**从左往右对着念**着核对的，余数在前会让人多看一遍才发现位数不对；
+//   - 空账号 ⇒ 空串（不选收款账号时不会留下孤零零的分隔符）。
+//
+// ⚠️ 只做**显示层**：落库原文不变，提交给企微的也只是给人看的文本。
+func formatBankAccountNo(s string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\n', '\r', '-', ' ':
+			return -1
+		}
+		return r
+	}, s)
+	if cleaned == "" {
+		return ""
+	}
+	var b strings.Builder
+	for i, r := range []rune(cleaned) {
+		if i > 0 && i%bankAccountGroupSize == 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // logPayeeFetchError 记一条"取账号失败"的日志（不带账号内容）。

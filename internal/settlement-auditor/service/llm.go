@@ -318,6 +318,9 @@ func buildAuditSystemPrompt() string {
   也不要把"数据对不上"说成"存在问题" —— 陈述事实即可,判断留给人工终审。
 - 例:写「商品 16.8升琅悦泉水桶装水-02000116 自 2026-08-25 采购入库后无销售记录,本次进货 18 桶,
   请核实该商品近期是否有销售」;不要写「存在虚进、滞销或套取付款风险」。
+- 提到**供应商**时用数据里给的写法「<供应商名称>-<供应商编号>」(2026-10-29 用户口径),
+  **不要只写编号** —— 店长看到「29」无从判断是哪家;名称在前、编号在后,
+  既能认出是哪家、又能核对到具体那家(同名供应商很常见)。
 
 金额口径(必须遵守,违反会误拒单):
 - 实际付款按元取整:分位一般不实际支付,角位也可能被舍去。
@@ -348,6 +351,20 @@ func buildAuditSystemPrompt() string {
 - 有**补差价**收款时:允许因进货偏多导致的**毛利降低**,降低幅度小于补差价总额即可,
   ⇒ 毛利相关的疑虑不作为拒绝理由;
 - 本单所有收付款项都会列在数据里,金额结论以引擎口径为准,不要自行推断或改写金额。
+
+毛利信号的两个口径(2026-10-29 用户口径,**必须正确区分**):
+- 「gross_margin」(**窗口毛利 / 预期毛利**):成本用**库存加权平均成本价**
+  ⇒ 回答"这批货整体上赚不赚钱"(含老库存的成本);
+- 「realized_margin」(**实现毛利**):成本用**本批次进货均价**,
+  量取「本批次进货总量」与「窗口销售总量」的较小者,
+  ⇒ 回答"**这批新进的货**按它自己的进价卖出去赚不赚钱"。
+- 两者**可能同时出现、且结论相反** —— 老库存成本低会**掩盖**"这次进货进贵了"
+  这件事(例:某生鲜的库存加权平均成本 2.82 元 ⇒ 窗口毛利为正;
+  但本批次进货均价 4.63 元 > 销售均价 3.56 元 ⇒ 实现毛利为负)。
+  ⇒ **不要**因为「gross_margin」为正就忽略「realized_margin」,也不要把两者混为一谈;
+- 出现「realized_margin」时,reason 里**只陈述事实**:哪个商品、
+  本批次进货均价多少、窗口销售均价多少、按可卖数量算的实现毛利为负多少,请人工终审关注。
+  **不要**写成"这单有问题""存在风险""舞弊"这类判断(见上面措辞纪律)。
 
 只输出 JSON,不要 markdown,不要解释:
 {"conclusion":"pass|reject","reason":"中文,200字内","confidence":0.0~1.0,
@@ -417,7 +434,8 @@ func buildAuditUserPrompt(in *AuditInput) string {
 			break
 		}
 		fmt.Fprintf(&sb, "  - %s 供应商=%s 类型=%s 货款=%s 账期=%s~%s\n",
-			st.ID, st.SupplierID, st.DocumentType, yuanText(st.TotalGoodsYuan), st.PeriodStart, st.PeriodEnd)
+			st.ID, supplierLabelForPrompt(st.SupplierName, st.SupplierID), st.DocumentType,
+			yuanText(st.TotalGoodsYuan), st.PeriodStart, st.PeriodEnd)
 		if lns := in.Lines[st.ID]; len(lns) > 0 {
 			for j, ln := range lns {
 				if j >= 10 {

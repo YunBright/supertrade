@@ -99,6 +99,21 @@ func (f *fakeCube) GetStocks(_ context.Context, _ string, _ []string) ([]service
 	return nil, nil
 }
 
+// GetSettlementsByIDs 按单号精确查（不过滤审核/单据类型）。
+func (f *fakeCube) GetSettlementsByIDs(_ context.Context, _ string, ids []string) ([]service.SettlementRow, error) {
+	want := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	var out []service.SettlementRow
+	for _, r := range f.settlements {
+		if want[r.ID] {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
 func seedCube() *fakeCube {
 	return &fakeCube{settlements: []service.SettlementRow{
 		{ID: "S1", SupplierID: "SUP1", DocumentType: "DP", ApproveStatus: "1", TotalGoodsYuan: decimal.NewFromInt(100)},

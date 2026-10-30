@@ -55,9 +55,9 @@ type BizAuditView struct {
 	// CutoffDate 是审计截止日("YYYY-MM-DD")。
 	CutoffDate string `json:"cutoff_date"`
 	// AuditedAt 是审计时间。
-	AuditedAt time.Time `json:"audited_at"`
-	OperatorID string  `json:"operator_id"`
-	Note       string  `json:"note,omitempty"`
+	AuditedAt  time.Time `json:"audited_at"`
+	OperatorID string    `json:"operator_id"`
+	Note       string    `json:"note,omitempty"`
 }
 
 // BizAuditInput POST /stock/audit 入参。
@@ -117,8 +117,8 @@ type AuditReplayResult struct {
 //
 // ⇒ 普通的、没有被动过的部位**不进这张表**。
 type BalanceDiffRow struct {
-	CutType   model.CutType `json:"cut_type"`
-	CutLabel  string        `json:"cut_label"`
+	CutType  model.CutType `json:"cut_type"`
+	CutLabel string        `json:"cut_label"`
 	// BeforeKg 是审计前的结存(kg)。
 	BeforeKg decimal.Decimal `json:"before_kg"`
 	// AfterKg 是审计后的结存(kg)。
@@ -168,6 +168,13 @@ type BizAuditPrecheck struct {
 	Error string `json:"error,omitempty"`
 	// MissingStocktakeDays 是缺完整日终盘点的日子。
 	MissingStocktakeDays []string `json:"missing_stocktake_days,omitempty"`
+	// ShortSellDays 是**有真短卖**的日子(owner 2026-10-30 口径:
+	// 当天卖出的总量超过了账面可售的总量)。
+	//
+	// ⚠️ **有短卖的日子不许审计结转**(审计 = 冻结这条时间线
+	//   ⇒ 冻结一份"账实不符"的账 ⇒ 以后谁都改不了)
+	// ⇒ 前端要把这几天列出来,让门店先把短卖查清楚。
+	ShortSellDays []string `json:"short_sell_days,omitempty"`
 	// HasBalance 表示这次审计**会产生结余**(有没有结余 = 有没有预售结转)。
 	HasBalance bool `json:"has_balance"`
 	// Presale 是这次审计**将会**产生的预期毛利(预售结转)测算。
@@ -262,9 +269,10 @@ func (s *Service) GetBizAuditStatus(ctx context.Context, branchID string) (*BizA
 //
 // 审计是**不可逆**的一刀(截止日及之前全部冻结)⇒ 门店在按下确认之前
 // 应当看到"这一刀下去会发生什么":
-//  ① 条件是否满足(缺哪几天的日终盘点);
-//  ② 本次会产生的**结余**与**预期毛利(预售结转)**测算;
-//  ③ 审计提示文案(门店原话)。
+//
+//	① 条件是否满足(缺哪几天的日终盘点);
+//	② 本次会产生的**结余**与**预期毛利(预售结转)**测算;
+//	③ 审计提示文案(门店原话)。
 func (s *Service) PrecheckBizAudit(ctx context.Context, branchID string, cutoffDate string) (*BizAuditPrecheck, error) {
 	if branchID == "" {
 		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
@@ -302,6 +310,20 @@ func (s *Service) PrecheckBizAudit(ctx context.Context, branchID string, cutoffD
 	if err != nil {
 		return nil, err
 	}
+	// ---- 短卖检查(owner 2026-10-30):有短卖的日子不许结转 ----
+	//
+	// ⚠️ **必须在"缺盘点"那一步之前算完**(2026-10-30 生产实测后改):
+	//
+	//	门店经常**同时**踩两个坑(那天没盘点 + 那天短卖)
+	//	⇒ 只报一个 ⇒ 门店补完盘点再点一次 ⇒ 又冒出短卖 ⇒ 来回好几轮才改得完
+	//	⇒ 一次把两样都列出来,门店一次改完。
+	shortSell, err := s.shortSellDays(ctx, branchID, lastCutoff, cutoffDate)
+	if err != nil {
+		return nil, err
+	}
+	if len(shortSell) > 0 {
+		out.ShortSellDays = shortSell
+	}
 	if len(missing) > 0 {
 		out.MissingStocktakeDays = missing
 		shown := missing
@@ -310,6 +332,25 @@ func (s *Service) PrecheckBizAudit(ctx context.Context, branchID string, cutoffD
 		}
 		out.Error = fmt.Sprintf("审计截止日 %s 之前还有 %d 天没有完整的日终盘点(%s…),补齐后才能审计结转",
 			cutoffDate, len(missing), joinDates(shown))
+		// ⚠️ 短卖也要一起说(见上面的说明)⇒ 门店一次看全两个坑。
+		if len(shortSell) > 0 {
+			shownShort := shortSell
+			if len(shownShort) > 10 {
+				shownShort = shownShort[:10]
+			}
+			out.Error += fmt.Sprintf(";另外还有 %d 天存在短卖(%s…),短卖没查清楚之前不能审计结转",
+				len(shortSell), joinDates(shownShort))
+		}
+		return out, nil
+	}
+	if len(shortSell) > 0 {
+		shown := shortSell
+		if len(shown) > 10 {
+			shown = shown[:10]
+		}
+		out.Error = fmt.Sprintf("审计截止日 %s 之前有 %d 天存在短卖(%s…)"+
+			",短卖没查清楚之前不能审计结转(结转 = 冻结,冻结了就改不了了)",
+			cutoffDate, len(shortSell), joinDates(shown))
 		return out, nil
 	}
 	out.Ready = true
@@ -399,6 +440,25 @@ func (s *Service) AuditBusinessDays(ctx context.Context, branchID string, in Biz
 		}
 		return nil, fmt.Errorf("%w: 审计截止日 %s 之前还有 %d 天没有完整的日终盘点(%s…),补齐后才能审计结转",
 			ErrInvalidInput, cutoffKey, len(missing), joinDates(shown))
+	}
+
+	// ---- 条件:截止日之前**不许有短卖**(owner 2026-10-30)----
+	//
+	//	审计 = **冻结**这条时间线 ⇒ 冻结一份"账实不符"的账 ⇒ 以后谁都改不了。
+	//	⇒ 有短卖(当天卖出的总量超过了账面可售的总量)的日子不许结转
+	//	  ⇒ 门店先把短卖查清楚(是记录漏了,还是真少了货)。
+	shortSell, err := s.shortSellDays(ctx, branchID, lastCutoff, cutoffKey)
+	if err != nil {
+		return nil, err
+	}
+	if len(shortSell) > 0 {
+		shown := shortSell
+		if len(shown) > 10 {
+			shown = shown[:10]
+		}
+		return nil, fmt.Errorf("%w: 审计截止日 %s 之前有 %d 天存在短卖(%s…),"+
+			"短卖没查清楚之前不能审计结转(结转 = 冻结,冻结了就改不了了)",
+			ErrInvalidInput, cutoffKey, len(shortSell), joinDates(shown))
 	}
 
 	// ---- 结转:重算成本日快照 + 落按营业日的结余快照(= 冻结产物)----
@@ -510,11 +570,14 @@ func (s *Service) AuditBusinessDays(ctx context.Context, branchID string, in Biz
 //
 // ① 截止日的**结余快照**(cut_stock_daily):cold_store_kg < 0 的部位 ⇒ 置 0;
 // ② 同一营业日的**成本日快照**(sku_cost_daily):closing_kg / closing_amount < 0 的行 ⇒ 置 0
-//   (下一期的期初金额从这张表读 ⇒ 不置 0 就等于把负数带进下一期);
+//
+//	(下一期的期初金额从这张表读 ⇒ 不置 0 就等于把负数带进下一期);
+//
 // ③ 返回**审计结存差异表**(按部位):改了哪些数量、从多少改到多少、为什么改。
 //
 // ⚠️ 负库存本身是**账面问题**(搬台超过了实际库存)⇒ 清零意味着
-//   这批不存在的货在**审计当期**被核销(成本进当期损益)⇒ 门店看得见这笔损失。
+//
+//	这批不存在的货在**审计当期**被核销(成本进当期损益)⇒ 门店看得见这笔损失。
 func (s *Service) zeroNegativeBalances(ctx context.Context, branchID string, cutoff time.Time) ([]BalanceDiffRow, error) {
 	start, end := s.businessDayBounds(cutoff)
 	var snaps []model.CutStockDaily
@@ -598,7 +661,7 @@ func (s *Service) replayAfterAudit(ctx context.Context, branchID string, cutoff 
 	cutoffKey := cutoff.In(loc).Format("2006-01-02")
 	out := &AuditReplayResult{
 		CutoffDate: cutoffKey,
-		Note: "截止日之后的动作已按新口径重放;当前余额已校准到「截止日结余 + 重放后的结果」。",
+		Note:       "截止日之后的动作已按新口径重放;当前余额已校准到「截止日结余 + 重放后的结果」。",
 	}
 	// ---- ① 重放:重算截止日之后的成本日快照 ----
 	chain, err := s.deriveColdChain(ctx, branchID, "", nil)
@@ -652,7 +715,8 @@ func (s *Service) replayAfterAudit(ctx context.Context, branchID string, cutoff 
 //
 // ⚠️ 只动**冷库**:柜台是今天的动作,不受历史结转影响。
 // ⚠️ **只动链上有部位的 SKU**:没有部位映射的 SKU 不在链里 ⇒ 不碰它
-//   (否则会把"链外"的余额清零)。
+//
+//	(否则会把"链外"的余额清零)。
 func (s *Service) calibrateCurrentBalance(ctx context.Context, branchID string, cutoff time.Time,
 	chain map[string]map[string]decimal.Decimal) ([]StockCalibrationRow, error) {
 	var cutCold map[string]decimal.Decimal
@@ -699,9 +763,9 @@ func (s *Service) calibrateCurrentBalance(ctx context.Context, branchID string, 
 		rows = append(rows, StockCalibrationRow{
 			CubeProductID: sku,
 			CutType:       cutOf[sku],
-			BeforeKg:     before,
-			AfterKg:      after,
-			DeltaKg:      delta,
+			BeforeKg:      before,
+			AfterKg:       after,
+			DeltaKg:       delta,
 		})
 	}
 	return rows, nil
@@ -715,6 +779,71 @@ func sortedKeys(m map[string]decimal.Decimal) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// shortSellDays 找出 (fromExclusive, toInclusive] 区间内**有真短卖**的日子。
+//
+// # 口径(owner 2026-10-30)
+//
+//	真短卖 = **当天卖出的总量超过了账面可售的总量**(全店口径)。
+//	⇒ 分部位的账面不足**不算**(那是"建议分割与门店实际卖的不匹配"的分摊口径问题,
+//	  生产实测 店 00 2026-10-29:总量 191.709kg ≥ 卖出 178.149kg ⇒ 短卖 = 0)。
+//
+// # 为什么审计要拦它
+//
+//	审计结转 = **冻结**这条时间线 ⇒ 冻结一份"账实不符"的账 ⇒ 以后谁都改不了
+//	⇒ 有短卖的日子不许结转 ⇒ 门店先把短卖查清楚(记录漏了,还是真少了货)。
+//
+// # ⚠️ 必须**逐日重算**(不走锚点)
+//
+//	锚点(上一营业日的已落库快照)会把锚点之前的天**跳过**
+//	⇒ 那些天的短卖就查不到 ⇒ 审计会漏放。
+func (s *Service) shortSellDays(ctx context.Context, branchID, fromExclusive, toInclusive string) ([]string, error) {
+	loc := s.bizTZOrUTC()
+	end, err := time.ParseInLocation("2006-01-02", toInclusive, loc)
+	if err != nil {
+		return nil, fmt.Errorf("parse cutoff %q: %w", toInclusive, err)
+	}
+	// 区间起点:上次审计截止日 + 1;没有上次审计 ⇒ 该店第一个营业日。
+	start := end
+	if fromExclusive != "" {
+		prev, perr := time.ParseInLocation("2006-01-02", fromExclusive, loc)
+		if perr != nil {
+			return nil, fmt.Errorf("parse last cutoff %q: %w", fromExclusive, perr)
+		}
+		start = prev.AddDate(0, 0, 1)
+	} else {
+		first, ferr := s.firstBizDay(ctx, branchID)
+		if ferr != nil {
+			return nil, ferr
+		}
+		if first == "" {
+			return nil, nil
+		}
+		fs, perr := time.ParseInLocation("2006-01-02", first, loc)
+		if perr != nil {
+			return nil, fmt.Errorf("parse first biz day %q: %w", first, perr)
+		}
+		start = fs
+	}
+	if start.After(end) {
+		return nil, nil
+	}
+	chainDays, err := s.computeCutChainDaysFull(ctx, branchID, start, end)
+	if err != nil {
+		return nil, err
+	}
+	startKey := start.In(loc).Format("2006-01-02")
+	var out []string
+	for _, cd := range chainDays {
+		if cd.dateKey < startKey || cd.dateKey > toInclusive {
+			continue
+		}
+		if cd.shortSellKg.IsPositive() {
+			out = append(out, cd.dateKey)
+		}
+	}
+	return out, nil
 }
 
 // missingStocktakeDays 找出 (fromExclusive, toInclusive] 区间内**没有完整日终盘点**的日子。

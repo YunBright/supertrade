@@ -146,6 +146,20 @@ func (s *Service) SubmitApproval(ctx context.Context, branchID string, in Submit
 	if len(ids) > maxSettlementsPerApproval {
 		return nil, fmt.Errorf("%w: 单次审批最多 %d 张结算单", ErrInvalidInput, maxSettlementsPerApproval)
 	}
+	// 结算单「待审批中」不可重复提交（2026-10-29 用户口径）。
+	//
+	// 为什么不能只靠列表过滤：列表过滤是**读时**的 —— 页面开着的时候
+	// 另一台设备（或另一个人）可能已经把同一张单提交走了；
+	// 也可能有人直接调接口提交。⇒ 提交时必须**再校验一次**。
+	//
+	// 校验通过后那张单被拒 ⇒ 它自动恢复可选（判定见 pending_approval.go）。
+	pending, err := s.ListPendingSettlements(ctx, branchID, ids)
+	if err != nil {
+		return nil, fmt.Errorf("check pending settlements: %w", err)
+	}
+	if len(pending) > 0 {
+		return nil, fmt.Errorf("%w: %s", ErrSettlementPending, describePendingSettlements(pending))
+	}
 	// 附件:个数上限 + 逐个解码校验(base64 坏/超大 ⇒ 当场拒,别留到流水线里炸)。
 	if len(in.Attachments) > maxAttachmentsPerApproval {
 		return nil, fmt.Errorf("%w: 附件最多 %d 个", ErrInvalidInput, maxAttachmentsPerApproval)
@@ -446,6 +460,12 @@ func (s *Service) stepFetchSettlements(ctx context.Context, ap *model.ApprovalIn
 	if err != nil {
 		return nil, fmt.Errorf("fetch settlements: %w", err)
 	}
+	// 补供应商名称（2026-10-29 用户口径：LLM 结论里的供应商要显示「<名称>-<编号>」）。
+	//
+	// ⚠️ cube 的 JOIN 只支持 live↔live，settlement 是 live、supplier 是 duck
+	// ⇒ 只能在 Go 侧 join（与 fillSupplierNames 同一套路）。
+	// 字典取不到时名称留空 ⇒ 提示词里只给编号（同 fillSupplierNames 的降级取舍）。
+	s.fillSupplierNames(ctx, ap.BranchID, rows)
 	*signals = append(*signals, checkSettlements(ids, rows)...)
 	s.logStep(ctx, ap, StepFetchSettlements,
 		fmt.Sprintf("勾选 %d 张: %s", len(ids), strings.Join(ids, ",")),
@@ -673,26 +693,107 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 		Names:      names,
 		WindowFrom: windowFromByProduct(groups),
 	})...)
-	// 毛利额度信号(有补差价收款时才产生;见 service/allowance.go)。
+	// 毛利额度信号(见 service/allowance.go)。
 	//
-	// 成本用**本次进货均价**估算(进货金额 ÷ 收货量)—— 引擎手上没有该商品的
-	// 历史成本,这是最接近的口径;只做"毛利是否为负/缺口多大"的相对判断。
-	unitCost := unitCostByProduct(lines)
-	gm := estimateGrossMargin(unitCost, salesByProduct)
-	gmSignals := checkGrossMarginWithAllowance(gm, allowance)
+	// 成本用**库存加权平均成本价**估算(cube `stock.avg_cost` = 思迅「库存查询」
+	// 里的平均成本价)—— 这与财务核对的数是**同一个数**。
+	//
+	// ⚠️ 2026-10-29 换过口径(生产实踩):旧口径是"本次进货均价",
+	//    拿最新一批的进价当成本 ⇒ 生鲜类商品必偏(蜜梨-01860 算成 -280.57 元,
+	//    而思迅库存里的平均成本价 2.82 明明是正毛利)。
+	//    ⇒ 优先 avg_cost,拿不到才回退本次进货均价(见 mergeCostBasis)。
+	//
+	// ⚠️ 逐 SKU 一起算(perSKU):整体毛利为正时,亏钱的 SKU 会被利润 SKU 盖住,
+	//    只看整体就发现不了"这批货卖一单亏一单"(2026-10-29 用户口径)。
+	cost := s.costBasisFor(ctx, ap.BranchID, products, lines)
+	gm := estimateGrossMargin(cost, salesByProduct)
+	perSKU := estimateProductMargins(cost, salesByProduct)
+	gmSignals := checkGrossMarginWithAllowance(gm, allowance, perSKU, names)
 	*signals = append(*signals, gmSignals...)
+
+	// ---- 实现毛利（2026-10-29 用户口径）----
+	//
+	// 窗口毛利问的是"这批货整体上赚不赚钱"（成本用库存加权平均成本价）；
+	// 实现毛利问的是"**这批新进的货**按它自己的进价卖出去赚不赚钱" ——
+	// 后者才是"要不要付这笔货款"的依据。
+	//
+	// 口径：用本批次进货均价与【最早采购日 ~ 发起付款审批当天】的销售均价，
+	// 量取 min(本批次进货总量, 窗口销售总量)。
+	realizedSales, realizedFrom := s.realizedWindowSales(
+		ctx, ap.BranchID, sheetDates, productSheets, today, toDate, fallbackFrom)
+	realized := estimateRealizedMargins(
+		batchPurchaseByProduct(lines), realizedSales, realizedFrom)
+	realizedNeg := negativeRealizedMargins(realized)
+	if len(realizedNeg) > 0 {
+		*signals = append(*signals, checkRealizedMargin(realized, names)...)
+	}
+
+	avgCnt, purchaseCnt := costBasisCounts(cost)
 	s.logStep(ctx, ap, StepCheckQuantity,
 		fmt.Sprintf("PI 单 %d 张,商品 %d 种,窗口 %s~%s(按各商品最后一次采购入库日起算,取不到则回退 %s)",
 			len(piSheets), len(products), groups[0].From, toDate, fallbackFrom),
-		fmt.Sprintf("新增 %d 条数量信号;窗口毛利估算 %s 元,补差价额度 %s 元",
-			len(*signals)-before, yuanText(gm.AmountYuan), yuanText(allowance.PriceDiffYuan)),
+		fmt.Sprintf("新增 %d 条数量信号;窗口毛利估算 %s 元(成本口径:库存加权平均成本价 %d 个商品,回退本次进货均价 %d 个),补差价额度 %s 元,毛利为负的商品 %d 个;实现毛利为负的商品 %d 个",
+			len(*signals)-before, yuanText(gm.AmountYuan), avgCnt, purchaseCnt,
+			yuanText(allowance.PriceDiffYuan),
+			len(negativeProductMargins(perSKU)),
+			len(realizedNeg)),
 		"", time.Since(start).Milliseconds())
 	return nil
+}
+
+// realizedWindowSales 拉「实现毛利」口径要用的窗口销售汇总。
+//
+// # 窗口口径（2026-10-29 用户口径）
+//
+// 起点 = 该 SKU 在**本单采购单**里的**最早**制单日期；
+// 终点 = 发起付款审批当天（开区间到明天 ⇒ 当天的销售也算在内，与窗口毛利一致）。
+//
+// ⚠️ 与窗口毛利的窗口**不是同一个**：窗口毛利取**最晚**采购日起算
+//    （"这批货进来到今天卖了多少"），实现毛利取**最早**采购日起算
+//    （"这批货从进店那天起一共卖了多少钱/多少量"）。
+//
+// # 性能
+//
+// 一次 sale_day 查询 ≈ 1.2s（源表 120 万行）⇒ 不能每个商品查一次。
+// ⇒ 与窗口毛利同一手法：**按起点日期归组**，一组一次查询，
+// 组数上限 [maxSaleWindowGroups]。
+func (s *Service) realizedWindowSales(
+	ctx context.Context,
+	branchID string,
+	sheetDates map[string]string,
+	productSheets map[string][]string,
+	today, toDate, fallbackFrom string,
+) (map[string]SaleRow, map[string]string) {
+	groups := buildSaleWindowGroupsByDate(
+		sheetDates, productSheets, today, fallbackFrom, maxSaleWindowGroups, windowStartEarliest)
+	sales := make(map[string]SaleRow)
+	fromByProduct := make(map[string]string)
+	for _, g := range groups {
+		rows, err := s.cube.SumSalesByProduct(ctx, branchID, g.Products, g.From, toDate)
+		if err != nil {
+			// 拉不到 ⇒ 这一组不参与实现毛利口径（宁可少算一个商品，
+			// 也不要拿半个数据编出一个"亏损"结论）。
+			s.logger.Warn("settlement-auditor: 取实现毛利窗口销量失败,该组跳过",
+				"branch_id", branchID, "from", g.From, "products", len(g.Products), "err", err)
+			continue
+		}
+		for _, r := range rows {
+			sales[r.ProductID] = r
+		}
+		for _, pid := range g.Products {
+			fromByProduct[pid] = g.From
+		}
+	}
+	return sales, fromByProduct
 }
 
 // unitCostByProduct 按货号算本次进货均价(元/件)。
 //
 // 口径:Σ(该商品各行进货金额) ÷ Σ(该商品各行收货量)。
+//
+// ⚠️ **它不再是毛利估算的主口径**(2026-10-29):主口径是库存加权平均成本价
+//    (stock.avg_cost),这里只作为**回退**(拿不到库存成本时用)。
+//    理由见 service/allowance.go 的 GrossMargin 注释(生产实踩)。
 //
 // ⚠️ 只用于**毛利估算**(相对判断),不是财务成本口径 —— 引擎没有历史成本。
 func unitCostByProduct(lines []SheetLineRow) map[string]decimal.Decimal {
@@ -714,6 +815,77 @@ func unitCostByProduct(lines []SheetLineRow) map[string]decimal.Decimal {
 		out[pid] = a.Div(q)
 	}
 	return out
+}
+
+// mergeCostBasis 合并两种成本口径,得到每个货号最终用的成本。
+//
+// # 优先级:库存加权平均成本价 > 本批次进货均价
+//
+// 库存加权平均成本价 = 思迅「库存查询」里的**平均成本价**,是财务核对的同一个数;
+// 本批次进货均价 = 这一笔进货的价格,只在该商品**没有库存成本记录**时回退。
+//
+// ⚠️ "没有库存成本记录"有两种:① cube 里查不到这个商品(没维护/没同步);
+//    ② avg_cost = 0(库存为 0 或成本没维护)—— 两种都要回退,否则该 SKU
+//    会因为"没成本"而**整个不进毛利口径**(静默少算一个商品)。
+func mergeCostBasis(batch map[string]decimal.Decimal, avgCost map[string]decimal.Decimal) map[string]CostBasis {
+	out := make(map[string]CostBasis, len(batch)+len(avgCost))
+	for pid, c := range avgCost {
+		if !c.GreaterThan(decimal.Zero) {
+			continue
+		}
+		out[pid] = CostBasis{UnitCostYuan: c, Source: CostSourceAvgCost}
+	}
+	for pid, c := range batch {
+		if !c.GreaterThan(decimal.Zero) {
+			continue
+		}
+		if _, ok := out[pid]; ok {
+			continue // 已有库存成本口径 ⇒ 本批次进货价不再覆盖
+		}
+		out[pid] = CostBasis{UnitCostYuan: c, Source: CostSourcePurchase}
+	}
+	return out
+}
+
+// costBasisFor 取本次审批涉及商品的**成本口径**。
+//
+// 优先 cube `stock.avg_cost`(思迅库存加权平均成本价);
+// 拉不到(查不到该商品 / cube 报错)时回退本批次进货均价。
+//
+// ⚠️ 拉库存成本失败**只告警不阻断**:毛利信号本来就是"估算 + 永不 block",
+//    因一个旁路查询失败就让整单审核失败是本末倒置。
+func (s *Service) costBasisFor(ctx context.Context, branchID string, products []string, lines []SheetLineRow) map[string]CostBasis {
+	batch := unitCostByProduct(lines)
+	avgCost := make(map[string]decimal.Decimal)
+	if s.cube != nil && len(products) > 0 {
+		stocks, err := s.cube.GetStocks(ctx, branchID, products)
+		if err != nil {
+			s.logger.Warn("settlement-auditor: 取库存成本失败,毛利估算回退本次进货均价",
+				"branch_id", branchID, "err", err)
+		} else {
+			for _, st := range stocks {
+				id := strings.TrimSpace(st.ProductID)
+				if id == "" {
+					continue
+				}
+				avgCost[id] = st.AvgCost
+			}
+		}
+	}
+	return mergeCostBasis(batch, avgCost)
+}
+
+// costBasisCounts 统计两种口径各覆盖了多少个商品(日志/信号里要能说清按哪个口径算的)。
+func costBasisCounts(cost map[string]CostBasis) (avgCost int, purchase int) {
+	for _, c := range cost {
+		switch c.Source {
+		case CostSourceAvgCost:
+			avgCost++
+		default:
+			purchase++
+		}
+	}
+	return avgCost, purchase
 }
 
 // containsString 判断字符串切片里是否已有该值(小规模,线性扫足够)。
@@ -1285,7 +1457,10 @@ type ApprovalDetail struct {
 }
 
 // ListApprovals 按 branch + 条件分页(created_at 降序)。
-func (s *Service) ListApprovals(ctx context.Context, branchID, status, from, to string, limit, offset int) ([]model.ApprovalInstance, int64, error) {
+//
+// 返回的是 [ApprovalListItem]（审批实例 + 列表卡片摘要：供应商名 / 付款项名）。
+// ⚠️ 摘要是**附带**的：读不到只少显示名字,列表照常(见 fillListSummaries)。
+func (s *Service) ListApprovals(ctx context.Context, branchID, status, from, to string, limit, offset int) ([]ApprovalListItem, int64, error) {
 	if branchID == "" {
 		return nil, 0, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
 	}
@@ -1310,7 +1485,13 @@ func (s *Service) ListApprovals(ctx context.Context, branchID, status, from, to 
 	if err := q.Order("created_at DESC").Limit(limit).Offset(offset).Find(&items).Error; err != nil {
 		return nil, 0, err
 	}
-	return items, total, nil
+	// 列表卡片摘要（供应商名 / 付款项名）—— 2026-10-29 用户口径。
+	out := make([]ApprovalListItem, 0, len(items))
+	for _, it := range items {
+		out = append(out, ApprovalListItem{ApprovalInstance: it})
+	}
+	s.fillListSummaries(ctx, branchID, out)
+	return out, total, nil
 }
 
 // GetApprovalDetail 读详情(branch 隔离由 handler 校验后传入)。

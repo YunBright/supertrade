@@ -161,17 +161,25 @@ func (s *Service) markBusinessDayPigIn(ctx context.Context, tx *gorm.DB, branchI
 // markBusinessDayCounterLoaded 搬上台后推进状态(已搬台)。
 //
 // ⚠️ CounterLoadKg 是**按流水重算**的(不是累加)⇒ 重复提交不会翻倍。
+//
+// ⚠️ 2026-10-30 owner：「今天不搬台」会落一条 **qty_kg = 0** 的标记行 ⇒
+//   **只有真的搬了货**(当天总搬台量 > 0)才算"已搬台":
+//   - 不置 HasCounterLoad;
+//   - 不推状态阶梯(状态是"走到最远的那一步",0 kg 不该算搬过)。
+//   ⇒ 否则那天的"营业日动作"判定与休市判定都会把它当成"搬过台"⇒ 误判。
 func (s *Service) markBusinessDayCounterLoaded(ctx context.Context, tx *gorm.DB, branchID string, bizDate time.Time) error {
 	total, err := s.counterLoadTotalKg(ctx, tx, branchID, bizDate)
 	if err != nil {
 		return err
 	}
 	return s.mergeBusinessDay(ctx, tx, branchID, bizDate, func(d *model.BusinessDay) {
-		d.HasCounterLoad = true
-		d.CounterLoadKg = total
-		if bizDayRank(d.Status) < bizDayRank(BizDayStatusCounterLoaded) {
-			d.Status = BizDayStatusCounterLoaded
+		if total.IsPositive() {
+			d.HasCounterLoad = true
+			if bizDayRank(d.Status) < bizDayRank(BizDayStatusCounterLoaded) {
+				d.Status = BizDayStatusCounterLoaded
+			}
 		}
+		d.CounterLoadKg = total
 	})
 }
 
@@ -371,8 +379,17 @@ func (s *Service) hasBizDayActions(ctx context.Context, branchID, dayKey string)
 		return true, nil
 	}
 	// ② 搬台（按归属营业日）。
+	//
+	// ⚠️ 2026-10-30 owner：**只有真的搬了货**才算营业日动作。
+	//   「今天不搬台」会落一条 qty_kg = 0 的标记行 ⇒ 那**不是**搬台动作。
+	//
+	//   ⇒ 为什么这里还要防:链起点会**随改期初而前移**(改期初 = 换链起点)
+	//   ⇒ 新链起点那天**可能已经有搬台流水**(那是旧链起点+1 的日子)
+	//   ⇒ 若把 0 kg 的标记行算成"搬过台"⇒ 新链起点会从"纯基线日"变成"营业日"
+	//   ⇒ 那天的日终就被迫盘点(而那天可能还没开张)⇒ 链断。
+	//   ⇒ 判据用 `qty_kg > 0`,不是"有没有行"。
 	if err := s.db.WithContext(ctx).Model(&model.CounterLoadRecord{}).
-		Where("branch_id = ? AND biz_date = ?", branchID, datatypesDate(start)).
+		Where("branch_id = ? AND biz_date = ? AND qty_kg > 0", branchID, datatypesDate(start)).
 		Count(&n).Error; err != nil {
 		return false, fmt.Errorf("count counter_loads(actions): %w", err)
 	}

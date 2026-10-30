@@ -61,20 +61,49 @@ type CutDailyCost struct {
 
 	OpeningKg     decimal.Decimal
 	OpeningAmount decimal.Decimal
-	ProducedKg    decimal.Decimal
+	// ProducedKg 是**入库量**(= 调整后权重 W_c,见 cut_split_algo.go)。
+	ProducedKg decimal.Decimal
+	// ProducedAmount 是**入库金额**(当日可摊猪成本按 W 的比例重分)。
 	ProducedAmount decimal.Decimal
-	SoldKg        decimal.Decimal
-	SoldAmount    decimal.Decimal
-	BulkSoldKg    decimal.Decimal
+	SoldKg         decimal.Decimal
+	SoldAmount     decimal.Decimal
+	BulkSoldKg     decimal.Decimal
 	BulkSoldAmount decimal.Decimal
-	WasteKg       decimal.Decimal
-	WasteAmount   decimal.Decimal
+	WasteKg        decimal.Decimal
+	WasteAmount    decimal.Decimal
 
 	// ExpectedClosingKg 是**账面应有**期末量(**不裁 0** ⇒ 负数 = 账面短卖)。
+	//
+	// ⚠️ 它是**账面推演**,永远可能是负数 ⇒ 报表用它提示"卖超了账面库存"。
+	//   但**期末量(ClosingKg)不裁 0** —— 链上永远是 ≥0(见下)。
 	ExpectedClosingKg decimal.Decimal
-	// ClosingKg 是期末量(有盘点 = 实盘;无盘点 = 账面推演)。
+	// ClosingKg 是期末量(有盘点 = 实盘;无盘点 = 账面推演**裁 0**)。
+	//
+	// ⚠️ **不为负**(owner 2026-10-30:「期初不能有负数」):
+	//   盘到的部位(含 0 kg)用实盘;没盘到的用 max(账面推演, 0)
+	//   ⇒ 链上永远是 ≥0 ⇒ 下一天的期初不会是负数。
 	ClosingKg     decimal.Decimal
 	ClosingAmount decimal.Decimal
+
+	// ---- 短卖(2026-10-30 owner 口径)----
+	//
+	// CutShortSellKg 是**该部位账面不足**的量(kg)—— 只作提示,**不进链**。
+	//
+	// = max(0, 卖出+统收+报损 + 期末 − 可售量)
+	// ⚠️ 典型场景(生产实测 店 00 2026-10-29):AI 的建议分割给 fat 只分了 5.073kg,
+	//   门店当天卖了 8.383kg ⇒ 账面差 3.311kg ⇒ **但总量够**(进货 181.7 ≥ 卖出 178.1)
+	//   ⇒ 这是**分摊口径**问题,不是真短卖 ⇒ 不该传递到下一天。
+	CutShortSellKg decimal.Decimal
+	// ShortSellKg 是**当日总量**短卖中分摊到该部位的量(kg)——
+	// 口径 = max(0, Σ卖出+统收+报损 − Σ期初+进货)(owner:「总量够就不算短卖」)。
+	//
+	// ⚠️ 生产实测 店 00:10-29 = 0(总量够);10-30 = 62.512(账面只剩 20.9kg 却卖了 83.4kg)。
+	// ⇒ >0 ⇒ ① 报表描红 ② **审计结转被拒** ③ 结转给下一天(累计短卖)。
+	ShortSellKg decimal.Decimal
+	// CarriedShortSellKg 是**从上一期结转过来**的短卖(kg)—— 累计口径。
+	//
+	// ⚠️ **绝不回写成负库存**:短卖只进"累计短卖"这个数,期初仍然是 ≥0。
+	CarriedShortSellKg decimal.Decimal
 
 	MovingAvgUnitCost decimal.Decimal
 	SalesCostYuan     decimal.Decimal
@@ -102,6 +131,45 @@ type CutDailyCost struct {
 	//
 	// ⇒ 报表层要**显式标注**这种天/部位,别让"算不出来"伪装成"成本是 0"。
 	CostUncomputable bool
+
+	// ---- 部位级分割数据(2026-10-29;owner 定案)----
+	//
+	// SuggestedSplitKg 是**建议分割** S_c(kg):纯算法建议(基线 p50 → LLM 兜底),
+	// **不含 pig_cuts 实录**。
+	SuggestedSplitKg decimal.Decimal
+	// ActualSplitKg 是**实际分割** A_c(kg);nil ⇒ 按显示规则隐藏(前端显示空)。
+	//
+	// ⚠ **内部值**在引擎里是全量(隐藏与否只影响报表展示层),
+	//   但重分配用的是**内部值**(owner:「用内部的 A_c,不是显示值」)。
+	ActualSplitKg *decimal.Decimal
+	// ActualSplitSource:recorded(实录)| derived(倒推)。
+	ActualSplitSource string
+	// AdjustedSplitKg 是**调整后权重** W_c(kg)—— 成本基准(= 入库量)。
+	AdjustedSplitKg decimal.Decimal
+	// CounterActualKg 是该部位当日的**猪肉台实盘**(kg)(完整盘点单口径)。
+	CounterActualKg decimal.Decimal
+	// ColdStoreKg 是该部位当日的**冷库量**(kg)。
+	ColdStoreKg decimal.Decimal
+	// CounterLoadKg 是该部位当日**搬上台**的重量(kg)。
+	//
+	// ⚠️ 2026-10-30 owner 口径:毛利看板那张表**整张都是猪肉台的** ⇒
+	//   「期初」那一列不该显示账面链值(可以是负数 = 账面短卖,门店看不懂),
+	//   而该显示**今天搬上台的量**(门店自己搬的,一眼认得)。
+	CounterLoadKg decimal.Decimal
+	// SuggestedUnitCostYuan 是**建议单价**(元/kg)——
+	// 「如果今天的猪按**建议分割**切,这刀货的成本单价是多少」。
+	//
+	// 口径 = (期初金额 + 今日入库金额按**建议**比例摊到的部分) ÷ (期初kg + 建议分割kg)
+	// ⚠️ nil = **没有建议分割**(当天没进猪 ⇒ Σ建议=0)⇒ 前端显示「—」,不显示 0。
+	SuggestedUnitCostYuan *decimal.Decimal
+	// ActualAvgUnitPriceYuan 是**实际均价**(元/kg)—— 当日这个部位**实际卖出**的平均单价。
+	//
+	// 口径 = 营收 ÷ 销量(零售来自思迅日汇总表 t_rm_daysum;统收是本地登记,一并计入)
+	// ⇒ **与「营收」列自洽**(均价 × 销量 = 营收),门店能自己验算。
+	// ⚠️ nil = 当天这个部位**没卖**(没销量)⇒ 前端显示「—」。
+	ActualAvgUnitPriceYuan *decimal.Decimal
+	// SplitWeightNote 是当天的**分割权重告警**(空 = 没有告警)。
+	SplitWeightNote string
 }
 
 // cutOpeningOverride 期初覆盖(链式接续用)。
@@ -114,10 +182,12 @@ type CutDailyCost struct {
 // 成本塌成"期初那点残值" ⇒ 毛利虚高(2026-10-27 生产实测:10-03 起成本 ≈ 100 元)。
 //
 // ⇒ 实时计算时,把**上一天算出来的期末**直接喂给下一天当期初
-//   ⇒ 链接续 ⇒ 数字自洽(不依赖任何落库快照)。
+//
+//	⇒ 链接续 ⇒ 数字自洽(不依赖任何落库快照)。
 //
 // ⚠️ amount 用的是**结转口径**的期末金额(与 cut_cost_daily.ClosingAmount 同义):
-//   成本口径期末金额 + 预售重估 ⇒ 下一期的期初单价自动 = 预期销售单价。
+//
+//	成本口径期末金额 + 预售重估 ⇒ 下一期的期初单价自动 = 预期销售单价。
 type cutOpeningOverride struct {
 	kg     map[string]decimal.Decimal
 	amount map[string]decimal.Decimal
@@ -135,6 +205,11 @@ type cutOpeningOverride struct {
 	// ⇒ 链必须把**上期的加权成本**一起传下去 ⇒ 短卖那部分照上期成本结转
 	//   (与"短卖按当期移动加权成本计入成本"的口径一致)。
 	unit map[string]decimal.Decimal
+	// shortSell 是**累计短卖**(kg)—— 从上一期结转过来的真短卖(口径见 ShortSellKg)。
+	//
+	// ⚠️ **它不是库存**:短卖不写回负库存(期初仍 ≥0)⇒ 它只是给门店看的
+	//   "这段时间一共短卖了多少"⇒ 链带着它往下传,次日报告显示「累计短卖」。
+	shortSell decimal.Decimal
 }
 
 // has 某个部位有没有覆盖值。
@@ -181,6 +256,33 @@ func (s *Service) loadStocktakeFlags(ctx context.Context, branchID string, start
 	return true, dataSourceActual, nil
 }
 
+// clampNonNegative 把"负的期末"裁成 0(kg 与金额**一起**裁)。
+//
+// # 为什么读快照时也要裁(2026-10-30 加)
+//
+//	新口径(R1)规定:**期末量永远 ≥0**(盘到的部位用实盘,没盘到的用 max(账面推演, 0))
+//	⇒ 链上永远是 ≥0 ⇒ 次日期初不会是负数。
+//
+//	⚠️ 但**存量快照**是旧口径写的 —— 里面真的有负数
+//	(生产实测 店 00 2026-10-29:8 个部位的 closing_kg 为负,最大 −3.311kg)。
+//	⇒ 新代码从快照/锚点读期末时若不裁,负数就**从快照漏回链里**
+//	⇒ owner 说的"期初不能有负数"又破功(而且只有存量门店会犯 ⇒ 新店测不出来)。
+//
+// # 为什么金额要**一起**裁
+//
+//	kg = 0 而金额是负数 ⇒ 可售金额为负 ⇒ 移动加权单价(金额÷kg)算不出来
+//	⇒ 又变成"成本算不出来 ⇒ 毛利虚高"的老坑。
+//
+//	⚠️ 裁掉的那部分**不会凭空消失**:它会变成当天的**短卖分量**
+//	(见 CutShortSellKg:可售量被裁小 ⇒ 账面不足变大 ⇒ 按当期单价补回成本)
+//	⇒ 对账恒等式仍然闭合(diff = 0)。
+func clampNonNegative(kg, amount decimal.Decimal) (decimal.Decimal, decimal.Decimal) {
+	if kg.IsNegative() {
+		return decimal.Zero, decimal.Zero
+	}
+	return kg, amount
+}
+
 // loadCutOpening 取某营业日的**部位级期初**(kg + 金额)。
 //
 // # kg 与金额**分开定价**(2026-10-27 修)
@@ -203,7 +305,8 @@ func (s *Service) loadStocktakeFlags(ctx context.Context, branchID string, start
 //	   ⇒ 金额必须由 ③/④ 兜住,否则期初按 0 元入账 ⇒ 整条链的毛利虚高。
 //
 // ⚠️ 第 ③ 步是这次改造的关键:旧引擎把它落到"主 SKU"上 ⇒ 另一个货号账面恒为 0
-//   ⇒ 卖出零成本 ⇒ 毛利率 100%。
+//
+//	⇒ 卖出零成本 ⇒ 毛利率 100%。
 //
 // # override(链式接续,2026-10-27)
 //
@@ -241,8 +344,9 @@ func (s *Service) loadCutOpening(ctx context.Context, branchID string, bizDate t
 		if r.CostUncomputable {
 			continue
 		}
-		snapKg[c] = r.ClosingKg
-		snapAmt[c] = r.ClosingAmount
+		// ⚠️ **负的期末要裁成 0**(2026-10-30 加,见 clampNonNegative 的说明):
+		//   旧口径把负的账面推演写进了存量快照 ⇒ 不裁的话负期初又漏回链里。
+		snapKg[c], snapAmt[c] = clampNonNegative(r.ClosingKg, r.ClosingAmount)
 		hasSnap[c] = true
 	}
 
@@ -266,6 +370,31 @@ func (s *Service) loadCutOpening(ctx context.Context, branchID string, bizDate t
 		return nil, nil, err
 	}
 	key := bizDate.In(s.bizTZOrUTC()).Format("2006-01-02")
+
+	// ⚠️ **基线日是「天」级别的,不是「部位」级别的**(2026-10-30 加)。
+	//
+	//	门店在生效日**重新定义了整天的期初** ⇒ 那天**所有**部位的期初都来自门店:
+	//	录了的 = 门店录的量;没录的 = 0。
+	//
+	//	# 为什么必须是天级(2026-10-30 生产实测,店 00)
+	//
+	//	旧实现是 `baselineDay := hasOp && op.dateKey == key` —— **按部位**判断:
+	//	只有「门店在这个部位上录了期初」的那个部位才让位给门店的值,
+	//	**其余部位照旧接链外的旧结余** ⇒ 链外的负账面值顺着「没录的部位」
+	//	又漏回了链里(实测:10-28 的猪耳 −1.279 / 猪肺 −17.64 / 猪手 −9.2 kg
+	//	—— 门店压根没录过这三个部位)。
+	//	⇒ 代码自己的注释写的就是「生效日当天:快照/链式接续/实时结余链
+	//	  **一律让位**给门店录的值」—— 承诺是天级,实现却是部位级。
+	//
+	//	⇒ 这里取该店期初结转的**最早生效日**(= 链的起点,见 cutChainBaseline)
+	//	  作为基线日;其余日子照旧链式接续。
+	chainStartDay := ""
+	for _, op := range openings {
+		if chainStartDay == "" || op.dateKey < chainStartDay {
+			chainStartDay = op.dateKey
+		}
+	}
+	baselineDay := chainStartDay != "" && chainStartDay == key
 
 	// 今日产出单价(兜底价):该部位的产出金额 ÷ 产出 kg。
 	producedUnit := map[string]decimal.Decimal{}
@@ -302,10 +431,16 @@ func (s *Service) loadCutOpening(ctx context.Context, branchID string, bizDate t
 		//	否则门店录了 100kg、报表写 95kg(昨天卖剩的量)⇒ 门店会以为系统算错了。
 		//
 		//	⇒ 生效日当天:快照 / 链式接续 / 实时结余链 **一律让位**给门店录的值。
-		baselineDay := hasOp && op.dateKey == key
+		//	  ⚠️ 但「让位」是**整天**的(见上面的 chainStartDay):
+		//	  没录的部位 = 0,**不接**链外的旧结余。
 		switch {
 		case baselineDay:
-			// 落到下面的定价(门店给的进价优先)。
+			// 门店重定义了这一天 ⇒ 整天的期初都来自门店(录了的用录的,没录的 = 0)。
+			// ⚠️ 这里**不接**快照/链式接续/实时结余链 ——
+			//   否则链外的旧账(上线前物化的负账面值)会顺着"没录的部位"漏回链里。
+			if !hasOp {
+				continue // 门店没录 ⇒ 这个部位当天期初 = 0
+			}
 			kg[c] = op.kg
 		case override.has(c):
 			// 链式接续:上一天的期末直接接成今天的期初(与快照同语义)。
@@ -356,6 +491,26 @@ func (s *Service) loadCutOpening(ctx context.Context, branchID string, bizDate t
 		}
 		amount[c] = decimal.Zero
 	}
+	// ⚠️ **期初永远 ≥0**(owner 2026-10-30:「期初不能有负数」)。
+	//
+	//	期初有三个来源,**都可能是负数**:
+	//	  ① 上一天的链值(override)—— 旧引擎会把负的期末传下来;
+	//	  ② 上一营业日的**快照**(历史数据里有负的 closing_kg);
+	//	  ③ **实时结余链**(closingForDay)—— 余额链算出来的冷库余额可以是负的
+	//	    (搬台超过库存时)⇒ 实测:10-30 卖出 50kg、账上只有 20kg
+	//	    ⇒ 余额链 = −30kg ⇒ 期初 −30 ⇒ 门店看到"期初有负数"。
+	//
+	//	⇒ 统一在这里裁 0(金额同步归零)⇒ **门店永远看不到负期初**,
+	//	  而短卖由「当日短卖 / 账面不足」这两个数显式表达(不靠负库存暗示)。
+	for c := range kg {
+		if kg[c].IsNegative() {
+			kg[c] = decimal.Zero
+			amount[c] = decimal.Zero
+		}
+		if amount[c].IsNegative() {
+			amount[c] = decimal.Zero
+		}
+	}
 	return kg, amount, nil
 }
 
@@ -364,10 +519,11 @@ func (s *Service) loadCutOpening(ctx context.Context, branchID string, bizDate t
 // 返回 (部位明细, SKU 明细, 成本对账行, 损耗汇总)。
 //
 // ⚠️ **SKU 明细只承载"卖了多少、卖了多少钱"**:
-//   销售 kg / 营收 / 分割产出是 SKU 级的事实;
-//   **期初 / 期末 / 成本 / 毛利都是部位口径** ⇒ SKU 行里不返(留 0)。
-//   ⇒ 这正是门店要的口径(2026-10-27):
-//   「以部位为主(分割仍然是部位的重量),销售、营收等和 SKU 有关的数据分列」。
+//
+//	销售 kg / 营收 / 分割产出是 SKU 级的事实;
+//	**期初 / 期末 / 成本 / 毛利都是部位口径** ⇒ SKU 行里不返(留 0)。
+//	⇒ 这正是门店要的口径(2026-10-27):
+//	「以部位为主(分割仍然是部位的重量),销售、营收等和 SKU 有关的数据分列」。
 func (s *Service) computeCutDailyCosts(ctx context.Context, branchID string, day time.Time) (
 	[]CutDailyCost, []SkuDailyCost, *ReconciliationRow, *LossSummary, error,
 ) {
@@ -378,7 +534,8 @@ func (s *Service) computeCutDailyCosts(ctx context.Context, branchID string, day
 // 并允许把**上一天的期末**接成今天的期初(链式接续)。
 //
 // ⚠️ override 只影响"期初"这一步;其余口径与 computeCutDailyCosts 完全一致
-//   ⇒ 单日毛利与长期毛利用同一个引擎,不会算出两套数。
+//
+//	⇒ 单日毛利与长期毛利用同一个引擎,不会算出两套数。
 func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID string, day time.Time,
 	override *cutOpeningOverride,
 ) (
@@ -415,6 +572,39 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 		s.loadSkuFlows(ctx, branchID, startOfDay, endOfDay)
 	if err != nil {
 		return nil, nil, nil, nil, err
+	}
+
+	// ---- 3a. ⚠️ **纯基线日**:只提供期初,当天的销售**不进这条链**(2026-10-30 owner 定案)----
+	//
+	//	owner 原话:「我把 2026-10-28 作为期初,2026-10-29 作为第一天正常开始使用这套鲜肉子系统」
+	//
+	//	⇒ **纯基线日** = 期初生效日 **且** 那天没有任何营业日动作
+	//	  (没录猪、没搬台、没盘点 ⇒ 见 isBaselineDay)
+	//	  ⇒ 那天的 POS 销售是**上线前那套账**的货:系统里没有对应的进货/搬台/盘点
+	//	  ⇒ 成本**算不出来**,而且那天的销售**根本不该在这条链里**
+	//	  (生产实测 店 00:10-28 卖了 172kg / 营收 3632.70 元,而期初只有"后腿 10kg"
+	//	   ⇒ 账面短卖 ⇒ 结余 −8.24kg ⇒ 传给 10-29 当期初 ⇒ 门店看到"期初为什么有负数")。
+	//
+	//	⇒ 纯基线日**只带期初**:销售/统收/报损一律不进链
+	//	  ⇒ 它的结余 = 期初 ⇒ 下一天(链的第一天)的期初 = 门店录的值 ⇒ **不再短卖**。
+	//
+	//	⚠️ **只对"纯基线日"生效**:那天**有**营业日动作的基线日(例如门店当天录了猪)
+	//	  ⇒ 那天是**真营业日** ⇒ 它的销售必须进链(否则链会断、货会凭空消失)。
+	//	  ⇒ 店 01 的期初生效日 10-01 有营业日动作 ⇒ 它的数字**不受影响**。
+	//
+	//	⚠️ 在**汇总到部位之前**清(SKU 级源头)⇒ 部位行、SKU 行、营收全部一致。
+	baselineKey := bizDate.In(s.bizTZOrUTC()).Format("2006-01-02")
+	if pureBaseline, err := s.isBaselineDay(ctx, branchID, baselineKey); err != nil {
+		s.pubLogger.Warn("computeCutDailyCosts: 判纯基线日失败(按普通营业日算)",
+			"branch_id", branchID, "biz_date", baselineKey, "err", err)
+	} else if pureBaseline {
+		soldKg = map[string]decimal.Decimal{}
+		soldAmount = map[string]decimal.Decimal{}
+		bulkKg = map[string]decimal.Decimal{}
+		bulkAmount = map[string]decimal.Decimal{}
+		wasteKg = map[string]decimal.Decimal{}
+		s.pubLogger.Info("纯基线日:只带期初,当天的销售不进成本链",
+			"branch_id", branchID, "biz_date", baselineKey)
 	}
 
 	// ---- 2b. 入库量兜底(门店没贴标签 ⇒ 没有袋子 ⇒ 不兜底) ----
@@ -534,13 +724,20 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 		return nil, nil, nil, nil, err
 	}
 	closeKg := map[string]decimal.Decimal{}
-	if hasStocktake {
-		counter, cold, ok, derr := s.closingForDay(ctx, branchID, bizDate)
-		if derr != nil {
-			s.pubLogger.Warn("computeCutDailyCosts: 读取按营业日的部位结余失败(回退账面推演)",
-				"branch_id", branchID, "biz_date", bizDate.Format("2006-01-02"), "err", derr)
-		} else if ok {
-			for cut, v := range cold {
+	// chainColdKg 是**引擎链的日终冷库余额**(按部位)。
+	//
+	// ⚠ 报表的「冷库量」在**没有盘点单**时退回它(owner 口径)⇒ 这里**每天**都要读一次链。
+	//   (链的推导是"按门店的流水"量级,不是按天量级 ⇒ 多读一次的代价可控。)
+	chainColdKg := map[string]decimal.Decimal{}
+	counter, cold, ok, derr := s.closingForDay(ctx, branchID, bizDate)
+	if derr != nil {
+		s.pubLogger.Warn("computeCutDailyCosts: 读取按营业日的部位结余失败(回退账面推演)",
+			"branch_id", branchID, "biz_date", bizDate.Format("2006-01-02"), "err", derr)
+	} else if ok {
+		for cut, v := range cold {
+			chainColdKg[cut] = v
+			// ⚠ 期末量**只在有盘点单时**用链值;没有盘点单 ⇒ 期末走账面推演(行为不变)。
+			if hasStocktake {
 				closeKg[cut] = v.Add(counter[cut])
 			}
 		}
@@ -587,6 +784,72 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 	}
 	sort.Strings(cutList)
 
+	// ---- 8b. 部位级分割数据(建议 S / 实际 A / 调整后权重 W)----
+	//
+	// ⚠ W 只在**要出行的部位**上算 ⇒ 每个 W > 0 的部位都有一行 ⇒ 入库金额不会"摊丢"。
+	//
+	// ⚠ W **每天现算**(不落快照)⇒ 盘点补录后 A_c 变 ⇒ W 变 ⇒ 成本跟着变。
+	cutSet := make(map[string]bool, len(cutList))
+	for _, c := range cutList {
+		cutSet[c] = true
+	}
+	split, err := s.computeCutSplit(ctx, branchID, startOfDay, endOfDay, bizDate, pigs,
+		cutOfSku, partSoldKg, partBulkKg, partWasteKg, openKg, cutSet)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	// ---- 8c. 入库量/入库金额按 W 重算 ----
+	//
+	// ⚠ ΣW == 0(没有建议分割)⇒ 完全不接管 ⇒ 与今天逐字一致(见 applySplitWeights)。
+	prodKg, prodAmount := applySplitWeights(split, partProducedKg, partProducedAmount)
+
+	// 今日可摊猪成本合计(元)= Σ 入库金额(按 W 重分后**总量不变**)。
+	//
+	// ⚠️ 「建议单价」要按**建议分割**摊同一笔钱 ⇒ 必须有这份总额。
+	var allocatable decimal.Decimal
+	for _, v := range prodAmount {
+		allocatable = allocatable.Add(v)
+	}
+	// Σ 建议分割(kg)—— 建议单价的分摊基数。
+	var totalSuggestedKg decimal.Decimal
+	for _, v := range split.Suggested {
+		totalSuggestedKg = totalSuggestedKg.Add(v)
+	}
+
+	// ---- 8d. 报表口径:冷库量 + 实际分割的显隐 ----
+	//
+	// 冷库量:盘点单优先(盘点**那一刻**的冷库余额);**没有盘点单** ⇒ 退回引擎链值
+	//   (owner 口径:「没有盘点单时退回 closingForDay 的 cold 那份」)。
+	//
+	// ⚠ 冷库量**不是实盘**:实盘 = 猪肉台实盘(ActualRemainKg)⇒ 两者分开出参。
+	coldStoreKg := split.Cold
+	if !split.HasAnyStocktake {
+		coldStoreKg = chainColdKg
+	}
+	//
+	// 实际分割的**显示规则**(owner 定案):
+	//	recorded ⇒ 总是给值;
+	//	derived  ⇒ 有完整日终盘点 ⇒ 给值;
+	//	           无完整日终盘点 且 A_c < S_c ⇒ 给 nil(前端显示空)。
+	//
+	// ⚠ 显隐**只影响展示**;重分配用的永远是**内部值**(split.Actual)。
+	splitActualKg := map[string]*decimal.Decimal{}
+	splitSource := map[string]string{}
+	for _, c := range cutList {
+		src := split.Source[c]
+		if src == "" {
+			src = ActualSplitSourceDerived
+		}
+		splitSource[c] = src
+		actual := split.Actual[c]
+		if src == ActualSplitSourceDerived && !split.HasStocktake && actual.LessThan(split.Suggested[c]) {
+			continue // 隐藏 ⇒ 前端显示空
+		}
+		v := actual
+		splitActualKg[c] = &v
+	}
+
 	// 部位的历史移动加权单价(上面已查)。
 	//
 	// ⚠️ 兜底价:该部位今日的产出单价(产出金额 ÷ 产出 kg)——
@@ -595,22 +858,44 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 		if histUnit[cut].IsPositive() {
 			return histUnit[cut]
 		}
-		k := partProducedKg[cut]
+		k := prodKg[cut]
 		if !k.IsPositive() {
 			return decimal.Zero
 		}
-		if a := partProducedAmount[cut]; a.IsPositive() {
+		if a := prodAmount[cut]; a.IsPositive() {
 			return a.Div(k)
 		}
 		return decimal.Zero
 	}
 
+	// ---- 从上一期结转过来的**累计短卖**(R4)----
+	//
+	//	链状态带 shortSellKg(累计)⇒ 次日报告显示「累计短卖」。
+	//	⚠️ **绝不回写成负库存**:短卖只进这个数,期初仍然是 ≥0(见上面的期末量口径)。
+	carriedShortSellKg := decimal.Zero
+	if override != nil {
+		carriedShortSellKg = override.shortSell
+	} else {
+		// 非链式调用(逐日物化:persistCutCostDaily)⇒ 从**上一营业日的快照**读累计值。
+		v, err := s.carriedShortSellFromSnapshot(ctx, branchID, bizDate)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		carriedShortSellKg = v
+	}
+
+	// 当日总量口径(R3)的两个累加项:Σ(期初+进货) 与 Σ(卖出+统收+报损)。
+	availTotalKg := decimal.Zero
+	outTotalKg := decimal.Zero
+
 	for _, c := range cutList {
 		cut := model.CutType(c)
 		openK := openKg[c]
 		openA := openAmount[c]
-		prodK := partProducedKg[c]
-		prodA := partProducedAmount[c]
+		// ⚠ 入库量/入库金额 = **调整后权重 W** 与按 W 比例重分的猪成本
+		//   (ΣW == 0 时完全沿用今天的值 ⇒ 行为逐字一致)。
+		prodK := prodKg[c]
+		prodA := prodAmount[c]
 		availAmt := openA.Add(prodA)
 		availKg := openK.Add(prodK)
 		movingAvg := decimal.Zero
@@ -640,22 +925,57 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 		//	  而不是把 0 当成成本报给门店。
 		costUncomputable := false
 		soldTotal := partSoldKg[c].Add(partBulkKg[c]).Add(partWasteKg[c])
+		// 当日总量口径(R3)的累加:Σ(期初+进货) / Σ(卖出+统收+报损)。
+		availTotalKg = availTotalKg.Add(availKg)
+		outTotalKg = outTotalKg.Add(soldTotal)
 		if !movingAvg.IsPositive() && soldTotal.IsPositive() {
 			costUncomputable = true
 		}
 		expectedCloseKg := availKg.
 			Sub(partSoldKg[c]).Sub(partBulkKg[c]).Sub(partWasteKg[c])
-		// ⚠️ **不裁 0**:负数 = 账面短卖 ⇒ 必须看得见。
+		// ---- 期末量(R1,2026-10-30 owner:「期初不能有负数」)----
+		//
+		//	① **盘到的部位(含 0 kg)** ⇒ 期末量 = **实盘**(盘点单里的数);
+		//	   ⚠️ 判据是"**盘点单里出现过这个部位**",**不是**"链的余额 map 里有没有它"
+		//	     —— 余额链(`dailyBalanceTerms.add`)只记**正数**重量
+		//	     ⇒ 盘到 0 kg(售罄)的部位压根不在 map 里
+		//	     ⇒ 旧实现以为"没盘到" ⇒ 用了**负的账面推演**当期末量
+		//	     ⇒ 负数写进 cut_cost_daily.closing_kg ⇒ 链把它当次日期初
+		//	     ⇒ 门店看到"期初为什么有负数"(生产实测 店 00 2026-10-29 的 8 个部位)。
+		//	② 其它部位 / 没有完整盘点单 ⇒ 期末量 = max(账面推演, 0)。
+		//
+		//	⇒ **链上永远是 ≥0** ⇒ 下一天的期初不会有负数。
 		closeK := expectedCloseKg
 		if hasStocktake {
 			if v, ok := closeKg[c]; ok {
 				closeK = v
+			} else if _, counted := split.CounterActual[c]; counted {
+				// 链余额里没有它(盘到 0 kg ⇒ 余额链只记正数)⇒ 用盘点单的实盘。
+				closeK = split.CounterActual[c].Add(split.Cold[c])
 			}
+		}
+		if closeK.IsNegative() {
+			// 兜底:链上永远 ≥0(绝不让负期末流到次日期初)。
+			closeK = decimal.Zero
 		}
 		closeAmtBasis := closeK.Mul(movingAvg)
 		bulkCost := partBulkKg[c].Mul(movingAvg)
 		wasteCost := partWasteKg[c].Mul(movingAvg)
-		salesCost := availAmt.Sub(closeAmtBasis).Sub(bulkCost).Sub(wasteCost)
+		// ---- 账面不足(R2)与"短卖必须计成本"(R5)----
+		//
+		//	cut_short_sell_kg = max(0, 卖出+统收+报损 + 期末 − 可售量)
+		//	⇒ 这部分货是**卖超了账面库存**的 ⇒ 它的成本必须计上,
+		//	  否则销售成本算成 0 ⇒ **毛利虚高**(生产实测 店 00 2026-10-30:
+		//	  14 个部位 sales_cost_yuan = 0 ⇒ 毛利率接近 100%)。
+		//
+		//	⚠️ 单价用**当期可用单价**(移动加权单价);当期算不出来时
+		//	  movingAvg 已经是**链传下来的上期单价 / 兜底价**(见上面的 switch)。
+		cutShortSellKg := soldTotal.Add(closeK).Sub(availKg)
+		if cutShortSellKg.IsNegative() {
+			cutShortSellKg = decimal.Zero
+		}
+		shortSellCost := cutShortSellKg.Mul(movingAvg)
+		salesCost := availAmt.Sub(closeAmtBasis).Sub(bulkCost).Sub(wasteCost).Add(shortSellCost)
 		if salesCost.IsNegative() {
 			// 期末实盘 > 可售金额(盘盈)⇒ 成本不能为负,裁到 0 并记日志。
 			s.pubLogger.Warn("computeCutDailyCosts: 销售成本为负(盘盈),已裁 0",
@@ -683,34 +1003,83 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 			f, _ := gm.Mul(decimal.NewFromInt(100)).Div(gmBase).Float64()
 			gmPct = f
 		}
+
+		// ---- 2026-10-30 owner 口径:这张表**整张都是猪肉台的** ----
+		//
+		// ① 搬上台的量(报表上的「搬上台」列,取代"期初"列):
+		//    门店自己搬了多少上台,一眼认得;
+		//    账面链值(期初)可以是负数(= 账面短卖)⇒ 门店看不懂"为什么期初是负的"。
+		counterLoadKg := split.CounterLoad[c]
+		// ② 建议单价(元/kg):「如果今天的猪按**建议分割**切,这刀货的成本单价」。
+		//    口径 = (期初金额 + 今日入库金额按**建议**比例摊到的部分) ÷ (期初kg + 建议分割kg)
+		//    ⚠️ nil = 当天**没有建议分割**(没进猪)⇒ 前端显示「—」,不显示 0。
+		var suggestedUnitCost *decimal.Decimal
+		if totalSuggestedKg.IsPositive() {
+			suggestedAmount := allocatable.Mul(split.Suggested[c]).Div(totalSuggestedKg)
+			suggestedKg := openK.Add(split.Suggested[c])
+			if suggestedKg.IsPositive() {
+				v := openA.Add(suggestedAmount).Div(suggestedKg)
+				suggestedUnitCost = &v
+			}
+		}
+		// ③ 实际均价(元/kg):当日这个部位**实际卖出**的平均单价 = 营收 ÷ 销量。
+		//    (零售来自思迅日汇总表 t_rm_daysum;统收是本地登记,一并计入
+		//     ⇒ 与「营收」列**自洽**:均价 × 销量 = 营收,门店能自己验算。)
+		//    ⚠️ nil = 当天这个部位**没卖**(没销量)⇒ 前端显示「—」。
+		var actualAvgUnitPrice *decimal.Decimal
+		soldTotalKg := partSoldKg[c].Add(partBulkKg[c])
+		if soldTotalKg.IsPositive() {
+			v := revenue.Div(soldTotalKg)
+			actualAvgUnitPrice = &v
+		}
 		out = append(out, CutDailyCost{
-			BranchID:          branchID,
-			CutType:           cut,
-			OpeningKg:         openK,
-			OpeningAmount:     openA,
-			ProducedKg:        prodK,
-			ProducedAmount:    prodA,
-			SoldKg:            partSoldKg[c],
-			SoldAmount:        partSoldAmount[c],
-			BulkSoldKg:        partBulkKg[c],
-			BulkSoldAmount:    partBulkAmount[c],
-			WasteKg:           partWasteKg[c],
-			WasteAmount:       partWasteKg[c].Mul(movingAvg),
-			ExpectedClosingKg: expectedCloseKg,
-			ClosingKg:         closeK,
-			ClosingAmount:     closeAmtBasis,
-			MovingAvgUnitCost: movingAvg,
-			SalesCostYuan:     salesCost,
-			BulkCostYuan:      bulkCost,
-			WasteCostYuan:     wasteCost,
-			RevenueYuan:       revenue,
-			GrossMarginYuan:   gm,
-			GrossMarginPct:    gmPct,
+			BranchID:                   branchID,
+			CutType:                    cut,
+			OpeningKg:                  openK,
+			OpeningAmount:              openA,
+			ProducedKg:                 prodK,
+			ProducedAmount:             prodA,
+			SoldKg:                     partSoldKg[c],
+			SoldAmount:                 partSoldAmount[c],
+			BulkSoldKg:                 partBulkKg[c],
+			BulkSoldAmount:             partBulkAmount[c],
+			WasteKg:                    partWasteKg[c],
+			WasteAmount:                partWasteKg[c].Mul(movingAvg),
+			ExpectedClosingKg:          expectedCloseKg,
+			ClosingKg:                  closeK,
+			ClosingAmount:              closeAmtBasis,
+			MovingAvgUnitCost:          movingAvg,
+			SalesCostYuan:              salesCost,
+			BulkCostYuan:               bulkCost,
+			WasteCostYuan:              wasteCost,
+			RevenueYuan:                revenue,
+			GrossMarginYuan:            gm,
+			GrossMarginPct:             gmPct,
 			PresaleMarginYuan:          revaluation,
 			PresaleExpectedRevenueYuan: presaleRevenue,
 			PresaleExpectedUnitYuan:    presaleUnit,
 			DataSource:                 dataSource,
 			CostUncomputable:           costUncomputable,
+			// ---- 部位级分割数据(owner 定案)----
+			SuggestedSplitKg: split.Suggested[c],
+			ActualSplitKg:    splitActualKg[c],
+			// ⚠ 调整后权重 = **成本实际用的那个权重**(= 入库量 prodK):
+			//   守卫①(没有建议分割)时引擎**完全不接管** ⇒ 成本用的仍是今天的产出量
+			//   ⇒ 这里报 prodK 而不是 0 ⇒ 与 purchased_kg 永远一致(前端两边对得上)。
+			ActualSplitSource: splitSource[c],
+			AdjustedSplitKg:   prodK,
+			CounterActualKg:   split.CounterActual[c],
+			ColdStoreKg:       coldStoreKg[c],
+			// ---- 2026-10-30:猪肉台口径的三件新数据 ----
+			CounterLoadKg:          counterLoadKg,
+			SuggestedUnitCostYuan:  suggestedUnitCost,
+			ActualAvgUnitPriceYuan: actualAvgUnitPrice,
+			SplitWeightNote:        split.Note,
+			// ---- 短卖(2026-10-30)----
+			CutShortSellKg:     cutShortSellKg,
+			CarriedShortSellKg: carriedShortSellKg,
+			// ⚠️ ShortSellKg(当日总量短卖的分摊)在**循环之后**回填
+			//   (当日总量要等所有部位都算完才知道)。
 		})
 		recon.OpeningInventoryCostYuan = recon.OpeningInventoryCostYuan.Add(openA)
 		recon.ProducedCostYuan = recon.ProducedCostYuan.Add(prodA)
@@ -719,9 +1088,50 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 		recon.WasteCostYuan = recon.WasteCostYuan.Add(wasteCost)
 		recon.ClosingInventoryCostYuan = recon.ClosingInventoryCostYuan.Add(closeAmtBasis)
 		recon.RevaluationYuan = recon.RevaluationYuan.Add(revaluation)
+		// ⚠️ 对账行的**短卖分量** = 各部位"账面不足"的合计(= 实际计入成本的那部分)。
+		//   它必须与 SalesCostYuan 里多计的那笔**完全一致**,否则对账恒等式会破。
+		recon.ShortSellKg = recon.ShortSellKg.Add(cutShortSellKg)
+		recon.ShortSellYuan = recon.ShortSellYuan.Add(shortSellCost)
 	}
 
-	// 对账行:差额 = (期初 + 入库) − (销售 + 统收 + 报损 + 期末)
+	// ---- 当日**总量**短卖(R3)----
+	//
+	//	口径(owner 2026-10-30):**当天卖出的总量超过了账面可售的总量**
+	//	⇒ 那部分货没有成本来源 ⇒ 才是"真短卖"。
+	//
+	//	⚠️ 分部位的账面不足**不算**:那是"建议分割与门店实际卖的不匹配"的**分摊口径**问题
+	//	  (生产实测 店 00 2026-10-29:总量 191.709kg ≥ 卖出 178.149kg ⇒ 短卖 = 0;
+	//	  但 fat 等 8 个部位的账面不足共 8.871kg ⇒ 只作提示)。
+	//
+	//	⚠️ 口径里**不含期末**:期末是"卖完之后还剩多少",它不影响"卖超了没有"
+	//	  (生产实测 店 00 2026-10-30:账面只剩 20.879kg 却卖了 83.391kg ⇒ 短卖 62.512kg)。
+	shortSellKg := outTotalKg.Sub(availTotalKg)
+	if shortSellKg.IsNegative() {
+		shortSellKg = decimal.Zero
+	}
+	// 分摊到各部位(按各部位自己的账面不足比例)⇒ Σ = 当日短卖。
+	// ⚠️ 分摊只用于**报表**(告诉门店"哪个部位短卖了");计成本用的是各部位自己的账面不足。
+	if shortSellKg.IsPositive() {
+		totalGap := decimal.Zero
+		for _, r := range out {
+			totalGap = totalGap.Add(r.CutShortSellKg)
+		}
+		if totalGap.IsPositive() {
+			for i := range out {
+				gap := out[i].CutShortSellKg
+				if !gap.IsPositive() {
+					continue
+				}
+				out[i].ShortSellKg = shortSellKg.Mul(gap).Div(totalGap)
+			}
+		}
+	}
+
+	// 对账行:差额 = (期初 + 入库 + **短卖**) − (销售 + 统收 + 报损 + 期末)
+	//
+	// ⚠️ **加了短卖分量后恒等式必须仍然闭合**(owner 2026-10-30):
+	//	短卖的那部分货**照当期可用单价计了成本**(进了 SalesCostYuan)
+	//	⇒ 左边必须把同一笔金额补回来 ⇒ 差额仍然是 0。
 	//
 	// ⚠️ **要 round**:移动加权单价是"金额 ÷ kg"除出来的 ⇒ 尾数 1e-16
 	//   ⇒ 显示成 "-0.0000000000000001" 会让人以为**对账不平**。
@@ -731,6 +1141,7 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 	}
 	recon.UnallocatedPigCostYuan = unallocatedPigCost
 	recon.DiffYuan = recon.OpeningInventoryCostYuan.Add(recon.ProducedCostYuan).
+		Add(recon.ShortSellYuan).
 		Sub(recon.SalesCostYuan).Sub(recon.BulkCostYuan).
 		Sub(recon.WasteCostYuan).Sub(recon.ClosingInventoryCostYuan).
 		Round(4)
@@ -754,10 +1165,11 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 // ⚠️ **只填 SKU 粒度真实存在的量**:销售 kg / 销售金额 / 统收 / 分割产出 / 营收。
 //
 // ⚠️ **期初 / 期末 / 销售成本 / 毛利一律留 0** —— 它们是**部位口径**:
-//   库存是部位的(门店口径)⇒ SKU 粒度的库存是**假的**
-//   ⇒ 填一个数进去就是继续制造同一个坑(门店会拿它跟盘点对账)。
 //
-//   ⇒ 门店要看 SKU 的销售/营收分列(2026-10-27),成本/毛利看部位行。
+//	库存是部位的(门店口径)⇒ SKU 粒度的库存是**假的**
+//	⇒ 填一个数进去就是继续制造同一个坑(门店会拿它跟盘点对账)。
+//
+//	⇒ 门店要看 SKU 的销售/营收分列(2026-10-27),成本/毛利看部位行。
 func buildSkuSalesRows(
 	branchID string,
 	cutOfSku map[string]model.CutType,
@@ -829,8 +1241,9 @@ func buildSkuSalesRows(
 // ⇒ 部位预期售价 = Σ(SKU 预期售价 × SKU 权重) / Σ(SKU 权重)。
 //
 // ⚠️ 权重优先用**当日营收**(SKU 粒度里最可靠的量:销售是实打实的);
-//   某货号当日没营收 ⇒ 退回**当日销量**;部位当期完全没动销 ⇒ 用该部位
-//   预售货号的**简单平均**(权���无意义时至少给个可解释的数)。
+//
+//	某货号当日没营收 ⇒ 退回**当日销量**;部位当期完全没动销 ⇒ 用该部位
+//	预售货号的**简单平均**(权���无意义时至少给个可解释的数)。
 func (s *Service) cutPresaleUnits(
 	presaleUnits map[string]decimal.Decimal,
 	cutOfSku map[string]model.CutType,
@@ -878,10 +1291,11 @@ func (s *Service) cutPresaleUnits(
 // 口径:昨日全店 − 今日全店 − (今日产出 − 今日卖出 − 今日报损)
 //
 // ⚠️ **负数不计入**(2026-10-27):部位期末为负 = **账面短卖**(卖超了库存),
-//   那不是"货凭空消失",而是**卖多了** ⇒ 计进"隔夜失重"会把销售问题
-//   误报成损耗问题 ⇒ 门店会去查损耗,而不是查销售。
-//   ⇒ 负余额(无论是今天的还是昨天的)一律按 0 参与合计,
-//     短卖本身由「账面短卖」红字告警暴露。
+//
+//	那不是"货凭空消失",而是**卖多了** ⇒ 计进"隔夜失重"会把销售问题
+//	误报成损耗问题 ⇒ 门店会去查损耗,而不是查销售。
+//	⇒ 负余额(无论是今天的还是昨天的)一律按 0 参与合计,
+//	  短卖本身由「账面短卖」红字告警暴露。
 func (s *Service) computeCutOvernightShrink(ctx context.Context, branchID string, bizDate time.Time,
 	rows []CutDailyCost) (*LossSummary, error) {
 	out := &LossSummary{ShrinkNote: "期初沿用昨日日终重量,未做隔夜失重修正;实测销量可能被高估。"}

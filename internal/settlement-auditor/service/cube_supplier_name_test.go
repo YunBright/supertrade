@@ -36,18 +36,18 @@ func TestListCubeSettlements_FillsSupplierName(t *testing.T) {
 		"02": "广西梧州XX商贸",
 	}
 
-	rows, _, err := svc.ListCubeSettlements(context.Background(), "B1", "", "", "", 200, false)
+	list, err := svc.ListCubeSettlements(context.Background(), "B1", "", "", "", "", 200, false)
 	if err != nil {
 		t.Fatalf("ListCubeSettlements: %v", err)
 	}
-	if len(rows) != 2 {
-		t.Fatalf("应有 2 行,got %d", len(rows))
+	if len(list.Rows) != 2 {
+		t.Fatalf("应有 2 行,got %d", len(list.Rows))
 	}
-	if rows[0].SupplierName != "岑溪市泰鼎粮油食品有限公司" {
-		t.Errorf("第 1 行供应商名 = %q,应为「岑溪市泰鼎粮油食品有限公司」", rows[0].SupplierName)
+	if list.Rows[0].SupplierName != "岑溪市泰鼎粮油食品有限公司" {
+		t.Errorf("第 1 行供应商名 = %q,应为「岑溪市泰鼎粮油食品有限公司」", list.Rows[0].SupplierName)
 	}
-	if rows[1].SupplierName != "广西梧州XX商贸" {
-		t.Errorf("第 2 行供应商名 = %q,应为「广西梧州XX商贸」", rows[1].SupplierName)
+	if list.Rows[1].SupplierName != "广西梧州XX商贸" {
+		t.Errorf("第 2 行供应商名 = %q,应为「广西梧州XX商贸」", list.Rows[1].SupplierName)
 	}
 }
 
@@ -61,12 +61,12 @@ func TestListCubeSettlements_UnknownSupplierIDLeavesNameEmpty(t *testing.T) {
 	cube.settlements = []SettlementRow{{ID: "DP001", SupplierID: "99"}}
 	cube.suppliers = map[string]string{"01": "某某公司"}
 
-	rows, _, err := svc.ListCubeSettlements(context.Background(), "B1", "", "", "", 200, false)
+	list, err := svc.ListCubeSettlements(context.Background(), "B1", "", "", "", "", 200, false)
 	if err != nil {
 		t.Fatalf("ListCubeSettlements: %v", err)
 	}
-	if rows[0].SupplierName != "" {
-		t.Errorf("字典里没有的供应商应留空名字,got %q", rows[0].SupplierName)
+	if list.Rows[0].SupplierName != "" {
+		t.Errorf("字典里没有的供应商应留空名字,got %q", list.Rows[0].SupplierName)
 	}
 }
 
@@ -80,15 +80,15 @@ func TestListCubeSettlements_SupplierDictFailureStillReturnsRows(t *testing.T) {
 	cube.settlements = []SettlementRow{{ID: "DP001", SupplierID: "01"}}
 	cube.supplierErr = errors.New("cube supplier query: boom")
 
-	rows, _, err := svc.ListCubeSettlements(context.Background(), "B1", "", "", "", 200, false)
+	list, err := svc.ListCubeSettlements(context.Background(), "B1", "", "", "", "", 200, false)
 	if err != nil {
 		t.Fatalf("字典失败不应让整个列表失败,got err = %v", err)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("应有 1 行,got %d", len(rows))
+	if len(list.Rows) != 1 {
+		t.Fatalf("应有 1 行,got %d", len(list.Rows))
 	}
-	if rows[0].SupplierName != "" {
-		t.Errorf("字典失败时名字应留空,got %q", rows[0].SupplierName)
+	if list.Rows[0].SupplierName != "" {
+		t.Errorf("字典失败时名字应留空,got %q", list.Rows[0].SupplierName)
 	}
 }
 
@@ -103,12 +103,12 @@ func TestFillSupplierNames_TrimsBothSides(t *testing.T) {
 	cube.settlements = []SettlementRow{{ID: "DP001", SupplierID: " 01 "}}
 	cube.suppliers = map[string]string{"01": "某某公司"}
 
-	rows, _, err := svc.ListCubeSettlements(context.Background(), "B1", "", "", "", 200, false)
+	list, err := svc.ListCubeSettlements(context.Background(), "B1", "", "", "", "", 200, false)
 	if err != nil {
 		t.Fatalf("ListCubeSettlements: %v", err)
 	}
-	if rows[0].SupplierName != "某某公司" {
-		t.Errorf("首尾空白的供应商号也应 join 上名字,got %q", rows[0].SupplierName)
+	if list.Rows[0].SupplierName != "某某公司" {
+		t.Errorf("首尾空白的供应商号也应 join 上名字,got %q", list.Rows[0].SupplierName)
 	}
 }
 
@@ -123,15 +123,15 @@ func TestListCubeSettlements_IncludePaidAlsoGetsNames(t *testing.T) {
 	cube.settlements = []SettlementRow{{ID: "DP001", SupplierID: "01"}}
 	cube.suppliers = map[string]string{"01": "某某公司"}
 
-	rows, hidden, err := svc.ListCubeSettlements(context.Background(), "B1", "", "", "", 200, true)
+	list, err := svc.ListCubeSettlements(context.Background(), "B1", "", "", "", "", 200, true)
 	if err != nil {
 		t.Fatalf("ListCubeSettlements: %v", err)
 	}
-	if hidden != 0 {
-		t.Errorf("include_paid=true 时不应有被剔除的张数,got %d", hidden)
+	if list.HiddenPaid != 0 {
+		t.Errorf("include_paid=true 时不应有被剔除的张数,got %d", list.HiddenPaid)
 	}
-	if len(rows) != 1 || rows[0].SupplierName != "某某公司" {
-		t.Errorf("include_paid 路径也要补名字,got %#v", rows)
+	if len(list.Rows) != 1 || list.Rows[0].SupplierName != "某某公司" {
+		t.Errorf("include_paid 路径也要补名字,got %#v", list.Rows)
 	}
 }
 

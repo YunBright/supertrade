@@ -16,7 +16,8 @@ import (
 // 需要一个入口才能断言「某营业日的冷库余额是多少」。
 //
 // ⚠️ 标准库的 export_test.go 同款做法:内部测试文件里的**导出**标识符
-//   对外部测试包可见,但只在测试构建里存在。
+//
+//	对外部测试包可见,但只在测试构建里存在。
 //
 // # 口径
 //
@@ -27,4 +28,15 @@ func ClosingByCutForTest(ctx context.Context, s *Service, branchID string, day t
 ) {
 	counter, cold, _, err = s.closingForDay(ctx, branchID, day)
 	return counter, cold, err
+}
+
+// ClampNonNegativeForTest 暴露 [clampNonNegative](负的期末 → 0)。
+//
+// ⚠️ 为什么它值得单独暴露:「读到负的期末要裁成 0」是 owner「期初不能有负数」
+//
+//	这条硬要求的**最后一道闸** —— 存量快照里真的还有旧口径写的负数
+//	(生产实测 店 00 2026-10-29:8 个部位为负)
+//	⇒ 不裁 ⇒ 负期初从快照/锚点漏回链里 ⇒ 只对新建门店成立。
+func ClampNonNegativeForTest(kg, amount decimal.Decimal) (decimal.Decimal, decimal.Decimal) {
+	return clampNonNegative(kg, amount)
 }

@@ -117,12 +117,21 @@ func TestOpeningBaselineDay_FirstBusinessDayCostChainIsConsistent(t *testing.T) 
 		t.Errorf("10-02 的产出金额应是那头猪的成本 40×20=800, got %s", rep1.Reconciliation.ProducedCostYuan)
 	}
 	// 账面应有 = 期初 100 + 产出 40 = 140(= 链算的日终 100+60−20)。
-	if !row1.ExpectedRemainKg.Equal(d("140")) {
-		t.Errorf("★ 10-02 的应有应是 140kg(100+60−20), got %s", row1.ExpectedRemainKg)
+	//
+	// ⚠️ 2026-10-29 owner 口径变更(契约变更,不是"改断言迁就代码"):
+	//   报表的「应有」改成**柜台口径** = 全店应有 − 冷库量 = 140 − 80 = **60**。
+	//   (80 = 盘点单里的冷库量:期初 100 都在冷库,搬上台 20 ⇒ 冷库 80。)
+	//   ⇒ 门店在卡片上看到的"台面该有多少"才和"台面实际盘出多少"同一口径。
+	if !row1.ExpectedRemainKg.Equal(d("60")) {
+		t.Errorf("★ 10-02 的应有应是 60kg(全店应有 140 − 冷库 80,柜台口径), got %s", row1.ExpectedRemainKg)
 	}
-	// 实盘(= 按营业日推导的日终结余)也是 140。
-	if row1.ActualRemainKg == nil || !row1.ActualRemainKg.Equal(d("140")) {
-		t.Errorf("★ 10-02 的实盘剩余应是 140kg, got %v", row1.ActualRemainKg)
+	// 实盘剩余 = **猪肉台实盘**(owner 2026-10-29:「报表的『实盘剩余』也要是猪肉台的实盘数」)
+	// = 盘点单报上来的柜台数 60 ⇒ 与上面的"台面应有 60"**同一口径**
+	// ⇒ 差异 = 60 − 60 = 0(盘点全对)。
+	//
+	// ⚠️ 以前这里是引擎的**全店结余 140**(含冷库)⇒ 那是"账面结余",不是门店盘出来的数。
+	if row1.ActualRemainKg == nil || !row1.ActualRemainKg.Equal(d("60")) {
+		t.Errorf("★ 10-02 的实盘剩余应是猪肉台实盘 60kg, got %v", row1.ActualRemainKg)
 	}
 	// 成本恒等式：期初 1800 + 产出 800 = 期末 2600 ⇒ 差额 0。
 	if !rep1.Reconciliation.DiffYuan.Equal(decimal.Zero) {

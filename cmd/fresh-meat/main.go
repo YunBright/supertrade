@@ -116,6 +116,12 @@ func initApp() error {
 		//   ⇒ 上面两行保留在列表里(表还得在,历史数据还要能读)。
 		&model.CutCostDaily{},
 		&model.CutCostState{},
+		// 2026-10-30:分割基线的**估计样本**(A 方案)+ 跨门店选用的预留表。
+		//
+		// ⚠️ `pig_cut_estimates` 是**新表** ⇒ 生产上第一次部署时由 AutoMigrate 建
+		//   ⇒ 漏登记 ⇒ 盘点提交时写估计样本会报 "relation pig_cut_estimates does not exist"。
+		&model.PigCutEstimate{},
+		&model.PigForecastBaselineBorrow{},
 	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
 	}

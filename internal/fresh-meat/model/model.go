@@ -806,8 +806,30 @@ type CutCostDaily struct {
 	//   旧引擎在这里裁 0 ⇒ 缺口被抹掉 ⇒ 部位"应有"反而变正 ⇒ 门店看到的行自相矛盾。
 	ExpectedClosingKg decimal.Decimal `gorm:"column:expected_closing_kg;type:decimal(14,3);not null;default:0" json:"expected_closing_kg"`
 	// ClosingKg 是**期末**量(有盘点 = 实盘;无盘点 = 账面推演)。
+	//
+	// ⚠️ **不为负**(owner 2026-10-30:「期初不能有负数」):
+	//   盘到的部位(含 0 kg)用实盘;没盘到的用 max(账面推演, 0)
+	//   ⇒ 链上永远是 ≥0 ⇒ 下一天的期初不会是负数。
+	//   ⚠️ **分部位的账面不足不算短卖**(见 CutShortSellKg)⇒ 它只是"建议分割与门店
+	//   实际卖的不匹配" ⇒ 不进链。
 	ClosingKg     decimal.Decimal `gorm:"column:closing_kg;type:decimal(14,3);not null;default:0" json:"closing_kg"`
 	ClosingAmount decimal.Decimal `gorm:"column:closing_amount;type:decimal(16,2);not null;default:0" json:"closing_amount"`
+
+	// CutShortSellKg 是**该部位账面不足**的量(kg)—— 只作提示,**不进链**。
+	//
+	// = max(0, 卖出+统收+报损 + 期末 − 可售量)
+	// ⚠️ 典型场景(生产实测 店 00 2026-10-29):AI 的建议分割给 fat 只分了 5.073kg,
+	//   门店当天卖了 8.383kg ⇒ 账面差 3.311kg ⇒ **但总量够**(进货 181.7 ≥ 卖出 178.1)
+	//   ⇒ 这是**分摊口径**问题,不是真短卖 ⇒ 不该传递到下一天。
+	CutShortSellKg decimal.Decimal `gorm:"column:cut_short_sell_kg;type:decimal(14,3);not null;default:0" json:"cut_short_sell_kg"`
+	// ShortSellKg 是**当日总量**短卖(kg)—— 只有它才算"短卖"(owner 2026-10-30)。
+	//
+	// = max(0, Σ(期初+进货) − Σ(卖出+统收+报损) − Σ期末)
+	// ⚠️ 生产实测 店 00:10-29 = 0(总量够);10-30 = 62.512(账面只剩 20.9kg 却卖了 83.4kg)。
+	// ⇒ >0 ⇒ ① 报表描红 ② **审计结转被拒** ③ 结转给下一天(累计短卖)。
+	ShortSellKg decimal.Decimal `gorm:"column:short_sell_kg;type:decimal(14,3);not null;default:0" json:"short_sell_kg"`
+	// CarriedShortSellKg 是**从上一期结转过来**的短卖(kg)—— 累计口径。
+	CarriedShortSellKg decimal.Decimal `gorm:"column:carried_short_sell_kg;type:decimal(14,3);not null;default:0" json:"carried_short_sell_kg"`
 
 	// MovingAvgUnitCost 是该部位的移动加权平均成本(元/kg)。
 	MovingAvgUnitCost decimal.Decimal `gorm:"column:moving_avg_unit_cost;type:decimal(16,4);not null;default:0" json:"moving_avg_unit_cost"`
@@ -824,7 +846,7 @@ type CutCostDaily struct {
 	PresaleExpectedRevenueYuan decimal.Decimal `gorm:"column:presale_expected_revenue_yuan;type:decimal(16,2);not null;default:0" json:"presale_expected_revenue_yuan"`
 
 	// DataSource:actual(有完整实盘) | partial(有盘点但未完成) | estimated(无盘点)
-	DataSource string    `gorm:"column:data_source;type:varchar(16);not null;default:'estimated'" json:"data_source"`
+	DataSource string `gorm:"column:data_source;type:varchar(16);not null;default:'estimated'" json:"data_source"`
 	// CostUncomputable = true ⇒ 该部位当天**成本算不出来**
 	// (既没有期初库存、当天也没有进货、又没有任何可用单价)。
 	//
@@ -850,8 +872,9 @@ func (CutCostDaily) TableName() string { return "cut_cost_daily" }
 // CutCostState 某店某**部位**的移动加权成本状态(当日有效)。
 //
 // ⚠️ 这是**部位级**的"账" —— 昨天的单价就是今天的期初金额基准。
-//   (旧的 `sku_cost_states` 是 SKU 级 ⇒ 多货号部位只有一个货号有单价,
-//    另一个货号卖出时移动加权单价恒为 0 ⇒ 零成本 ⇒ 毛利率 100%。)
+//
+//	(旧的 `sku_cost_states` 是 SKU 级 ⇒ 多货号部位只有一个货号有单价,
+//	 另一个货号卖出时移动加权单价恒为 0 ⇒ 零成本 ⇒ 毛利率 100%。)
 type CutCostState struct {
 	// ID 是**确定性**代理主键(surrogateID("CCS", branch_id, cut_type))。
 	ID       string  `gorm:"primaryKey;column:id;type:varchar(64)" json:"id"`
@@ -1110,21 +1133,146 @@ func (BulkSettlementAllocation) TableName() string { return "bulk_settlement_all
 // 统计 = n / mean / p10 / p50 / p90。
 //
 // ⚠️ 样本数不足(n < MinSamples)时**不用**该基线 ⇒ 回退 LLM。
+//
+// # 2026-10-30 owner 选的 A 方案:两个**样本池**
+//
+//	① **实录池** = `pig_cuts`（门店手工补录的分割）—— 最准;
+//	② **估计池** = `pig_cut_estimates`（由日终倒推值按毛重比例摊到每头猪的估计）—— 近似。
+//
+// ⇒ 口径:**实录样本够(≥ MinForecastSamples)就用实录**,不够才用估计。
+// ⇒ 用了哪个池子记在 [SampleSource] 里(前端能看出"这条建议是学来的还是录来的")。
 type PigForecastBaseline struct {
-	ID          string          `gorm:"primaryKey;column:id;type:varchar(64)" json:"id"`
-	BranchID    string          `gorm:"column:branch_id;type:varchar(64);not null;uniqueIndex:idx_pig_baseline,priority:1" json:"branch_id"`
-	WeightBand  string          `gorm:"column:weight_band;type:varchar(16);not null;uniqueIndex:idx_pig_baseline,priority:2" json:"weight_band"`
-	CutType     CutType         `gorm:"column:cut_type;type:varchar(32);not null;uniqueIndex:idx_pig_baseline,priority:3" json:"cut_type"`
-	SampleCount int             `gorm:"column:sample_count;not null;default:0" json:"sample_count"`
-	MeanKg      decimal.Decimal `gorm:"column:mean_kg;type:decimal(10,3);not null;default:0" json:"mean_kg"`
-	P10Kg       decimal.Decimal `gorm:"column:p10_kg;type:decimal(10,3);not null;default:0" json:"p10_kg"`
-	P50Kg       decimal.Decimal `gorm:"column:p50_kg;type:decimal(10,3);not null;default:0" json:"p50_kg"`
-	P90Kg       decimal.Decimal `gorm:"column:p90_kg;type:decimal(10,3);not null;default:0" json:"p90_kg"`
-	ComputedAt  time.Time       `gorm:"column:computed_at;not null" json:"computed_at"`
+	ID         string  `gorm:"primaryKey;column:id;type:varchar(64)" json:"id"`
+	BranchID   string  `gorm:"column:branch_id;type:varchar(64);not null;uniqueIndex:idx_pig_baseline,priority:1" json:"branch_id"`
+	WeightBand string  `gorm:"column:weight_band;type:varchar(16);not null;uniqueIndex:idx_pig_baseline,priority:2" json:"weight_band"`
+	CutType    CutType `gorm:"column:cut_type;type:varchar(32);not null;uniqueIndex:idx_pig_baseline,priority:3" json:"cut_type"`
+	// SampleCount 是**实际采用**的那个样本池的样本数(= 可用性判据,见 service.ForecastBaseline.Usable)。
+	SampleCount int `gorm:"column:sample_count;not null;default:0" json:"sample_count"`
+	// RecordedSampleCount / EstimatedSampleCount 是两个池子**各自**的样本数(留痕用)。
+	RecordedSampleCount  int `gorm:"column:recorded_sample_count;not null;default:0" json:"recorded_sample_count"`
+	EstimatedSampleCount int `gorm:"column:estimated_sample_count;not null;default:0" json:"estimated_sample_count"`
+	// SampleSource:recorded | estimated —— 这条基线**实际采用**的是哪个池子。
+	SampleSource string `gorm:"column:sample_source;type:varchar(16);not null;default:'recorded'" json:"sample_source"`
+	// SourceBranchID 是这条基线**实际采用的样本来源门店**。
+	//
+	// ⚠️ 本店自产 = 本店；跨店借用 = 被借方（见 [PigForecastBaselineBorrow]）。
+	SourceBranchID string `gorm:"column:source_branch_id;type:varchar(64);not null;default:''" json:"source_branch_id"`
+	// ManualGenerated = true ⇒ 这条基线是管理员**按某一天手动生成**的
+	// （owner 2026-10-30:「只要那天的数据录入、搬台（含0搬台）、销售、盘点都全就可以」）
+	// ⇒ **绕过 MinForecastSamples(5) 的可用性门槛**（见 service.ForecastBaseline.Usable）。
+	ManualGenerated bool `gorm:"column:manual_generated;not null;default:false" json:"manual_generated"`
+	// GeneratedFromDate 是手动生成时**用的那一天**（YYYY-MM-DD）；空 = 不是手动生成。
+	//
+	// ⚠️ 用 **varchar** 而不是 datatypes.Date：可选日期用日期类型会落成
+	//   0001-01-01（PG 上 date 类型的零值）⇒ 读出来像"公元 1 年"。
+	GeneratedFromDate string `gorm:"column:generated_from_date;type:varchar(10);not null;default:''" json:"generated_from_date"`
+	// Borrowed = true ⇒ 这一行是**重算时自动借来的**（来源是别的门店，见 SourceBranchID）。
+	//
+	// # ⚠️ 为什么单独一列，而不是靠 `manual_generated` / `source_branch_id` 推断
+	//
+	//	有**两种**跨店行，光看 source_branch_id 分不出来：
+	//	  ① **自动借用**：重算时按借用配置搬过来的 ⇒ 借用一关就该消失；
+	//	  ② **管理员手动跨店选用**：管理员挑了别店某一天生成 ⇒ **永远不许**被覆盖/删。
+	//	而 ① 的来源行可能本身就是手动生成的（manual_generated=true）
+	//	⇒ 借来的行会**继承** manual_generated ⇒ 靠它判断"管理员指定的"就分不出来了
+	//	⇒ 借来的行会变成"钉死"的：既不会被刷新，也不会在关掉借用后消失
+	//	⇒ "关掉借用就回到只用本店样本"这条语义就废了。
+	//
+	//	⇒ 用这一列把 ① 标出来：借用行永远可刷新、可清理；手动行永远受保护。
+	Borrowed   bool            `gorm:"column:borrowed;not null;default:false" json:"borrowed"`
+	MeanKg     decimal.Decimal `gorm:"column:mean_kg;type:decimal(10,3);not null;default:0" json:"mean_kg"`
+	P10Kg      decimal.Decimal `gorm:"column:p10_kg;type:decimal(10,3);not null;default:0" json:"p10_kg"`
+	P50Kg      decimal.Decimal `gorm:"column:p50_kg;type:decimal(10,3);not null;default:0" json:"p50_kg"`
+	P90Kg      decimal.Decimal `gorm:"column:p90_kg;type:decimal(10,3);not null;default:0" json:"p90_kg"`
+	ComputedAt time.Time       `gorm:"column:computed_at;not null" json:"computed_at"`
 }
 
 // TableName 显式表名。
 func (PigForecastBaseline) TableName() string { return "pig_forecast_baselines" }
+
+// ---- 表16:pig_cut_estimates(分割的**估计样本**) ----
+//
+// PigCutEstimate 分割的**估计样本**（2026-10-30 owner 选的 A 方案）。
+//
+// # 它是什么
+//
+//	当天各部位的**倒推**实际分割(全店恒等式解出来的"今日新分割"),
+//	按当日各猪的**毛重比例**摊到每头猪 ⇒ 每头猪每个部位一条估计值。
+//	⇒ 用来喂「分割建议基线」(让建议分割学到**本店真实出肉率**,而不是 LLM 的通用先验)。
+//
+// # 为什么**单独一张表**(不写进 pig_cuts)
+//
+//	① `pig_cuts` 同时是「**按猪摊成本**」的输入(moving_average.go::computeProducedBySku)
+//	   ⇒ 把估计值混进去 ⇒ **污染 FIFO 摊销** ⇒ 成本跟着错;
+//	② `pig_cuts` 挂在**具体某头猪**上 ⇒ 门店删猪时会被"有补录"锁死(pig_delete.go);
+//	③ 估计值是**部位级总量按比例摊出来的近似** ⇒ 不是门店手工录的事实。
+//
+// ⇒ 估计样本只喂基线,**不碰**成本与删猪。
+//
+// # 门店隔离
+//
+//	唯一键含 branch_id ⇒ **每店一份样本** ⇒ 每店生成**自己的**基线。
+type PigCutEstimate struct {
+	// ID 是确定性代理键(surrogateID("PCE", branch_id, pig_id, cut_type))
+	// ⇒ 同一 (店, 猪, 部位) 只有一行 ⇒ 重建 = 覆盖。
+	ID       string  `gorm:"primaryKey;column:id;type:varchar(64)" json:"id"`
+	BranchID string  `gorm:"column:branch_id;type:varchar(64);not null;uniqueIndex:idx_pig_estimate,priority:1" json:"branch_id"`
+	PigID    string  `gorm:"column:pig_id;type:varchar(64);not null;uniqueIndex:idx_pig_estimate,priority:2" json:"pig_id"`
+	CutType  CutType `gorm:"column:cut_type;type:varchar(32);not null;uniqueIndex:idx_pig_estimate,priority:3" json:"cut_type"`
+	// WeightKg 是这一头猪这个部位的**估计**分割量(kg)。
+	WeightKg decimal.Decimal `gorm:"column:weight_kg;type:decimal(10,3);not null;default:0" json:"weight_kg"`
+	// WeightBand 是这头猪的体重段(冗余:分桶时直接用,不用再 join whole_pigs)。
+	WeightBand string `gorm:"column:weight_band;type:varchar(16);not null;index" json:"weight_band"`
+	// BizDate 是这条估计所属的**营业日**(倒推那天)。
+	BizDate datatypes.Date `gorm:"column:biz_date;not null;index" json:"biz_date"`
+	// Source 是估计来源(目前只有 stocktake_derived = 由日终倒推摊出来的)。
+	Source    string    `gorm:"column:source;type:varchar(32);not null;default:'stocktake_derived'" json:"source"`
+	CreatedAt time.Time `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
+}
+
+// TableName 显式表名。
+func (PigCutEstimate) TableName() string { return "pig_cut_estimates" }
+
+// ---- 表17:pig_forecast_baseline_borrows(跨门店选用基线) ----
+//
+// PigForecastBaselineBorrow 「本店借用别店基线」的配置（2026-10-30 **预留**）。
+//
+// # 状态：**只建表 + 留模型，业务逻辑未实现**
+//
+//	owner 原话：「每个门店样本要单独，这样可以生成门店自己的分割建议基线，
+//	并实现多门店分级基线对比和跨门店选用（可跟这次做 A 时顺便预留数据模型，
+//	但先把具体实现列为待办，等我通知再做）」。
+//
+// ⇒ 本轮：模型就位（表 + [PigForecastBaseline.SourceBranchID] 落"实际采用的样本来源门店"）
+//
+//	⇒ 以后做"跨店选用"时**不用再改表结构**。
+//
+// # 语义（将来实现时按这个来）
+//
+//	BranchID       = 借用方（本店）
+//	WeightBand/CutType = 哪个分层借用
+//	SourceBranchID = 被借方（样本来源门店）
+//	Enabled        = 关掉就回到"只用本店样本"
+//
+// # 门店隔离
+//
+//	唯一键 (branch_id, weight_band, cut_type) ⇒ 每店一份借用配置 ⇒ 互不影响。
+type PigForecastBaselineBorrow struct {
+	ID       string `gorm:"primaryKey;column:id;type:varchar(64)" json:"id"`
+	BranchID string `gorm:"column:branch_id;type:varchar(64);not null;uniqueIndex:idx_pig_borrow,priority:1" json:"branch_id"`
+	// WeightBand / CutType 是借用哪个分层。
+	WeightBand string  `gorm:"column:weight_band;type:varchar(16);not null;uniqueIndex:idx_pig_borrow,priority:2" json:"weight_band"`
+	CutType    CutType `gorm:"column:cut_type;type:varchar(32);not null;uniqueIndex:idx_pig_borrow,priority:3" json:"cut_type"`
+	// SourceBranchID 是**被借方**（样本来源门店）。
+	SourceBranchID string    `gorm:"column:source_branch_id;type:varchar(64);not null" json:"source_branch_id"`
+	Enabled        bool      `gorm:"column:enabled;not null;default:false" json:"enabled"`
+	CreatedAt      time.Time `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt      time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
+}
+
+// TableName 显式表名。
+func (PigForecastBaselineBorrow) TableName() string { return "pig_forecast_baseline_borrows" }
 
 // ---- 表15:business_days(营业日状态机)----
 //

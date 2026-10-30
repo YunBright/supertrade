@@ -60,6 +60,8 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/settlement-approvals", requireBranch, h.List)
 	r.GET("/settlement-approvals/export", requireBranch, h.Export)
 	r.GET("/settlement-approvals/cube/settlements", requireBranch, h.ListCubeSettlements)
+	// 结算单状态诊断（只读）：这张单去哪了 / 在哪一笔审批里。
+	r.GET("/settlement-status", requireBranch, h.ListSettlementStatuses)
 	r.GET("/settlement-approvals/approver-preference", requireBranch, h.GetApproverPreference)
 	// ⚠️ 必须注册在 /:id 之前(见 GetApprovalFlow 的注释)。
 	r.GET("/settlement-approvals/approval-flow", requireBranch, h.GetApprovalFlow)
@@ -371,6 +373,10 @@ func mapErr(c *gin.Context, err error) {
 		// 必须收窄筛选条件。批量写入下尤其不能放行 —— 预览说"影响 800 张"、
 		// 实际只处理 500 张,剩下 300 张既没标记也没跳过,事后对不上账。
 		writeError(c, http.StatusConflict, "result_truncated", err.Error())
+	case errors.Is(err, service.ErrSettlementPending):
+		// 409 而不是 400:结算单已被另一笔审批占用,客户端改任何参数都没用 ——
+		// 只能等那一笔出终态(或被拒后重新选)。400 会被当成参数错误放弃/无限重试。
+		writeError(c, http.StatusConflict, "settlement_pending", err.Error())
 	case errors.Is(err, service.ErrCubeUnavailable):
 		writeError(c, http.StatusServiceUnavailable, "cube_unavailable", err.Error())
 	case errors.Is(err, service.ErrUserInfoUnavailable):
@@ -671,6 +677,10 @@ func (h *Handler) Delete(c *gin.Context) {
 //
 // include_paid 缺省 false —— 已付款的单**不再出现**在发起勾选列表里。
 // hidden_paid_count 把被剔除的张数回给前端,让页面能说明"为什么少了"。
+//
+// hidden_pending_count 是被剔除的「待审批中」张数（2026-10-29 用户口径）：
+// 已被某笔未终态的付款审批占用、还没付但也不能再选一次的结算单。
+// 两类张数**分开计数** —— 成因不同,给用户的话也不同。
 func (h *Handler) ListCubeSettlements(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "settlement:view") {
@@ -678,16 +688,67 @@ func (h *Handler) ListCubeSettlements(c *gin.Context) {
 	}
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "200"))
 	includePaid := c.Query("include_paid") == "1" || c.Query("include_paid") == "true"
-	rows, hidden, err := h.svc.ListCubeSettlements(c.Request.Context(), branchID,
-		c.Query("from"), c.Query("to"), c.Query("supplier_id"), limit, includePaid)
+	// q = 关键字搜索（单号 / 供应商编号 / 供应商名称）。
+	//
+	// ⚠️ 有 q 时后端走**全量集合 + Go 侧包含匹配**，不再按 limit 截断 ——
+	//    否则老单永远搜不到（2026-10-29 生产实测：limit=200 时那 4 张单
+	//    按账期倒序的排名是 256/210/205/200，全部在截断线之外）。
+	query := c.Query("q")
+	list, err := h.svc.ListCubeSettlements(c.Request.Context(), branchID,
+		c.Query("from"), c.Query("to"), c.Query("supplier_id"), query, limit, includePaid)
 	if err != nil {
 		mapErr(c, err)
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"items":             rows,
-		"hidden_paid_count": hidden,
+		"items":                list.Rows,
+		"hidden_paid_count":    list.HiddenPaid,
+		"hidden_pending_count": list.HiddenPending,
+		// 搜索模式才有值：服务端命中总数 + 命中但不可勾的单（含原因）。
+		"match_total": list.MatchTotal,
+		"unavailable": list.Unavailable,
 	})
+}
+
+// ListSettlementStatuses GET /settlement-status —— 结算单状态诊断。
+//
+// # 解决什么问题（2026-10-29 用户口径）
+//
+//	「遇到这类结算单，我该如何准确找出该单在什么状态？
+//	  被初始化结算了，还是待审核中，如果待审批，那现在它在哪个付款审批里，
+//	  查到了，我从哪里可以点击进去查看其审批详情。」
+//
+// ⇒ 三件事一起回答：源库有没有（not_audited/not_payable/not_found）、
+// 台账里什么状态（paid_init/paid_approval/payable）、
+// 待审批中的话**在哪一笔审批**（approval_id + sp_no ⇒ 前端可跳详情）。
+//
+// # 入参
+//
+//	ids —— 逗号分隔的结算单号（也接受一段自由文本，前端可以直接把用户贴的
+//	       内容整段丢进来，服务端按分隔符切开）。
+//	q   —— 关键字（单号 / 供应商编号 / 供应商名称），与 ids 二选一。
+//
+// ⚠️ scope 用 settlement:view（与列表同级）：这是**只读诊断**，
+//    不涉及任何状态变更 ⇒ 不需要 settlement:audit。
+func (h *Handler) ListSettlementStatuses(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "settlement:view") {
+		return
+	}
+	ids := service.SettlementStatusIDsFromText(c.Query("ids"))
+	if q := strings.TrimSpace(c.Query("q")); q != "" {
+		ids = append(ids, service.SettlementStatusIDsFromText(q)...)
+	}
+	if len(ids) == 0 {
+		c.JSON(http.StatusOK, gin.H{"items": []any{}})
+		return
+	}
+	items, err := h.svc.ListSettlementStatuses(c.Request.Context(), branchID, ids)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items})
 }
 
 // ---- 打印对账 ----

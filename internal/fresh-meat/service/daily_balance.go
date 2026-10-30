@@ -44,6 +44,7 @@ import (
 	"github.com/YunBright/supertrade/internal/fresh-meat/model"
 	"github.com/shopspring/decimal"
 	"gorm.io/datatypes"
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -236,8 +237,19 @@ type stockOpening struct {
 //
 // ⚠️ 一个部位一条(upsert 覆盖)⇒ 改了期初就是改链的起点。
 func (s *Service) loadOpenings(ctx context.Context, branchID string) (map[string]stockOpening, error) {
+	return s.loadOpeningsFrom(ctx, nil, branchID)
+}
+
+// loadOpeningsFrom 同 loadOpenings,但可指定事务(读**事务内**已改动的状态)。
+//
+// ⚠️ 改期初的事务里要用它:删掉一个部位的期初后,链的起点可能后移
+//   ⇒ 算边界时必须看到"事务内已经删掉"的状态,否则会拿旧边界去清东西。
+func (s *Service) loadOpeningsFrom(ctx context.Context, tx *gorm.DB, branchID string) (map[string]stockOpening, error) {
+	if tx == nil {
+		tx = s.db
+	}
 	var rows []model.SkuStockOpening
-	if err := s.db.WithContext(ctx).
+	if err := tx.WithContext(ctx).
 		Where("branch_id = ?", branchID).
 		Find(&rows).Error; err != nil {
 		return nil, fmt.Errorf("query sku_stock_openings: %w", err)
@@ -341,6 +353,18 @@ func (s *Service) deriveColdChain(ctx context.Context, branchID string,
 	for cut, v := range baseCold {
 		prev[cut] = v
 	}
+	// ⚠️ **链的起点 = 该店期初结转的最早生效日**(2026-10-30 加)。
+	//
+	//	这一天**整天重置**:门店重定义了基线日的全部库存 ⇒
+	//	链外(上线前)的余额**不许**顺着"没录期初的部位"漏进来。
+	//	实测(店 00):10-02 有一笔链外的搬台(猪手 9.2kg,上线后才补录的),
+	//	旧实现只重置了门店录过期初的部位 ⇒ 猪手 −9.2 kg 一路带进基线日。
+	chainStartDay := ""
+	for _, op := range openings {
+		if chainStartDay == "" || op.dateKey < chainStartDay {
+			chainStartDay = op.dateKey
+		}
+	}
 	for _, d := range dates {
 		// 基准日之前的天已冻结 ⇒ 链不再重推(基准快照里已经含它们)。
 		if baseDay != "" && d <= baseDay {
@@ -350,6 +374,10 @@ func (s *Service) deriveColdChain(ctx context.Context, branchID string,
 		cur := make(map[string]decimal.Decimal, len(prev))
 		for cut, v := range prev {
 			cur[cut] = v
+		}
+		// ⚠️ 链的起点这一天**整天重置**:链外的余额不许漏进来。
+		if chainStartDay != "" && d == chainStartDay {
+			cur = map[string]decimal.Decimal{}
 		}
 		// 期初结转:生效日 ⇒ 该**部位**的余额**重新从期初起算**。
 		for _, op := range openings {

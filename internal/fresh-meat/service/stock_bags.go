@@ -188,7 +188,7 @@ func (s *Service) registerStockBags(ctx context.Context, branchID string, origin
 				CreatedAt:     now,
 				UpdatedAt:     now,
 			}
-			if err := s.upsertStockBag(ctx, bag); err != nil {
+			if err := s.upsertStockBag(ctx, nil, bag); err != nil {
 				return err
 			}
 			submittedIDs = append(submittedIDs, bag.ID)
@@ -217,7 +217,7 @@ func (s *Service) registerStockBags(ctx context.Context, branchID string, origin
 			CreatedAt:     now,
 			UpdatedAt:     now,
 		}
-		if err := s.upsertStockBag(ctx, bag); err != nil {
+		if err := s.upsertStockBag(ctx, nil, bag); err != nil {
 			return err
 		}
 		submittedIDs = append(submittedIDs, bag.ID)
@@ -233,8 +233,14 @@ func (s *Service) registerStockBags(ctx context.Context, branchID string, origin
 //
 // ⚠️ **不覆盖 consumed_kg**:已卖掉的重量不会因为重提交盘点而"复活"
 // (否则同一批货会被 FIFO 再摊一次)。
-func (s *Service) upsertStockBag(ctx context.Context, bag model.StockBag) error {
-	if err := s.db.WithContext(ctx).Clauses(clause.OnConflict{
+//
+// ⚠️ tx 可空:传 nil 时用 s.db(非事务场景);
+//   改期初那种"多张表一起动"的事务场景要传 tx ⇒ 期初/位置表/队列要么全成要么全滚。
+func (s *Service) upsertStockBag(ctx context.Context, tx *gorm.DB, bag model.StockBag) error {
+	if tx == nil {
+		tx = s.db
+	}
+	if err := tx.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "id"}},
 		DoUpdates: clause.AssignmentColumns([]string{
 			"cube_product_id", "cut_type", "qty_kg", "location", "status", "source",

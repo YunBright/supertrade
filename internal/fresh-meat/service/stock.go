@@ -25,7 +25,8 @@
 //	         − 本期**大宗结算出库**(大宗可以直接从冷库出,不必先搬上台)
 //
 // ⇒ 「**搬上台**」是**可选动作**:门店可以只把一部分搬上台零售,剩下的压冷库
-//   (冷库里的货不参与盘点、盘点管不到它)⇒ **"没搬上台"不是异常**。
+//
+//	(冷库里的货不参与盘点、盘点管不到它)⇒ **"没搬上台"不是异常**。
 //
 // # 为什么"搬上台"必须记录
 //
@@ -120,10 +121,31 @@ type StockLine struct {
 
 // StockSnapshot 某店某范围的库存快照。
 type StockSnapshot struct {
-	BranchID string       `json:"branch_id"`
-	Scope    string       `json:"scope"` // counter | all
-	Lines    []StockLine  `json:"lines"`
+	BranchID string          `json:"branch_id"`
+	Scope    string          `json:"scope"` // counter | all
+	Lines    []StockLine     `json:"lines"`
 	TotalKg  decimal.Decimal `json:"total_kg"`
+}
+
+// isCounterLoadMarkerOnly 判断这次搬台提交是不是**纯标记**（"今天不搬台"）。
+//
+// ⚠️ 纯标记 = **每一行都是 0 kg**、且没有标签号（没搬任何货）。
+//
+//	⇒ 数值上等于"没搬"⇒ 不动货、不改余额链
+//	⇒ 所以它**不需要**"前一个营业日已盘点"这条前置条件
+//	（那条校验是为真搬台服务的:搬货要拿昨天的日终当基线）。
+//
+//	⚠️ 只要有一行 > 0 或带 label ⇒ 就是真搬台 ⇒ 校验照走。
+func isCounterLoadMarkerOnly(lines []CounterLoadLine) bool {
+	if len(lines) == 0 {
+		return false
+	}
+	for _, ln := range lines {
+		if !ln.QtyKg.IsZero() || strings.TrimSpace(ln.Label) != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // CounterLoad 把冷库的货搬上猪肉台(开市准备)。
@@ -135,7 +157,8 @@ type StockSnapshot struct {
 // # 一行一个动作(2026-10-24 门店口径)
 //
 // 「一个 sku 在当天搬台里可以有多条记录,多个标签袋,早上一袋,卖完了,中午加一袋,
-//   可以随时修改,甚至过一天修改。」
+//
+//	可以随时修改,甚至过一天修改。」
 //
 // ⇒ **一行 = 一次搬台动作**:
 //   - 行里**带 id** ⇒ **覆盖**那一行(幂等:同一份重复提交不会多搬一次);
@@ -145,7 +168,8 @@ type StockSnapshot struct {
 //   - 改/撤**过往**某天的一行也允许(过一天修改)⇒ 只影响那一天的余额链。
 //
 // ⚠️ **改/撤造成的负库存不拦**(门店口径:要在每日毛利的告警里红字显示)
-//   ⇒ 见 service/gross_margin.go 的 MarginAlert。
+//
+//	⇒ 见 service/gross_margin.go 的 MarginAlert。
 //
 // ⚠️ 2026-10-24:**两种搬法都留流水**(counter_loads 表):
 // 按标签整袋搬 / 按 SKU+kg 搬 ⇒ 都有 (归属日, SKU, 重量, 操作人)。
@@ -168,8 +192,15 @@ func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLo
 		return nil, err
 	}
 	// ---- 跨日顺序校验:前一个营业日必须已盘点 ----
-	if err := s.assertPrevBizDayStocktaken(ctx, branchID, takenDate); err != nil {
-		return nil, err
+	//
+	// ⚠️ 2026-10-30 owner:「今天不搬台」的**纯标记**请求
+	//   (每一行都是 0 kg、没有标签号)⇒ **跳过**这条校验。
+	//   理由:它不动任何货、不改余额链 ⇒ 不需要"昨天的盘点"做基线
+	//   ⇒ 不能因为昨天没盘点,就把门店"记一笔今天没搬台"这件事也挡住。
+	if !isCounterLoadMarkerOnly(in.Lines) {
+		if err := s.assertPrevBizDayStocktaken(ctx, branchID, takenDate); err != nil {
+			return nil, err
+		}
 	}
 	// ---- 冻结检查:已审计结转的期间不能再改(含补录)----
 	if err := s.assertNotAudited(ctx, branchID, takenDate, "搬台"); err != nil {
@@ -204,11 +235,20 @@ func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLo
 			continue
 		}
 		sku := strings.TrimSpace(ln.CubeProductID)
-		if sku == "" {
-			return nil, fmt.Errorf("%w: lines[%d].cube_product_id 必填(或填 label 按整袋搬)", ErrInvalidInput, i)
+		// ⚠️ 2026-10-30 owner：「今天整日都不搬台」也是一个**合法的动作**
+		//   ⇒ 允许 qty_kg = 0(之前是"必须 > 0" ⇒ 门店根本没法表达"今天不搬台")。
+		//
+		//   0 kg 的行 = 「**门店确认今天没有搬任何货上台**」:
+		//   - **数值上等于"没搬"**(所有计算都是加减 0)⇒ 不影响毛利/成本链;
+		//   - 但把"这一步已确认"记下来了 ⇒ 每日作业页第②步不再永远显示"未搬台"。
+		//
+		// ⚠️ 0 kg 的行**没有货号**(没搬任何货)⇒ 允许为空。
+		zeroKg := ln.QtyKg.IsZero()
+		if ln.QtyKg.IsNegative() {
+			return nil, fmt.Errorf("%w: lines[%d].qty_kg 必须 >= 0", ErrInvalidInput, i)
 		}
-		if !ln.QtyKg.IsPositive() {
-			return nil, fmt.Errorf("%w: lines[%d].qty_kg 必须 > 0", ErrInvalidInput, i)
+		if sku == "" && !zeroKg {
+			return nil, fmt.Errorf("%w: lines[%d].cube_product_id 必填(或填 label 按整袋搬)", ErrInvalidInput, i)
 		}
 		lines = append(lines, counterLoadLine{
 			id: strings.TrimSpace(ln.ID), sku: sku, kg: ln.QtyKg, label: "",
@@ -416,12 +456,12 @@ func sortStockLines(lines []StockLine) {
 // ⇒ 症状是"库存查询永远是空的",而服务 200 正常、零报错。
 func (s *Service) addPosition(ctx context.Context, tx *gorm.DB, branchID, sku string, loc model.StockLocation, delta decimal.Decimal) error {
 	rec := model.SkuStockPosition{
-		ID:           StockPositionID(branchID, sku, string(loc)),
-		BranchID:     branchID,
+		ID:            StockPositionID(branchID, sku, string(loc)),
+		BranchID:      branchID,
 		CubeProductID: sku,
-		Location:     loc,
-		QtyKg:        delta,
-		UpdatedAt:    s.now(),
+		Location:      loc,
+		QtyKg:         delta,
+		UpdatedAt:     s.now(),
 	}
 	// 累加表达式:PG 要带表名限定,其它方言用裸列名。
 	expr := "qty_kg + ?"
@@ -496,7 +536,8 @@ func (s *Service) applyOvernightMove(ctx context.Context, branchID string, count
 // 快照同时是**次日期初的来源**(链式一致,不会因为某天漏算而断链)。
 //
 // ⚠️ 2026-10-27:成本链改**部位级** ⇒ 落的是 `cut_cost_daily` / `cut_cost_states`。
-//   旧的 `sku_cost_daily` / `sku_cost_states` **停止写入**(历史保留只读)。
+//
+//	旧的 `sku_cost_daily` / `sku_cost_states` **停止写入**(历史保留只读)。
 func (s *Service) PersistCutCostDaily(ctx context.Context, branchID string, day time.Time) (int, error) {
 	return s.persistCutCostDaily(ctx, branchID, day, true)
 }
@@ -507,15 +548,17 @@ func (s *Service) PersistCutCostDaily(ctx context.Context, branchID string, day 
 //
 // true  —— 同时刷新 **cut_cost_states**(「当前」成本状态)⇒ 只用于**今天**那次盘点;
 // false —— **只写 cut_cost_daily**(按营业日的成本快照)⇒ 用于**补录往日**时的重算:
-//         补录不能把"当前成本状态"改成历史某天的值(那会把今天的毛利带歪)。
+//
+//	补录不能把"当前成本状态"改成历史某天的值(那会把今天的毛利带歪)。
 //
 // # closing_amount 记的是**结转口径**(下一期的期初金额来源)
 //
 // ⚠️ 有**预售结转**的那天:期末金额按**预期售价口径**记
-//   (成本口径金额 + 预售重估)⇒ 下一期的期初单价自动 = 预期销售单价
-//   ⇒ 两期总毛利 = 实际毛利(不多算、不少算)。
 //
-//   成本口径本身仍然保留在快照里:closing_kg × moving_avg_unit_cost。
+//	(成本口径金额 + 预售重估)⇒ 下一期的期初单价自动 = 预期销售单价
+//	⇒ 两期总毛利 = 实际毛利(不多算、不少算)。
+//
+//	成本口径本身仍然保留在快照里:closing_kg × moving_avg_unit_cost。
 //
 // # ⚠️ 成本状态(**单价**)只从"**上一营业日有冻结快照**"的那天刷新
 //
@@ -526,10 +569,12 @@ func (s *Service) PersistCutCostDaily(ctx context.Context, branchID string, day 
 // ⇒ 而且每重算一次就漂一次(自引用)。
 //
 // ⇒ 只在"上一营业日有冻结快照"时刷新状态(= 链真的从冻结快照接续过来);
-//   链的起点那天(上一日没有快照)不刷新 ⇒ 期初由**门店给的进价**定价。
+//
+//	链的起点那天(上一日没有快照)不刷新 ⇒ 期初由**门店给的进价**定价。
 //
 // (根因在 cut_cost.go 的定价优先级:它没有比较状态的 last_biz_date;
-//  这边用"刷新时机"规避,不改引擎。)
+//
+//	这边用"刷新时机"规避,不改引擎。)
 func (s *Service) persistCutCostDaily(ctx context.Context, branchID string, day time.Time, updateState bool) (int, error) {
 	rows, _, _, _, err := s.computeCutDailyCosts(ctx, branchID, day)
 	if err != nil {
@@ -549,65 +594,86 @@ func (s *Service) persistCutCostDaily(ctx context.Context, branchID string, day 
 			// ⇒ 下一期的期初金额从这张表读 ⇒ 自动按预期售价进来(链式)。
 			closingAmount := r.ClosingAmount.Add(r.PresaleMarginYuan)
 			snap := model.CutCostDaily{
-				ID:                        CutCostDailyID(branchID, bizKey, string(r.CutType)),
-				BranchID:                  branchID,
-				BizDate:                   datatypesDate(bizDate),
-				CutType:                   r.CutType,
-				OpeningKg:                 r.OpeningKg,
-				OpeningAmount:             r.OpeningAmount,
-				ProducedKg:                r.ProducedKg,
-				ProducedAmount:            r.ProducedAmount,
-				SoldKg:                    r.SoldKg,
-				SoldAmount:                r.SoldAmount,
-				BulkSoldKg:                r.BulkSoldKg,
-				BulkSoldAmount:            r.BulkSoldAmount,
-				WasteKg:                   r.WasteKg,
-				WasteAmount:               r.WasteAmount,
-				ExpectedClosingKg:         r.ExpectedClosingKg,
-				ClosingKg:                 r.ClosingKg,
-				ClosingAmount:             closingAmount,
-				MovingAvgUnitCost:         r.MovingAvgUnitCost,
-				SalesCostYuan:             r.SalesCostYuan,
-				BulkCostYuan:              r.BulkCostYuan,
-				WasteCostYuan:             r.WasteCostYuan,
-				RevenueYuan:               r.RevenueYuan,
-				GrossMarginYuan:           r.GrossMarginYuan,
-				GrossMarginPct:            r.GrossMarginPct,
-				PresaleMarginYuan:         r.PresaleMarginYuan,
+				ID:                         CutCostDailyID(branchID, bizKey, string(r.CutType)),
+				BranchID:                   branchID,
+				BizDate:                    datatypesDate(bizDate),
+				CutType:                    r.CutType,
+				OpeningKg:                  r.OpeningKg,
+				OpeningAmount:              r.OpeningAmount,
+				ProducedKg:                 r.ProducedKg,
+				ProducedAmount:             r.ProducedAmount,
+				SoldKg:                     r.SoldKg,
+				SoldAmount:                 r.SoldAmount,
+				BulkSoldKg:                 r.BulkSoldKg,
+				BulkSoldAmount:             r.BulkSoldAmount,
+				WasteKg:                    r.WasteKg,
+				WasteAmount:                r.WasteAmount,
+				ExpectedClosingKg:          r.ExpectedClosingKg,
+				ClosingKg:                  r.ClosingKg,
+				ClosingAmount:              closingAmount,
+				MovingAvgUnitCost:          r.MovingAvgUnitCost,
+				SalesCostYuan:              r.SalesCostYuan,
+				BulkCostYuan:               r.BulkCostYuan,
+				WasteCostYuan:              r.WasteCostYuan,
+				RevenueYuan:                r.RevenueYuan,
+				GrossMarginYuan:            r.GrossMarginYuan,
+				GrossMarginPct:             r.GrossMarginPct,
+				PresaleMarginYuan:          r.PresaleMarginYuan,
 				PresaleExpectedRevenueYuan: r.PresaleExpectedRevenueYuan,
-				DataSource:                r.DataSource,
-				CostUncomputable:          r.CostUncomputable,
-				CreatedAt:                 now,
-				UpdatedAt:                 now,
+				DataSource:                 r.DataSource,
+				CostUncomputable:           r.CostUncomputable,
+				// ---- 短卖(2026-10-30 owner 口径)----
+				//
+				// ⚠️ 这三列是**链的累计短卖能跨日传下去**的唯一载体:
+				//   逐日物化(本函数)是"一次算一天、不带链状态"的
+				//   ⇒ 次日只能从**上一营业日的快照**把累计短卖读回来
+				//   (见 service/cut_chain.go::carriedShortSellFromSnapshot)。
+				//   不落这三列 ⇒ 累计短卖每天断链 ⇒ 门店只看得到"当天短卖",
+				//   看不到"这段时间一共短卖了多少"。
+				//
+				// ⚠️ short_sell_kg 存的是**当日总量短卖分摊到各部位**的值
+				//   ⇒ Σ(各行) = 当日短卖(读的时候要按行求和)。
+				// ⚠️ carried_short_sell_kg 每行都存**同一个**累计值
+				//   ⇒ 读的时候只取**第一行**即可(读法见上面那个函数)。
+				ShortSellKg:        r.ShortSellKg,
+				CarriedShortSellKg: r.CarriedShortSellKg,
+				CutShortSellKg:     r.CutShortSellKg,
+				CreatedAt:          now,
+				UpdatedAt:          now,
 			}
 			if err := tx.Clauses(clause.OnConflict{
 				Columns: []clause.Column{{Name: "branch_id"}, {Name: "biz_date"}, {Name: "cut_type"}},
 				DoUpdates: clause.Assignments(map[string]any{
-					"opening_kg":                  r.OpeningKg,
-					"opening_amount":              r.OpeningAmount,
-					"produced_kg":                 r.ProducedKg,
-					"produced_amount":             r.ProducedAmount,
-					"sold_kg":                     r.SoldKg,
-					"sold_amount":                 r.SoldAmount,
-					"bulk_sold_kg":                r.BulkSoldKg,
-					"bulk_sold_amount":            r.BulkSoldAmount,
-					"waste_kg":                    r.WasteKg,
-					"waste_amount":                r.WasteAmount,
-					"expected_closing_kg":         r.ExpectedClosingKg,
-					"closing_kg":                  r.ClosingKg,
-					"closing_amount":              closingAmount,
-					"moving_avg_unit_cost":        r.MovingAvgUnitCost,
-					"sales_cost_yuan":             r.SalesCostYuan,
-					"bulk_cost_yuan":              r.BulkCostYuan,
-					"waste_cost_yuan":             r.WasteCostYuan,
-					"revenue_yuan":                r.RevenueYuan,
-					"gross_margin_yuan":           r.GrossMarginYuan,
-					"gross_margin_pct":            r.GrossMarginPct,
-					"presale_margin_yuan":         r.PresaleMarginYuan,
+					"opening_kg":                    r.OpeningKg,
+					"opening_amount":                r.OpeningAmount,
+					"produced_kg":                   r.ProducedKg,
+					"produced_amount":               r.ProducedAmount,
+					"sold_kg":                       r.SoldKg,
+					"sold_amount":                   r.SoldAmount,
+					"bulk_sold_kg":                  r.BulkSoldKg,
+					"bulk_sold_amount":              r.BulkSoldAmount,
+					"waste_kg":                      r.WasteKg,
+					"waste_amount":                  r.WasteAmount,
+					"expected_closing_kg":           r.ExpectedClosingKg,
+					"closing_kg":                    r.ClosingKg,
+					"closing_amount":                closingAmount,
+					"moving_avg_unit_cost":          r.MovingAvgUnitCost,
+					"sales_cost_yuan":               r.SalesCostYuan,
+					"bulk_cost_yuan":                r.BulkCostYuan,
+					"waste_cost_yuan":               r.WasteCostYuan,
+					"revenue_yuan":                  r.RevenueYuan,
+					"gross_margin_yuan":             r.GrossMarginYuan,
+					"gross_margin_pct":              r.GrossMarginPct,
+					"presale_margin_yuan":           r.PresaleMarginYuan,
 					"presale_expected_revenue_yuan": r.PresaleExpectedRevenueYuan,
-					"data_source":                 r.DataSource,
-					"cost_uncomputable":           r.CostUncomputable,
-					"updated_at":                  now,
+					"data_source":                   r.DataSource,
+					"cost_uncomputable":             r.CostUncomputable,
+					// ⚠️ 短卖三列也要跟着更新(见上面 Create 那处的说明):
+					//   不在 DoUpdates 里 ⇒ 重算时列会留旧值 ⇒ 累计短卖越算越乱。
+					"short_sell_kg":         r.ShortSellKg,
+					"carried_short_sell_kg": r.CarriedShortSellKg,
+					"cut_short_sell_kg":     r.CutShortSellKg,
+					"updated_at":            now,
 				}),
 			}).Create(&snap).Error; err != nil {
 				return err
@@ -645,10 +711,71 @@ func (s *Service) persistCutCostDaily(ctx context.Context, branchID string, day 
 				return err
 			}
 		}
+		// ---- 删除本轮**不再产出**的旧行(2026-10-30)----
+		//
+		// ⚠️ **只 upsert 不 delete ⇒ 脏行会永远留在表里**,
+		//   而且会被次日"读前一日快照接链"当成**真的期初**接回去 ⇒ 负数凭空复活。
+		//   (生产实测 店 00:10-28 的 ear / lung / bone_spine / skin 四行是**旧链残留**,
+		//    updated_at 还停在 10-29 16:42(那一刻算过)⇒ 10-29 读成 −1.279 / −17.64 …)
+		//
+		// ⇒ 重算某天 = "这天的快照**就是**引擎这一轮产出的那几行"
+		//   ⇒ 产出集合之外的行 = 脏行 ⇒ **同事务**删掉。
+		//
+		// ⚠️ **只删这一天**(branch_id + biz_date)⇒ 不碰别的日子。
+		//
+		// ⚠️ **查询必须用"纯日期字符串"区间**,不能用 time.Time / datatypes.Date 等值:
+		//   - PG:date 列与 **date 字面量**比较是精确的(与 DateStyle、会话时区都无关);
+		//     与 timestamp 比较会按会话 TimeZone 折算 ⇒ 不可靠(仓库里踩过)。
+		//   - SQLite:datatypes.Date 落库**保留时区表示**
+		//     (业务时区写 "2026-10-06T00:00:00+08:00"、UTC 写 "2026-10-06T00:00:00Z")
+		//     ⇒ 纯日期串做**字典序**区间能同时罩住两种形态
+		//     (两者都以 "2026-10-06" 开头 ⇒ 都落在 ["2026-10-06","2026-10-07") 内)。
+		//   ⇒ 再在 Go 里按**业务时区**的日期精确过滤一道(防御)。
+		produced := make(map[string]bool, len(rows))
+		for _, r := range rows {
+			produced[string(r.CutType)] = true
+		}
+		var existing []model.CutCostDaily
+		if err := tx.WithContext(ctx).
+			Where("branch_id = ? AND biz_date >= ? AND biz_date < ?",
+				branchID, bizKey, startDatePlusOne(bizKey)).
+			Find(&existing).Error; err != nil {
+			return err
+		}
+		var staleIDs []string
+		for _, e := range existing {
+			if produced[string(e.CutType)] {
+				continue
+			}
+			if time.Time(e.BizDate).In(s.bizTZOrUTC()).Format("2006-01-02") != bizKey {
+				continue // 防御:不是这一天 ⇒ 不动
+			}
+			staleIDs = append(staleIDs, e.ID)
+		}
+		if len(staleIDs) > 0 {
+			if err := tx.WithContext(ctx).
+				Where("id IN ?", staleIDs).
+				Delete(&model.CutCostDaily{}).Error; err != nil {
+				return err
+			}
+			s.pubLogger.Info("成本日快照: 已删除本轮不再产出的脏行",
+				"branch_id", branchID, "biz_date", bizKey, "rows", len(staleIDs))
+		}
 		return nil
 	})
 	if err != nil {
 		return 0, err
+	}
+	// ---- 估计样本(2026-10-30 owner 选的 A 方案)----
+	//
+	// 这一天算完了 ⇒ 倒推值定了 ⇒ 把"倒推值按毛重比例摊到每头猪"的**估计样本**落库
+	// ⇒ 之后「重算基线」就能用它 ⇒ 建议分割开始反映**本店真实出肉率**(而不是 LLM 通用先验)。
+	//
+	// ⚠️ **失败不阻断**:成本快照已经落好了 ⇒ 估计样本只是"喂基线"的材料
+	//   ⇒ 挂了就挂了(下次重算/物化时再补)⇒ 不能让盘点提交整个失败。
+	if _, estErr := s.rebuildEstimatedSplitSamples(ctx, branchID, day, rows); estErr != nil {
+		s.pubLogger.Warn("persistCutCostDaily: 估计样本重建失败(不影响成本快照)",
+			"branch_id", branchID, "biz_date", bizKey, "err", estErr)
 	}
 	return len(rows), nil
 }
@@ -656,8 +783,9 @@ func (s *Service) persistCutCostDaily(ctx context.Context, branchID string, day 
 // cutsWithFrozenPrevDay 取"上一营业日**有冻结成本快照**"的部位集合。
 //
 // ⚠️ 这是成本状态刷新时机的判据(见 persistCutCostDaily 的说明):
-//   上一日有冻结快照 ⇒ 链真的从冻结快照接续 ⇒ 当天的期初金额来自快照
-//   ⇒ 刷新状态里的单价不会反过来影响当天的期初定价。
+//
+//	上一日有冻结快照 ⇒ 链真的从冻结快照接续 ⇒ 当天的期初金额来自快照
+//	⇒ 刷新状态里的单价不会反过来影响当天的期初定价。
 func (s *Service) cutsWithFrozenPrevDay(ctx context.Context, branchID string, day time.Time) (map[string]bool, error) {
 	out := map[string]bool{}
 	prevStart, prevEnd := s.previousBizDayBounds(day.In(s.bizTZOrUTC()))

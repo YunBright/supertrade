@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,10 +67,17 @@ func (f *fakeCube) ListSettlements(_ context.Context, _ string, ids []string) ([
 	return out, nil
 }
 
-func (f *fakeCube) ListAuditedSettlements(_ context.Context, _, _, _, _ string, _ int) ([]SettlementRow, error) {
+func (f *fakeCube) ListAuditedSettlements(_ context.Context, _, _, _, _ string, limit int) ([]SettlementRow, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]SettlementRow(nil), f.settlements...), nil
+	rows := append([]SettlementRow(nil), f.settlements...)
+	// ⚠️ 真实现是「按账期结束日**倒序截断**到 limit 张」——
+	//    fake 也要照做，否则测不出"老单被 limit 截断、只有搜索才找得到"这件事。
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].PeriodEnd > rows[j].PeriodEnd })
+	if limit > 0 && len(rows) > limit {
+		rows = rows[:limit]
+	}
+	return rows, nil
 }
 
 func (f *fakeCube) ListPurchaseLines(_ context.Context, _, settlementID string) ([]SettlementLineRow, error) {
@@ -128,6 +136,21 @@ func (f *fakeCube) SumSalesByProduct(_ context.Context, _ string, productIDs []s
 
 func (f *fakeCube) GetStocks(_ context.Context, _ string, _ []string) ([]StockRow, error) {
 	return nil, nil
+}
+
+// GetSettlementsByIDs 按单号精确查（不过滤审核/单据类型）。
+func (f *fakeCube) GetSettlementsByIDs(_ context.Context, _ string, ids []string) ([]SettlementRow, error) {
+	want := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	var out []SettlementRow
+	for _, r := range f.settlements {
+		if want[r.ID] {
+			out = append(out, r)
+		}
+	}
+	return out, nil
 }
 
 // ListProductNames 货号 → 商品名(信号里写「<名称>-<货号>」;测试默认没有名字 ⇒ 回退纯货号)。

@@ -58,6 +58,11 @@ type cutChainDay struct {
 	losses *LossSummary
 	// closing 是当天算出来的**部位期末**(kg + 结转口径金额)⇒ 喂给下一天当期初。
 	closing *cutOpeningOverride
+	// shortSellKg 是当天的**总量短卖**(kg)—— owner 口径(口径见 CutDailyCost.ShortSellKg)。
+	//
+	// ⚠️ 分部位的账面不足**不算**在这里(那是 CutShortSellKg)⇒
+	//   >0 ⇒ ① 报表描红 ② 审计结转被拒 ③ 结转给下一天(累计短卖)。
+	shortSellKg decimal.Decimal
 	// costIncomplete = true ⇒ 当天有部位的成本**算不出来**(不是成本为 0)。
 	costIncomplete bool
 	// costUncomputableAll = true ⇒ 当天**所有**部位的成本都算不出来
@@ -73,9 +78,10 @@ type cutChainDay struct {
 // cutChainRunner 逐日推进一条成本链(内存链)。
 //
 // ⚠️ **链是按部位独立接续的**:部位 A 的库存变动不影响部位 B。
-//   ⇒ 某个部位一旦"入链"(有过库存或进货),它的期末就逐日传给下一天;
-//     没入链的部位(既无期初结转也无进货)**不接续** ——
-//     否则"无基线期间卖出的货"会变成负库存,一路污染到有基线的日子。
+//
+//	⇒ 某个部位一旦"入链"(有过库存或进货),它的期末就逐日传给下一天;
+//	  没入链的部位(既无期初结转也无进货)**不接续** ——
+//	  否则"无基线期间卖出的货"会变成负库存,一路污染到有基线的日子。
 type cutChainRunner struct {
 	svc      *Service
 	branchID string
@@ -90,6 +96,14 @@ func newCutChainRunner(svc *Service, branchID string) *cutChainRunner {
 		svc:      svc,
 		branchID: branchID,
 		inChain:  map[string]bool{},
+		// ⚠️ **链的起点也要有一个状态**(不是 nil):
+		//   nil 会让引擎改从"上一营业日的快照"读累计短卖
+		//   ⇒ 而链起点的上一期不属于这条链 ⇒ 累计值必须是 0。
+		prev: &cutOpeningOverride{
+			kg:     map[string]decimal.Decimal{},
+			amount: map[string]decimal.Decimal{},
+			unit:   map[string]decimal.Decimal{},
+		},
 	}
 }
 
@@ -112,11 +126,21 @@ func (r *cutChainRunner) day(ctx context.Context, d time.Time) (cutChainDay, err
 		amount: map[string]decimal.Decimal{},
 		unit:   map[string]decimal.Decimal{},
 	}
+	// ★ 累计短卖(R4):今天之前结转过来的 + 今天的当日短卖。
+	//
+	//	⚠️ **它不是库存**:短卖**绝不回写成负库存** ⇒ 期初仍然是 ≥0
+	//	  (期末量裁 0,见 cut_cost.go 的 R1)⇒ 链上带着的只有这个"提示数"。
+	carriedShortSell := decimal.Zero
+	if r.prev != nil {
+		carriedShortSell = r.prev.shortSell
+	}
+	dayShortSell := decimal.Zero
 	totalCuts := 0
 	uncomputableCuts := 0
 	for _, row := range cutRows {
 		cut := string(row.CutType)
 		totalCuts++
+		dayShortSell = dayShortSell.Add(row.ShortSellKg)
 		if row.CostUncomputable {
 			out.costIncomplete = true
 			uncomputableCuts++
@@ -139,17 +163,33 @@ func (r *cutChainRunner) day(ctx context.Context, d time.Time) (cutChainDay, err
 			next.unit[cut] = row.MovingAvgUnitCost
 		}
 	}
+	next.shortSell = carriedShortSell.Add(dayShortSell)
+	out.shortSellKg = dayShortSell
 	r.prev = next
 	// 当天**所有**部位都算不出来 ⇒ 这天的成本完全算不出来。
 	out.costUncomputableAll = totalCuts > 0 && uncomputableCuts == totalCuts
 	return out, nil
 }
 
-// cutChainBaseline 取该店**最早有基线**的营业日(YYYY-MM-DD);空 = 没有基线。
+// cutChainBaseline 取该店**链的起点**(YYYY-MM-DD);空 = 没有基线。
+//
+// # ⚠️ 链的起点 = **期初结转的最早生效日**(门店口径,不要被更早的快照日拉低)
+//
+//	2026-10-30 生产实测(店 00)踩过的坑:
+//	门店是 10-29 晚上才补录期初的(生效日 10-28 = 鲜肉子系统正式启用前一天),
+//	而 10-01~10-27 的**上线前旧账**早就物化成了成本日快照。
+//	⇒ 若这里取 min(期初生效日, 最早快照日) = 10-01,
+//	  链就被拉回**上线前** ⇒ 那些天的旧账(账面短卖的负链值)被当成链内来算
+//	  ⇒ 负数一路带进启用第一天(实测:猪耳 −1.279 / 猪肺 −17.64 / 猪手 −9.2 kg)
+//	  ⇒ 门店看到"期初为什么有负数"。
+//
+//	⇒ **期初生效日就是链的起点**(见 loadCutOpening 的 baselineDay 分支:
+//	   "生效日当天:快照/链式接续/实时结余链 一律让位给门店录的值")。
+//	⇒ 只有**没有期初结转**的店才退回"最早快照日"(链从第一期营业日起算)。
 func (s *Service) cutChainBaseline(ctx context.Context, branchID string) (string, error) {
 	loc := s.bizTZOrUTC()
 	best := ""
-	// ① 门店期初结转(按部位)的最早生效日。
+	// ① 门店期初结转(按部位)的最早生效日 —— **链的起点**。
 	openings, err := s.loadOpenings(ctx, branchID)
 	if err != nil {
 		return "", err
@@ -159,7 +199,10 @@ func (s *Service) cutChainBaseline(ctx context.Context, branchID string) (string
 			best = op.dateKey
 		}
 	}
-	// ② 已落库的成本日快照的最早日。
+	if best != "" {
+		return best, nil
+	}
+	// ② 没有期初结转 ⇒ 退回"已落库的最早快照日"。
 	var firstSnap model.CutCostDaily
 	if err := s.db.WithContext(ctx).
 		Select("biz_date").
@@ -170,10 +213,7 @@ func (s *Service) cutChainBaseline(ctx context.Context, branchID string) (string
 		return "", fmt.Errorf("query cut_cost_daily(first): %w", err)
 	}
 	if firstSnap.ID != "" {
-		k := time.Time(firstSnap.BizDate).In(loc).Format("2006-01-02")
-		if best == "" || k < best {
-			best = k
-		}
+		best = time.Time(firstSnap.BizDate).In(loc).Format("2006-01-02")
 	}
 	return best, nil
 }
@@ -188,7 +228,8 @@ func (s *Service) cutChainBaseline(ctx context.Context, branchID string) (string
 //	(实测:成本 8.4 万 → 19.4 万、毛利率 −98.71%)。
 //
 // ⇒ 这里做**连续性校验**:基线 ~ 锚点日,每一天都要有快照,否则**不用锚点**
-//   (宁可慢一点回溯,也不能拿断链的结余当期初)。
+//
+//	(宁可慢一点回溯,也不能拿断链的结余当期初)。
 //
 // 返回 (锚点那天的日期, 锚点的结余)。没有可信锚点时返回 (零值, nil)。
 func (s *Service) cutChainAnchor(ctx context.Context, branchID string,
@@ -229,6 +270,14 @@ func (s *Service) cutChainAnchor(ctx context.Context, branchID string,
 	if bs.After(anchorDate) {
 		return time.Time{}, nil, nil
 	}
+	// ⚠️ **锚点必须晚于基线日**(2026-10-30 加)。
+	//
+	//	基线日(= 期初生效日)当天必须由**链自己算**(它的期初 = 门店录的值),
+	//	不能用快照接续 —— 否则会把"基线日之前物化的旧快照"当成基线日的结余,
+	//	旧账(含账面短卖的负链值)就又接回链里了。
+	if !bs.Before(anchorDate) {
+		return time.Time{}, nil, nil
+	}
 	var nSnap int64
 	if err := s.db.WithContext(ctx).
 		Model(&model.CutCostDaily{}).
@@ -262,14 +311,67 @@ func (s *Service) cutChainAnchor(ctx context.Context, branchID string,
 		if r.CostUncomputable {
 			continue
 		}
-		prev.kg[string(r.CutType)] = r.ClosingKg
-		prev.amount[string(r.CutType)] = r.ClosingAmount
+		// ⚠️ **负的期末要裁成 0**(2026-10-30 加,见 clampNonNegative 的说明):
+		//   锚点读的是**已落库**的快照 ⇒ 存量快照里可能还有旧口径写的负数
+		//   ⇒ 不裁 ⇒ 负期初从锚点漏回链里 ⇒ owner 说的"期初不能有负数"又破功。
+		kg, amount := clampNonNegative(r.ClosingKg, r.ClosingAmount)
+		prev.kg[string(r.CutType)] = kg
+		prev.amount[string(r.CutType)] = amount
 		// ★ 锚点也要带上移动加权单价(短卖时的兜底价)。
 		if r.MovingAvgUnitCost.IsPositive() {
 			prev.unit[string(r.CutType)] = r.MovingAvgUnitCost
 		}
 	}
+	// ★ 累计短卖(R4):锚点那天"结转过来的累计" + "锚点当天的当日短卖"。
+	//
+	//	⚠️ **这里要把所有行都算上**(包括成本算不出来的部位):
+	//	  短卖是**实物事实**,不是成本推导出来的 ⇒ 不能因为成本算不出来就不计。
+	carried := decimal.Zero
+	for _, r := range rows {
+		carried = carried.Add(r.ShortSellKg)
+	}
+	if len(rows) > 0 {
+		carried = carried.Add(rows[0].CarriedShortSellKg)
+	}
+	prev.shortSell = carried
 	return anchorDate, prev, nil
+}
+
+// carriedShortSellFromSnapshot 读**上一营业日**的累计短卖(kg)。
+//
+// # 为什么需要它
+//
+// 逐日物化(`persistCutCostDaily`)是**一次算一天、不带链状态**的
+// ⇒ 累计短卖只能从**上一营业日的快照**读回来。
+//
+// ⚠️ 快照里存的是:
+//   - `short_sell_kg`      = 当日**总量**短卖**分摊到各部位**的值(Σ = 当日短卖);
+//   - `carried_short_sell_kg` = 从上一期结转过来的累计值。
+//
+// ⇒ 累计(到上一营业日为止) = carried + 当日短卖。
+//
+// ⚠️ 查询用**纯日期字符串**区间(不用 time.Time 等值):
+//
+//	datatypes.Date 落库保留时区表示 ⇒ 字符串区间能同时罩住两种形态。
+func (s *Service) carriedShortSellFromSnapshot(ctx context.Context, branchID string, bizDate time.Time) (decimal.Decimal, error) {
+	loc := s.bizTZOrUTC()
+	prevStart, _ := s.previousBizDayBounds(bizDate)
+	prevKey := prevStart.In(loc).Format("2006-01-02")
+	nextKey := prevStart.In(loc).AddDate(0, 0, 1).Format("2006-01-02")
+	var rows []model.CutCostDaily
+	if err := s.db.WithContext(ctx).
+		Where("branch_id = ? AND biz_date >= ? AND biz_date < ?", branchID, prevKey, nextKey).
+		Find(&rows).Error; err != nil {
+		return decimal.Zero, fmt.Errorf("query cut_cost_daily(carried short sell): %w", err)
+	}
+	if len(rows) == 0 {
+		return decimal.Zero, nil
+	}
+	total := rows[0].CarriedShortSellKg
+	for _, r := range rows {
+		total = total.Add(r.ShortSellKg)
+	}
+	return total, nil
 }
 
 // computeCutChainDays 逐日链式算一条链,返回 **start ~ to** 每一天的结果。
@@ -323,6 +425,45 @@ func (s *Service) computeCutChainDays(ctx context.Context, branchID string,
 	return out, nil
 }
 
+// computeCutChainDaysFull 逐日链式算一条链,**不走锚点**(一定从链的起点重算)。
+//
+// # 为什么审计要这样(而不是用 computeCutChainDays)
+//
+//	锚点 = 上一营业日的**已落库快照** ⇒ 它会把锚点之前的天**整段跳过**
+//	⇒ 那些天的短卖就查不到 ⇒ 审计会**漏放**。
+//	⇒ 审计要检查**截止日及之前的每一天** ⇒ 必须逐日重算。
+//
+// ⚠️ 代价:O(天) 的重算(与审计本身的成本重算同量级)⇒ 审计本来就是重操作,可以接受。
+func (s *Service) computeCutChainDaysFull(ctx context.Context, branchID string,
+	from, to time.Time,
+) ([]cutChainDay, error) {
+	loc := s.bizTZOrUTC()
+	start := from
+	baseline, err := s.cutChainBaseline(ctx, branchID)
+	if err != nil {
+		return nil, err
+	}
+	if baseline != "" {
+		bs, perr := time.ParseInLocation("2006-01-02", baseline, loc)
+		if perr != nil {
+			return nil, perr
+		}
+		if bs.Before(start) {
+			start = bs
+		}
+	}
+	runner := newCutChainRunner(s, branchID)
+	out := make([]cutChainDay, 0, 8)
+	for d := start; !d.After(to); d = d.AddDate(0, 0, 1) {
+		row, err := runner.day(ctx, d)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
 // materializeCostChain 逐日**物化**成本链(落 `cut_cost_daily`),**不要求当天有盘点单**。
 //
 // # 为什么落库不绑盘点
@@ -332,7 +473,8 @@ func (s *Service) computeCutChainDays(ctx context.Context, branchID string,
 // (2026-10-27 生产实测:店 00 从 10-03 起成本 ≈ 100 元、毛利率 97%)。
 //
 // ⇒ 这里逐日重算 fromDate → 今天并落库;**链靠"前一日快照"自动接续**
-//   (引擎的 loadCutOpening ① 就是读前一日快照的结余)。
+//
+//	(引擎的 loadCutOpening ① 就是读前一日快照的结余)。
 //
 // ⚠️ 链必须**从早到晚**落:后一天要读前一天的快照。
 func (s *Service) materializeCostChain(ctx context.Context, branchID string, fromDate time.Time) (int, error) {
@@ -424,7 +566,8 @@ type chainJob struct {
 // ⇒ 后台跑 + **不继承请求 ctx**(请求返回后 ctx 会被取消 ⇒ 物化会中途夭折)。
 //
 // ⚠️ ctx 语义:用 context.WithoutCancel 保留 trace/值,但**去掉取消**;
-//   再套自己的超时 ⇒ 物化不会因为客户端断开而半途而废。
+//
+//	再套自己的超时 ⇒ 物化不会因为客户端断开而半途而废。
 //
 // # 为什么要"合并"
 //
@@ -436,7 +579,8 @@ type chainJob struct {
 //
 // 成本链是**逐日接续**的 ⇒ 任何一天的产出/库存变了,后面所有天的成本都要跟着变。
 // ⇒ 写路径(录猪/删猪/大宗/搬上台/期初结转)之后必须把链重算一遍,
-//   否则门店看到的成本是旧的。
+//
+//	否则门店看到的成本是旧的。
 func (s *Service) ScheduleChainMaterialize(ctx context.Context, branchID string, fromDate time.Time) {
 	if branchID == "" {
 		return

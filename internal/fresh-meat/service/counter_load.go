@@ -324,6 +324,22 @@ type CounterLoadLineView struct {
 	Source     string    `json:"source"`
 	OperatorID string    `json:"operator_id"`
 	CreatedAt  time.Time `json:"created_at"`
+	// CutType 是这一行的**部位**(2026-10-29 加)。
+	//
+	// ⚠️ 搬台流水表 `counter_loads` **本来就有** `cut_type` 列(落库时就记了)
+	//   ⇒ 直接取,不用再查部位映射表。
+	//
+	// ⚠️ 用 `model.CutType`(底层就是 string)⇒ wire 上仍是 JSON 字符串,
+	//   与 `service.StockLine.CutType` 同一口径(前端两边都能拿到部位名)。
+	CutType model.CutType `json:"cut_type"`
+	// CubeProductName 是**商品名**(2026-10-29 加)。
+	//
+	// ⚠️ 搬台流水表**没有**名字 ⇒ 用 `loadSkuCatalog` 的 `nameOf` 反查
+	//   (部位↔货号映射表里有 `cube_product_name`)。
+	//
+	// ⚠️ 查不到(该店没配这个货号的映射)⇒ 留空 ⇒ `omitempty` ⇒ wire 上
+	//   **直接不出这个 key**(前端显示货号即可,别让整个列表挂掉)。
+	CubeProductName string `json:"cube_product_name,omitempty"`
 }
 
 // CounterLoadView 某营业日的搬台流水(对外 JSON)。
@@ -340,6 +356,12 @@ type CounterLoadView struct {
 	StatusText string `json:"status_text"`
 	// HasCounterLoad 是"当天有没有搬过台"。
 	HasCounterLoad bool `json:"has_counter_load"`
+	// CounterLoadSkipped 是"门店**已确认今天不搬台**"(2026-10-30 owner)。
+	//
+	// ⚠️ 门店口径：「有时候整日都不需要搬台」⇒ 得有个办法把这一步标成"已完成"，
+	//   否则每日作业页第②步永远显示"未搬台"。
+	// ⇒ 落一条 qty_kg = 0 的搬台流水当标记 ⇒ **数值上等于没搬**。
+	CounterLoadSkipped bool `json:"counter_load_skipped"`
 	// RestDay 是"当天是不是鲜肉休市"(既没进猪也没搬台)。
 	RestDay bool `json:"rest_day"`
 }
@@ -362,10 +384,25 @@ func (s *Service) ListCounterLoads(ctx context.Context, branchID string, day tim
 		Find(&rows).Error; err != nil {
 		return nil, fmt.Errorf("query counter_loads: %w", err)
 	}
+	// 商品名反查(2026-10-29):搬台流水表没有名字 ⇒ 从部位↔货号映射表反查。
+	//
+	// ⚠️ 名字只是"锦上添花"(前端拿它显示"货号(商品名)")⇒ 查不到**降级**,
+	//   不要让整个搬台列表 500。
+	_, nameOf, err := s.loadSkuCatalog(ctx, branchID, nil)
+	if err != nil {
+		s.pubLogger.Warn("ListCounterLoads: 读 SKU 名称失败(降级:列表不显示商品名)",
+			"branch_id", branchID, "err", err)
+		nameOf = map[string]string{}
+	}
 	total := decimal.Zero
 	lines := make([]CounterLoadLineView, 0, len(rows))
+	skipped := false
 	for _, r := range rows {
 		total = total.Add(r.QtyKg)
+		// ⚠️ qty_kg = 0 的行 = 「门店确认今天不搬台」的标记(2026-10-30 owner)。
+		if r.QtyKg.IsZero() {
+			skipped = true
+		}
 		lines = append(lines, CounterLoadLineView{
 			ID:            r.ID,
 			BranchID:      r.BranchID,
@@ -377,6 +414,9 @@ func (s *Service) ListCounterLoads(ctx context.Context, branchID string, day tim
 			Source:        r.Source,
 			OperatorID:    r.OperatorID,
 			CreatedAt:     r.CreatedAt,
+			CutType:       r.CutType,
+			// ⚠️ 查不到就留空(`omitempty` ⇒ wire 上不出这个 key)。
+			CubeProductName: nameOf[r.CubeProductID],
 		})
 	}
 
@@ -394,6 +434,9 @@ func (s *Service) ListCounterLoads(ctx context.Context, branchID string, day tim
 	view.Status = bd.Status
 	view.StatusText = bd.StatusText
 	view.HasCounterLoad = bd.HasCounterLoad
+	// ⚠️ 「已确认今天不搬台」= 有一条 0 kg 的标记行、且当天**确实没搬过货**。
+	//   (又搬了货又有标记行 ⇒ 以"搬过"为准。)
+	view.CounterLoadSkipped = skipped && !total.IsPositive()
 	view.RestDay = bd.RestDay
 	return view, nil
 }

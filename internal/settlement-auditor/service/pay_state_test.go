@@ -146,6 +146,11 @@ func TestResolveSettlementSet_TruncatedWhenFetchHitsCap(t *testing.T) {
 		row("TARGET-B", "S1", "DP", "20.00"),
 		row("TARGET-C", "S1", "DP", "30.00"),
 	)
+	// ⚠️ 真实现是「按账期倒序截断到 limit 张」⇒ 目标单必须落在**最新**的那批里，
+	//    否则它在取数阶段就被截掉了，测不出"源侧触顶但过滤后很小"这件事。
+	for i := len(rows) - 3; i < len(rows); i++ {
+		rows[i].PeriodEnd = "2026-10-31"
+	}
 	seedSettlementRows(t, cube, rows...)
 
 	set, err := svc.ResolveSettlementSet(context.Background(), "B1", SettlementFilter{Query: "TARGET-"})
@@ -433,23 +438,23 @@ func TestListCubeSettlements_HidesPaidByDefault(t *testing.T) {
 	seedPayState(t, db, "B1", "DP2", model.PayStatusPaid, model.PayMethodInit, admin.UserID)
 	ctx := context.Background()
 
-	rows, hidden, err := svc.ListCubeSettlements(ctx, "B1", "", "", "", 200, false)
+	list, err := svc.ListCubeSettlements(ctx, "B1", "", "", "", "", 200, false)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if len(rows) != 2 || rows[0].ID == "DP2" || rows[1].ID == "DP2" {
-		t.Fatalf("已付款的 DP2 不该出现,实际 %+v", rows)
+	if len(list.Rows) != 2 || list.Rows[0].ID == "DP2" || list.Rows[1].ID == "DP2" {
+		t.Fatalf("已付款的 DP2 不该出现,实际 %+v", list.Rows)
 	}
-	if hidden != 1 {
-		t.Errorf("hidden 应为 1(前端要据此说明「列表少了 N 张」),实际 %d", hidden)
+	if list.HiddenPaid != 1 {
+		t.Errorf("hidden 应为 1(前端要据此说明「列表少了 N 张」),实际 %d", list.HiddenPaid)
 	}
 
-	rows, hidden, err = svc.ListCubeSettlements(ctx, "B1", "", "", "", 200, true)
+	list, err = svc.ListCubeSettlements(ctx, "B1", "", "", "", "", 200, true)
 	if err != nil {
 		t.Fatalf("list includePaid: %v", err)
 	}
-	if len(rows) != 3 || hidden != 0 {
-		t.Fatalf("include_paid=true 应返回全量 3 张且 hidden=0,实际 %d/%d", len(rows), hidden)
+	if len(list.Rows) != 3 || list.HiddenPaid != 0 {
+		t.Fatalf("include_paid=true 应返回全量 3 张且 hidden=0,实际 %d/%d", len(list.Rows), list.HiddenPaid)
 	}
 }
 
@@ -465,23 +470,23 @@ func TestListCubeSettlements_RevertedBecomesSelectable(t *testing.T) {
 	if _, err := svc.ApplySettlementInit(ctx, "B1", SettlementFilter{}, admin, ""); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	rows, _, err := svc.ListCubeSettlements(ctx, "B1", "", "", "", 200, false)
+	list, err := svc.ListCubeSettlements(ctx, "B1", "", "", "", "", 200, false)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if len(rows) != 0 {
-		t.Fatalf("标记后应从勾选列表消失,实际仍有 %d 张", len(rows))
+	if len(list.Rows) != 0 {
+		t.Fatalf("标记后应从勾选列表消失,实际仍有 %d 张", len(list.Rows))
 	}
 
 	if _, err := svc.RevertSettlementInit(ctx, "B1", SettlementFilter{}, admin); err != nil {
 		t.Fatalf("revert: %v", err)
 	}
-	rows, _, err = svc.ListCubeSettlements(ctx, "B1", "", "", "", 200, false)
+	list, err = svc.ListCubeSettlements(ctx, "B1", "", "", "", "", 200, false)
 	if err != nil {
 		t.Fatalf("list after revert: %v", err)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("撤销后应重新可勾选,实际 %d 张", len(rows))
+	if len(list.Rows) != 1 {
+		t.Fatalf("撤销后应重新可勾选,实际 %d 张", len(list.Rows))
 	}
 }
 

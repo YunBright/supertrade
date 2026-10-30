@@ -31,6 +31,7 @@ import (
 
 	"github.com/YunBright/supertrade/internal/fresh-meat/model"
 	"github.com/shopspring/decimal"
+	"gorm.io/gorm"
 )
 
 // bulkCutSku 取大宗品项对应部位的**主 SKU**。
@@ -39,7 +40,15 @@ import (
 // 伪 SKU 不在部位映射里 ⇒ 没有入库金额 ⇒ 移动加权单价恒为 0
 // ⇒ 统收成本 0 ⇒ 毛利率 100%(2026-10-23 实测)。
 func (s *Service) bulkCutSku(ctx context.Context, branchID string, cut model.CutType) (string, error) {
-	m, err := s.primarySkuPerCut(ctx, branchID)
+	return s.bulkCutSkuFrom(ctx, nil, branchID, cut)
+}
+
+// bulkCutSkuFrom 同 bulkCutSku,但可指定事务。
+//
+// ⚠️ **事务里必须用它**(2026-10-30):SQLite 单测库只开 1 条连接
+//   ⇒ 事务内再走 s.db 读 ⇒ 拿不到连接 ⇒ **死锁**。
+func (s *Service) bulkCutSkuFrom(ctx context.Context, tx *gorm.DB, branchID string, cut model.CutType) (string, error) {
+	m, err := s.primarySkuPerCutFrom(ctx, tx, branchID)
 	if err != nil {
 		return "", err
 	}

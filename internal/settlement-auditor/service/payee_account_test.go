@@ -146,7 +146,8 @@ func TestPayeeAccountLines(t *testing.T) {
 		AccountName: "南宁某某贸易有限公司",
 	}
 	got := payeeAccountLines(row)
-	want := "开户行：中国银行南宁分行\n账号：6228480012345678\n户名：南宁某某贸易有限公司"
+	// ⚠️ 账号**分段显示**（2026-10-29 用户口径）：审批人照着打款时要核对位数。
+	want := "开户行：中国银行南宁分行\n账号：6228 4800 1234 5678\n户名：南宁某某贸易有限公司"
 	if got != want {
 		t.Fatalf("payeeAccountLines =\n%q\nwant\n%q", got, want)
 	}
@@ -164,6 +165,46 @@ func TestPayeeAccountLines_NilAndPartial(t *testing.T) {
 	got := payeeAccountLines(&model.ApprovalPayeeAccount{AccountNo: "6222"})
 	if got != "账号：6222" {
 		t.Fatalf("部分字段 = %q, want %q", got, "账号：6222")
+	}
+}
+
+// TestFormatBankAccountNo 账号分段规则（2026-10-29 用户口径）。
+//
+// 规则与支付宝/微信绑卡、银行 App 的银行卡号显示一致：
+// 从左往右每 4 位一组，**余数在末组**（不打头、不补零、不丢位）。
+func TestFormatBankAccountNo(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"6222000011112222", "6222 0000 1111 2222"},
+		{"1234567", "1234 567"},   // 余数在末组
+		{"12345", "1234 5"},      // 余数 1 位也不补零
+		{"6217996100139550568", "6217 9961 0013 9550 568"}, // 19 位企业账号
+		{"6222 0000 1111 2222", "6222 0000 1111 2222"},      // 已带空格 ⇒ 不重复分段
+		{"6222-0000-1111-2222", "6222 0000 1111 2222"},      // 已带连字符
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := formatBankAccountNo(c.in); got != c.want {
+			t.Fatalf("formatBankAccountNo(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestPayeeAccountLines_SegmentsAccount 锁住「付款信息」控件里的账号是分段的。
+//
+// ⚠️ 判别力：把 formatBankAccountNo 换回原样返回 ⇒ 本用例立刻红。
+func TestPayeeAccountLines_SegmentsAccount(t *testing.T) {
+	row := &model.ApprovalPayeeAccount{
+		BankName:    "中国邮政储蓄",
+		AccountNo:   "6217996100139550568",
+		AccountName: "廖克德",
+	}
+	got := payeeAccountLines(row)
+	want := "开户行：中国邮政储蓄\n账号：6217 9961 0013 9550 568\n户名：廖克德"
+	if got != want {
+		t.Fatalf("payeeAccountLines =\n%q\nwant\n%q", got, want)
 	}
 }
 
@@ -206,7 +247,7 @@ func TestBuildApplyData_WritesPaymentInfoControl(t *testing.T) {
 			t.Fatalf("控件类型 = %q, want Textarea", c.Control)
 		}
 		if !strings.Contains(c.Value.Text, "开户行：中国银行") ||
-			!strings.Contains(c.Value.Text, "账号：6228480012345678") ||
+			!strings.Contains(c.Value.Text, "账号：6228 4800 1234 5678") ||
 			!strings.Contains(c.Value.Text, "户名：某某公司") {
 			t.Fatalf("控件文本 = %q, 缺开户行/账号/户名", c.Value.Text)
 		}

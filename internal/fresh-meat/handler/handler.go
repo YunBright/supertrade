@@ -166,7 +166,18 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 
 	// 分割重量统计基线(替掉 LLM 做数值回归)
 	r.GET("/forecast-baselines", requireBranch, h.ListForecastBaselines)
+	// DELETE —— 删除不准确/脏基线(默认本店;可加 ?branch_id= 删别家店的)。
+	r.DELETE("/forecast-baselines", requireBranch, h.DeleteForecastBaseline)
+	// POST —— 选**数据完整的一天**生成新基线(新增或覆盖)。
+	r.POST("/forecast-baselines/generate", requireBranch, h.GenerateForecastBaselines)
 	r.POST("/forecast-baselines/recompute", requireBranch, h.RecomputeForecastBaselines)
+	// GET —— 多门店分级基线对比(按权重段 × 部位并排)。
+	r.GET("/forecast-baselines/compare", requireBranch, h.CompareForecastBaselines)
+
+	// 跨门店选用基线的配置(本店借用别店的基线)
+	r.GET("/forecast-baseline-borrows", requireBranch, h.ListForecastBaselineBorrows)
+	r.POST("/forecast-baseline-borrows", requireBranch, h.UpsertForecastBaselineBorrow)
+	r.DELETE("/forecast-baseline-borrows/:id", requireBranch, h.DeleteForecastBaselineBorrow)
 
 	// 成本链逐日物化:落 `cut_cost_daily` ⇒ 长期毛利变快。
 	// ⚠️ 幂等的派生数据重算,不绑盘点(绑盘点 ⇒ 零盘点门店的链每天断一次)。
@@ -1266,6 +1277,156 @@ func (h *Handler) RecomputeForecastBaselines(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"baselines": n})
+}
+
+// DeleteForecastBaseline DELETE /forecast-baselines?weight_band=&cut_type=
+//
+// 删除不准确/脏的基线(只删**本店**那一行;带 ?branch_id= 才删别家店的)。
+//
+// ⚠️ 目标是谁就按谁判权限 ⇒ 不能靠这个端点删掉没权限的店的基线。
+func (h *Handler) DeleteForecastBaseline(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	target := strings.TrimSpace(c.Query("branch_id"))
+	if target == "" {
+		target = branchID
+	}
+	if !h.requireScope(c, target, "freshmeat:write") {
+		return
+	}
+	band := strings.TrimSpace(c.Query("weight_band"))
+	cut := strings.TrimSpace(c.Query("cut_type"))
+	n, err := h.svc.DeleteForecastBaseline(c.Request.Context(), target, band, cut)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"deleted":     n,
+		"branch_id":   target,
+		"weight_band": band,
+		"cut_type":    cut,
+	})
+}
+
+// GenerateForecastBaselines POST /forecast-baselines/generate
+//
+// 按**数据完整的一天**生成新基线(新增或覆盖)。
+//
+// 入参:{"date":"2026-10-29","source_branch_id":"","overwrite":true}
+//
+// ⚠️ 那天缺"录入/搬台/销售/盘点"任一项 ⇒ 400 并点名缺哪一项。
+func (h *Handler) GenerateForecastBaselines(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	var in service.ForecastBaselineGenerateInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
+		return
+	}
+	out, err := h.svc.GenerateForecastBaselines(c.Request.Context(), branchID, in)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// CompareForecastBaselines GET /forecast-baselines/compare?branches=00,01
+//
+// 多门店分级基线对比(按权重段 × 部位并排)。
+//
+// ⚠️ **请求的每一个门店**都必须有 freshmeat:view ⇒ 任一无权 ⇒ 403。
+//
+//	(绝不能让一个门店看到别家的基线。)
+func (h *Handler) CompareForecastBaselines(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	ids := splitCSV(c.Query("branches"))
+	if len(ids) == 0 {
+		// 不给门店号 ⇒ 只看本店(单店自查)。
+		ids = []string{branchID}
+	}
+	for _, b := range ids {
+		if !h.requireScope(c, b, "freshmeat:view") {
+			return
+		}
+	}
+	out, err := h.svc.CompareForecastBaselines(c.Request.Context(), ids)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ListForecastBaselineBorrows GET /forecast-baseline-borrows
+//
+// 本店的"借用别店基线"配置清单。
+func (h *Handler) ListForecastBaselineBorrows(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	out, err := h.svc.ListForecastBaselineBorrows(c.Request.Context(), branchID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// UpsertForecastBaselineBorrow POST /forecast-baseline-borrows
+//
+// 新增/更新借用配置。
+//
+// 入参:{"source_branch_id":"01","weight_band":"","cut_type":"","enabled":true}
+//
+// ⚠️ weight_band 与 cut_type 都空 = 整店借用;只给 weight_band = 该体重段全部部位;
+//
+//	都给 = 精确分层。
+func (h *Handler) UpsertForecastBaselineBorrow(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	var in service.ForecastBaselineBorrowInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
+		return
+	}
+	out, err := h.svc.UpsertForecastBaselineBorrow(c.Request.Context(), branchID, in)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// DeleteForecastBaselineBorrow DELETE /forecast-baseline-borrows/:id
+func (h *Handler) DeleteForecastBaselineBorrow(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	id := strings.TrimSpace(c.Param("id"))
+	if err := h.svc.DeleteForecastBaselineBorrow(c.Request.Context(), branchID, id); err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// splitCSV 拆逗号分隔的字符串(去空白、去空项)。
+func splitCSV(s string) []string {
+	out := []string{}
+	for _, part := range strings.Split(s, ",") {
+		p := strings.TrimSpace(part)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // MaterializeCostChain POST /cost-chain/materialize?from=YYYY-MM-DD

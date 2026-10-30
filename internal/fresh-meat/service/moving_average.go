@@ -53,6 +53,7 @@ import (
 	"github.com/YunBright/supertrade/internal/cubesource"
 	"github.com/YunBright/supertrade/internal/fresh-meat/model"
 	"github.com/shopspring/decimal"
+	"gorm.io/gorm"
 )
 
 // SkuDailyCost 单 SKU 的当日移动加权成本明细(对外 JSON)。
@@ -112,7 +113,7 @@ type SkuDailyCost struct {
 
 // ReconciliationRow 成本对账行 —— **整猪/整店毛利准不准,一眼可判**。
 //
-// 恒等式:期初存货金额 + 本期入库金额 == 销售成本 + 统收成本 + 报损成本 + 期末存货金额
+// 恒等式:期初存货金额 + 本期入库金额 + **短卖金额** == 销售成本 + 统收成本 + 报损成本 + 期末存货金额
 //
 // DiffYuan 是差额。正常应为 0;不为 0 说明有**未显式化**的损耗
 // (切分损耗 / 隔夜失重 / 盘亏),报表会把它们单列,而不是让它们凭空消失。
@@ -123,11 +124,23 @@ type ReconciliationRow struct {
 	BulkCostYuan             decimal.Decimal `json:"bulk_cost_yuan"`
 	WasteCostYuan            decimal.Decimal `json:"waste_cost_yuan"`
 	ClosingInventoryCostYuan decimal.Decimal `json:"closing_inventory_cost_yuan"`
+	// ShortSellKg 是本期**计入成本的**账面不足合计(kg)——
+	// = 各部位 max(0, 卖出+统收+报损 + 期末 − 可售量) 之和。
+	//
+	// ⚠️ 它与报表的 `total.short_sell_kg`(owner 的**总量口径**:卖出的总量超过了
+	//   可售的总量)**不是同一个数**:前者是"实际补记了成本的缺口",
+	//   后者是"这天是不是真短卖"(总量够 ⇒ 不算短卖 ⇒ 不阻断审计结转)。
+	ShortSellKg decimal.Decimal `json:"short_sell_kg"`
+	// ShortSellYuan 是上面那笔缺口的**成本金额**(按当期可用单价计)。
+	//
+	// ⚠️ 它已经**含在 SalesCostYuan 里** ⇒ 恒等式左边要把它补回来,
+	//   否则差额行会凭空多出这一笔(见 DiffYuan 的算法)。
+	ShortSellYuan decimal.Decimal `json:"short_sell_yuan"`
 	// PigPurchaseCostYuan 是今日进场猪的采购成本合计。
 	PigPurchaseCostYuan decimal.Decimal `json:"pig_purchase_cost_yuan"`
 	// UnallocatedPigCostYuan 是"今日进场但没有任何产出数据、因而摊不出去"的猪成本。
 	UnallocatedPigCostYuan decimal.Decimal `json:"unallocated_pig_cost_yuan"`
-	// DiffYuan = (期初 + 入库) − (销售 + 统收 + 报损 + 期末);应为 0。
+	// DiffYuan = (期初 + 入库 + 短卖) − (销售 + 统收 + 报损 + 期末);应为 0。
 	DiffYuan decimal.Decimal `json:"diff_yuan"`
 	// RevaluationYuan 是**期末结存重估**(2026-10-24 预售结转)。
 	//
@@ -613,8 +626,19 @@ func (s *Service) loadSkuCatalog(ctx context.Context, branchID string, skuSet ma
 //
 // 取"该部位下 cube_product_id 最小"的那条 ⇒ 确定性,且与前端下拉顺序一致。
 func (s *Service) primarySkuPerCut(ctx context.Context, branchID string) (map[model.CutType]string, error) {
+	return s.primarySkuPerCutFrom(ctx, nil, branchID)
+}
+
+// primarySkuPerCutFrom 同 primarySkuPerCut,但可指定事务。
+//
+// ⚠️ **事务里必须用它**(2026-10-30):SQLite 单测库只开 1 条连接
+//   ⇒ 事务内再走 s.db 读 ⇒ 拿不到连接 ⇒ **死锁**。
+func (s *Service) primarySkuPerCutFrom(ctx context.Context, tx *gorm.DB, branchID string) (map[model.CutType]string, error) {
+	if tx == nil {
+		tx = s.db
+	}
 	var mappings []model.BranchCutMapping
-	if err := s.db.WithContext(ctx).
+	if err := tx.WithContext(ctx).
 		Where("branch_id = ?", branchID).
 		Order("cut_type ASC, cube_product_id ASC").
 		Find(&mappings).Error; err != nil {

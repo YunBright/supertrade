@@ -71,8 +71,20 @@ func PurgeRegistry() *purge.Registry {
 		// ⇒ 不会被误删。登记上只是兜底。
 		purge.Model{Table: "branch_cut_mappings", Model: &model.BranchCutMapping{}},
 		purge.Model{Table: "sku_cost_daily", Model: &model.SkuCostDaily{}},
-		// ⚠️ **不登记** `pig_forecast_baselines`:主键是复合的(体重段×部位),
-		// purge 按**单列**主键定位 ⇒ 报"模型没有主键";它是派生状态,本来就该留在库里。
+		// 分割基线 + 估计样本 + 跨店借用预留(2026-10-30 A 方案)。
+		//
+		// ⚠️ 这三张表**现在都有单列代理主键**(`id`):
+		//   - pig_forecast_baselines.id = "PFB" + 体重段 + 部位 + 门店号
+		//   - pig_cut_estimates.id      = surrogateID("PCE", 店, 猪, 部位)
+		//   - pig_forecast_baseline_borrows.id = surrogateID(...)
+		// ⇒ purge 按**单列**主键定位 ⇒ **进得了 PurgeRegistry** ⇒ 清得掉。
+		//
+		// (旧注释说"pig_forecast_baselines 主键是复合的 ⇒ 登记不了" —— 那是代理主键
+		//  改造**之前**的情况,现在已不成立 ⇒ 留着它 = 契约测试在生产留下的
+		//  基线/估计样本行永远清不掉。)
+		purge.Model{Table: "pig_forecast_baselines", Model: &model.PigForecastBaseline{}},
+		purge.Model{Table: "pig_cut_estimates", Model: &model.PigCutEstimate{}},
+		purge.Model{Table: "pig_forecast_baseline_borrows", Model: &model.PigForecastBaselineBorrow{}},
 	)
 }
 

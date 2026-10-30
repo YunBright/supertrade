@@ -140,22 +140,25 @@ func (s *Service) ListStockOpenings(ctx context.Context, branchID string) (*Stoc
 // 期初是**上线前就在冷库里的货** ⇒ 没有产出猪 ⇒ 归属快照为空
 // ⇒ FIFO 领用它时收入记「**未归属**」（钱不丢，但也不硬塞给某头猪）。
 func (s *Service) applyOpeningToStock(
-	ctx context.Context, branchID string, cutType model.CutType,
+	ctx context.Context, tx *gorm.DB, branchID string, cutType model.CutType,
 	bizDate time.Time, newKg, deltaKg, unitPrice decimal.Decimal,
 ) error {
+	if tx == nil {
+		tx = s.db
+	}
 	if !deltaKg.IsZero() {
 		// 位置表：冷库 ← 差额。
-		sku, err := s.bulkCutSku(ctx, branchID, cutType)
+		sku, err := s.bulkCutSkuFrom(ctx, tx, branchID, cutType)
 		if err != nil {
-			// 该部位没映射 SKU ⇒ 位置表无处安放（链仍按部位算）⇒ 跳过，不猜。
+			// 该部位没映射 SKU ⇒ 位置表无处安放(链仍按部位算)⇒ 跳过,不猜。
 			s.pubLogger.Warn("applyOpeningToStock: 部位没有映射 SKU,期初只进链",
 				"branch_id", branchID, "cut_type", cutType, "err", err)
-		} else if err := s.addPosition(ctx, s.db, branchID, sku, model.StockLocationColdStore, deltaKg); err != nil {
+		} else if err := s.addPosition(ctx, tx, branchID, sku, model.StockLocationColdStore, deltaKg); err != nil {
 			return err
 		}
 	}
-	// 结转记录(袋子)：source='opening' ⇒ 进 FIFO 队列（可领用/可结掉）。
-	sku, err := s.bulkCutSku(ctx, branchID, cutType)
+	// 结转记录(袋子):source='opening' ⇒ 进 FIFO 队列(可领用/可结掉)。
+	sku, err := s.bulkCutSkuFrom(ctx, tx, branchID, cutType)
 	if err != nil {
 		s.pubLogger.Warn("applyOpeningToStock: 部位没有映射 SKU,期初不进队列",
 			"branch_id", branchID, "cut_type", cutType, "err", err)
@@ -163,8 +166,8 @@ func (s *Service) applyOpeningToStock(
 	}
 	now := s.now()
 	if newKg.IsZero() {
-		// 期初被清零/删掉 ⇒ 这一行不该留在队列里（留着会看到一条 0kg 的"袋"）。
-		if err := s.db.WithContext(ctx).
+		// 期初被清零/删掉 ⇒ 这一行不该留在队列里(留着会看到一条 0kg 的"袋")。
+		if err := tx.WithContext(ctx).
 			Where("id = ?", StockOpeningBagID(branchID, string(cutType))).
 			Delete(&model.StockBag{}).Error; err != nil {
 			return fmt.Errorf("delete opening stock_bag: %w", err)
@@ -182,12 +185,12 @@ func (s *Service) applyOpeningToStock(
 		Location:      string(model.StockLocationColdStore),
 		Status:        BagStatusActive,
 		Source:        BagSourceOpening,
-		// 成本快照 = **门店给的**单价（不是 0,也不是倒算的移动加权单价）。
+		// 成本快照 = **门店给的**单价(不是 0,也不是倒算的移动加权单价)。
 		UnitCostYuan: unitPrice,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
-	if err := s.upsertStockBag(ctx, bag); err != nil {
+	if err := s.upsertStockBag(ctx, tx, bag); err != nil {
 		return err
 	}
 	return nil
@@ -198,6 +201,22 @@ func (s *Service) applyOpeningToStock(
 // 幂等:同一 (门店, 部位) 一条 ⇒ 重复保存 = 覆盖。
 //
 // ⚠️ 已审计结转的期间**冻结** ⇒ 期初生效日落在冻结区 ⇒ 400。
+//
+// # ⚠️ 改期初 = 换链的起点 ⇒ 链外的旧账要**同事务**清干净(2026-10-30 owner 要求)
+//
+//	「按理若要修改期初日期,需要把起初日期当天和之前的所有采购录入(猪)、
+//	  搬台、日终盘点都删除干净,但是之前没有这样的验证就修改入库了,
+//	  所以趁此机会可以在修改期初日期时增加这个事务判断」
+//
+//	⇒ 见 dropChainExternalRecords:边界与 assertAfterChainStart 一致
+//	  (链起点当天及之前 = "不是营业日"),清的是**已经录进去**的那些。
+//	⇒ 与"写期初"在**同一个事务**里 ⇒ 不许出现"新期初 + 旧记录"并存。
+//
+// # 事务边界(2026-10-30)
+//
+//	① 校验(全部先做完,再动数据)—— 事务之外;
+//	② **一个事务**:清链外旧账 + 写期初 + 位置表/队列;
+//	③ 事务之外:作废链外的旧成本快照 + 重算(派生数据,可重放)。
 func (s *Service) SaveStockOpenings(ctx context.Context, branchID string, items []StockOpeningInput) (*StockOpeningsView, error) {
 	if branchID == "" {
 		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
@@ -206,7 +225,16 @@ func (s *Service) SaveStockOpenings(ctx context.Context, branchID string, items 
 	loc := s.bizTZOrUTC()
 	today := now.In(loc)
 
-	earliest := ""
+	// ---- ① 校验(全部先做完,再动数据)----
+	//
+	// ⚠️ 为什么要拆成两段:下面要在一个事务里做「清链外旧账 + 写期初」
+	//   ⇒ 校验必须在**事务之外**先跑完 ⇒ 否则第 3 条不合法时,
+	//   前 2 条已经动过数据(虽然事务会回滚,但报错时机/原因会变得难懂)。
+	type preparedOpening struct {
+		it      StockOpeningInput
+		bizDate time.Time
+	}
+	prepared := make([]preparedOpening, 0, len(items))
 	for i, it := range items {
 		if !it.CutType.Valid() {
 			return nil, fmt.Errorf("%w: openings[%d].cut_type %q 不在 %d 类枚举", ErrInvalidInput, i, it.CutType, len(model.AllCutTypes))
@@ -247,68 +275,151 @@ func (s *Service) SaveStockOpenings(ctx context.Context, branchID string, items 
 		if it.UnitPriceYuan.IsNegative() {
 			return nil, fmt.Errorf("%w: openings[%d].unit_price_yuan 不能为负", ErrInvalidInput, i)
 		}
-		// ⚠️ 先读**旧值**:位置表与结转记录都要按**差额**调整
-		//   (链的起点是"绝对值",位置表是"增量" ⇒ 改期初必须走差额,否则会叠两次)。
-		oldKg := decimal.Zero
-		var old model.SkuStockOpening
-		if err := s.db.WithContext(ctx).
-			Where("id = ?", StockOpeningID(branchID, string(it.CutType))).
-			First(&old).Error; err == nil {
-			oldKg = old.ColdStoreKg
-		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, fmt.Errorf("query sku_stock_opening(old): %w", err)
-		}
-		rec := model.SkuStockOpening{
-			ID:          StockOpeningID(branchID, string(it.CutType)),
-			BranchID:    branchID,
-			CutType:     it.CutType,
-			ColdStoreKg: it.ColdStoreKg,
-			// 单价 = 门店给的;总价 = 重量 × 单价(**服务端算,不可填**)。
-			UnitPriceYuan:   it.UnitPriceYuan,
-			TotalAmountYuan: it.ColdStoreKg.Mul(it.UnitPriceYuan),
-			BizDate:         datatypesDate(bizDate),
-			Note:            strings.TrimSpace(it.Note),
-			CreatedAt:       now,
-			UpdatedAt:       now,
-		}
-		if err := s.db.WithContext(ctx).Clauses(clause.OnConflict{
-			Columns: []clause.Column{{Name: "id"}},
-			DoUpdates: clause.Assignments(map[string]any{
-				"cold_store_kg":     rec.ColdStoreKg,
-				"unit_price_yuan":   rec.UnitPriceYuan,
-				"total_amount_yuan": rec.TotalAmountYuan,
-				"biz_date":          rec.BizDate,
-				"note":              rec.Note,
-				"updated_at":        rec.UpdatedAt,
-			}),
-		}).Create(&rec).Error; err != nil {
-			return nil, fmt.Errorf("upsert sku_stock_opening %s: %w", rec.ID, err)
-		}
-		key := bizDate.Format("2006-01-02")
-		if earliest == "" || key < earliest {
-			earliest = key
-		}
-		// ⚠️ **期初也要落进「位置表」与「结转记录(袋子)」** —— 2026-10-25 模拟一周时抓到的断链。
-		//
-		// 只写 `sku_stock_openings` 的话，期初的货**只活在链里**：
-		//	- 库存查询(位置表)看不到它 ⇒ 门店说"冷库是空的"，报表说 100kg；
-		//	- 大宗结算的 FIFO 队列里没有它 ⇒ 那批货**结不出去**（可领用量不足）。
-		//
-		// ⇒ 这里补上：① 位置表(冷库) 按**差额**调整；② 登记一行
-		//   source='opening' 的结转记录（**没有产出猪** ⇒ 归属为空，收入记「未归属」）。
-		if err := s.applyOpeningToStock(ctx, branchID, it.CutType, bizDate, it.ColdStoreKg,
-			it.ColdStoreKg.Sub(oldKg), it.UnitPriceYuan); err != nil {
-			return nil, err
-		}
+		prepared = append(prepared, preparedOpening{it: it, bizDate: bizDate})
 	}
+
+	// ---- ② 新链起点(清链外旧账的边界)----
+	//
+	// ⚠️ 必须在**写之前**算:清理链外旧账要用它当边界,
+	//   而边界 = "这次写入之后"的期初结转最早生效日(见 chainStartAfterSave)。
+	chainStart, err := s.chainStartAfterSave(ctx, nil, branchID, items, loc)
+	if err != nil {
+		return nil, fmt.Errorf("算链的起点: %w", err)
+	}
+	// ⚠️ **冻结期要在事务外读**:SQLite 单测库只开 1 条连接
+	//   ⇒ 事务内再走 s.db 读 ⇒ 拿不到连接 ⇒ **死锁**。
+	frozenKey, err := s.auditCutoff(ctx, branchID)
+	if err != nil {
+		return nil, fmt.Errorf("读审计冻结期: %w", err)
+	}
+
+	// ---- ③ 一个事务:清链外旧账 + 写期初 ----
+	//
+	// ⚠️ **必须同事务**(2026-10-30 owner 要求):改期初 = 换链的起点
+	//   ⇒ 起点当天及之前的旧账(猪/搬台/日终盘点)必须与"写期初"一起生效
+	//   ⇒ 不许出现"新期初 + 旧记录"并存(那正是这次事故的形态)。
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// ③a 链外的旧账 —— 边界与 assertAfterChainStart 一致(链起点当天及之前)。
+		if chainStart != "" {
+			if err := s.dropChainExternalRecords(ctx, tx, branchID, chainStart, frozenKey); err != nil {
+				return fmt.Errorf("清理链外的旧账: %w", err)
+			}
+		}
+		// ③b 写期初 + 位置表/队列
+		for _, p := range prepared {
+			it, bizDate := p.it, p.bizDate
+			// ⚠️ 先读**旧值**:位置表与结转记录都要按**差额**调整
+			//   (链的起点是"绝对值",位置表是"增量" ⇒ 改期初必须走差额,否则会叠两次)。
+			oldKg := decimal.Zero
+			var old model.SkuStockOpening
+			if err := tx.WithContext(ctx).
+				Where("id = ?", StockOpeningID(branchID, string(it.CutType))).
+				First(&old).Error; err == nil {
+				oldKg = old.ColdStoreKg
+			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("query sku_stock_opening(old): %w", err)
+			}
+			rec := model.SkuStockOpening{
+				ID:          StockOpeningID(branchID, string(it.CutType)),
+				BranchID:    branchID,
+				CutType:     it.CutType,
+				ColdStoreKg: it.ColdStoreKg,
+				// 单价 = 门店给的;总价 = 重量 × 单价(**服务端算,不可填**)。
+				UnitPriceYuan:   it.UnitPriceYuan,
+				TotalAmountYuan: it.ColdStoreKg.Mul(it.UnitPriceYuan),
+				BizDate:         datatypesDate(bizDate),
+				Note:            strings.TrimSpace(it.Note),
+				CreatedAt:       now,
+				UpdatedAt:       now,
+			}
+			if err := tx.WithContext(ctx).Clauses(clause.OnConflict{
+				Columns: []clause.Column{{Name: "id"}},
+				DoUpdates: clause.Assignments(map[string]any{
+					"cold_store_kg":     rec.ColdStoreKg,
+					"unit_price_yuan":   rec.UnitPriceYuan,
+					"total_amount_yuan": rec.TotalAmountYuan,
+					"biz_date":          rec.BizDate,
+					"note":              rec.Note,
+					"updated_at":        rec.UpdatedAt,
+				}),
+			}).Create(&rec).Error; err != nil {
+				return fmt.Errorf("upsert sku_stock_opening %s: %w", rec.ID, err)
+			}
+			// ⚠️ **期初也要落进「位置表」与「结转记录(袋子)」** —— 2026-10-25 模拟一周时抓到的断链。
+			//
+			// 只写 `sku_stock_openings` 的话，期初的货**只活在链里**：
+			//	- 库存查询(位置表)看不到它 ⇒ 门店说"冷库是空的"，报表说 100kg；
+			//	- 大宗结算的 FIFO 队列里没有它 ⇒ 那批货**结不出去**（可领用量不足）。
+			//
+			// ⇒ 这里补上：① 位置表(冷库) 按**差额**调整；② 登记一行
+			//   source='opening' 的结转记录（**没有产出猪** ⇒ 归属为空，收入记「未归属」）。
+			if err := s.applyOpeningToStock(ctx, tx, branchID, it.CutType, bizDate, it.ColdStoreKg,
+				it.ColdStoreKg.Sub(oldKg), it.UnitPriceYuan); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	// ---- ④ 事务外:派生数据(可重放)----
+	//
 	// 期初改了 ⇒ 链的起点变了 ⇒ 各营业日的成本日快照要重算
 	// (结余快照是**审计结转**的产物,审计前实时算,这里不落)。
-	if earliest != "" {
-		if err := s.recomputeCostSnapshots(ctx, branchID, mustParseDateInLoc(earliest, loc)); err != nil {
+	//
+	// ⚠️ **顺序很重要:先清"链外"的旧快照,再重算**(2026-10-30 加)。
+	//
+	//	旧快照是**旧链起点**下算出来的 ⇒ 起点一旦前移/后移,它们就不再属于这条链
+	//	⇒ 留着会被链的**锚点**接回来(锚点 = 早于目标日的最近一份快照)
+	//	⇒ 上线前的旧账(含账面短卖的**负链值**)又回到链里
+	//	⇒ 门店看到"期初为什么有负数"。
+	//	(生产实测 2026-10-30,店 00:猪耳 −1.279 / 猪肺 −17.64 / 猪手 −9.2 kg)
+	//
+	//	⇒ 不许出现"新期初 + 旧快照"并存的状态 ⇒ 先清,后重算。
+	if err := s.dropStaleCostSnapshots(ctx, branchID); err != nil {
+		return nil, fmt.Errorf("作废链外的旧成本快照: %w", err)
+	}
+	if chainStart != "" {
+		if err := s.recomputeCostSnapshots(ctx, branchID, mustParseDateInLoc(chainStart, loc)); err != nil {
 			return nil, fmt.Errorf("重算按营业日的成本快照: %w", err)
 		}
 	}
 	return s.ListStockOpenings(ctx, branchID)
+}
+
+// dropStaleCostSnapshots 删掉某店**链起点之前**的成本日快照。
+//
+// # 为什么
+//
+//	链的起点 = 期初结转的最早生效日(见 cutChainBaseline)。
+//	起点之前的日子**不在链里** ⇒ 那些快照是"旧起点"下的产物
+//	⇒ 留着就会被锚点接回来(锚点 = 早于目标日的最近一份快照)
+//	⇒ 旧账(负链值)污染启用后的第一天。
+//
+// ⚠️ 只删**起点之前**的;起点之后的由 recomputeCostSnapshots + 物化任务覆盖。
+//
+// ⚠️ 审计结转后**不许**再改期初(见 SaveStockOpenings 的冻结检查)
+//   ⇒ 冻结期的快照不会被这里删掉。
+func (s *Service) dropStaleCostSnapshots(ctx context.Context, branchID string) error {
+	openings, err := s.loadOpenings(ctx, branchID)
+	if err != nil {
+		return err
+	}
+	baseKey := ""
+	for _, op := range openings {
+		if baseKey == "" || op.dateKey < baseKey {
+			baseKey = op.dateKey
+		}
+	}
+	if baseKey == "" {
+		// 没有期初结转 ⇒ 链从第一期营业日起算 ⇒ 没有"链外"可清。
+		return nil
+	}
+	base := mustParseDateInLoc(baseKey, s.bizTZOrUTC())
+	return s.db.WithContext(ctx).
+		Where("branch_id = ? AND biz_date < ?", branchID, datatypesDate(base)).
+		Delete(&model.CutCostDaily{}).Error
 }
 
 // DeleteStockOpening 删掉某个部位的**期初结转**(把该部位从链的起点里去掉)。
@@ -341,16 +452,49 @@ func (s *Service) DeleteStockOpening(ctx context.Context, branchID string, cutTy
 	if err := s.assertNotAudited(ctx, branchID, time.Time(rec.BizDate).In(s.bizTZOrUTC()), "期初结转"); err != nil {
 		return nil, err
 	}
-	if err := s.db.WithContext(ctx).Delete(&model.SkuStockOpening{}, "id = ?", rec.ID).Error; err != nil {
-		return nil, fmt.Errorf("delete sku_stock_opening: %w", err)
+	// ⚠️ **同事务**:删期初 + 撤位置表/队列 + 清链外的旧账(2026-10-30)。
+	//
+	//	删掉一个部位的期初 ⇒ 链的起点可能**后移** ⇒ 新的起点当天及之前
+	//	那些"链外旧账"(猪/搬台/日终盘点)就变成链外的了 ⇒ 必须一起清
+	//	⇒ 不许出现"起点后移了、旧账还在"的状态(旧账会顺着冷链漏进链里)。
+	// ⚠️ **冻结期要在事务外读**:SQLite 单测库只开 1 条连接
+	//   ⇒ 事务内再走 s.db 读 ⇒ 拿不到连接 ⇒ **死锁**。
+	frozenKey, err := s.auditCutoff(ctx, branchID)
+	if err != nil {
+		return nil, fmt.Errorf("读审计冻结期: %w", err)
 	}
-	// ⚠️ 删掉期初 ⇒ **位置表与队列**里的那批货也要一起撤
-	//   （否则"链里没了、账上还在"⇒ 门店看到两本账）。
-	if err := s.applyOpeningToStock(ctx, branchID, rec.CutType,
-		time.Time(rec.BizDate).In(s.bizTZOrUTC()), decimal.Zero, rec.ColdStoreKg.Neg(), decimal.Zero); err != nil {
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.WithContext(ctx).Delete(&model.SkuStockOpening{}, "id = ?", rec.ID).Error; err != nil {
+			return fmt.Errorf("delete sku_stock_opening: %w", err)
+		}
+		// ⚠️ 删掉期初 ⇒ **位置表与队列**里的那批货也要一起撤
+		//   （否则"链里没了、账上还在"⇒ 门店看到两本账）。
+		if err := s.applyOpeningToStock(ctx, tx, branchID, rec.CutType,
+			time.Time(rec.BizDate).In(s.bizTZOrUTC()), decimal.Zero, rec.ColdStoreKg.Neg(), decimal.Zero); err != nil {
+			return err
+		}
+		// 新链起点(在事务内算 ⇒ 看得到"已经删掉"的状态)。
+		chainStart, err := s.chainStartAfterSave(ctx, tx, branchID, nil, s.bizTZOrUTC())
+		if err != nil {
+			return fmt.Errorf("算链的起点: %w", err)
+		}
+		if chainStart != "" {
+			if err := s.dropChainExternalRecords(ctx, tx, branchID, chainStart, frozenKey); err != nil {
+				return fmt.Errorf("清理链外的旧账: %w", err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 	// 链的起点变了 ⇒ 各营业日的成本日快照要重算。
+	//
+	// ⚠️ 同样要**先清链外的旧快照**(见 dropStaleCostSnapshots 的说明):
+	//   删掉一个部位的期初 ⇒ 起点可能后移 ⇒ 起点之前的旧快照不再属于这条链。
+	if err := s.dropStaleCostSnapshots(ctx, branchID); err != nil {
+		return nil, fmt.Errorf("作废链外的旧成本快照: %w", err)
+	}
 	if err := s.recomputeCostSnapshots(ctx, branchID, time.Time(rec.BizDate).In(s.bizTZOrUTC())); err != nil {
 		return nil, fmt.Errorf("重算按营业日的成本快照: %w", err)
 	}

@@ -71,6 +71,19 @@ func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation) ([]Pe
 
 	perCut := make([]PerCutGrossMargin, 0, len(cutRows))
 	var tot TotalGrossMargin
+	// ---- 短卖(2026-10-30)----
+	//
+	// ⚠️ **先单独累加**:promo 桶在下面会被 `continue` 跳过
+	//   (特价已分摊到各部位 ⇒ 不能再单列)⇒ 若在循环里累加,会漏掉它那部分短卖。
+	var shortSellKg, carriedShortSellKg decimal.Decimal
+	for _, r := range cutRows {
+		shortSellKg = shortSellKg.Add(r.ShortSellKg)
+		carriedShortSellKg = carriedShortSellKg.Add(r.CarriedShortSellKg)
+	}
+	// 累计短卖是**每天一个值**(所有部位行相同)⇒ 取一个代表值即可。
+	if len(cutRows) > 0 {
+		carriedShortSellKg = cutRows[0].CarriedShortSellKg
+	}
 	for _, r := range cutRows {
 		if allocated && r.CutType == model.CutPromo {
 			// 已分摊到各部位 ⇒ 这里不再计(否则重复)。
@@ -95,6 +108,19 @@ func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation) ([]Pe
 			f, _ := gm.Mul(decimal.NewFromInt(100)).Div(gmBase).Float64()
 			gmPct = f
 		}
+		// 「应有」= **柜台口径**(owner 2026-10-29)= 全店应有 − 冷库量。
+		//
+		// ⚠ 与「实盘剩余(猪肉台实盘)」**同一口径** ⇒ variance_kg = 实盘 − 应有 才自洽。
+		//
+		// ⚠ **只在有完整盘点(有柜台实盘读数)时换口径**:
+		//   没有盘点单时,冷库量只能退回**引擎链值** —— 而链值**不含今天切出来的量**
+		//   (今天的分割先进冷库、没搬上台就不在链里)⇒ 拿它去减会算出一个
+		//   「今天的分割已经摆上台面了」的假数(实测会把 19.23 算成 10)。
+		//   ⇒ 没有柜台读数可比时,「应有」保持**全店口径**(与引擎期末一致 ⇒ 链的连续性不破)。
+		expected := r.ExpectedClosingKg
+		if r.DataSource == dataSourceActual {
+			expected = r.ExpectedClosingKg.Sub(r.ColdStoreKg)
+		}
 		row := PerCutGrossMargin{
 			CutType:           r.CutType,
 			OpeningKg:         r.OpeningKg,
@@ -104,7 +130,7 @@ func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation) ([]Pe
 			WasteKg:           r.WasteKg,
 			// ⚠️ 应有 = **账面推演**(不裁 0)⇒ 负数 = **账面短卖**。
 			//   旧实现是"逐 SKU 裁剪后再求和"⇒ 缺口被抹掉 ⇒ 门店看到的行自相矛盾。
-			ExpectedRemainKg: r.ExpectedClosingKg,
+			ExpectedRemainKg: expected,
 			RevenueYuan:       revenue,
 			SalesCostYuan:     salesCost,
 			BulkCostYuan:      bulkCost,
@@ -116,13 +142,32 @@ func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation) ([]Pe
 			MovingAvgUnitCost: r.MovingAvgUnitCost,
 			// ⚠️ 该部位当天成本**算不出来**(不是成本为 0)⇒ 行级标注。
 			CostIncomplete: r.CostUncomputable,
+			// ---- 部位级分割数据(owner 定案)----
+			SuggestedSplitKg:      r.SuggestedSplitKg,
+			ActualSplitKg:         r.ActualSplitKg,
+			ActualSplitSource:     r.ActualSplitSource,
+			AdjustedSplitKg:       r.AdjustedSplitKg,
+			BulkRevenueYuan:       r.BulkSoldAmount,
+			CounterActualKg:       r.CounterActualKg,
+			ColdStoreKg:           r.ColdStoreKg,
+			ColdStoreUnitCostYuan: r.MovingAvgUnitCost,
+			// ---- 猪肉台口径(2026-10-30)----
+			CounterLoadKg:          r.CounterLoadKg,
+			SuggestedUnitCostYuan:  r.SuggestedUnitCostYuan,
+			ActualAvgUnitPriceYuan: r.ActualAvgUnitPriceYuan,
+			// ---- 短卖(2026-10-30)----
+			// ⚠️ 这是**分部位的账面不足**(只作提示,不进链);
+			//   "这天真短卖"看的是全店合计的 Total.ShortSellKg。
+			CutShortSellKg: r.CutShortSellKg,
 		}
-		// ⚠️ 「实盘剩余」**只在有真实盘点时才有值**。
+		// ⚠️ 「实盘剩余」= **猪肉台(柜台)实盘**(owner 2026-10-29),**不含冷库**。
+		//
+		// ⚠️ 「实盘剩余」**只在有真实盘点(is_complete=true)时才有值**。
 		// 无盘点 ⇒ 留空(指针 nil ⇒ JSON 里**没有这个键**)⇒ 前端显示「—」,
 		// 而不是把账面推演值冒充成实盘(2026-10-26 门店反馈)。
 		if r.DataSource == dataSourceActual {
-			actual := r.ClosingKg
-			variance := r.ClosingKg.Sub(r.ExpectedClosingKg)
+			actual := r.CounterActualKg
+			variance := actual.Sub(expected)
 			row.ActualRemainKg = &actual
 			row.VarianceKg = &variance
 		}
@@ -141,6 +186,10 @@ func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation) ([]Pe
 			Div(tot.RevenueYuan.Add(tot.PresaleExpectedRevenueYuan)).Float64()
 		tot.GrossMarginPct = f
 	}
+	// ---- 短卖(2026-10-30):全店合计 ----
+	tot.ShortSellKg = shortSellKg
+	tot.CarriedShortSellKg = carriedShortSellKg
+	tot.ShortSell = shortSellKg.IsPositive()
 	sortPerCut(perCut)
 	return perCut, tot
 }
@@ -245,6 +294,25 @@ func (s *Service) buildCutMarginAlerts(ctx context.Context, branchID string, day
 				Kg:            v,
 			})
 		}
+	}
+	// ①c 分割权重**没能重分配**(黄字)—— 让门店看见"今天的进货权重不是按实际切出来的量"。
+	//
+	// ⚠ 为什么必须让门店看见:守卫生效 ⇒ 成本仍按**建议分割**算,
+	//   而门店以为"进货 = 实际切出来的量"⇒ 两边对不上,却没人告诉他。
+	//
+	// ⚠ 同一天只出一条(部位行上带的是**同一条**告警)⇒ 按文案去重。
+	seenNote := map[string]bool{}
+	for _, r := range cutRows {
+		note := r.SplitWeightNote
+		if note == "" || seenNote[note] {
+			continue
+		}
+		seenNote[note] = true
+		out = append(out, MarginAlert{
+			Level:   MarginAlertLevelWarning,
+			Code:    MarginAlertSplitWeightUnbalanced,
+			Message: note,
+		})
 	}
 	// ② 当前余额 vs 按营业日推导的结余(有当天快照时才可比)。
 	snapCounter, snapCold, ok, err := s.closingForDay(ctx, branchID, day)

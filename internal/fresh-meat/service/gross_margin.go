@@ -85,6 +85,18 @@ type GrossMarginReport struct {
 	SalesSource string `json:"sales_source"`
 	// SalesSourceNote 是给门店看的**人话**说明(前端直接显示)。
 	SalesSourceNote string `json:"sales_source_note,omitempty"`
+	// PigsRecorded 是当天(营业日)**进场猪的头数**。
+	//
+	// ⚠️ 为什么前端需要它(2026-10-30 owner):
+	//   「今天还没录猪」时,这张表的数字是**临时的**:
+	//   入库量按 0 算、销售成本按**昨天**的移动加权单价估、期末是账面短卖(负数)
+	//   ⇒ 门店必须先知道"今天还没录猪",别把临时数当成结论。
+	//
+	// ⚠️ 前端**不能靠入库量判断**:录了猪但没补录分割时,入库量同样是 0
+	//   ⇒ 只能由后端给出"今天到底有没有进猪"。
+	//
+	// ⇒ 0 = 当天没录猪 ⇒ 前端显示那段解释;>0 ⇒ 隐藏(已经录了就不用再提醒)。
+	PigsRecorded int `json:"pigs_recorded"`
 	PerCut              []PerCutGrossMargin `json:"per_cut"`
 	// PerSku 是**货号级销售明细** —— 只承载"货号粒度真实存在"的量
 	// (产出 / 销量 / 营收 / 统收 / 报损)。
@@ -171,27 +183,96 @@ const (
 	MarginAlertNegativeInventory = "negative_inventory"
 	// MarginAlertBalanceMismatch 当前余额与"按营业日推导"的余额不一致。
 	MarginAlertBalanceMismatch = "balance_mismatch"
+	// MarginAlertSplitWeightUnbalanced 分割权重**没能重分配**:
+	// 实际分割超出建议,但其它部位没有可压缩量(没处可挪)⇒ 今天仍按建议分割算成本。
+	//
+	// ⚠ 必须让门店看见:否则门店会以为"今天的进货就是实际切出来的量"。
+	MarginAlertSplitWeightUnbalanced = "split_weight_unbalanced"
 )
 
 // PerCutGrossMargin 单部位的毛利明细(由其下各 SKU 汇总)。
 type PerCutGrossMargin struct {
 	CutType           model.CutType   `json:"cut_type"`
 	OpeningKg         decimal.Decimal `json:"opening_kg"`
-	PurchasedKg       decimal.Decimal `json:"purchased_kg"` // 本期入库 kg(语义同旧:进货)
+	// PurchasedKg 是**本期入库量**(kg)—— 2026-10-29 起 = **调整后权重 W_c**
+	// (成本基准,见 cut_split_algo.go;语义仍是"进货")。
+	PurchasedKg decimal.Decimal `json:"purchased_kg"`
 	SoldKg            decimal.Decimal `json:"sold_kg"`
 	BulkSoldKg        decimal.Decimal `json:"bulk_sold_kg"`
 	WasteKg           decimal.Decimal `json:"waste_kg"`
-	// ActualRemainKg 是**实盘**剩余(kg);**nil = 当天没有实盘**。
+	// ActualRemainKg 是**猪肉台(柜台)实盘**(kg);**nil = 当天没有完整实盘**。
 	//
 	// ⚠️ 必须用**指针**:decimal.Decimal 是 struct,encoding/json 的 omitempty
 	// 对 struct **无效** ⇒ 用值类型时零值也会序列化出 "actual_remain_kg":"0"
 	// ⇒ 前端拿到 0 就会显示"实盘剩余 0"(门店会误读成"我盘出来是 0 kg")。
 	// 指针 nil ⇒ 整个键缺失 ⇒ 前端显示「—」。
 	ActualRemainKg *decimal.Decimal `json:"actual_remain_kg,omitempty"`
-	// ExpectedRemainKg 是**账面应有**剩余(kg)—— 任何口径下都有值。
+	// ExpectedRemainKg 是**柜台口径的账面应有**(kg)—— 任何口径下都有值。
+	//
+	// ⚠️ 2026-10-29 owner 口径变更:以前是**全店**应有(引擎 ExpectedClosingKg),
+	//   现在 = **全店应有 − 冷库量** ⇒ 与 ActualRemainKg(柜台实盘)**同口径**
+	//   ⇒ variance_kg = 实盘 − 应有 才不是"柜台减全店"的胡说。
+	//
+	// ⚠️ 引擎内部的 ExpectedClosingKg(全店)**没动**(成本/短卖告警/对账都靠它)。
 	ExpectedRemainKg decimal.Decimal `json:"expected_remain_kg"`
-	// VarianceKg = 实盘 − 应有;**nil = 当天没有实盘**(恒 0 是**假的**"对上了")。
+	// CutShortSellKg 是该部位**账面不足**的量(kg)—— 只作提示,**不进链**。
+	//
+	// = max(0, 卖出+统收+报损 + 期末 − 可售量)
+	// ⚠️ 它**不等于**"这天真短卖":真短卖看的是**总量口径**(见 Total.ShortSellKg)。
+	//   生产实测 店 00 2026-10-29:fat 等 8 个部位各有账面不足,但总量够 ⇒ 不是短卖。
+	CutShortSellKg decimal.Decimal `json:"cut_short_sell_kg"`
+	// VarianceKg = 实盘 − 应有;**nil = 当天没有完整实盘**(恒 0 是**假的**"对上了")。
 	VarianceKg *decimal.Decimal `json:"variance_kg,omitempty"`
+	// ---- 部位级分割数据(2026-10-29;owner 定案,前端按这些键渲染)----
+	//
+	// SuggestedSplitKg 是该部位的**建议分割**(kg)—— AI/算法建议
+	// (统计基线 p50 优先、LLM 兜底),**不含 pig_cuts 实录**。
+	SuggestedSplitKg decimal.Decimal `json:"suggested_split_kg"`
+	// ActualSplitKg 是该部位的**实际分割**(kg);nil ⇒ 前端显示空。
+	//
+	// ⚠️ 必须用**指针**(同上:omitempty 对 decimal.Decimal 无效)。
+	// ⚠️ 显示规则(owner 定案):
+	//	recorded(实录)⇒ 总是给值;
+	//	derived(倒推)⇒ 有完整日终盘点 ⇒ 给值;
+	//	无完整日终盘点 且 实际 < 建议 ⇒ 留空(前端显示「—」)。
+	ActualSplitKg *decimal.Decimal `json:"actual_split_kg,omitempty"`
+	// ActualSplitSource:recorded(当日 pig_cuts 实录)| derived(倒推)。
+	ActualSplitSource string `json:"actual_split_source"`
+	// AdjustedSplitKg 是**调整后权重**(kg)—— 成本基准(= 本期入库量)。
+	AdjustedSplitKg decimal.Decimal `json:"adjusted_split_kg"`
+	// BulkRevenueYuan 是该部位当日的**统收金额**(元)—— 营收角标气泡用。
+	//
+	// ⚠️ `revenue_yuan` **已经含**它(零售 + 统收)⇒ 别重复加。
+	BulkRevenueYuan decimal.Decimal `json:"bulk_revenue_yuan"`
+	// CounterActualKg 是该部位当日的**猪肉台实盘**(kg)
+	// (来自完整盘点单;没有完整盘点 ⇒ 0)。
+	CounterActualKg decimal.Decimal `json:"counter_actual_kg"`
+	// ColdStoreKg 是该部位当日的**冷库量**(kg)
+	// (盘点单的冷库余额;没有盘点单 ⇒ 退回引擎链值)。
+	ColdStoreKg decimal.Decimal `json:"cold_store_kg"`
+	// ColdStoreUnitCostYuan 是**冷库库存部位单价**(元/kg)
+	// = 该部位的**移动加权单价**(owner:「冷库单价不是新的部位单价,是移动加权单价」)。
+	ColdStoreUnitCostYuan decimal.Decimal `json:"cold_store_unit_cost_yuan"`
+	// ---- 猪肉台口径的三件新数据(2026-10-30 owner 定案)----
+	//
+	// ⚠️ 背景:owner 看报表后说「这张表(甚至整个鲜肉-毛利看板页)都是**猪肉台**的数据」
+	//   ⇒ ① 「期初」列(账面链值,可以是负数 = 账面短卖)看不懂 ⇒ 改成「搬上台」;
+	//     ② 「冷库单价」这一列不涉及冷库 ⇒ 换成「单价」(建议单价 / 实际均价 两行)。
+	//
+	// CounterLoadKg 是该部位当日**搬上台**的重量(kg)—— 门店自己搬的量。
+	CounterLoadKg decimal.Decimal `json:"counter_load_kg"`
+	// SuggestedUnitCostYuan 是**建议单价**(元/kg):
+	// 「如果今天的猪按**建议分割**切,这刀货的成本单价是多少」。
+	//
+	// ⚠️ nil = 当天**没有建议分割**(没进猪)⇒ 前端显示「—」(不是 0)。
+	SuggestedUnitCostYuan *decimal.Decimal `json:"suggested_unit_cost_yuan,omitempty"`
+	// ActualAvgUnitPriceYuan 是**实际均价**(元/kg):
+	// 当日这个部位**实际卖出**的平均单价 = 营收 ÷ 销量
+	// (零售来自思迅日汇总表 t_rm_daysum;统收是本地登记,一并计入
+	//  ⇒ 与「营收」列**自洽**:均价 × 销量 = 营收,门店能自己验算)。
+	//
+	// ⚠️ nil = 当天这个部位**没卖** ⇒ 前端显示「—」。
+	ActualAvgUnitPriceYuan *decimal.Decimal `json:"actual_avg_unit_price_yuan,omitempty"`
 	RevenueYuan       decimal.Decimal `json:"revenue_yuan"`
 	// ⚠️ 改名(2026-10-23):旧字段 `purchase_cost_yuan` 是"按消耗比例摊销的猪采购成本";
 	// 新字段是**本期销售成本**(移动加权结转)—— 两者语义不同,不是同一个数。
@@ -239,6 +320,22 @@ type TotalGrossMargin struct {
 	// PresaleMarginYuan / PresaleExpectedRevenueYuan 与部位行同义(预期毛利结转)。
 	PresaleMarginYuan          decimal.Decimal `json:"presale_margin_yuan,omitempty"`
 	PresaleExpectedRevenueYuan decimal.Decimal `json:"presale_expected_revenue_yuan,omitempty"`
+	// ---- 短卖(2026-10-30 owner 口径)----
+	//
+	// ShortSellKg 是**当日总量短卖**(kg)——
+	// 口径 = max(0, Σ卖出+统收+报损 − Σ期初+进货)(owner:「总量够就不算短卖」)。
+	//
+	// ⚠️ **分部位的账面不足不算**(那是分摊口径问题)⇒
+	//   生产实测 店 00:10-29 = 0(总量 191.7kg ≥ 卖出 178.1kg);
+	//   10-30 = 62.512kg(账面只剩 20.9kg 却卖了 83.4kg)。
+	// ⇒ >0 ⇒ 报表描红 + **审计结转被拒** + 结转给下一天(累计短卖)。
+	ShortSellKg decimal.Decimal `json:"short_sell_kg"`
+	// CarriedShortSellKg 是**从上一期结转过来的累计短卖**(kg)。
+	//
+	// ⚠️ 短卖**绝不回写成负库存**(期初仍 ≥0)⇒ 它只是给门店看的提示数。
+	CarriedShortSellKg decimal.Decimal `json:"carried_short_sell_kg"`
+	// ShortSell = true ⇒ 当日有短卖(前端据此**描红**)。
+	ShortSell bool `json:"short_sell"`
 }
 
 // ComputeGrossMargin 按 (branchID, day) 算毛利。
@@ -326,6 +423,13 @@ func (s *Service) ComputeGrossMargin(ctx context.Context, branchID string, day t
 			len(incompleteCuts), strings.Join(shown, "、"))
 	}
 
+	// 当天进猪头数(2026-10-30):前端据此提示"今天还没录猪 ⇒ 数字是临时的",
+	// 录了猪就隐藏(见 GrossMarginReport.PigsRecorded 的说明)。
+	pigsRecorded, err := s.countPigsForDay(ctx, branchID, day)
+	if err != nil {
+		return nil, err
+	}
+
 	return &GrossMarginReport{
 		BranchID:            branchID,
 		Date:                day.In(s.bizTZOrUTC()).Format("2006-01-02"),
@@ -333,6 +437,7 @@ func (s *Service) ComputeGrossMargin(ctx context.Context, branchID string, day t
 		DataSource:          dataSource,
 		SalesSource:         salesSource,
 		SalesSourceNote:     salesSourceNote,
+		PigsRecorded:        pigsRecorded,
 		PerCut:              perCut,
 		// ⚠️ SKU 明细**只承载销售 / 营收 / 分割产出**(2026-10-27 口径):
 		//   库存 / 成本 / 毛利是**部位口径** ⇒ SKU 行里**不返**(键缺失)。
@@ -348,6 +453,28 @@ func (s *Service) ComputeGrossMargin(ctx context.Context, branchID string, day t
 		PresaleHint:         hint,
 		GeneratedAt:         s.now(),
 	}, nil
+}
+
+// countPigsForDay 数某店当天(营业日窗口内)**进场的猪**。
+//
+// ⚠️ 口径与引擎一致:营业日窗口 = [当天 00:00 bizTZ, +24h)(见 businessDayBounds)
+//   ⇒ 猪按**到店时间**归属,不用 UTC 日期硬比。
+//
+// # 为什么要有它(2026-10-30 owner)
+// 「今天还没录猪」时报表的数字是**临时的**(入库=0、成本按昨天的进价估、
+// 期末是账面短卖)⇒ 前端要据此给门店一句提示,录了猪就隐藏。
+//
+// ⚠️ 前端**不能靠入库量判断**:录了猪但没补录分割时,入库量同样是 0
+//   ⇒ 只能由后端告诉它"今天到底有没有进猪"。
+func (s *Service) countPigsForDay(ctx context.Context, branchID string, day time.Time) (int, error) {
+	start, end := s.businessDayBounds(day)
+	var n int64
+	if err := s.db.WithContext(ctx).Model(&model.WholePig{}).
+		Where("branch_id = ? AND arrived_at >= ? AND arrived_at < ?", branchID, start, end).
+		Count(&n).Error; err != nil {
+		return 0, fmt.Errorf("count whole_pigs(gross margin): %w", err)
+	}
+	return int(n), nil
 }
 
 // sortPerCut 按 cut_type 字符串升序(输出稳定,便于 e2e 断言)。

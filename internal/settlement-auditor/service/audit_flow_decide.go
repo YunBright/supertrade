@@ -543,8 +543,18 @@ func (s *Service) approvalYear(ap *model.ApprovalInstance) int {
 // ⚠️ **数据正确性硬拦优先于流程结论**：
 // 流程配置说"直接通过"，但这一单的结算单在 ERP 里不存在 / 金额勾稽不上 ⇒
 // 仍然拒绝（见 flowHardStopSignals 的理由）。
+//
+// ⚠️ **不产盘点建议 ⇒ 不触发「盘点联动」**（2026-10-28 用户口径）：
+//
+//	「按流程逻辑通过的不需要触发盘点联动」。
+//
+//	「盘点联动」是**机器人研判的副产物**（stepStocktake 按 verdict 的建议建
+//	针对性盘点计划）。命中流程定制 ⇒ 这一单**根本没问机器人** ⇒ 没有研判
+//	⇒ 不该凭空造一个盘点计划出来（那等于让人去盘一台机器没怀疑过的货）。
+//
+//	⚠️ 顺带把 raw 里的 "suggest_stocktake" 也去掉 ——
+//		留着它等于在 wire 上宣称"建议盘点"，详情页会照着显示。
 func (s *Service) buildFlowVerdict(dec *FlowDecision, signals []signalDraft) *VerdictResult {
-	suggestion := stocktakeSuggestionFromSignals(signals)
 	var hard []string
 	for _, d := range signals {
 		if d.Level == model.SignalBlock && flowHardStopSignals[d.SignalType] {
@@ -558,10 +568,9 @@ func (s *Service) buildFlowVerdict(dec *FlowDecision, signals []signalDraft) *Ve
 		reason = "流程定制判定被数据校验阻断:" + strings.Join(hard, ";")
 	}
 	raw, _ := json.Marshal(map[string]any{
-		"conclusion":        conclusion,
-		"reason":            reason,
-		"confidence":        1,
-		"suggest_stocktake": suggestion,
+		"conclusion": conclusion,
+		"reason":     reason,
+		"confidence": 1,
 		"flow": map[string]any{
 			"applied":  dec.Applied,
 			"path":     dec.Path,
@@ -569,12 +578,13 @@ func (s *Service) buildFlowVerdict(dec *FlowDecision, signals []signalDraft) *Ve
 		},
 	})
 	return &VerdictResult{
-		Conclusion:       conclusion,
-		Reason:           reason,
-		Confidence:       decimal.NewFromInt(1),
-		SuggestStocktake: suggestion,
-		RawJSON:          raw,
-		Source:           model.VerdictSourceFlowConfig,
+		Conclusion: conclusion,
+		Reason:     reason,
+		Confidence: decimal.NewFromInt(1),
+		// ⚠️ SuggestStocktake 故意留 nil ⇒ stepStocktake 直接返回 ⇒
+		//    时间线上不会出现「盘点联动」这一条。
+		RawJSON: raw,
+		Source:  model.VerdictSourceFlowConfig,
 	}
 }
 

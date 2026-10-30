@@ -947,10 +947,15 @@ func (s *Service) isRestDay(ctx context.Context, branchID string, takenDate time
 	//
 	// ⚠️ 2026-10-24:改用**搬台流水**(两种搬法都记)⇒ 不再漏判
 	// "按 SKU+kg 搬上台"的日子(之前完全没有流水)。
+	//
+	// ⚠️ 2026-10-30 owner:「今天不搬台」会落一条 **qty_kg = 0** 的标记行
+	//   ⇒ 那**不算**"搬过台" ⇒ 判据用 `qty_kg > 0`,不是"有没有行"。
+	//   (否则"门店确认今天不搬台"会把那天判成"不是休市" ⇒ 口径反了。)
 	var loads int64
 	loadStart, loadEnd := s.businessDayBounds(takenDate)
 	if err := s.db.WithContext(ctx).Model(&model.CounterLoadRecord{}).
-		Where("branch_id = ? AND biz_date >= ? AND biz_date < ?", branchID, loadStart, loadEnd).
+		Where("branch_id = ? AND biz_date >= ? AND biz_date < ? AND qty_kg > 0",
+			branchID, loadStart, loadEnd).
 		Count(&loads).Error; err != nil {
 		return false, fmt.Errorf("count counter_loads(rest day): %w", err)
 	}
