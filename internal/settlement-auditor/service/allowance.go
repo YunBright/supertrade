@@ -73,6 +73,52 @@ func applyReceiptAllowance(drafts []signalDraft, al Allowance) []signalDraft {
 	return out
 }
 
+// applyStocktakeVerification 按「关联盘点单已审核通过」放宽数量类信号。
+//
+// # 用户口径（2026-10-30）
+//
+//	「盘点审核后重新提交付款审批，可以通过机器人审核」。
+//
+// 盘点单就是对「进货量/有无销售」的**实地核对结果** —— 盘点人已经确认过
+// 库存实际数量，机器再用"进货量是销量的 N 倍"拦这单，等于让同一件事审两遍。
+//
+// ⚠️ 放宽后信号**仍是 warn**（不是消失）⇒ 人工终审照旧看得见这些事实；
+// 只降级数量类（SigQtyDeviation / SigPurchaseWithoutSales），
+// 单据缺失/未审核/金额勾稽**不受影响**（那些盘点解决不了）。
+//
+// 返回新切片：入参可能是共享底层数组的切片，原地改会污染调用方的快照。
+func applyStocktakeVerification(drafts []signalDraft, verified []StocktakeVerification) []signalDraft {
+	if len(verified) == 0 || len(drafts) == 0 {
+		return drafts
+	}
+	ids := make([]string, 0, len(verified))
+	for _, v := range verified {
+		if v.HeaderID != "" {
+			ids = append(ids, v.HeaderID)
+		}
+	}
+	if len(ids) == 0 {
+		return drafts
+	}
+	if len(ids) > 3 {
+		ids = ids[:3]
+	}
+	label := strings.Join(ids, ",")
+	out := make([]signalDraft, len(drafts))
+	copy(out, drafts)
+	for i := range out {
+		if out[i].Level != model.SignalBlock {
+			continue
+		}
+		switch out[i].SignalType {
+		case SigQtyDeviation, SigPurchaseWithoutSales:
+			out[i].Level = model.SignalWarn
+			out[i].Message += fmt.Sprintf(";关联盘点单 %s 已审核通过,库存已盘点核对,按口径不作为阻断项", label)
+		}
+	}
+	return out
+}
+
 // GrossMargin 是本次审批涉及商品的**窗口毛利估算**。
 //
 // # 口径（为什么是"估算"）

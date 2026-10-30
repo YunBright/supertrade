@@ -97,6 +97,14 @@ type SubmitInput struct {
 	//
 	// 空 ⇒ 本次审批不带「付款信息」(选了结算单但没选账号是允许的)。
 	BankAccountID string
+	// StocktakeHeaderIDs 是「重新发起」时**关联的盘点计划单**(2026-10-30 用户口径)。
+	//
+	// 被机器拒绝的那一单曾自动建计划盘点单;盘点审核完成后从「审批记录」
+	// 重新发起,把那张盘点单关联进来 ⇒ 机器审核看到"库存已盘点核对",
+	// 数量类信号不再阻断,从而通过机器人审核。
+	//
+	// ⚠️ 前端只传 header id;是否存在/属于本门店/是否已审核由服务端核对。
+	StocktakeHeaderIDs []string
 }
 
 // maxSettlementsPerApproval 单次审批勾选上限(防 LLM prompt 爆炸)。
@@ -244,6 +252,13 @@ func (s *Service) SubmitApproval(ctx context.Context, branchID string, in Submit
 	if err := s.resolveAndStorePayeeAccount(ctx, ap, in.BankAccountID); err != nil {
 		logPayeeFetchError(s.logger, ap.ID, err)
 	}
+	// 关联盘点计划单(重新发起路径,2026-10-30):落 approval_stocktake_links。
+	//
+	// ⚠️ 校验不过**不阻断提交**(只是失去放宽依据):盘点单被删/换了门店
+	// 都不该让这一单提交失败。
+	if err := s.storeStocktakeLinks(ctx, ap, in.StocktakeHeaderIDs); err != nil {
+		s.logger.Warn("store stocktake links failed", "approval_id", ap.ID, "err", err)
+	}
 
 	// 后台异步审核(detach ctx:请求返回后流水线继续)。
 	go s.runAudit(context.Background(), ap.ID)
@@ -342,7 +357,8 @@ func (s *Service) runAudit(ctx context.Context, approvalID string) {
 	amountCheck := s.stepCheckAmounts(ctx, ap, settlements, linesBySettlement, &signals, items)
 
 	// step 5: 数量信号(采购量 vs 销售) + 毛利额度信号(补差价)
-	if err := s.stepCheckQuantity(ctx, ap, linesBySettlement, sheets, &signals, allowance); err != nil {
+	margins, err := s.stepCheckQuantity(ctx, ap, linesBySettlement, sheets, &signals, allowance)
+	if err != nil {
 		s.markFailed(ctx, ap, err.Error())
 		return
 	}
@@ -353,6 +369,14 @@ func (s *Service) runAudit(ctx context.Context, approvalID string) {
 	// LLM 与规则降级路径看到的也是同一份。
 	signals = applyReceiptAllowance(signals, allowance)
 
+	// step 5.6: 盘点核对放宽(关联盘点单已审核通过 ⇒ 数量类信号不再阻断)
+	//
+	// 用户口径(2026-10-30):「盘点审核后重新提交付款审批可以通过机器人审核」。
+	// 盘点单是**库存事实的核对结果** ⇒ 数量类信号(自入库无销售/数量偏离)
+	// 的疑问已被盘点回答,不应再拦这一单。
+	verified := s.verifiedStocktakes(ctx, ap)
+	signals = applyStocktakeVerification(signals, verified)
+
 	// 信号统一落库
 	if err := s.saveSignals(ctx, ap.ID, signals); err != nil {
 		s.markFailed(ctx, ap, "save signals: "+err.Error())
@@ -360,7 +384,8 @@ func (s *Service) runAudit(ctx context.Context, approvalID string) {
 	}
 
 	// step 6: 出结论 —— 命中流程定制配置 ⇒ 用流程结论；没命中 ⇒ 现有机器人(LLM)研判
-	verdict, err := s.decideVerdict(ctx, ap, settlements, linesBySettlement, sheets, signals, &amountCheck, items, allowance)
+	extras := AuditExtras{Margins: *marginsOrZero(margins), Stocktakes: verified}
+	verdict, err := s.decideVerdict(ctx, ap, settlements, linesBySettlement, sheets, signals, &amountCheck, items, allowance, extras)
 	if err != nil {
 		s.markFailed(ctx, ap, err.Error())
 		return
@@ -608,7 +633,7 @@ func (s *Service) stepCheckAmounts(ctx context.Context, ap *model.ApprovalInstan
 //
 // 信号里写「<商品名称>-<商品货号>」(ProductLabel)⇒ 这里要先把名字查出来。
 // 名字查不到只 warn 不失败:回退成纯货号,不影响主结论。
-func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInstance, linesBySettlement map[string][]SettlementLineRow, sheets []PurchaseSheetRow, signals *[]signalDraft, allowance Allowance) error {
+func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInstance, linesBySettlement map[string][]SettlementLineRow, sheets []PurchaseSheetRow, signals *[]signalDraft, allowance Allowance) (*MarginSummary, error) {
 	start := time.Now()
 	// 仅 PI(进货)单做收货量聚合;RO 退货本期不建信号(见 checks.go 注释)。
 	piSheetSet := make(map[string]struct{})
@@ -625,11 +650,11 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 	}
 	if len(piSheets) == 0 {
 		s.logStep(ctx, ap, StepCheckQuantity, "无 PI 进货单", "跳过数量信号", "", time.Since(start).Milliseconds())
-		return nil
+		return nil, nil
 	}
 	lines, err := s.cube.ListSheetLines(ctx, ap.BranchID, piSheets)
 	if err != nil {
-		return fmt.Errorf("fetch sheet lines: %w", err)
+		return nil, fmt.Errorf("fetch sheet lines: %w", err)
 	}
 	received := make(map[string]decimal.Decimal)
 	productSheets := make(map[string][]string) // 商品 → 它出现过的采购单
@@ -673,7 +698,7 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 	for _, g := range groups {
 		sales, err := s.cube.SumSalesByProduct(ctx, ap.BranchID, g.Products, g.From, toDate)
 		if err != nil {
-			return fmt.Errorf("fetch sales: %w", err)
+			return nil, fmt.Errorf("fetch sales: %w", err)
 		}
 		for _, r := range sales {
 			salesByProduct[r.ProductID] = r
@@ -729,16 +754,24 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 	}
 
 	avgCnt, purchaseCnt := costBasisCounts(cost)
+	negGross := negativeProductMargins(perSKU)
+	summary := &MarginSummary{GrossNegCount: len(negGross), RealizedNegCount: len(realizedNeg)}
+	for _, pm := range negGross {
+		summary.GrossNegYuan = summary.GrossNegYuan.Add(pm.AmountYuan)
+	}
+	for _, rm := range realizedNeg {
+		summary.RealizedNegYuan = summary.RealizedNegYuan.Add(rm.AmountYuan)
+	}
 	s.logStep(ctx, ap, StepCheckQuantity,
 		fmt.Sprintf("PI 单 %d 张,商品 %d 种,窗口 %s~%s(按各商品最后一次采购入库日起算,取不到则回退 %s)",
 			len(piSheets), len(products), groups[0].From, toDate, fallbackFrom),
 		fmt.Sprintf("新增 %d 条数量信号;窗口毛利估算 %s 元(成本口径:库存加权平均成本价 %d 个商品,回退本次进货均价 %d 个),补差价额度 %s 元,毛利为负的商品 %d 个;实现毛利为负的商品 %d 个",
 			len(*signals)-before, yuanText(gm.AmountYuan), avgCnt, purchaseCnt,
 			yuanText(allowance.PriceDiffYuan),
-			len(negativeProductMargins(perSKU)),
+			len(negGross),
 			len(realizedNeg)),
-		"", time.Since(start).Milliseconds())
-	return nil
+		"", 0)
+	return summary, nil
 }
 
 // realizedWindowSales 拉「实现毛利」口径要用的窗口销售汇总。
@@ -919,8 +952,12 @@ func (s *Service) saveSignals(ctx context.Context, approvalID string, drafts []s
 }
 
 // stepLLMVerdict 调 verdictFn;失败降级 defaultVerdictFn;落 llm_verdicts。
-func (s *Service) stepLLMVerdict(ctx context.Context, ap *model.ApprovalInstance, settlements []SettlementRow, linesBySettlement map[string][]SettlementLineRow, sheets []PurchaseSheetRow, signals []signalDraft, amount *AmountCheck, items []model.ApprovalItem, allowance Allowance) (*VerdictResult, error) {
+func (s *Service) stepLLMVerdict(ctx context.Context, ap *model.ApprovalInstance, settlements []SettlementRow, linesBySettlement map[string][]SettlementLineRow, sheets []PurchaseSheetRow, signals []signalDraft, amount *AmountCheck, items []model.ApprovalItem, allowance Allowance, extras ...AuditExtras) (*VerdictResult, error) {
 	start := time.Now()
+	var ex AuditExtras
+	if len(extras) > 0 {
+		ex = extras[0]
+	}
 	in := &AuditInput{
 		Approval:    ap,
 		Settlements: settlements,
@@ -931,6 +968,8 @@ func (s *Service) stepLLMVerdict(ctx context.Context, ap *model.ApprovalInstance
 		Items:       buildItemRows(settlements, items),
 		Totals:      totalsOf(settlements, items),
 		Allowance:   allowance,
+		Margins:     ex.Margins,
+		Stocktakes:  ex.Stocktakes,
 	}
 	verdict, err := s.verdictFn(ctx, in)
 	trace := ""
@@ -941,6 +980,11 @@ func (s *Service) stepLLMVerdict(ctx context.Context, ap *model.ApprovalInstance
 		if err != nil {
 			return nil, fmt.Errorf("rule fallback verdict: %w", err)
 		}
+	}
+	// 通过结论必须带**毛利合计**(2026-10-30 用户口径:不能缺少总和)。
+	// LLM 漏了就由引擎补一句 —— 总不能因为模型没写,审批人就看不到总账。
+	if verdict.Conclusion == ConclusionPass {
+		verdict.Reason = ensureMarginTotals(verdict.Reason, ex.Margins)
 	}
 	if err := s.saveVerdict(ctx, ap, verdict, trace, StepLLMVerdict, len(signals),
 		time.Since(start).Milliseconds()); err != nil {
@@ -984,6 +1028,91 @@ func (s *Service) saveVerdict(ctx context.Context, ap *model.ApprovalInstance, v
 		trace, durMs)
 	return nil
 }
+
+// maxStocktakeLinksPerApproval 单次审批可关联的盘点单上限(防滥用/脏数据)。
+const maxStocktakeLinksPerApproval = 5
+
+// storeStocktakeLinks 落「本审批 ↔ 盘点计划单」绑定(重新发起路径)。
+//
+// 只存**核对通过**的 id:盘点单不存在 / 不属于本门店 ⇒ 跳过(丢了放宽依据,
+// 但不会让审批带上别人的盘点单)。
+func (s *Service) storeStocktakeLinks(ctx context.Context, ap *model.ApprovalInstance, headerIDs []string) error {
+	ids := dedupeStrings(headerIDs)
+	if len(ids) == 0 {
+		return nil
+	}
+	if len(ids) > maxStocktakeLinksPerApproval {
+		ids = ids[:maxStocktakeLinksPerApproval]
+	}
+	for _, hid := range ids {
+		if s.stocktake != nil {
+			h, err := s.stocktake.GetHeader(ctx, hid)
+			if err != nil {
+				s.logger.Warn("verify stocktake header failed", "approval_id", ap.ID,
+					"header_id", hid, "err", err)
+				continue
+			}
+			if ap.BranchID != "" && h.BranchID != "" && h.BranchID != ap.BranchID {
+				s.logger.Warn("stocktake header branch mismatch", "approval_id", ap.ID,
+					"header_id", hid, "header_branch", h.BranchID, "approval_branch", ap.BranchID)
+				continue
+			}
+		}
+		link := &model.ApprovalStocktakeLink{
+			ID:                uuid.NewString(),
+			ApprovalID:        ap.ID,
+			StocktakeHeaderID: hid,
+		}
+		if err := s.db.WithContext(ctx).Create(link).Error; err != nil {
+			return fmt.Errorf("create stocktake link %s: %w", hid, err)
+		}
+	}
+	return nil
+}
+
+// marginsOrZero 把可空的毛利汇总转成零值(避免解引用 nil)。
+func marginsOrZero(m *MarginSummary) *MarginSummary {
+	if m == nil {
+		return &MarginSummary{}
+	}
+	return m
+}
+
+// verifiedStocktakes 读本审批关联的盘点单,只保留**已审核通过**的。
+//
+// ⚠️ 跨服务调用失败只 warn 不阻断:盘点信息是**放宽依据**,
+// 取不到就退回"没有盘点"的严格口径,不该让整条审核失败。
+func (s *Service) verifiedStocktakes(ctx context.Context, ap *model.ApprovalInstance) []StocktakeVerification {
+	var links []model.ApprovalStocktakeLink
+	if err := s.db.WithContext(ctx).Where("approval_id = ?", ap.ID).Find(&links).Error; err != nil {
+		s.logger.Warn("load stocktake links failed", "approval_id", ap.ID, "err", err)
+		return nil
+	}
+	if len(links) == 0 || s.stocktake == nil {
+		return nil
+	}
+	out := make([]StocktakeVerification, 0, len(links))
+	for _, l := range links {
+		h, err := s.stocktake.GetHeader(ctx, l.StocktakeHeaderID)
+		if err != nil {
+			s.logger.Warn("get stocktake header failed", "approval_id", ap.ID,
+				"header_id", l.StocktakeHeaderID, "err", err)
+			continue
+		}
+		if h.BranchID != "" && ap.BranchID != "" && h.BranchID != ap.BranchID {
+			continue
+		}
+		if h.Status != stocktakeStatusApproved {
+			continue
+		}
+		out = append(out, StocktakeVerification{HeaderID: h.ID, Status: h.Status})
+	}
+	return out
+}
+
+// stocktakeStatusApproved 是盘点单「已审核」状态字面量
+// (与 internal/stocktake/model.StatusApproved 同值;本包不跨引 stocktake 模型)。
+const stocktakeStatusApproved = "approved"
 
 // stepStocktake 按 LLM 建议建针对性盘点计划 + 绑定 + taskcard 待办。
 // 失败仅 log + 写 step 日志,不影响审批主结论。
@@ -1067,6 +1196,9 @@ func (s *Service) stepStocktake(ctx context.Context, ap *model.ApprovalInstance,
 			Description: truncate(desc, 200),
 			URL:         planURL,
 			TaskID:      "stocktake-plan-" + header.ID,
+			// 让 wechat-bot 把链接包成企微 OAuth2 授权链接 ⇒
+			// 群卡片点「去盘点」进自建应用「云商AI」的盘点单页,而不是系统浏览器。
+			OpenInApp: true,
 		}
 		if _, err := s.publishCommand(ctx, CmdTaskCard, payload); err != nil {
 			s.logger.Warn("publish stocktake_taskcard(群) failed", "approval_id", ap.ID, "err", err)
@@ -1325,9 +1457,23 @@ func (s *Service) buildApplyData(ctx context.Context, ap *model.ApprovalInstance
 	summaryText := fmt.Sprintf("结算单 %d 张 / 付款 %s 元", len(ids), ap.ManualAmountYuan.StringFixed(2))
 	if len(items) > 0 {
 		t := totalsOf(settlements, items)
-		summaryText = fmt.Sprintf("结算单 %d 张 / 付款 %s 元(货款 %s + 付款项 %s - 收款项 %s)",
-			len(ids), ap.ManualAmountYuan.StringFixed(2),
-			yuanText(t.GoodsTotalYuan), yuanText(t.PaymentTotalYuan), yuanText(t.ReceiptTotalYuan))
+		// 2026-10-30 用户口径:值为 0 的项**不写出来**
+		// (企微卡片原文「付款 5403.52 元(货款 6284.947 + 付款项 0 - 收款项 881.43)」
+		//  里的「+ 付款项 0」是噪音)。
+		parts := make([]string, 0, 3)
+		if t.GoodsTotalYuan.GreaterThan(decimal.Zero) {
+			parts = append(parts, "货款 "+yuanText(t.GoodsTotalYuan))
+		}
+		if t.PaymentTotalYuan.GreaterThan(decimal.Zero) {
+			parts = append(parts, "+ 付款项 "+yuanText(t.PaymentTotalYuan))
+		}
+		if t.ReceiptTotalYuan.GreaterThan(decimal.Zero) {
+			parts = append(parts, "- 收款项 "+yuanText(t.ReceiptTotalYuan))
+		}
+		if len(parts) > 0 {
+			summaryText = fmt.Sprintf("结算单 %d 张 / 付款 %s 元(%s)",
+				len(ids), ap.ManualAmountYuan.StringFixed(2), strings.Join(parts, " "))
+		}
 	}
 	summaryList, _ = json.Marshal(map[string]any{
 		"summary_info": []map[string]string{
@@ -1356,9 +1502,14 @@ func aiConclusionText(verdict *VerdictResult, signals []signalDraft) string {
 	case verdict.Source == model.VerdictSourceAdminOverride:
 		// ⚠️ **不能**写"机器审核通过" —— 机器人审的是"拒绝"，
 		//    是人放行的。写成"机器审核通过"会让审批人以为机器审过了。
-		base = strings.TrimSpace(verdict.Reason)
+		//
+		// 放行说明（note）在 reason 的最前面 ⇒ 按句子边界截断也不会把它切掉。
+		base = truncateAtSentence(strings.TrimSpace(verdict.Reason), 500)
 	case verdict.Conclusion == ConclusionPass:
-		base = truncateRunes("机器审核通过:"+verdict.Reason, 200)
+		// 企微「多行文本(Textarea)」控件上限 10000 字符(官方帮助 docid=14876),
+		// 这里按**可读性**限到 300 字,且按句子边界截断 ——
+		// 2026-10-30 用户口径:「避免语义割裂」(旧实现按 200 字硬切会断在句子中间)。
+		base = truncateAtSentence("机器审核通过:"+verdict.Reason, 300)
 	default:
 		for _, d := range signals {
 			if d.Level == model.SignalBlock {
@@ -1374,7 +1525,7 @@ func aiConclusionText(verdict *VerdictResult, signals []signalDraft) string {
 	if base == "" {
 		return prefix
 	}
-	return prefix + "\n" + truncateRunes(base, 200)
+	return prefix + "\n" + base
 }
 
 // truncateRunes 按 rune 数截断(中文安全)。
@@ -1448,6 +1599,11 @@ type ApprovalDetail struct {
 	Signals []model.AuditSignal           `json:"signals"`
 	Verdict *model.LLMVerdict             `json:"verdict,omitempty"`
 	Links   []model.ApprovalStocktakeLink `json:"stocktake_links"`
+	// Stocktakes 是关联盘点单的**当前状态**(2026-10-30 重新发起用)。
+	//
+	// H5 用它判断"被拒时建的计划盘点单是否已审核通过" ⇒ 决定是否带
+	// stocktake_header_ids 重新提交。⚠️ 跨服务取不到就留空(不影响详情主体)。
+	Stocktakes []StocktakeHeaderDTO `json:"stocktake_headers"`
 	// Payee 是本次付款的**收款账号快照**(2026-10-28)。
 	//
 	// ⚠️ 它**不在** `Approval`(ApprovalInstance)里 ⇒ 不在 LLM 输入面内
@@ -1523,6 +1679,19 @@ func (s *Service) GetApprovalDetail(ctx context.Context, branchID, id string) (*
 		d.Verdict = &verdict
 	}
 	s.db.WithContext(ctx).Where("approval_id = ?", id).Find(&d.Links)
+	// 关联盘点单的当前状态(重新发起的 H5 用来判断"盘点是否已审核")。
+	// 跨服务失败只跳过 —— 详情主体是审批快照,不该因盘点服务抖动而 500。
+	if s.stocktake != nil {
+		for _, l := range d.Links {
+			h, err := s.stocktake.GetHeader(ctx, l.StocktakeHeaderID)
+			if err != nil {
+				s.logger.Warn("detail: get stocktake header failed",
+					"approval_id", id, "header_id", l.StocktakeHeaderID, "err", err)
+				continue
+			}
+			d.Stocktakes = append(d.Stocktakes, *h)
+		}
+	}
 	// 收款账号快照(2026-10-28):独立表,**不混进 d.Approval** ——
 	// d.Approval 会进 AuditInput ⇒ 账号信息混进去就等于发给 LLM 了。
 	if payee, err := s.loadPayeeAccount(ctx, id); err == nil {

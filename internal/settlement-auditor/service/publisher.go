@@ -139,6 +139,12 @@ type TaskCardPayload struct {
 	// 用别的应用的 token 发会被拒(301002 一族)⇒ 群与应用必须成对传。
 	ToChat string `json:"to_chat,omitempty"`
 	AppID  string `json:"app_id,omitempty"`
+	// OpenInApp 要求 wechat-bot 把 URL 包成**企微 OAuth2 授权链接**后再发。
+	//
+	// 用户口径(2026-10-30):群卡片里的「去盘点」点击后应进入自建应用
+	// 「云商AI」的盘点单页面,而不是用系统浏览器直接打开 H5。
+	// 只有群通道消费这个开关(taskcard 本身就在企微内)。
+	OpenInApp bool `json:"open_in_app,omitempty"`
 }
 
 // WecomCommandResult 是 wecom.approval.command_result 的载荷(订阅侧)。
@@ -255,9 +261,11 @@ type StocktakeHeaderDTO struct {
 	Status   string `json:"status"`
 }
 
-// StocktakeClient 盘点建单抽象(单测注入 fake)。
+// StocktakeClient 盘点建单/查单抽象(单测注入 fake)。
 type StocktakeClient interface {
 	CreatePlanHeader(ctx context.Context, in StocktakeCreatePlanInput) (*StocktakeHeaderDTO, error)
+	// GetHeader 查盘点单头(重新发起时核对「关联盘点单是否已审核通过」)。
+	GetHeader(ctx context.Context, id string) (*StocktakeHeaderDTO, error)
 }
 
 // DaprStocktakeClient 经 dapr service invocation 调 stocktake **内部端点**
@@ -287,6 +295,29 @@ func (c *DaprStocktakeClient) CreatePlanHeader(ctx context.Context, in Stocktake
 		&dapr.DataContent{ContentType: "application/json", Data: b})
 	if err != nil {
 		return nil, fmt.Errorf("invoke stocktake create plan header: %w", err)
+	}
+	var out StocktakeHeaderDTO
+	if err := json.Unmarshal(resp, &out); err != nil {
+		return nil, fmt.Errorf("decode stocktake header: %w", err)
+	}
+	if out.ID == "" {
+		return nil, fmt.Errorf("stocktake returned empty header id")
+	}
+	return &out, nil
+}
+
+// GetHeader 调 stocktake 内部端点查单头(GET /internal/stocktake-plan-headers/:id)。
+func (c *DaprStocktakeClient) GetHeader(ctx context.Context, id string) (*StocktakeHeaderDTO, error) {
+	if c.client == nil {
+		return nil, fmt.Errorf("dapr client not injected")
+	}
+	if id == "" {
+		return nil, fmt.Errorf("%w: stocktake header id 为空", ErrInvalidInput)
+	}
+	resp, err := c.client.InvokeMethod(ctx, c.appID,
+		"internal/stocktake-plan-headers/"+id, "GET")
+	if err != nil {
+		return nil, fmt.Errorf("invoke stocktake get header: %w", err)
 	}
 	var out StocktakeHeaderDTO
 	if err := json.Unmarshal(resp, &out); err != nil {

@@ -40,10 +40,24 @@ import (
 // AdminApprovePrefix 是「AI审核结论」控件的**首行**（2026-10-28 用户口径原文）。
 const AdminApprovePrefix = "已转人工审核并通过"
 
+// maxAdminApproveNoteLen 是「放行说明」的字数上限（企微多行文本控件 10000 字符，
+// 这里按可读性限住；前端同款校验）。
+const maxAdminApproveNoteLen = 300
+
 // AdminApprove 把"机器拒绝"的审批重新推进企微人工终审。
 //
 // operator 是放行人（auth user id）—— 写进审计日志，不进企微文案。
-func (s *Service) AdminApprove(ctx context.Context, branchID, approvalID, operator string) error {
+//
+// note 是可选的「放行说明」（2026-10-30 用户口径：管理员放行时填写，
+// 回填到 AI 审核结论里，让审批人知道**为什么**被放行）。
+func (s *Service) AdminApprove(ctx context.Context, branchID, approvalID, operator string, notes ...string) error {
+	note := ""
+	if len(notes) > 0 {
+		note = strings.TrimSpace(notes[0])
+	}
+	if len([]rune(note)) > maxAdminApproveNoteLen {
+		note = string([]rune(note)[:maxAdminApproveNoteLen])
+	}
 	ap, err := s.loadApproval(ctx, approvalID)
 	if err != nil {
 		return err
@@ -94,6 +108,9 @@ func (s *Service) AdminApprove(ctx context.Context, branchID, approvalID, operat
 	}
 
 	reason := fmt.Sprintf("管理员人工放行（原机器结论：%s）", truncate(origReason, 800))
+	if note != "" {
+		reason = fmt.Sprintf("管理员人工放行（放行说明：%s；原机器结论：%s）", note, truncate(origReason, 800))
+	}
 	raw, _ := json.Marshal(map[string]any{
 		"conclusion": ConclusionPass,
 		"reason":     reason,
@@ -102,6 +119,7 @@ func (s *Service) AdminApprove(ctx context.Context, branchID, approvalID, operat
 			"operator":        operator,
 			"original_reason": origReason,
 			"prefix":          AdminApprovePrefix,
+			"note":            note,
 		},
 	})
 	verdict := &VerdictResult{

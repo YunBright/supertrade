@@ -451,6 +451,12 @@ type submitReq struct {
 	// 前端传账号文本 = 客户端可以伪造付款目标 ⇒ 审批人看到假的收款账号。
 	// 空 ⇒ 本次审批不带「付款信息」。
 	BankAccountID string `json:"bank_account_id"`
+	// StocktakeHeaderIDs 是「重新发起」时关联的盘点计划单 id(2026-10-30)。
+	//
+	// 被机器拒绝的单曾自动建计划盘点单;盘点审核后重新发起时把它带进来 ⇒
+	// 机器审核据此确认"库存已盘点核对",数量类信号不再阻断。
+	// 只传 id;存在性/门店归属由服务端核对(见 service.storeStocktakeLinks)。
+	StocktakeHeaderIDs []string `json:"stocktake_header_ids"`
 }
 
 // itemReq 是提交请求里的一行收付款明细。
@@ -541,6 +547,7 @@ func (h *Handler) Submit(c *gin.Context) {
 		ReceiptItems:     receiptItems,
 		PaymentItems:     paymentItems,
 		BankAccountID:    req.BankAccountID,
+		StocktakeHeaderIDs: req.StocktakeHeaderIDs,
 	})
 	if err != nil {
 		mapErr(c, err)

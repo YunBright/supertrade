@@ -63,6 +63,9 @@ type CreatePlanHeaderResponse struct {
 // 它把 Authorization 与 X-Branch-ID 注入 ctx,cube 调用才带得上门店与凭证。
 func (h *Handler) RegisterInternalRoutes(r *gin.Engine, db *gorm.DB, mw ...gin.HandlerFunc) {
 	r.POST("/internal/stocktake-plan-headers", append(append([]gin.HandlerFunc{}, mw...), h.CreatePlanHeaderInternal)...)
+	// GET:settlement-auditor 重新发起付款审批时核对「关联盘点单是否已审核通过」
+	// (2026-10-30 用户口径)。
+	r.GET("/internal/stocktake-plan-headers/:id", append(append([]gin.HandlerFunc{}, mw...), h.GetPlanHeaderInternal)...)
 	RegisterPurgeRoutes(r, db)
 }
 
@@ -100,6 +103,23 @@ func (h *Handler) CreatePlanHeaderInternal(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusCreated, CreatePlanHeaderResponse{
+		ID:       header.ID,
+		BranchID: header.BranchID,
+		Type:     string(header.Type),
+		Status:   string(header.Status),
+	})
+}
+
+// GetPlanHeaderInternal GET /internal/stocktake-plan-headers/:id
+//
+// 返回盘点单头(id/branch/type/status);404 = 盘点单不存在。
+func (h *Handler) GetPlanHeaderInternal(c *gin.Context) {
+	header, err := h.svc.GetHeader(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		h.mapInternalErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, CreatePlanHeaderResponse{
 		ID:       header.ID,
 		BranchID: header.BranchID,
 		Type:     string(header.Type),

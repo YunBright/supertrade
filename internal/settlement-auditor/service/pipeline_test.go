@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -245,6 +246,19 @@ func (f *fakeStocktake) CreatePlanHeader(_ context.Context, in StocktakeCreatePl
 	f.got = &cp
 	if f.err != nil {
 		return nil, f.err
+	}
+	return f.header, nil
+}
+
+// GetHeader 返回预置的盘点单头（重新发起关联核对用）。
+func (f *fakeStocktake) GetHeader(_ context.Context, id string) (*StocktakeHeaderDTO, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.header == nil {
+		return nil, fmt.Errorf("fake stocktake: header %s not found", id)
 	}
 	return f.header, nil
 }

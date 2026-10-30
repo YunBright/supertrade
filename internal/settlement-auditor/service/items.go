@@ -61,12 +61,22 @@ const (
 	ReceiptTypeOther       = "其它"
 
 	// 付款项类型。
-	PaymentTypeUtility  = "水电费"
-	PaymentTypeRent     = "租金"
-	PaymentTypeProperty = "物业费"
-	PaymentTypeTrash    = "垃圾处理费"
-	PaymentTypeSoftware = "软件服务费"
-	PaymentTypeOther    = "其它"
+	//
+	// 2026-10-30 用户口径：门店实际还会付运费、肉类加工费、设备维护费、
+	// 耗材、招待费、燃气费、福利 ⇒ 一并进下拉,避免店长全填「其它」。
+	PaymentTypeUtility         = "水电费"
+	PaymentTypeRent            = "租金"
+	PaymentTypeProperty        = "物业费"
+	PaymentTypeTrash           = "垃圾处理费"
+	PaymentTypeSoftware        = "软件服务费"
+	PaymentTypeFreight         = "运费"
+	PaymentTypeMeatProcessing  = "肉类加工费"
+	PaymentTypeEquipMaintenance = "设备维护费"
+	PaymentTypeConsumable      = "耗材"
+	PaymentTypeEntertainment   = "招待费"
+	PaymentTypeGas             = "燃气费"
+	PaymentTypeWelfare         = "福利"
+	PaymentTypeOther           = "其它"
 )
 
 // ReceiptTypeOptions 是收款项下拉选项（前端同款，改这里要同步改前端）。
@@ -81,7 +91,10 @@ func ReceiptTypeOptions() []string {
 func PaymentTypeOptions() []string {
 	return []string{
 		PaymentTypeUtility, PaymentTypeRent, PaymentTypeProperty,
-		PaymentTypeTrash, PaymentTypeSoftware, PaymentTypeOther,
+		PaymentTypeTrash, PaymentTypeSoftware,
+		PaymentTypeFreight, PaymentTypeMeatProcessing, PaymentTypeEquipMaintenance,
+		PaymentTypeConsumable, PaymentTypeEntertainment, PaymentTypeGas, PaymentTypeWelfare,
+		PaymentTypeOther,
 	}
 }
 

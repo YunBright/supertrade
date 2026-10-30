@@ -600,7 +600,7 @@ func (s *Service) buildFlowVerdict(dec *FlowDecision, signals []signalDraft) *Ve
 func (s *Service) decideVerdict(ctx context.Context, ap *model.ApprovalInstance,
 	settlements []SettlementRow, linesBySettlement map[string][]SettlementLineRow,
 	sheets []PurchaseSheetRow, signals []signalDraft, amount *AmountCheck,
-	items []model.ApprovalItem, allowance Allowance,
+	items []model.ApprovalItem, allowance Allowance, extras ...AuditExtras,
 ) (*VerdictResult, error) {
 	dec, err := s.decideAuditFlow(ctx, ap, settlements, linesBySettlement, sheets, items)
 	if err != nil {
@@ -608,7 +608,7 @@ func (s *Service) decideVerdict(ctx context.Context, ap *model.ApprovalInstance,
 	}
 	if !dec.Applied {
 		// 没命中任何配置 ⇒ 走机器人审核流程（现状）。
-		return s.stepLLMVerdict(ctx, ap, settlements, linesBySettlement, sheets, signals, amount, items, allowance)
+		return s.stepLLMVerdict(ctx, ap, settlements, linesBySettlement, sheets, signals, amount, items, allowance, extras...)
 	}
 	start := time.Now()
 	verdict := s.buildFlowVerdict(dec, signals)

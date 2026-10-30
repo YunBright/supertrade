@@ -61,6 +61,43 @@ type AuditInput struct {
 	Totals ItemTotals
 	// Allowance 是收款项给审核的放宽额度(陈列费/堆头费/补差价)。
 	Allowance Allowance
+	// Margins 是引擎算好的**毛利汇总**(2026-10-30 用户口径)。
+	//
+	// ⚠️ 与金额同理:**总括数字由引擎给** —— LLM 自己把逐条信号里的
+	// 负毛利相加会造出假合计(而且信号里只列了最亏的几个)。
+	// 用户要求结论"不能缺少总和",所以这里必须给「负毛利商品数 + 合计金额」。
+	Margins MarginSummary
+	// Stocktakes 是本次审批关联且**已审核通过**的盘点单。
+	//
+	// 有它 ⇒ 库存已被盘点核对过 ⇒ 数量类信号(无销售记录/数量偏离)
+	// 不作为拒绝理由(与陈列费/堆头费的放宽口径同构,见 allowance.go)。
+	Stocktakes []StocktakeVerification
+}
+
+// MarginSummary 是引擎口径的毛利汇总(两个口径分开统计)。
+type MarginSummary struct {
+	// GrossNegCount / GrossNegYuan 是窗口毛利为负的商品数与合计负毛利。
+	GrossNegCount int
+	GrossNegYuan  decimal.Decimal
+	// RealizedNegCount / RealizedNegYuan 是实现毛利为负的商品数与合计负毛利。
+	RealizedNegCount int
+	RealizedNegYuan  decimal.Decimal
+}
+
+// StocktakeVerification 是一张**已审核通过**的关联盘点单。
+type StocktakeVerification struct {
+	HeaderID string
+	// Status 是盘点单状态(approved 才进入本结构)。
+	Status string
+}
+
+// AuditExtras 是流水线可选的补充事实(毛利汇总 / 已盘点)。
+//
+// ⚠️ 用可变参数传给 decideVerdict / stepLLMVerdict:
+// 单测里的旧调用点(不传 extras)行为完全不变。
+type AuditExtras struct {
+	Margins    MarginSummary
+	Stocktakes []StocktakeVerification
 }
 
 // VerdictResult 是 VerdictFn 的返回值。
@@ -307,6 +344,9 @@ func buildAuditSystemPrompt() string {
   通常应 reject,并在 reason 中引用最关键的几条;
 - 只有 warn 信号时,结合销售/供应商/商品常识判断是否需要人工复核,
   无明显问题则 pass,把 warn 摘要写进 reason 供人工终审关注;
+- 数据里若给出「已关联盘点单且审核通过」,说明库存已经盘点核对过 ⇒
+  数量类信号(自入库后无销售记录/进货量偏离销量)**不作为拒绝理由**,应 pass,
+  并在 reason 中写「已通过盘点核对」;
 - 若发现某类商品/某供应商/个别商品数据需要盘点,建议针对性盘点:
   suggest_stocktake.scope 取 category|supplier|product,ids 填商品/分类/供应商 id 列表;
   无建议则省略该字段或置 null。
@@ -321,6 +361,15 @@ func buildAuditSystemPrompt() string {
 - 提到**供应商**时用数据里给的写法「<供应商名称>-<供应商编号>」(2026-10-29 用户口径),
   **不要只写编号** —— 店长看到「29」无从判断是哪家;名称在前、编号在后,
   既能认出是哪家、又能核对到具体那家(同名供应商很常见)。
+
+结论写法(2026-10-30 用户口径,必须遵守):
+- reason 会原样填进企微审批单的「AI审核结论」控件,它与备注、付款金额、
+  结算单号在**同一张单**上 ⇒ **不要复述别处已经显示的信息**:
+  不写应付金额/取整后金额、不写结算单号与单号明细金额、不逐笔写收付款明细金额;
+- 但**不能缺少总和**:必须给出总括数字,例如「实现毛利为负 3 个商品(合计 -88.66 元)」
+  「数量异常 N 个商品」;明细只举 1~2 个最有代表性的商品作例证,不要逐条罗列;
+- 用完整句子表达(不要写成逗号串);整段控制在 300 字以内,
+  宁可少举例子,也不要让句子在中间被截断。
 
 金额口径(必须遵守,违反会误拒单):
 - 实际付款按元取整:分位一般不实际支付,角位也可能被舍去。
@@ -426,6 +475,24 @@ func buildAuditUserPrompt(in *AuditInput) string {
 			yuanText(in.Allowance.DisplayYuan), yuanText(in.Allowance.PromotionYuan),
 			yuanText(in.Allowance.PriceDiffYuan))
 	}
+	// 毛利汇总:总括数字由引擎算好(结论里必须给出总和,不要自己把逐条信号相加)。
+	if in.Margins.GrossNegCount > 0 || in.Margins.RealizedNegCount > 0 {
+		fmt.Fprintf(&sb, "毛利汇总(引擎口径):窗口毛利为负 %d 个商品,合计 %s 元;实现毛利为负 %d 个商品,合计 %s 元。\n",
+			in.Margins.GrossNegCount, yuanText(in.Margins.GrossNegYuan),
+			in.Margins.RealizedNegCount, yuanText(in.Margins.RealizedNegYuan))
+	}
+	// 已通过盘点的盘点单:数量类信号不再是阻断项(库存已核对过)。
+	if len(in.Stocktakes) > 0 {
+		ids := make([]string, 0, len(in.Stocktakes))
+		for i, st := range in.Stocktakes {
+			if i >= 3 {
+				break
+			}
+			ids = append(ids, st.HeaderID)
+		}
+		fmt.Fprintf(&sb, "已关联盘点单 %d 张且均审核通过(header_id=%s):库存已盘点核对,数量类信号不作为拒绝理由。\n",
+			len(in.Stocktakes), strings.Join(ids, ","))
+	}
 
 	fmt.Fprintf(&sb, "勾选结算单 %d 张:\n", len(in.Settlements))
 	for i, st := range in.Settlements {
@@ -456,4 +523,72 @@ func buildAuditUserPrompt(in *AuditInput) string {
 		fmt.Fprintf(&sb, "  - [%s][%s] %s\n", d.Level, d.SignalType, d.Message)
 	}
 	return sb.String()
+}
+
+// marginTotalsSentence 生成引擎口径的**毛利合计句**(结论里必须出现的总和)。
+//
+// 两个口径分开写:窗口毛利回答"这批货整体赚不赚钱",实现毛利回答
+// "这批新进的货按自己的进价卖赚不赚钱" —— 混成一句会让人误读。
+func marginTotalsSentence(m MarginSummary) string {
+	parts := make([]string, 0, 2)
+	if m.GrossNegCount > 0 {
+		parts = append(parts, fmt.Sprintf("窗口毛利为负 %d 个商品(合计 %s 元)",
+			m.GrossNegCount, yuanText(m.GrossNegYuan)))
+	}
+	if m.RealizedNegCount > 0 {
+		parts = append(parts, fmt.Sprintf("实现毛利为负 %d 个商品(合计 %s 元)",
+			m.RealizedNegCount, yuanText(m.RealizedNegYuan)))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "毛利合计:" + strings.Join(parts, ",") + "。"
+}
+
+// ensureMarginTotals 保证结论里出现毛利合计(缺失才追加,不重复)。
+//
+// ⚠️ 只在**通过**结论上调用:拒绝结论的重点是阻断原因,不该被总账冲淡;
+// 而且拒绝单不会填进「AI审核结论」控件(reject 走通知,不走 applyevent)。
+func ensureMarginTotals(reason string, m MarginSummary) string {
+	sentence := marginTotalsSentence(m)
+	if sentence == "" {
+		return reason
+	}
+	// 已带合计(模型自己写过) ⇒ 不重复追加。
+	if strings.Contains(reason, "合计") {
+		return reason
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return sentence
+	}
+	return reason + "\n" + sentence
+}
+
+// truncateAtSentence 按**句子边界**截断(中文安全),避免结论在句子中间断掉。
+//
+// 2026-10-30 用户口径:「避免语义割裂」—— 旧实现按 rune 硬切(200 字),
+// 会把「这批货按自己的进价卖出去…」切成半句。现在优先找 ≤max 的最后一个
+// 句末标点(。！？;;)或换行;找不到才退回硬截断(并补省略号)。
+func truncateAtSentence(s string, max int) string {
+	s = strings.TrimSpace(s)
+	rs := []rune(s)
+	if len(rs) <= max {
+		return s
+	}
+	// 在 [0,max] 内从后往前找句末标点,且不能切得太短(至少保留 60%)。
+	cut := -1
+	for i := max - 1; i >= max*6/10 && i >= 0; i-- {
+		switch rs[i] {
+		case '。', '！', '？', ';', '；', '\n':
+			cut = i + 1
+		}
+		if cut >= 0 {
+			break
+		}
+	}
+	if cut > 0 {
+		return strings.TrimSpace(string(rs[:cut]))
+	}
+	return strings.TrimSpace(string(rs[:max])) + "…"
 }

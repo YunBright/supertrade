@@ -2,6 +2,8 @@
 package handler
 
 import (
+	"errors"
+	"io"
 	"net/http"
 
 	"github.com/YunBright/authkit/claims"
@@ -9,6 +11,13 @@ import (
 
 	"github.com/YunBright/supertrade/pkg/middleware"
 )
+
+// adminApproveReq 是人工放行的可选请求体。
+//
+// Note 是「放行说明」（2026-10-30 用户口径）：可选，回填到「AI审核结论」。
+type adminApproveReq struct {
+	Note string `json:"note"`
+}
 
 // RoleAdmin 是"管理员"角色名（auth 的 roles 表字面量）。
 const RoleAdmin = "admin"
@@ -37,7 +46,13 @@ func (h *Handler) AdminApprove(c *gin.Context) {
 		writeError(c, http.StatusForbidden, "forbidden", "人工放行仅限管理员")
 		return
 	}
-	if err := h.svc.AdminApprove(c.Request.Context(), branchID, c.Param("id"), cl.Sub); err != nil {
+	// 放行说明可选：空 body 视为"不填"，不报 400（旧前端只发空请求）。
+	var req adminApproveReq
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(c, http.StatusBadRequest, "bad_request", "请求体非法: "+err.Error())
+		return
+	}
+	if err := h.svc.AdminApprove(c.Request.Context(), branchID, c.Param("id"), cl.Sub, req.Note); err != nil {
 		mapErr(c, err)
 		return
 	}
