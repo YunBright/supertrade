@@ -18,7 +18,9 @@
 package handler
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -76,19 +78,33 @@ func branchFromHeader(c *gin.Context) (string, bool) {
 func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	requireBranch := middleware.RequireBranch()
 	resolver := rbac.HasAnyScopeWithBranch(h.users)
+	guard := func(scope string) gin.HandlerFunc {
+		return rbac.RequireScopeWithBranch(scope, branchFromHeader, resolver)
+	}
 
-	r.POST("/batches/preview",
-		requireBranch,
-		rbac.RequireScopeWithBranch(ScopeOperate, branchFromHeader, resolver),
-		h.PreviewBatch)
-	r.GET("/batches",
-		requireBranch,
-		rbac.RequireScopeWithBranch(ScopeView, branchFromHeader, resolver),
-		h.ListBatches)
-	r.GET("/batches/:id",
-		requireBranch,
-		rbac.RequireScopeWithBranch(ScopeView, branchFromHeader, resolver),
-		h.GetBatch)
+	r.POST("/batches/preview", requireBranch, guard(ScopeOperate), h.PreviewBatch)
+	r.GET("/batches", requireBranch, guard(ScopeView), h.ListBatches)
+	r.GET("/batches/:id", requireBranch, guard(ScopeView), h.GetBatch)
+
+	// ---- S1：取数 / 建账 / 导入 ----
+	r.GET("/flows/cash", requireBranch, guard(ScopeView), h.GetCashFlows)
+	r.GET("/flows/payment-methods", requireBranch, guard(ScopeView), h.GetPaymentMethods)
+
+	r.POST("/imports/bank", requireBranch, guard(ScopeOperate), h.ImportBank)
+	r.GET("/imports", requireBranch, guard(ScopeView), h.ListImports)
+	r.GET("/imports/:id", requireBranch, guard(ScopeView), h.GetImport)
+
+	r.GET("/rules", requireBranch, guard(ScopeView), h.GetRules)
+	r.PUT("/rules", requireBranch, guard(ScopeReview), h.PutRule)
+
+	r.GET("/accounts", requireBranch, guard(ScopeView), h.ListAccounts)
+	r.POST("/accounts", requireBranch, guard(ScopeAudit), h.CreateAccount)
+	r.PUT("/accounts/:id", requireBranch, guard(ScopeAudit), h.UpdateAccount)
+
+	r.GET("/opening-balances", requireBranch, guard(ScopeView), h.GetOpeningBalances)
+	r.GET("/opening-balances/check", requireBranch, guard(ScopeView), h.CheckOpenings)
+	r.POST("/opening-balances", requireBranch, guard(ScopeAudit), h.CreateOpenings)
+	r.POST("/opening-balances/:id/void", requireBranch, guard(ScopeAudit), h.VoidOpening)
 }
 
 // errBody 是错误响应体(与 settlement-auditor 同形:code + message)。
@@ -124,8 +140,12 @@ func mapErr(c *gin.Context, err error) {
 		writeError(c, http.StatusConflict, "cash_count_missing", err.Error())
 	case errors.Is(err, model.ErrCubeSourceUnavailable):
 		writeError(c, http.StatusServiceUnavailable, "cube_source_unavailable", err.Error())
+	case errors.Is(err, model.ErrCubeSourceDisabled):
+		writeError(c, http.StatusServiceUnavailable, "cube_source_disabled", err.Error())
 	case errors.Is(err, model.ErrCubeQueryFailed):
 		writeError(c, http.StatusServiceUnavailable, "cube_query_failed", err.Error())
+	case errors.Is(err, model.ErrAlreadyExists):
+		writeError(c, http.StatusConflict, "already_exists", err.Error())
 	default:
 		writeError(c, http.StatusInternalServerError, "internal_error", err.Error())
 	}
@@ -237,6 +257,435 @@ func (h *Handler) ListBatches(c *gin.Context) {
 // GetBatch GET /batches/:id
 func (h *Handler) GetBatch(c *gin.Context) {
 	row, err := h.svc.GetBatch(c.Request.Context(), branchIDOf(c), c.Param("id"))
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, row)
+}
+
+// ---- S1：取数 ----
+
+// cashFlowItem 是收银流水聚合的一行（金额字面量 = 4 位小数字符串）。
+type cashFlowItem struct {
+	BizDate   string `json:"biz_date"`
+	PayWay    string `json:"pay_way"`
+	Method    string `json:"method"`
+	AmountNet string `json:"amount_net"`
+	TxnCount  int    `json:"txn_count"`
+}
+
+// cashResp 是 /flows/* 的响应体。
+//
+// ⚠️ data_source 必须透出：cube 与本地 PG 的口径（是否含冲销 / 是否有快照延迟）
+// 并不相同，出纳看到"这一天没有流水"时要能分清是"没有"还是"读的是另一条链路"。
+type cashResp struct {
+	DataSource string         `json:"data_source"`
+	From       string         `json:"from"`
+	To         string         `json:"to"`
+	Items      []cashFlowItem `json:"items"`
+}
+
+// dayFromQuery 解析 YYYY-MM-DD 查询参数。
+func dayFromQuery(c *gin.Context, key string) (time.Time, bool) {
+	v := strings.TrimSpace(c.Query(key))
+	if v == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse("2006-01-02", v)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "bad_request", key+" 必须是 YYYY-MM-DD")
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// cashRange 取 from/to（也接受单个 date）。
+func cashRange(c *gin.Context) (from, to time.Time, ok bool) {
+	if d, has := dayFromQuery(c, "date"); has {
+		return d, d, true
+	}
+	f, okFrom := dayFromQuery(c, "from")
+	t, okTo := dayFromQuery(c, "to")
+	if !okFrom || !okTo {
+		if !okFrom && !okTo {
+			writeError(c, http.StatusBadRequest, "bad_request", "需要 date 或 from+to")
+		}
+		return time.Time{}, time.Time{}, false
+	}
+	return f, t, true
+}
+
+func cashItems(rows []service.CashDay) []cashFlowItem {
+	out := make([]cashFlowItem, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, cashFlowItem{
+			BizDate:   r.BizDate.Format("2006-01-02"),
+			PayWay:    r.PayWay,
+			Method:    r.Method,
+			AmountNet: r.AmountNet.StringFixed(4),
+			TxnCount:  r.TxnCount,
+		})
+	}
+	return out
+}
+
+// GetCashFlows GET /flows/cash?date= | ?from=&to=
+func (h *Handler) GetCashFlows(c *gin.Context) {
+	from, to, ok := cashRange(c)
+	if !ok {
+		return
+	}
+	rows, src, err := h.svc.CashDayRows(c.Request.Context(), branchIDOf(c), from, to)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, cashResp{
+		DataSource: src,
+		From:       from.Format("2006-01-02"),
+		To:         to.Format("2006-01-02"),
+		Items:      cashItems(rows),
+	})
+}
+
+// GetPaymentMethods GET /flows/payment-methods?date=
+//
+// 支付方式分析（FR-01）：单日有界聚合 + 映射结果，**未映射项显式列出**（不猜）。
+func (h *Handler) GetPaymentMethods(c *gin.Context) {
+	d, ok := dayFromQuery(c, "date")
+	if !ok {
+		if strings.TrimSpace(c.Query("date")) == "" {
+			writeError(c, http.StatusBadRequest, "bad_request", "date 必填（单日有界查询）")
+		}
+		return
+	}
+	rows, src, err := h.svc.CashDayRows(c.Request.Context(), branchIDOf(c), d, d)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	unmapped := make([]cashFlowItem, 0)
+	for _, it := range cashItems(rows) {
+		if it.Method == model.MethodUnmapped {
+			unmapped = append(unmapped, it)
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"data_source": src,
+		"date":        d.Format("2006-01-02"),
+		"items":       cashItems(rows),
+		"unmapped":    unmapped,
+	})
+}
+
+// ---- S1：银行流水导入 ----
+
+// importBankReq 是 JSON 导入的请求体。
+type importBankReq struct {
+	Kind     string                  `json:"kind"`
+	FileName string                  `json:"file_name"`
+	CSV      string                  `json:"csv"`
+	Rows     []service.ImportBankRow `json:"rows"`
+}
+
+// ImportBank POST /imports/bank
+//
+// 支持两种 body：
+//   - JSON：{kind,file_name,csv|rows}
+//   - multipart/form-data：file=CSV 文件，kind=bank|channel
+func (h *Handler) ImportBank(c *gin.Context) {
+	actor := operatorOf(c)
+	if actor == "" {
+		writeError(c, http.StatusUnauthorized, "unauthenticated", "缺少调用者身份")
+		return
+	}
+	in := service.ImportBankInput{
+		BranchID: branchIDOf(c),
+		Actor:    actor,
+	}
+	if strings.HasPrefix(c.ContentType(), "multipart/form-data") {
+		fh, err := c.FormFile("file")
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "bad_request", "multipart 需要 file 字段")
+			return
+		}
+		if fh.Size > 8<<20 {
+			writeError(c, http.StatusBadRequest, "bad_request", "文件超过 8MB")
+			return
+		}
+		f, err := fh.Open()
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "bad_request", "无法读取上传文件")
+			return
+		}
+		defer f.Close()
+		b, err := io.ReadAll(io.LimitReader(f, 8<<20))
+		if err != nil {
+			writeError(c, http.StatusBadRequest, "bad_request", "无法读取上传文件")
+			return
+		}
+		in.CSV = string(b)
+		in.FileName = fh.Filename
+		in.Kind = c.PostForm("kind")
+	} else {
+		var req importBankReq
+		if err := c.ShouldBindJSON(&req); err != nil {
+			writeError(c, http.StatusBadRequest, "bad_request", "请求体必须是 JSON 或 multipart")
+			return
+		}
+		in.Kind = req.Kind
+		in.FileName = req.FileName
+		in.CSV = req.CSV
+		in.Rows = req.Rows
+	}
+
+	res, err := h.svc.ImportBankFlows(c.Request.Context(), in)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
+// ListImports GET /imports
+func (h *Handler) ListImports(c *gin.Context) {
+	rows, err := h.svc.ListImports(c.Request.Context(), branchIDOf(c), 0)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	if rows == nil {
+		rows = []model.ReconImport{}
+	}
+	c.JSON(http.StatusOK, gin.H{"items": rows, "total": len(rows)})
+}
+
+// GetImport GET /imports/:id
+func (h *Handler) GetImport(c *gin.Context) {
+	row, err := h.svc.GetImport(c.Request.Context(), branchIDOf(c), c.Param("id"))
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, row)
+}
+
+// ---- S1：规则 ----
+
+// GetRules GET /rules（返回生效值：默认值 + 全局行 + 门店行合并）
+func (h *Handler) GetRules(c *gin.Context) {
+	rules, err := h.svc.EffectiveRules(c.Request.Context(), branchIDOf(c))
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"branch_id": branchIDOf(c), "rules": rules})
+}
+
+// putRuleReq 是 PUT /rules 的请求体。
+type putRuleReq struct {
+	RuleKey string          `json:"rule_key"`
+	Value   json.RawMessage `json:"value"`
+}
+
+// PutRule PUT /rules（门店级 upsert）
+func (h *Handler) PutRule(c *gin.Context) {
+	var req putRuleReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_request", "请求体必须是 JSON: {rule_key,value}")
+		return
+	}
+	if len(req.Value) == 0 {
+		writeError(c, http.StatusBadRequest, "bad_request", "value 必填")
+		return
+	}
+	if err := h.svc.SaveRule(c.Request.Context(), branchIDOf(c), operatorOf(c), req.RuleKey, string(req.Value)); err != nil {
+		mapErr(c, err)
+		return
+	}
+	rules, err := h.svc.EffectiveRules(c.Request.Context(), branchIDOf(c))
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"branch_id": branchIDOf(c), "rules": rules})
+}
+
+// ---- S1：账户台账 ----
+
+// ListAccounts GET /accounts
+func (h *Handler) ListAccounts(c *gin.Context) {
+	includeInactive := strings.EqualFold(c.Query("include_inactive"), "true")
+	rows, err := h.svc.ListAccounts(c.Request.Context(), branchIDOf(c), includeInactive)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	if rows == nil {
+		rows = []model.ReconAccount{}
+	}
+	c.JSON(http.StatusOK, gin.H{"items": rows, "total": len(rows)})
+}
+
+// createAccountReq 是 POST /accounts 的请求体。
+type createAccountReq struct {
+	AccountType string `json:"account_type"`
+	AccountKey  string `json:"account_key"`
+	Name        string `json:"name"`
+	Currency    string `json:"currency"`
+	SortOrder   int    `json:"sort_order"`
+	Note        string `json:"note"`
+}
+
+// CreateAccount POST /accounts
+func (h *Handler) CreateAccount(c *gin.Context) {
+	var req createAccountReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_request", "请求体必须是 JSON")
+		return
+	}
+	row, err := h.svc.CreateAccount(c.Request.Context(), service.CreateAccountInput{
+		BranchID:    branchIDOf(c),
+		AccountType: req.AccountType,
+		AccountKey:  req.AccountKey,
+		Name:        req.Name,
+		Currency:    req.Currency,
+		SortOrder:   req.SortOrder,
+		Note:        req.Note,
+		Actor:       operatorOf(c),
+	})
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, row)
+}
+
+// updateAccountReq 是 PUT /accounts/:id 的请求体（指针 = 未提供）。
+type updateAccountReq struct {
+	Name      *string `json:"name"`
+	IsActive  *bool   `json:"is_active"`
+	SortOrder *int    `json:"sort_order"`
+	Note      *string `json:"note"`
+}
+
+// UpdateAccount PUT /accounts/:id
+func (h *Handler) UpdateAccount(c *gin.Context) {
+	var req updateAccountReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_request", "请求体必须是 JSON")
+		return
+	}
+	row, err := h.svc.UpdateAccount(c.Request.Context(), service.UpdateAccountInput{
+		BranchID:  branchIDOf(c),
+		ID:        c.Param("id"),
+		Name:      req.Name,
+		IsActive:  req.IsActive,
+		SortOrder: req.SortOrder,
+		Note:      req.Note,
+		Actor:     operatorOf(c),
+	})
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, row)
+}
+
+// ---- S1：期初余额 ----
+
+// GetOpeningBalances GET /opening-balances?date=
+func (h *Handler) GetOpeningBalances(c *gin.Context) {
+	d, ok := dayFromQuery(c, "date")
+	if !ok {
+		if strings.TrimSpace(c.Query("date")) == "" {
+			writeError(c, http.StatusBadRequest, "bad_request", "date 必填")
+		}
+		return
+	}
+	view, err := h.svc.OpeningView(c.Request.Context(), branchIDOf(c), d)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, view)
+}
+
+// CheckOpenings GET /opening-balances/check?from=
+//
+// 前置校验：列出该期首日缺期初的启用账户（前端跳"期初建账"页）。
+func (h *Handler) CheckOpenings(c *gin.Context) {
+	from, ok := dayFromQuery(c, "from")
+	if !ok {
+		if strings.TrimSpace(c.Query("from")) == "" {
+			writeError(c, http.StatusBadRequest, "bad_request", "from 必填")
+		}
+		return
+	}
+	missing, err := h.svc.MissingOpenings(c.Request.Context(), branchIDOf(c), from)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"from":     from.Format("2006-01-02"),
+		"missing":  missing,
+		"total":    len(missing),
+		"complete": len(missing) == 0,
+	})
+}
+
+// createOpeningsReq 是 POST /opening-balances 的请求体。
+type createOpeningsReq struct {
+	EffectiveDate string                     `json:"effective_date"`
+	Note          string                     `json:"note"`
+	Items         []service.OpeningItemInput `json:"items"`
+}
+
+// CreateOpenings POST /opening-balances
+func (h *Handler) CreateOpenings(c *gin.Context) {
+	var req createOpeningsReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_request", "请求体必须是 JSON: {effective_date,items}")
+		return
+	}
+	eff, err := time.Parse("2006-01-02", strings.TrimSpace(req.EffectiveDate))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "bad_request", "effective_date 必须是 YYYY-MM-DD")
+		return
+	}
+	rows, err := h.svc.CreateOpenings(c.Request.Context(), service.CreateOpeningsInput{
+		BranchID:      branchIDOf(c),
+		EffectiveDate: eff,
+		Items:         req.Items,
+		Note:          req.Note,
+		Actor:         operatorOf(c),
+	})
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": rows, "total": len(rows)})
+}
+
+// voidOpeningReq 是 POST /opening-balances/:id/void 的请求体。
+type voidOpeningReq struct {
+	Reason string `json:"reason"`
+}
+
+// VoidOpening POST /opening-balances/:id/void
+func (h *Handler) VoidOpening(c *gin.Context) {
+	var req voidOpeningReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_request", "请求体必须是 JSON: {reason}")
+		return
+	}
+	if strings.TrimSpace(req.Reason) == "" {
+		writeError(c, http.StatusBadRequest, "bad_request", "reason 必填（作废必须留痕）")
+		return
+	}
+	row, err := h.svc.VoidOpening(c.Request.Context(), branchIDOf(c), c.Param("id"), operatorOf(c), req.Reason)
 	if err != nil {
 		mapErr(c, err)
 		return

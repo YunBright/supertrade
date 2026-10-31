@@ -50,6 +50,13 @@ var (
 	ErrOpeningItemsIncomplete = errors.New("cash-recon: 期初建账缺账户")
 	// ErrCubeSourceUnavailable：问不到数据源（链路故障）⇒ 503，**不回落本地**。
 	ErrCubeSourceUnavailable = errors.New("cash-recon: 数据源路由暂不可用")
+	// ErrCubeSourceDisabled：门店配了数据源但被停用 ⇒ 503，**不回落本地**。
+	//
+	// ⚠️ 与"没配"（正常自营店，读本地 PG）严格区分：回落会让用户看到
+	// 一份空流水，而真相是"这个门店现在查不了"。
+	ErrCubeSourceDisabled = errors.New("cash-recon: 该门店的数据源已停用")
+	// ErrAlreadyExists：唯一键冲突 ⇒ 409 already_exists。
+	ErrAlreadyExists = errors.New("cash-recon: 记录已存在")
 	// ErrCubeQueryFailed：cube 查询失败 ⇒ 503（不静默返回 0）。
 	ErrCubeQueryFailed = errors.New("cash-recon: 收银流水查询失败")
 	// ErrNotFound ⇒ 404。

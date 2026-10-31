@@ -29,16 +29,22 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/YunBright/authkit/daprclient"
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 	"gorm.io/gorm"
 
 	"github.com/YunBright/supertrade/internal/cashrecon/db"
 	"github.com/YunBright/supertrade/internal/cashrecon/handler"
 	"github.com/YunBright/supertrade/internal/cashrecon/model"
 	"github.com/YunBright/supertrade/internal/cashrecon/service"
+	"github.com/YunBright/supertrade/internal/cubeclient"
+	"github.com/YunBright/supertrade/internal/cubesource"
 	"github.com/YunBright/supertrade/pkg/cmdbootstrap"
 	"github.com/YunBright/supertrade/pkg/middleware"
 )
@@ -94,7 +100,22 @@ func initApp() error {
 	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
 	}
-	appSvc = service.New(appDB)
+	appSvc = service.NewWithConfig(appDB, loadConfig())
+
+	// dapr 客户端 + cube 读端：门店的收银流水可能长在外部数据源上。
+	//
+	// ⚠️ 用 daprclient.New() 而不是 dapr.NewClient():go-sdk 的 api-token 拦截器
+	// 会整块替换 outgoing metadata,把转发给 cube 的 Authorization 头抹掉。
+	daprCli, err := daprclient.New()
+	if err != nil {
+		return fmt.Errorf("创建 dapr 客户端失败: %w (确认 dapr run 已起)", err)
+	}
+	cubeCli := cubeclient.NewDaprCubeClient(
+		daprCli, cubeclient.DefaultCubeAppID(), cubeclient.DefaultCubeQueryPath())
+	// 解析器与读端**共用同一个** cube client(门店隔离靠 X-Branch-ID 路由链)。
+	srcResolver := cubesource.NewCachedResolver(cubeCli, cubesource.DefaultTTL, slog.Default())
+	appSvc.SetCashSource(srcResolver, cubeCli)
+	slog.Info("cash-recon: cube 取数已启用", "app_id", cubeclient.DefaultCubeAppID())
 
 	// userinfo 客户端:per-branch effective scopes 校验(recon:view / operate / …)。
 	//
@@ -120,8 +141,77 @@ func registerRoutes(r *gin.Engine) {
 	if appSvc == nil {
 		panic("cash-recon: appSvc 未初始化,可能是 OnStart 失败")
 	}
+	// JWT / X-Branch-ID 透传给下游 cube 调用(否则 cube 拿不到调用者身份 ⇒ 403)。
+	r.Use(forwardBearerToOutgoing())
 	r.Use(middleware.XBranchID())
 	handler.New(appSvc, appUser).RegisterRoutes(r)
+}
+
+// forwardBearerToOutgoing 把请求头透传进 ctx（cubeclient / userinfo 从 ctx 取）。
+func forwardBearerToOutgoing() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ctx := c.Request.Context()
+		if bearer := c.Request.Header.Get("Authorization"); bearer != "" {
+			ctx = cubeclient.WithBearer(ctx, bearer)
+		}
+		if branchID := strings.TrimSpace(c.Request.Header.Get("X-Branch-ID")); branchID != "" {
+			ctx = cubeclient.WithBranchID(ctx, branchID)
+		}
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	}
+}
+
+// loadConfig 从 env 读运行参数（键名见 deploy/cash-recon.env.example）。
+func loadConfig() service.Config {
+	cfg := service.DefaultConfig()
+	if d := envDuration("CASH_RECON_CUBE_TIMEOUT"); d > 0 {
+		cfg.CubeTimeout = d
+	}
+	if d := envDuration("CASH_RECON_CACHE_TTL"); d > 0 {
+		cfg.CacheTTL = d
+	}
+	if n := envInt("CASH_RECON_MAX_RANGE_DAYS"); n > 0 {
+		cfg.MaxRangeDays = n
+	}
+	if n := envInt("CASH_RECON_DEFAULT_TOLERANCE_DAYS"); n > 0 {
+		cfg.DefaultToleranceDays = n
+	}
+	if d := envDecimal("CASH_RECON_DEFAULT_CASH_TOLERANCE_YUAN"); d.IsPositive() {
+		cfg.DefaultCashTolerance = d
+	}
+	// CASH_RECON_BIZ_TZ 本期只做展示口径（对账一律按日历日），保留键位不参与计算。
+	return cfg
+}
+
+// envDuration 解析 Go duration（"30s"/"5m"）。
+func envDuration(key string) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+// envInt 解析正整数。
+func envInt(key string) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+// envDecimal 解析正小数。
+func envDecimal(key string) decimal.Decimal {
+	if v := os.Getenv(key); v != "" {
+		if d, err := decimal.NewFromString(strings.TrimSpace(v)); err == nil && d.IsPositive() {
+			return d
+		}
+	}
+	return decimal.Zero
 }
 
 // registerDaprRoutes 注册免鉴权端点(在 auth 中间件之前)。
