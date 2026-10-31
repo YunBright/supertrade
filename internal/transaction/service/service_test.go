@@ -15,11 +15,11 @@
 // 显示成"这个门店没有流水",而根因与结论完全无关。
 package service_test
 
-
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -52,9 +52,9 @@ const seedDay = "2026-10-22"
 
 // fakeSource 替身 cubesource.Resolver(三态:配了 / 没配 / 问不到)。
 type fakeSource struct {
-	src cubesource.Source
-	err error
-	calls int
+	src    cubesource.Source
+	err    error
+	calls  int
 	branch string
 }
 
@@ -100,27 +100,27 @@ func newSvc(t *testing.T, src *fakeSource) (*service.Service, *gorm.DB, *cuberea
 		case "sale_detail":
 			rows := []map[string]any{
 				{
-					"sale_detail.id":             "9",
-					"sale_detail.order_no":       "06202610220435",
+					"sale_detail.id":              "9",
+					"sale_detail.order_no":        "06202610220435",
 					"sale_detail.random_order_no": "06429097872618",
-					"sale_detail.branch_no":      "0001",
-					"sale_detail.product_id":     "6911754103296",
-					"sale_detail.source_price":   "2.5",
-					"sale_detail.sale_price":     "2.5",
-					"sale_detail.qty":            "1",
-					"sale_detail.sale_amount":    "2.5",
-					"sale_detail.sale_way":       "A",
-					"sale_detail.cashier_id":     "1012",
-					"sale_detail.salesman_id":    "9999",
-					"sale_detail.counter_no":     "9999",
-					"sale_detail.sold_at":        "10 22 2026  9:54PM",
-					"sale_detail.online_flag":    "0",
+					"sale_detail.branch_no":       "0001",
+					"sale_detail.product_id":      "6911754103296",
+					"sale_detail.source_price":    "2.5",
+					"sale_detail.sale_price":      "2.5",
+					"sale_detail.qty":             "1",
+					"sale_detail.sale_amount":     "2.5",
+					"sale_detail.sale_way":        "A",
+					"sale_detail.cashier_id":      "1012",
+					"sale_detail.salesman_id":     "9999",
+					"sale_detail.counter_no":      "9999",
+					"sale_detail.sold_at":         "10 22 2026  9:54PM",
+					"sale_detail.online_flag":     "0",
 					"sale_detail.discount_amount": "0",
-					"product.sub_code":           "00001",
-					"product.name":               "小白菜",
-					"product.spec":               "500g",
-					"product.unit":               "kg",
-					"product.brand_name":         "其它品牌",
+					"product.sub_code":            "00001",
+					"product.name":                "小白菜",
+					"product.spec":                "500g",
+					"product.unit":                "kg",
+					"product.brand_name":          "其它品牌",
 				},
 			}
 			return rows, len(rows), nil
@@ -241,6 +241,117 @@ func TestListSales_SourceDisabledIsNotLocalFallback(t *testing.T) {
 	assert.ErrorIs(t, err, model.ErrCubeSourceDisabled)
 }
 
+// ---- 翻页(cube 路径) ----
+
+// cubePagedDataset 造一份可翻页的 cube 数据,并**按 cube 的语义**执行
+// limit / offset(offset > 0 ⇒ 从第 offset 行开始)。
+//
+// ⚠️ 旧实现同时用了 cube 侧 offset 与 Go 侧切片(双重分页):
+// 第 2 页会被切成第 3 页的数据;而一旦 cube 侧实际返回行数
+// ≤ (page-1)*pageSize,整页会被置空 —— 用户看到的是
+// 「共 2154 条,点下一页却显示『没有符合条件的销售流水』」。
+func cubePagedDataset(model string, n int) func(string, cubeclient.CubeQuery) ([]map[string]any, int, error) {
+	return func(m string, q cubeclient.CubeQuery) ([]map[string]any, int, error) {
+		if m != model {
+			return nil, 0, nil
+		}
+		all := make([]map[string]any, n)
+		for i := 0; i < n; i++ {
+			no := fmt.Sprintf("%s-%03d", model, i)
+			row := map[string]any{
+				// ⚠️ id 维度对应源列 flow_id:**大量重复**(实测 330 万行只有 96 个不同值)。
+				// 拿它当去重键会把整页压成个位数 —— 这里必须按真实形状造数据。
+				model + ".id":              fmt.Sprintf("%s-flow-%d", model, i%3),
+				model + ".order_no":        no,
+				model + ".random_order_no": no,
+				model + ".branch_no":       "0001",
+			}
+			if model == "sale_detail" {
+				row["sale_detail.sold_at"] = "2026-10-22 21:54:52"
+				row["sale_detail.qty"] = "1"
+				row["sale_detail.sale_amount"] = "2.5"
+			} else {
+				row["payflow.paid_at"] = "2026-10-22 21:54:52"
+				row["payflow.pay_amount"] = "2.5"
+			}
+			all[i] = row
+		}
+		limit := q.Limit
+		if limit <= 0 {
+			limit = len(all)
+		}
+		off := q.Offset
+		if off > len(all) {
+			off = len(all)
+		}
+		end := off + limit
+		if end > len(all) {
+			end = len(all)
+		}
+		return all[off:end], len(all), nil
+	}
+}
+
+// cubeSvcFor 造一个"配了数据源 + 可翻页数据集"的服务。
+func cubeSvcFor(t *testing.T, model string, n int) (*service.Service, *cubereadfake.Client) {
+	t.Helper()
+	reader := cubereadfake.New()
+	reader.Handler = cubePagedDataset(model, n)
+	svc := service.New(nil, nil)
+	svc.SetCubeSource(&fakeSource{src: configuredSource()}, reader)
+	return svc, reader
+}
+
+// TestListSales_CubePageTwoNotEmpty 锁"第 2 页不是空态,且与第 1 页不重叠"。
+func TestListSales_CubePageTwoNotEmpty(t *testing.T) {
+	svc, reader := cubeSvcFor(t, "sale_detail", 120)
+	ctx := branchCtx("00")
+
+	page1, err := svc.ListSales(ctx, "00", service.SaleQuery{From: seedDay, To: seedDay, Page: 1, PageSize: 50})
+	require.NoError(t, err)
+	require.Len(t, page1.Items, 50)
+	assert.Equal(t, "sale_detail-000", page1.Items[0].OrderNo)
+	assert.Equal(t, 120, page1.Total)
+
+	page2, err := svc.ListSales(ctx, "00", service.SaleQuery{From: seedDay, To: seedDay, Page: 2, PageSize: 50})
+	require.NoError(t, err)
+	require.Len(t, page2.Items, 50, "第 2 页必须有 50 条,不能是空态")
+	assert.Equal(t, "sale_detail-050", page2.Items[0].OrderNo, "第 2 页必须从第 51 条开始")
+	assert.Equal(t, "sale_detail-099", page2.Items[49].OrderNo)
+	assert.Equal(t, 120, page2.Total)
+
+	page3, err := svc.ListSales(ctx, "00", service.SaleQuery{From: seedDay, To: seedDay, Page: 3, PageSize: 50})
+	require.NoError(t, err)
+	require.Len(t, page3.Items, 20, "末页只剩余数")
+
+	// cube 侧不再用 offset(否则就是双重分页),只取够行数由 Go 侧切页。
+	q, ok := reader.LastQuery("sale_detail")
+	require.True(t, ok)
+	assert.Equal(t, 0, q.Query.Offset, "cube 侧 offset 必须为 0")
+	assert.Equal(t, 150, q.Query.Limit, "第 3 页要取够 3*50 行")
+}
+
+// TestListPayments_CubePageTwoNotEmpty 收款流水同一口径(同一段代码,同一组断言)。
+func TestListPayments_CubePageTwoNotEmpty(t *testing.T) {
+	svc, reader := cubeSvcFor(t, "payflow", 120)
+	ctx := branchCtx("00")
+
+	page1, err := svc.ListPayments(ctx, "00", service.PayQuery{From: seedDay, To: seedDay, Page: 1, PageSize: 50})
+	require.NoError(t, err)
+	require.Len(t, page1.Items, 50)
+	assert.Equal(t, "payflow-000", page1.Items[0].OrderNo)
+
+	page2, err := svc.ListPayments(ctx, "00", service.PayQuery{From: seedDay, To: seedDay, Page: 2, PageSize: 50})
+	require.NoError(t, err)
+	require.Len(t, page2.Items, 50, "第 2 页必须有 50 条,不能是空态")
+	assert.Equal(t, "payflow-050", page2.Items[0].OrderNo)
+
+	q, ok := reader.LastQuery("payflow")
+	require.True(t, ok)
+	assert.Equal(t, 0, q.Query.Offset, "cube 侧 offset 必须为 0")
+	assert.Equal(t, 100, q.Query.Limit)
+}
+
 // ---- 派生列 ----
 
 // TestSaleFlow_DiscountRateIsDerived 锁"折扣度是派生的,且 source_price=0 ⇒ null"。
@@ -317,7 +428,7 @@ func TestListSales_CubeQueryCarriesFilters(t *testing.T) {
 	src := &fakeSource{src: configuredSource()}
 	svc, _, reader := newSvc(t, src)
 
-	_, err := svc.ListSales(branchCtx("00"), "00", service.SaleQuery{From: seedDay, To: seedDay, 
+	_, err := svc.ListSales(branchCtx("00"), "00", service.SaleQuery{From: seedDay, To: seedDay,
 		ProductID: "P-1", CategoryID: "C1", SaleWay: "A", CashierID: "1012",
 		CounterNo: "9999", BranchID: "0001", Page: 1, PageSize: 50,
 	})

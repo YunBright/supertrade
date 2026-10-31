@@ -207,6 +207,7 @@ func (q SaleQuery) normalized() SaleQuery {
 // ⇒ 给了任意一端就**不动**(半开区间是有意义的用法)。
 //
 // ⚠️ **两条路径都补**(本域 PG 与 cube):
+//
 //	只给 cube 补 ⇒ 同一个查询在两个门店给出不同答案(本地是"全部"、cube 是"今天"),
 //	而"换个门店就换个答案"正是本仓最忌讳的那类问题。
 func defaultDayRange(from, to string) (string, string) {
@@ -290,6 +291,53 @@ func payFlowDims() []string {
 	}
 }
 
+// ---- 分页(cube 路径) ----
+
+// cubePageFetch 是"翻到第 page 页需要向 cube 取多少行"。
+//
+// ⚠️ 交易域**不在 cube 侧用 offset**:一次取够 (page-1)*pageSize+pageSize 行,
+// 然后在 Go 侧统一切页(见 [sliceCubePage])。关键字路径要合并两条查询,
+// 页边界只有合并去重之后才成立 ⇒ offset 只能由 Go 侧算。
+func cubePageFetch(page, pageSize int) int {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = DefaultPageSize
+	}
+	return page * pageSize
+}
+
+// sliceCubePage 从"已取够前 page 页行数"的结果里切出第 page 页。
+//
+// 越界 ⇒ nil(调用方组装成空列表),不返回半页之后的越界切片。
+func sliceCubePage(rows []map[string]any, page, pageSize int) []map[string]any {
+	start := (page - 1) * pageSize
+	if start >= len(rows) {
+		return nil
+	}
+	end := start + pageSize
+	if end > len(rows) {
+		end = len(rows)
+	}
+	return rows[start:end]
+}
+
+// cubeRowKey 拼出一行的身份键(用于**关键字路径**两条查询的合并去重)。
+//
+// ⚠️ **不能**用 id 维度:销售/收款的 `id` 都映射到源列 `flow_id` ——
+// 实测 330 万行里只有 96 个不同值(那是收银机台/班次号,不是行的身份)。
+// 按它去重会把一天 2064 行压成个位数 ⇒ 第 2 页整页为空,
+// 症状是「共 2154 条,点下一页却显示『没有符合条件的销售流水』」。
+func cubeRowKey(row map[string]any, members ...string) string {
+	var b strings.Builder
+	for _, m := range members {
+		b.WriteString(cuberead.Str(row, m))
+		b.WriteByte(0x1f) // 单元分隔符:避免 "ab"+"c" 与 "a"+"bc" 撞键
+	}
+	return b.String()
+}
+
 // ---- 商品销售流水 ----
 
 // ListSales 分页查商品销售流水。
@@ -365,9 +413,10 @@ func rangeFilters(member, from, to string) []cubeclient.CubeFilter {
 // "2026-10-22 21:54:52",**不带时区**。
 //
 // ⇒ 直接把 "2026-10-21T16:00:00Z" 丢给 MSSQL 当 datetime 比较:
-//   ① 'T' 与 'Z' 让它**转换失败**(SQL Server 认 ISO8601 的 'T' 分隔符要靠
-//      特定 SET LANGUAGE / dateformat,默认会报错或截断);
-//   ② 就算勉强转过去,UTC 与墙钟**差 8 小时** ⇒ 流水被切掉一整天。
+//
+//	① 'T' 与 'Z' 让它**转换失败**(SQL Server 认 ISO8601 的 'T' 分隔符要靠
+//	   特定 SET LANGUAGE / dateformat,默认会报错或截断);
+//	② 就算勉强转过去,UTC 与墙钟**差 8 小时** ⇒ 流水被切掉一整天。
 //
 // ⇒ 三种输入都收,统一归一成 "YYYY-MM-DD HH:MM:SS"(**业务时区墙钟**):
 //
@@ -425,10 +474,7 @@ func normalizeToWallClock(s string) string {
 // ⚠️ total 是两者之和(**上界**):两次的结果集可能有重叠。
 // 前端只用 total 判断"还有没有下一页" ⇒ 上界可接受。
 func (s *Service) cubeListSales(ctx context.Context, q SaleQuery) (*model.SaleFlowPage, error) {
-	fetch := q.PageSize
-	if q.Page > 1 {
-		fetch = q.Page * q.PageSize
-	}
+	fetch := cubePageFetch(q.Page, q.PageSize)
 	type hit struct {
 		rows  []map[string]any
 		total int
@@ -441,9 +487,9 @@ func (s *Service) cubeListSales(ctx context.Context, q SaleQuery) (*model.SaleFl
 				Dimensions: saleDetailDims(),
 				Filters: append(saleFilters(q),
 					cuberead.Filter(member, cubeclient.OperatorContainsCI, kw)),
-				Order:  []cubeclient.CubeOrder{{ID: "sale_detail.order_no", Order: "desc"}},
-				Limit:  fetch,
-				Total:  true,
+				Order: []cubeclient.CubeOrder{{ID: "sale_detail.order_no", Order: "desc"}},
+				Limit: fetch,
+				Total: true,
 			}
 			rows, total, err := s.reader.LoadCubeQueryPage(ctx, "sale_detail", cq)
 			if err != nil {
@@ -452,13 +498,22 @@ func (s *Service) cubeListSales(ctx context.Context, q SaleQuery) (*model.SaleFl
 			hits = append(hits, hit{rows: rows, total: total})
 		}
 	} else {
+		// ⚠️ **不在 cube 侧用 offset**(与 catalog 商品分页同一范式):
+		// 只把"够翻到第 N 页的行数"取回来,切页统一在 Go 侧做。
+		//
+		// 为什么:
+		//  1. 关键字路径有两条查询(单号 / 随机单号),页边界只有**合并去重之后**
+		//     才成立 ⇒ cube 侧的 offset 对它没有意义。
+		//  2. cube 侧 offset + Go 侧再切页 = **双重分页**:第 N 页切走的是
+		//     第 N+1 页的数据;更糟的是只要 cube 侧实际返回行数 ≤ (N-1)*pageSize
+		//     (offset 未生效 / 被下游截断),`start >= len(items)` 就把整页置空
+		//     ⇒ 症状是"共 2154 条,点下一页却显示『没有符合条件的销售流水』"。
 		cq := cubeclient.CubeQuery{
 			Measures:   []string{"sale_detail.count"},
 			Dimensions: saleDetailDims(),
 			Filters:    saleFilters(q),
 			Order:      []cubeclient.CubeOrder{{ID: "sale_detail.order_no", Order: "desc"}},
 			Limit:      fetch,
-			Offset:     (q.Page - 1) * q.PageSize,
 			Total:      true,
 		}
 		rows, total, err := s.reader.LoadCubeQueryPage(ctx, "sale_detail", cq)
@@ -471,33 +526,33 @@ func (s *Service) cubeListSales(ctx context.Context, q SaleQuery) (*model.SaleFl
 	seen := make(map[string]bool)
 	merged := make([]map[string]any, 0, len(hits)*fetch)
 	sum := 0
+	keyword := len(hits) > 1
 	for _, h := range hits {
 		sum += h.total
 		for _, r := range h.rows {
-			id := cuberead.Str(r, "sale_detail.id")
-			if seen[id] {
-				continue
+			// ⚠️ 只有关键字路径(两条查询)需要合并去重;单条查询路径**不去重**。
+			//
+			// ⚠️ 去重键**不能**是 sale_detail.id:它映射到源列 flow_id,
+			// 实测 330 万行里只有 96 个不同值(收银机台/班次号,不是行的身份)
+			// ⇒ 按它去重会把一天 2000+ 行压成个位数,第 2 页必然整页为空
+			//   (2026-10-30 生产反馈:共 2154 条,点下一页却显示空态)。
+			if keyword {
+				key := cubeRowKey(r,
+					"sale_detail.order_no", "sale_detail.product_id",
+					"sale_detail.sold_at", "sale_detail.qty",
+					"sale_detail.sale_amount", "sale_detail.counter_no")
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
 			}
-			seen[id] = true
 			merged = append(merged, r)
 		}
 	}
-	items := make([]model.SaleFlowItem, 0, len(merged))
-	for _, r := range merged {
+	pageRows := sliceCubePage(merged, q.Page, q.PageSize)
+	items := make([]model.SaleFlowItem, 0, len(pageRows))
+	for _, r := range pageRows {
 		items = append(items, saleFlowItemOf(r))
-	}
-	if len(items) > 0 {
-		// 合并之后才知道真正的第 N 页在哪 ⇒ 在 Go 里切页。
-		start := (q.Page - 1) * q.PageSize
-		if start >= len(items) {
-			items = nil
-		} else {
-			end := start + q.PageSize
-			if end > len(items) {
-				end = len(items)
-			}
-			items = items[start:end]
-		}
 	}
 	return &model.SaleFlowPage{
 		Items:      items,
@@ -559,27 +614,27 @@ func saleFlowItemOf(r map[string]any) model.SaleFlowItem {
 	sourcePrice := cuberead.Dec(r, "sale_detail.source_price")
 	qty := cuberead.Dec(r, "sale_detail.qty")
 	item := model.SaleFlowItem{
-		ID:              cuberead.Str(r, "sale_detail.order_no"),
-		OrderNo:         cuberead.Str(r, "sale_detail.order_no"),
-		RandomOrderNo:   cuberead.Str(r, "sale_detail.random_order_no"),
-		BranchID:        cuberead.Str(r, "sale_detail.branch_no"),
-		SoldAt:          cuberead.Time(cuberead.Str(r, "sale_detail.sold_at")),
-		ProductID:       cuberead.Str(r, "sale_detail.product_id"),
-		SubCode:         cuberead.Str(r, "product.sub_code"),
-		ProductName:     cuberead.Str(r, "product.name"),
-		Spec:            cuberead.Str(r, "product.spec"),
-		BrandName:       cuberead.Str(r, "product.brand_name"),
-		Unit:            cuberead.Str(r, "product.unit"),
-		SaleWay:         cuberead.Str(r, "sale_detail.sale_way"),
-		CounterNo:       cuberead.Str(r, "sale_detail.counter_no"),
-		CashierID:       cuberead.Str(r, "sale_detail.cashier_id"),
-		SalesmanID:      cuberead.Str(r, "sale_detail.salesman_id"),
-		Qty:             cuberead.MoneyPtr(&qty),
-		SaleAmount:      cuberead.MoneyPtr(cuberead.DecPtr(r, "sale_detail.sale_amount")),
-		DiscountAmount:  cuberead.MoneyPtr(cuberead.DecPtr(r, "sale_detail.discount_amount")),
-		SalePrice:       cuberead.MoneyPtr(&salePrice),
-		SourcePrice:     cuberead.MoneyPtr(&sourcePrice),
-		OnlineFlag:      cuberead.Str(r, "sale_detail.online_flag"),
+		ID:             cuberead.Str(r, "sale_detail.order_no"),
+		OrderNo:        cuberead.Str(r, "sale_detail.order_no"),
+		RandomOrderNo:  cuberead.Str(r, "sale_detail.random_order_no"),
+		BranchID:       cuberead.Str(r, "sale_detail.branch_no"),
+		SoldAt:         cuberead.Time(cuberead.Str(r, "sale_detail.sold_at")),
+		ProductID:      cuberead.Str(r, "sale_detail.product_id"),
+		SubCode:        cuberead.Str(r, "product.sub_code"),
+		ProductName:    cuberead.Str(r, "product.name"),
+		Spec:           cuberead.Str(r, "product.spec"),
+		BrandName:      cuberead.Str(r, "product.brand_name"),
+		Unit:           cuberead.Str(r, "product.unit"),
+		SaleWay:        cuberead.Str(r, "sale_detail.sale_way"),
+		CounterNo:      cuberead.Str(r, "sale_detail.counter_no"),
+		CashierID:      cuberead.Str(r, "sale_detail.cashier_id"),
+		SalesmanID:     cuberead.Str(r, "sale_detail.salesman_id"),
+		Qty:            cuberead.MoneyPtr(&qty),
+		SaleAmount:     cuberead.MoneyPtr(cuberead.DecPtr(r, "sale_detail.sale_amount")),
+		DiscountAmount: cuberead.MoneyPtr(cuberead.DecPtr(r, "sale_detail.discount_amount")),
+		SalePrice:      cuberead.MoneyPtr(&salePrice),
+		SourcePrice:    cuberead.MoneyPtr(&sourcePrice),
+		OnlineFlag:     cuberead.Str(r, "sale_detail.online_flag"),
 	}
 	applyDerived(&item, salePrice, sourcePrice, qty)
 	return item
@@ -747,10 +802,7 @@ func payFilters(q PayQuery) []cubeclient.CubeFilter {
 
 // cubeListPayments 走 cube 的收款流水。
 func (s *Service) cubeListPayments(ctx context.Context, q PayQuery) (*model.PayFlowPage, error) {
-	fetch := q.PageSize
-	if q.Page > 1 {
-		fetch = q.Page * q.PageSize
-	}
+	fetch := cubePageFetch(q.Page, q.PageSize)
 	type hit struct {
 		rows  []map[string]any
 		total int
@@ -763,9 +815,9 @@ func (s *Service) cubeListPayments(ctx context.Context, q PayQuery) (*model.PayF
 				Dimensions: payFlowDims(),
 				Filters: append(payFilters(q),
 					cuberead.Filter(member, cubeclient.OperatorContainsCI, kw)),
-				Order:  []cubeclient.CubeOrder{{ID: "payflow.order_no", Order: "desc"}},
-				Limit:  fetch,
-				Total:  true,
+				Order: []cubeclient.CubeOrder{{ID: "payflow.order_no", Order: "desc"}},
+				Limit: fetch,
+				Total: true,
 			}
 			rows, total, err := s.reader.LoadCubeQueryPage(ctx, "payflow", cq)
 			if err != nil {
@@ -774,13 +826,13 @@ func (s *Service) cubeListPayments(ctx context.Context, q PayQuery) (*model.PayF
 			hits = append(hits, hit{rows: rows, total: total})
 		}
 	} else {
+		// 同 cubeListSales:不在 cube 侧用 offset,取够行后在 Go 侧切页。
 		cq := cubeclient.CubeQuery{
 			Measures:   []string{"payflow.count"},
 			Dimensions: payFlowDims(),
 			Filters:    payFilters(q),
 			Order:      []cubeclient.CubeOrder{{ID: "payflow.order_no", Order: "desc"}},
 			Limit:      fetch,
-			Offset:     (q.Page - 1) * q.PageSize,
 			Total:      true,
 		}
 		rows, total, err := s.reader.LoadCubeQueryPage(ctx, "payflow", cq)
@@ -792,32 +844,27 @@ func (s *Service) cubeListPayments(ctx context.Context, q PayQuery) (*model.PayF
 	seen := make(map[string]bool)
 	merged := make([]map[string]any, 0, len(hits)*fetch)
 	sum := 0
+	keyword := len(hits) > 1
 	for _, h := range hits {
 		sum += h.total
 		for _, r := range h.rows {
-			id := cuberead.Str(r, "payflow.id")
-			if seen[id] {
-				continue
+			// 同 cubeListSales:去重键不能用 payflow.id(= 源列 flow_id)。
+			if keyword {
+				key := cubeRowKey(r,
+					"payflow.order_no", "payflow.pay_way",
+					"payflow.paid_at", "payflow.pay_amount", "payflow.card_no")
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
 			}
-			seen[id] = true
 			merged = append(merged, r)
 		}
 	}
-	items := make([]model.PayFlowItem, 0, len(merged))
-	for _, r := range merged {
+	pageRows := sliceCubePage(merged, q.Page, q.PageSize)
+	items := make([]model.PayFlowItem, 0, len(pageRows))
+	for _, r := range pageRows {
 		items = append(items, payFlowItemOf(r))
-	}
-	if len(items) > 0 {
-		start := (q.Page - 1) * q.PageSize
-		if start >= len(items) {
-			items = nil
-		} else {
-			end := start + q.PageSize
-			if end > len(items) {
-				end = len(items)
-			}
-			items = items[start:end]
-		}
 	}
 	return &model.PayFlowPage{
 		Items:      items,
