@@ -730,28 +730,32 @@ func pickPriceBorrowWinner(cfgs []model.PigForecastBaselineBorrow,
 //
 //	由 pigSuggestedUnitPrices 的封顶保证(超了就按比例缩,只往下缩)。
 //
-// 返回:部位 → 建议成本单价;部位 → 单价来源标记。
+// 返回:部位 → 建议成本单价;部位 → 单价来源标记;是否有猪被**封顶**。
+//
+// ⚠️ capped 的意义:owner 给的边界②(各部位合计价值 ≤ 猪的总进货金额)是**静默**生效的
+//   ⇒ 门店看不到"基线给的价比猪还贵,系统帮我砍了"⇒ 必须让他看见。
 func (s *Service) suggestedCutUnitPrices(ctx context.Context, branchID string,
 	pigs []model.WholePig, splitPerPig map[string]map[string]decimal.Decimal,
-	bizDate time.Time) (map[string]decimal.Decimal, map[string]string, error) {
+	bizDate time.Time) (map[string]decimal.Decimal, map[string]string, bool, error) {
 	out := map[string]decimal.Decimal{}
 	sources := map[string]string{}
 	if len(pigs) == 0 {
-		return out, sources, nil
+		return out, sources, false, nil
 	}
 	baselines, err := s.loadPriceBaselinesAsOf(ctx, branchID, bizDate)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	storeAvg, err := s.storeWeightedAvgCostPrice(ctx, branchID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	num := map[string]decimal.Decimal{}
 	den := map[string]decimal.Decimal{}
 	srcWeight := map[string]map[string]decimal.Decimal{}
 	anyPriced := map[string]bool{}
 	seenCuts := map[string]bool{}
+	anyCapped := false
 	for _, p := range pigs {
 		split := splitPerPig[p.ID]
 		if len(split) == 0 {
@@ -760,9 +764,12 @@ func (s *Service) suggestedCutUnitPrices(ctx context.Context, branchID string,
 		for cut := range split {
 			seenCuts[cut] = true
 		}
-		perCut, perCutSource, err := s.pigSuggestedUnitPrices(ctx, branchID, p, split, baselines, storeAvg)
+		perCut, perCutSource, capped, err := s.pigSuggestedUnitPrices(ctx, branchID, p, split, baselines, storeAvg)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
+		}
+		if capped {
+			anyCapped = true
 		}
 		for cut, v := range perCut {
 			kg := split[cut]
@@ -797,7 +804,7 @@ func (s *Service) suggestedCutUnitPrices(ctx context.Context, branchID string,
 			sources[cut] = PriceSourceNone
 		}
 	}
-	return out, sources, nil
+	return out, sources, anyCapped, nil
 }
 
 // pickPriceSource 从来源投票里选出胜者(票数最多;并列取字典序小的 ⇒ 确定性)。
@@ -840,9 +847,10 @@ func sortedSourceKeys(m map[string]decimal.Decimal) []string {
 //
 //	超了 ⇒ 按比例把**单价**缩下去(只往下缩,与重量同一条原则)
 //	⇒ 绝不允许"建议出来的货比猪还贵"。
+// 返回的 capped = 本次是否真的触发了封顶(缩放)。
 func (s *Service) pigSuggestedUnitPrices(ctx context.Context, branchID string, p model.WholePig,
 	split map[string]decimal.Decimal, baselines map[model.CutType]priceBaselineValue,
-	storeAvg decimal.Decimal) (map[string]decimal.Decimal, map[string]string, error) {
+	storeAvg decimal.Decimal) (map[string]decimal.Decimal, map[string]string, bool, error) {
 	out := map[string]decimal.Decimal{}
 	sources := map[string]string{}
 	pigPrice := pigUnitPriceYuan(p)
@@ -852,7 +860,7 @@ func (s *Service) pigSuggestedUnitPrices(ctx context.Context, branchID string, p
 		}
 		v, src, err := s.resolveCutUnitPrice(ctx, branchID, model.CutType(cut), pigPrice, baselines, storeAvg)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 		if src == PriceSourceNone || !v.IsPositive() {
 			// ⚠️ 取不到价 ⇒ 该部位**没有**建议成本单价(前端显示「—」,不是 0)。
@@ -868,16 +876,18 @@ func (s *Service) pigSuggestedUnitPrices(ctx context.Context, branchID string, p
 	for cut, v := range out {
 		total = total.Add(v.Mul(split[cut]))
 	}
+	capped := false
 	if pigCost.IsPositive() && total.GreaterThan(pigCost) {
 		factor := pigCost.Div(total)
 		for cut := range out {
 			out[cut] = out[cut].Mul(factor)
 		}
+		capped = true
 		s.pubLogger.Warn("建议成本单价合计超过猪的总进货金额,已按比例缩到总进货金额",
 			"branch_id", branchID, "pig_id", p.ID,
 			"pig_cost_yuan", pigCost.String(), "suggested_value_yuan", total.String())
 	}
-	return out, sources, nil
+	return out, sources, capped, nil
 }
 
 // resolveCutUnitPrice 走**退取链**取某个部位的成本单价。

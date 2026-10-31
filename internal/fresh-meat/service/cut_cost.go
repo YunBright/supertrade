@@ -323,6 +323,53 @@ func clampNonNegative(kg, amount decimal.Decimal) (decimal.Decimal, decimal.Deci
 	return kg, amount
 }
 
+// clampMarginPct 把毛利率**钳进列能装下的范围**。
+//
+// # 为什么需要它(2026-10-31 实测)
+//
+//	`cut_cost_daily.gross_margin_pct` 的列类型是 `numeric(8,4)`
+//	⇒ 只能装 **±9999.9999**。
+//	而毛利率 = 毛利 ÷ 营收×100 ⇒ 当**营收很小、成本很大**时会算出任意大的百分比。
+//
+//	实测(契约测试门店):某部位营收 30 元、成本 4000 元
+//	⇒ 毛利率 = -13233.33% ⇒ **超出 numeric(8,4) 的上限**
+//	⇒ PG 报 `numeric field overflow (SQLSTATE 22003)`
+//	⇒ **整条成本链物化失败**(不只是这一行)⇒ 门店看到 500。
+//
+//	⚠️ 这不是理论风险:切「只用基线」时,引擎把**整头猪的成本**摊到
+//	  **基线覆盖的那几 kg** 上(基线常常只覆盖一小部分)
+//	⇒ 那些部位的 kg 很小、成本很重 ⇒ 毛利率必然爆。
+//	  (生产实测店 00 2026-10-30 已出现 -1482.69%,离上限只差一个量级。)
+//
+// # 为什么钳制而不是改列
+//
+//	改列类型要 DDL + owner 批准;而**数值本身在业务上也没有意义**
+//	(毛利率 -13233% 对门店只是"这刀货卖得极亏",不是精确数字)
+//	⇒ 钳到边界内更稳,且不依赖迁移。
+//
+// # 钳的方向
+//
+//	**双向**钳:超上限取上限,超下限取下限
+//	⇒ 保证写库永远成功,同时也保留"极度亏损"的信号(仍然是很大的负数)。
+const (
+	// marginPctMax / marginPctMin 是 numeric(8,4) 的安全边界。
+	//
+	// ⚠️ 留一点余量(9999.99 而不是 9999.9999)⇒ 避免四舍五入后又超。
+	marginPctMax = 9999.99
+	marginPctMin = -9999.99
+)
+
+// clampMarginPct 把毛利率钳进 numeric(8,4) 装得下的范围。
+func clampMarginPct(pct float64) float64 {
+	if pct > marginPctMax {
+		return marginPctMax
+	}
+	if pct < marginPctMin {
+		return marginPctMin
+	}
+	return pct
+}
+
 // loadCutOpening 取某营业日的**部位级期初**(kg + 金额)。
 //
 // # kg 与金额**分开定价**(2026-10-27 修)
@@ -861,7 +908,10 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 	//   ⇒ 结构性断环(见 forecast_price.go 的包注释)。
 	//
 	// ⚠️ 取不到价的部位**不出现在结果里** ⇒ 报表显示「—」(不是 0)。
-	suggestedCostUnit, suggestedCostSource, err := s.suggestedCutUnitPrices(ctx, branchID, pigs,
+	//
+	// ⚠️ 封顶标志(capped)在这里**丢弃**:报表是**多猪汇总**口径,
+	//   "哪头猪被封顶了"只有单猪视角(预览/录猪页)才讲得清 ⇒ 不在这里误导门店。
+	suggestedCostUnit, suggestedCostSource, _, err := s.suggestedCutUnitPrices(ctx, branchID, pigs,
 		split.SuggestedPerPig, bizDate)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -1182,7 +1232,9 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 			WasteCostYuan:              wasteCost,
 			RevenueYuan:                revenue,
 			GrossMarginYuan:            gm,
-			GrossMarginPct:             gmPct,
+			// ⚠️ **必须钳制**:列是 numeric(8,4) ⇒ 装不下超过 ±9999.99 的毛利率
+			//   ⇒ 不钳会直接写库失败、**打挂整条成本链物化**(见 clampMarginPct)。
+			GrossMarginPct:             clampMarginPct(gmPct),
 			PresaleMarginYuan:          revaluation,
 			PresaleExpectedRevenueYuan: presaleRevenue,
 			PresaleExpectedUnitYuan:    presaleUnit,

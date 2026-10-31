@@ -42,6 +42,19 @@ func ClampNonNegativeForTest(kg, amount decimal.Decimal) (decimal.Decimal, decim
 	return clampNonNegative(kg, amount)
 }
 
+// ClampMarginPctForTest 暴露 [clampMarginPct](毛利率钳进 numeric(8,4) 的范围)。
+//
+// ⚠️ 为什么值得单独暴露:
+//
+//	列类型是 `numeric(8,4)` ⇒ 装不下超过 ±9999.99 的毛利率
+//	⇒ 不钳会**直接写库失败**、打挂整条成本链物化
+//	(2026-10-31 实测:切「只用基线」后某部位营收 30 元 / 成本 4000 元
+//	 ⇒ 毛利率 -13233.33% ⇒ PG 报 numeric field overflow ⇒ 端点 500)。
+//	⇒ 这条只有**直接锁判据**才可靠(端到端很难稳定构造出爆表的场景)。
+func ClampMarginPctForTest(pct float64) float64 {
+	return clampMarginPct(pct)
+}
+
 // ForecastSplitSampleGapForTest 暴露 [forecastSplitSampleGap](分割样本缺口的判定)。
 //
 // ⚠️ 为什么它值得单独暴露:
@@ -95,11 +108,27 @@ func ProducedBySkuForTest(ctx context.Context, s *Service, branchID string,
 //
 //	**只在这里**发生 ⇒ 不导出就没法从外部测试包锁它
 //	⇒ owner 给的两条边界(各部位合计价值 ≤ 猪总进货金额)会被静默破坏。
+//
+// ⚠️ 封顶标志(capped)**故意不导出**:现有用例锁的是"单价 + 来源"这一对契约,
+//   封顶行为由 [SuggestedCutUnitPricesCappedForTest] 单独锁。
 func SuggestedCutUnitPricesForTest(ctx context.Context, s *Service, branchID string,
 	pigs []model.WholePig, splitPerPig map[string]map[string]decimal.Decimal, bizDate time.Time) (
 	unit map[string]decimal.Decimal, source map[string]string, err error,
 ) {
-	return s.suggestedCutUnitPrices(ctx, branchID, pigs, splitPerPig, bizDate)
+	unit, source, _, err = s.suggestedCutUnitPrices(ctx, branchID, pigs, splitPerPig, bizDate)
+	return unit, source, err
+}
+
+// SuggestedCutUnitPricesCappedForTest 暴露"本次是否触发封顶"。
+//
+// ⚠️ 为什么单独导出:封顶是**静默**的(单价被按比例砍下去,数值上看不出来)
+//   ⇒ 少了这个标志,owner 给的边界②被破坏时没有任何信号。
+func SuggestedCutUnitPricesCappedForTest(ctx context.Context, s *Service, branchID string,
+	pigs []model.WholePig, splitPerPig map[string]map[string]decimal.Decimal, bizDate time.Time) (
+	capped bool, err error,
+) {
+	_, _, capped, err = s.suggestedCutUnitPrices(ctx, branchID, pigs, splitPerPig, bizDate)
+	return capped, err
 }
 
 // PriceMarginRateOfRowsForTest 暴露 [priceMarginRateOfRows](整体毛利率 + 是否可用于倒推)。

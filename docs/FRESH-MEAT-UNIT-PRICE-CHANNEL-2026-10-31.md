@@ -142,6 +142,87 @@ D 日结束后采样的 D 日样本            ← 供 D+1 日使用
 | POST | `/forecast-price-samples/collect` | 采集某天的单价日样本 |
 | DELETE | `/forecast-price-samples` | 删样本（**墓碑**，不物理删） |
 | POST | `/cut-unit-prices/refresh` | 兜底：重新问 LLM 要部位单价 |
+| GET | `/forecast-price-preview` | **预览**：按基线算建议分割 + 建议成本单价（只读） |
+| POST | `/whole-pigs/:pig_id/apply-baseline` | **重算**：已录的猪切成「只用基线」+ 重算成本链 |
+
+---
+
+## 七之二、「按基线预览 / 重算」通道（owner 2026-10-31 20:36 追加）
+
+> owner：「我打算用 29 日的 2 个分割样本、1 个 7.3 元/斤(14.6 元/kg)的 29 日猪单价样本
+>   倒推出的『分割基线 + 部位进货单价基线』应用到 30 日去，
+>   需要你在录入猪的时候提供使用基线重算建议分割和建议成本单价的功能
+>   （目前只能靠删除和重录实现）。我这样才能看到效果。」
+
+### 为什么要有这条通道
+
+原来只有「**录猪时选**建议生成方式」（`advice_mode`）⇒ 录错了就只能**删了重录**
+⇒ 会丢掉当天的补录与销售归属 ⇒ 门店不愿意用「只用基线」这个模式。
+
+⇒ 这里补两个动作：**预览**（还没录猪时先看）与**重算**（已录的猪就地改口径）。
+
+### `GET /forecast-price-preview?date=&weight_kg=&pig_price_yuan=`
+
+**只读**，不写任何库。返回**扁平**结构：
+
+| 键 | 类型 | 含义 |
+|---|---|---|
+| `date` | string | 归属营业日 |
+| `weight_kg` / `pig_price_yuan` | decimal | 这头猪的毛重 / 进价 |
+| `pig_total_cost_yuan` | decimal | 猪的总进货金额（= 毛重 × 进价） |
+| `total_split_kg` | decimal | 各部位建议分割之和 |
+| `total_value_yuan` | decimal | 各部位「建议成本单价 × 建议分割 kg」之和 |
+| `capped` | bool | **true** ⇒ 合计价值超了猪的总进货金额，已按比例**只往下缩** |
+| `rows[]` | array | 逐部位：`cut_type` / `suggested_split_kg` / `suggested_cost_unit_price_yuan`（**键可能缺失**）/ `cost_price_source` |
+
+> ⚠️ **与毛利看板同源**：预览走的是 `loadSuggestedSplitPerPig` + `suggestedCutUnitPrices`
+> ⇒ 和看板「成本单价」列的建议行**同一个数** ⇒ 门店在两个页面不会看到两个数。
+>
+> ⚠️ **预览一律基线口径**（`advice_mode=baseline`）⇒ 不取 LLM 兜底
+> ⇒ 门店看到的就是"**纯基线**会给什么"，不会被 AI 的建议搅混。
+
+### `POST /whole-pigs/:pig_id/apply-baseline`
+
+body `{"mode":"baseline"}`（可省；`"auto"` 改回自动）。
+
+| 键 | 类型 | 含义 |
+|---|---|---|
+| `pig_id` / `advice_mode` / `rematerialized_days` | string/string/int | 被改的猪 / 改后的模式 / 重算了几天成本链 |
+| 其余 | 同预览 | 与预览**同一套结构**（扁平） |
+
+### ⚠️ 三条语义（容易踩）
+
+1. **切「只用基线」会清掉 AI 建议**（`llm_advice_json=nil`、`advice_status=none`、
+   `data_source=stub`）⇒ 免得门店以为 AI 建议还在生效。
+   ⚠️ 顺带让「盘点预期剩余」的兜底（它读 `llm_advice_json`）不再含 LLM 那份
+   ⇒ 与成本链口径一致（都是基线接管）。
+2. **切回「自动」时**不**清** `llm_advice_json` —— 新建议是**异步**生成的
+   ⇒ 清掉会让这段时间这头猪一条建议都没有 ⇒ 反而制造缺口。
+3. **切「只用基线」前必须校验该体重段有可用基线**（`hasUsableBaselineBand`）
+   ⇒ baseline 模式 = **基线没覆盖的部位没有建议** ⇒ 若这个体重段压根没基线，
+   这头猪就**一条建议都没有** ⇒ 当天产出凭空少一整头猪
+   ⇒ 到处是「缺口 / 短卖 / 幻影搭赠」⇒ **400 拦住**并说清"先补基线，或改用自动"。
+
+### 已审计冻结
+
+改建议 ⇒ 改成本链 ⇒ 已结转的期间不能被静默改写 ⇒ 与「补录 / 重新生成建议」同口径
+（`assertNotAudited`）。
+
+---
+
+## 七之三、前端（`F:\flutter\tradewind_app`）
+
+| 位置 | 改动 |
+|---|---|
+| `baseline_price_card.dart` / `baseline_price_row.dart` | 分割基线页新增「**部位进货单价基线**」卡（部位 / 进货单价 / 参考猪进价 / 样本 n / 来源）+「重算」按钮 |
+| `pig_create_baseline_preview_card.dart` / `_result.dart` | 录猪表单新增「**按基线预览**建议分割与成本单价」卡（斤→kg 换算统一收敛到 `PigCreateFormState`） |
+| `pig_apply_baseline_button.dart` | 已录的猪加「**用基线重算**」按钮（写操作 ⇒ 前置确认弹窗）；已是基线口径 ⇒ 显示「已按基线」且禁用 |
+
+> ⚠️ **取不到价的部位显示「—」**，不是 `0.00` ⇒ 用 `double?` + `parseOptionalDecimal`
+> ⇒ 缺键 ≠ 0（0 会被店长读成"这个部位不要钱"）。
+>
+> ⚠️ **斤→kg 换算只有一份**：表单的 `_submit` 与预览都走 `PigCreateFormState.weightKgValue /
+> pigPriceYuanValue` ⇒ 避免两处换算规则漂移。
 
 ---
 

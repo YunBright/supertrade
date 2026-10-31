@@ -207,6 +207,17 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	// POST —— 退取链③:让 AI 重新给某个部位的进货单价(写进缓存,之后退取链②就能命中)。
 	r.POST("/cut-unit-prices/refresh", requireBranch, h.RefreshCutUnitPrice)
 
+	// ---- 「按基线预览 / 重算」通道(2026-10-31 owner)----
+	//
+	// owner:「我打算把 29 日的样本倒推出的『分割基线 + 部位进货单价基线』应用到 30 日去,
+	//        需要你在录入猪的时候提供使用基线重算建议分割和建议成本单价的功能
+	//        (目前只能靠删除和重录实现)。」
+	//
+	// GET —— 预览:还没录猪时,按基线算一遍建议分割 + 建议成本单价(**不写库**)。
+	r.GET("/forecast-price-preview", requireBranch, h.PreviewCutPrice)
+	// POST —— 重算:已录的猪切成「只用基线」口径 + 重算当天成本链(不用删了重录)。
+	r.POST("/whole-pigs/:pig_id/apply-baseline", requireBranch, h.ApplyBaselineToPig)
+
 	// 跨门店选用基线的配置(本店借用别店的基线)
 	r.GET("/forecast-baseline-borrows", requireBranch, h.ListForecastBaselineBorrows)
 	r.POST("/forecast-baseline-borrows", requireBranch, h.UpsertForecastBaselineBorrow)
