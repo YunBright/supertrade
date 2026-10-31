@@ -416,9 +416,26 @@ func (s *Service) evaluateMonthlySingle(ctx context.Context, ap *model.ApprovalI
 		}
 		counts[yearMonth{y, m}]++
 	}
-	hist, err := s.countHistoricalMonthlyItems(ctx, ap, cfg, re, groupIndex)
+	hist, unmatched, err := s.countHistoricalMonthlyItems(ctx, ap, cfg, re, groupIndex)
 	if err != nil {
 		return false, "", err
+	}
+	if len(unmatched) > 0 {
+		// ⚠️ 历史行提不出「所属年月」⇒ **拒绝**（2026-10-31 用户口径：从"静默跳过"收紧）。
+		//
+		//	静默跳过等于把这些笔数从统计里抹掉 ⇒ 同月其实已经付过一单也会判"1 笔"
+		//	⇒ 漏放（比误拒更危险：错的是钱）。宁可让审批人核对备注/改正则。
+		shown := unmatched
+		if len(shown) > maxUnmatchedHistoryInReason {
+			shown = shown[:maxUnmatchedHistoryInReason]
+		}
+		detail := strings.Join(shown, ";")
+		if len(unmatched) > len(shown) {
+			detail += fmt.Sprintf(";…共 %d 笔", len(unmatched))
+		}
+		return false, fmt.Sprintf(
+			"无法判定「每月有且仅有一单」:历史付款项有 %d 笔提取不出所属年月(%s)",
+			len(unmatched), detail), nil
 	}
 	for k, v := range hist {
 		counts[k] += v
@@ -446,6 +463,9 @@ func (s *Service) evaluateMonthlySingle(ctx context.Context, ap *model.ApprovalI
 	return true, fmt.Sprintf("满足「每月有且仅有一单」:%s 所属月份各 1 笔", cfg.ItemType), nil
 }
 
+// maxUnmatchedHistoryInReason 是结论文案里最多列出的"提不出月份"的历史行数。
+const maxUnmatchedHistoryInReason = 5
+
 // histItemRow 是历史付款项的一行（带所属审批单的年份）。
 type histItemRow struct {
 	ApprovalID        string
@@ -461,9 +481,13 @@ type histItemRow struct {
 //	否则「拒了 → 改好再提交」会永远卡在"该月已有 1 笔"上（无限循环）。
 //
 // ⚠️ 本单被排除（excludeApprovalID）⇒ 重跑/重审不会把自己算两遍。
+//
+// ⚠️ 提不出「所属年月」的行**不计数、但会返回给调用方并导致拒绝**（2026-10-31
+// 用户口径）：以前是静默跳过，等于把可能的重复付款从统计里抹掉 ⇒ 会漏放。
+// unmatched 是这些行的可读描述（审批单 id + 备注 + 提取结果）。
 func (s *Service) countHistoricalMonthlyItems(ctx context.Context, ap *model.ApprovalInstance,
 	cfg *model.AuditPaymentItemFlow, re *regexp.Regexp, groupIndex int,
-) (map[yearMonth]int, error) {
+) (map[yearMonth]int, []string, error) {
 	var rows []histItemRow
 	err := s.db.WithContext(ctx).Model(&model.ApprovalItem{}).
 		Select(`approval_items.approval_id AS approval_id,
@@ -477,23 +501,25 @@ func (s *Service) countHistoricalMonthlyItems(ctx context.Context, ap *model.App
 			[]string{model.StatusRejected, model.StatusFailed, model.StatusCancelled}).
 		Scan(&rows).Error
 	if err != nil {
-		return nil, fmt.Errorf("count historical monthly items: %w", err)
+		return nil, nil, fmt.Errorf("count historical monthly items: %w", err)
 	}
 	out := map[yearMonth]int{}
+	var unmatched []string
 	for _, r := range rows {
 		text, ok := matchRegexGroup(re, groupIndex, r.Remark)
 		if !ok {
-			// 历史行提不出月份 ⇒ 归不到任何月份 ⇒ 不计数。
-			// ⚠️ 不当成"该月多了一笔"：那是误拒。
+			unmatched = append(unmatched, fmt.Sprintf("审批单 %s 备注 %q(正则未匹配)", r.ApprovalID, r.Remark))
 			continue
 		}
 		y, m, ok := parsePeriodText(text, r.ApprovalCreatedAt.Year())
 		if !ok {
+			unmatched = append(unmatched, fmt.Sprintf(
+				"审批单 %s 备注 %q(提取结果 %q 解析不出年/月)", r.ApprovalID, r.Remark, text))
 			continue
 		}
 		out[yearMonth{y, m}]++
 	}
-	return out, nil
+	return out, unmatched, nil
 }
 
 // loadRegex 取该门店的正则（没配 / 不存在 / 已停用 / 非法 ⇒ nil）。

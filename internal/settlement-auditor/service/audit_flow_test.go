@@ -298,6 +298,40 @@ func TestEvaluateMonthlySingle(t *testing.T) {
 		}
 	})
 
+	t.Run("历史备注提不出月份 ⇒ 不满足(不再静默跳过)", func(t *testing.T) {
+		svc, db, flow := setup(t)
+		if err := db.Create(ap).Error; err != nil {
+			t.Fatalf("建审批: %v", err)
+		}
+		other := &model.ApprovalInstance{
+			ID: "ap-2", BranchID: "B1", Status: model.StatusApproved,
+			CreatedAt: time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC),
+		}
+		if err := db.Create(other).Error; err != nil {
+			t.Fatalf("建历史审批: %v", err)
+		}
+		if err := db.Create(&model.ApprovalItem{
+			ApprovalID: "ap-2", BranchID: "B1", Direction: ItemDirectionPayment,
+			ItemType: "水电费", Remark: "上期水电费已结清", AmountYuan: dec("100"),
+		}).Error; err != nil {
+			t.Fatalf("建历史明细: %v", err)
+		}
+		items := []model.ApprovalItem{{
+			ApprovalID: "ap-1", BranchID: "B1", Direction: ItemDirectionPayment,
+			ItemType: "水电费", Remark: "9月水电费", AmountYuan: dec("100"),
+		}}
+		ok, reason, err := svc.evaluateMonthlySingle(ctx, ap, flow, items)
+		if err != nil {
+			t.Fatalf("evaluateMonthlySingle: %v", err)
+		}
+		if ok {
+			t.Fatal("历史行提不出月份时不能静默跳过(会漏掉同月已付过的那笔)")
+		}
+		if !strings.Contains(reason, "历史") || !strings.Contains(reason, "ap-2") {
+			t.Errorf("理由应指出是哪条历史备注: %q", reason)
+		}
+	})
+
 	t.Run("备注提不出日期 ⇒ 不满足(宁可不通过)", func(t *testing.T) {
 		svc, db, flow := setup(t)
 		if err := db.Create(ap).Error; err != nil {
