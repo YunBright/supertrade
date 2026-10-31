@@ -301,14 +301,29 @@ func dayFromQuery(c *gin.Context, key string) (time.Time, bool) {
 }
 
 // cashRange 取 from/to（也接受单个 date）。
+//
+// ⚠️ **每个分支最多写一次错误体**：`AbortWithStatusJSON` 会追加写，
+// 两次 writeError 会把两个 JSON 对象拼在一个 body 里 ⇒ 客户端反序列化失败、
+// 丢掉 error.code（表现为 400 但 code 变成 "Bad Request"）。
+// 因此"参数存在但格式非法"后**不再**回落到下一组参数。
 func cashRange(c *gin.Context) (from, to time.Time, ok bool) {
-	if d, has := dayFromQuery(c, "date"); has {
+	if strings.TrimSpace(c.Query("date")) != "" {
+		d, ok := dayFromQuery(c, "date")
+		if !ok {
+			return time.Time{}, time.Time{}, false
+		}
 		return d, d, true
 	}
 	f, okFrom := dayFromQuery(c, "from")
+	if !okFrom {
+		if strings.TrimSpace(c.Query("from")) == "" {
+			writeError(c, http.StatusBadRequest, "bad_request", "需要 date 或 from+to")
+		}
+		return time.Time{}, time.Time{}, false
+	}
 	t, okTo := dayFromQuery(c, "to")
-	if !okFrom || !okTo {
-		if !okFrom && !okTo {
+	if !okTo {
+		if strings.TrimSpace(c.Query("to")) == "" {
 			writeError(c, http.StatusBadRequest, "bad_request", "需要 date 或 from+to")
 		}
 		return time.Time{}, time.Time{}, false
