@@ -208,6 +208,33 @@ func mustDiffs(t *testing.T, db *gorm.DB, batchID string) []model.ReconDiff {
 	return rows
 }
 
+// TestApplyBatch_SampleMatchRateAtLeast90 锁住样本匹配率 ≥ 90%（S2 验收口径）。
+func TestApplyBatch_SampleMatchRateAtLeast90(t *testing.T) {
+	svc, db := newTestService(t)
+	svc.SetCashSource(localSource(), nil)
+	ctx := context.Background()
+
+	// 10 天收银流水，前 9 天都有等额到账 ⇒ 9 匹配 + 1 未到账 = 90%。
+	for i := 0; i < 10; i++ {
+		d := day(2026, 10, 1).AddDate(0, 0, i)
+		insertPayFlows(t, db, map[string]any{
+			"branch_id": "00", "pay_way": "SWX", "pay_amount": "100", "exchange_rate": "1",
+			"paid_at": d.Format("2006-01-02") + " 10:00:00",
+		})
+		if i < 9 {
+			seedBankFlow(t, db, "00", model.MethodWechat, d, "100", "0")
+		}
+	}
+
+	res, err := svc.ApplyBatch(ctx, ApplyBatchInput{
+		BranchID: "00", BizDateFrom: day(2026, 10, 1), BizDateTo: day(2026, 10, 10), Actor: "u1",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 9, res.InsertedMatches)
+	require.Equal(t, 1, res.InsertedDiffs)
+	require.Equal(t, "0.9", res.Batch.MatchRate.String(), "样本匹配率必须 ≥ 90%")
+}
+
 // TestApplyBatch_InvalidRange 锁住入参校验。
 func TestApplyBatch_InvalidRange(t *testing.T) {
 	svc, _ := newTestService(t)
