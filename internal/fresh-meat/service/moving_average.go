@@ -273,8 +273,21 @@ func (s *Service) computeProducedBySku(
 	if err != nil {
 		return nil, nil, decimal.Zero, decimal.Zero, err
 	}
+	// ⚠️ 每头猪的「建议生成方式」(owner 2026-10-31)—— 必须**这里**也认,
+	//   否则「只用基线」的猪照样会拿到 LLM 的部位 ⇒ 选了没用。
+	//
+	//   (报表口径的取数在 cut_split_algo.go 的 loadSuggestedSplitKg,
+	//    那边已经按模式取过了;这里是**兜底产出**路径 ⇒ 同一口径。)
+	modeByPig := map[string]string{}
+	for _, p := range pigs {
+		modeByPig[p.ID] = adviceModeOf(p)
+	}
 	coveredByBaseline := map[string]map[model.CutType]bool{}
 	for _, p := range pigs {
+		// ⚠️ 「只用 AI」⇒ **不查基线**。
+		if modeByPig[p.ID] == model.AdviceModeLLM {
+			continue
+		}
 		band := WeightBandOf(p.GrossWeightKg)
 		for k, b := range baselines {
 			if b.WeightBand != band || !b.Usable() {
@@ -302,6 +315,10 @@ func (s *Service) computeProducedBySku(
 	// 2b) LLM 兜底(基线没覆盖的部位)
 	for _, a := range advised {
 		if hasActual(a.PigID, a.Cut) {
+			continue
+		}
+		// ⚠️ 「只用基线」⇒ **不取 LLM**(没调过 ⇒ 反正也没有)。
+		if modeByPig[a.PigID] == model.AdviceModeBaseline {
 			continue
 		}
 		if coveredByBaseline[a.PigID][a.Cut] {

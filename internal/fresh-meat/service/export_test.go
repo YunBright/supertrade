@@ -69,3 +69,22 @@ func SuggestedSplitKgForTest(ctx context.Context, s *Service, branchID string, p
 ) {
 	return s.loadSuggestedSplitKg(ctx, branchID, pigs)
 }
+
+// ProducedBySkuForTest 暴露 [computeProducedBySku](兜底产出口径)。
+//
+// ⚠️ 为什么值得单独暴露:「只用基线 / 只用 AI」这两个模式在**两处**取数
+//
+//	① loadSuggestedSplitKg(建议)⇒ 决定报表的入库量(W 接管);
+//	② computeProducedBySku(兜底产出)⇒ 决定"这头猪有没有产出数据"。
+//
+// ⇒ 只锁①的话,②里"只用基线的猪照样拿到 LLM 的部位"就是**静默**的
+//
+//	⇒ 门店选了没用 ⇒ 功能等于没做。
+func ProducedBySkuForTest(ctx context.Context, s *Service, branchID string,
+	start, end time.Time, pigs []model.WholePig, pigCost map[string]decimal.Decimal,
+) (
+	producedKg map[string]decimal.Decimal, byPig map[string]map[string]decimal.Decimal,
+	unallocated decimal.Decimal, cuttingLoss decimal.Decimal, err error,
+) {
+	return s.computeProducedBySku(ctx, branchID, start, end, pigs, pigCost)
+}

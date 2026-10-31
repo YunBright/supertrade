@@ -28,6 +28,7 @@ import (
 
 	"github.com/YunBright/supertrade/internal/fresh-meat/model"
 	"github.com/YunBright/supertrade/internal/fresh-meat/service"
+	"github.com/shopspring/decimal"
 	"gorm.io/datatypes"
 )
 
@@ -228,6 +229,56 @@ func TestRegeneratePigAdvice_BaselineModeRejected(t *testing.T) {
 	}
 	if fake.calls != 0 {
 		t.Errorf("★ 被拒也不该调 LLM,got %d 次调用", fake.calls)
+	}
+}
+
+// TestProducedBySku_AdviceModeHonored 锁「兜底产出」这条路径也认模式。
+//
+// ⚠️ 为什么必须锁:模式在**两处**取数 ——
+//
+//	① loadSuggestedSplitKg(建议)⇒ 决定报表的入库量;
+//	② computeProducedBySku(兜底产出)⇒ 决定"这头猪有没有产出数据"。
+//
+// ⇒ 只锁①的话,②里「只用基线的猪照样拿到 LLM 的部位」是**静默**的
+//
+//	⇒ 门店选了没用 ⇒ 功能等于没做。
+func TestProducedBySku_AdviceModeHonored(t *testing.T) {
+	svc, ctx, _ := splitSetup(t)
+	// 部位 → 货号映射(belly/rib 各一个)⇒ computeProducedBySku 要用主 SKU。
+	_, err := svc.CreateBranchCutMapping(ctx, "S001",
+		model.CreateBranchCutMappingInput{CutType: model.CutRib, CubeProductID: "P-RIB"})
+	mustNoErr(t, err, "建 rib 映射")
+	splitBaseline(t, model.CutBelly, modeBand, "30")
+
+	// 这头猪的 LLM 建议:belly 20.5(基线已覆盖)+ rib 15(基线没覆盖)。
+	advice := `{"cuts":[{"cut_type":"belly","expected_kg":20.5},{"cut_type":"rib","expected_kg":15}]}`
+	start := time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+	end := start.Add(24 * time.Hour)
+
+	cases := []struct {
+		mode    string
+		wantSKU string // 该模式下**应该**有产出的货号
+		noSKU   string // 该模式下**不该**有产出的货号
+	}{
+		{model.AdviceModeBaseline, "P-BELLY", "P-RIB"},
+		{model.AdviceModeLLM, "P-RIB", ""},
+		{model.AdviceModeAuto, "P-BELLY", ""}, // auto: 两个都要有
+	}
+	for _, c := range cases {
+		pig := modePig(t, c.mode, advice)
+		pig.ArrivedAt = start
+		kg, _, _, _, err := service.ProducedBySkuForTest(ctx, svc, "S001", start, end,
+			[]model.WholePig{pig}, map[string]decimal.Decimal{pig.ID: d("1620.6")})
+		mustNoErr(t, err, "computeProducedBySku")
+		if !kg[c.wantSKU].IsPositive() {
+			t.Errorf("★ mode=%s 应有 %s 的产出,got %v", c.mode, c.wantSKU, kg)
+		}
+		if c.noSKU != "" && kg[c.noSKU].IsPositive() {
+			t.Errorf("★ mode=%s 不该有 %s 的产出,got %s", c.mode, c.noSKU, kg[c.noSKU])
+		}
+		if c.mode == model.AdviceModeAuto && !kg["P-RIB"].IsPositive() {
+			t.Errorf("★ mode=auto 应同时有基线与 LLM 的产出,got %v", kg)
+		}
 	}
 }
 
