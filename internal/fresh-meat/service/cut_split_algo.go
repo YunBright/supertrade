@@ -77,6 +77,20 @@ type stocktakeCutKg struct {
 type cutSplitWeights struct {
 	// Suggested 是**建议分割** S_c(kg):纯算法建议(基线 p50 → LLM 兜底),不含 pig_cuts 实录。
 	Suggested map[string]decimal.Decimal
+	// SuggestedPerPig 是**逐猪**的建议分割(pig_id → 部位 → kg)。
+	//
+	// ⚠️ 为什么要有逐猪这一份(2026-10-31 加):
+	//
+	//	「建议成本单价」必须**逐猪**算(owner:「结合单猪的采购价,如基线是 14.6/kg 的,
+	//	  那 16/kg 的猪每个部位单价都要按比例上涨」)
+	//	⇒ 同一天两头猪进价不同 ⇒ 各部位的建议单价不同
+	//	⇒ 而"Suggested"是**跨猪汇总**的(Σ 各猪)⇒ 算不出逐猪单价。
+	//
+	//	⇒ 保留逐猪明细 ⇒ 单价可以逐猪算、再按建议 kg 加权汇总成部位口径。
+	//
+	//	⚠️ 这里存的是**未经 keep() 过滤**的完整集合
+	//	  (封顶要按这头猪的**全部**部位算 ⇒ 过滤过会漏算额度)。
+	SuggestedPerPig map[string]map[string]decimal.Decimal
 	// Actual 是**实际分割** A_c(kg)—— **内部值**(含按显示规则被隐藏的那些)。
 	Actual map[string]decimal.Decimal
 	// Source 是每个部位的实际分割来源:recorded | derived。
@@ -131,7 +145,36 @@ type cutSplitWeights struct {
 //	| llm        | **不看基线**   | 用 LLM 建议      | 要           |
 func (s *Service) loadSuggestedSplitKg(ctx context.Context, branchID string, pigs []model.WholePig) (
 	map[string]decimal.Decimal, error) {
+	perPig, err := s.loadSuggestedSplitPerPig(ctx, branchID, pigs)
+	if err != nil {
+		return nil, err
+	}
 	out := map[string]decimal.Decimal{}
+	for _, m := range perPig {
+		for c, v := range m {
+			out[c] = out[c].Add(v)
+		}
+	}
+	return out, nil
+}
+
+// loadSuggestedSplitPerPig **逐猪**算各部位的**建议分割** S_c(kg)。
+//
+// # 为什么要逐猪这一层(2026-10-31)
+//
+//	「建议成本单价」必须逐猪算(owner:「结合单猪的采购价」)
+//	⇒ 同一天两头猪进价不同 ⇒ 各部位的建议单价不同
+//	⇒ 汇总口径(Suggested)算不出单价 ⇒ 保留逐猪明细。
+//
+// # 口径(与旧的汇总口径**逐字一致**,只是拆成两层)
+//
+//	对当日**每一头猪**:
+//	  ① 该猪体重段的统计基线 p50(样本够)⇒ 该部位的建议值;
+//	  ② 基线没覆盖到的部位 ⇒ 用这头猪的 LLM 建议(expected_kg)。
+//	⇒ 逐猪缩到不超过猪重(见 scaleSplitToPigWeight)。
+func (s *Service) loadSuggestedSplitPerPig(ctx context.Context, branchID string, pigs []model.WholePig) (
+	map[string]map[string]decimal.Decimal, error) {
+	out := map[string]map[string]decimal.Decimal{}
 	if len(pigs) == 0 {
 		return out, nil
 	}
@@ -178,9 +221,7 @@ func (s *Service) loadSuggestedSplitKg(ctx context.Context, branchID string, pig
 				"gross_weight_kg", p.GrossWeightKg.String(),
 				"suggested_sum_kg", sumKgOf(perPig).String())
 		}
-		for c, v := range perPig {
-			out[c] = out[c].Add(v)
-		}
+		out[p.ID] = perPig
 	}
 	return out, nil
 }
@@ -667,9 +708,18 @@ func (s *Service) computeCutSplit(ctx context.Context, branchID string,
 		return cuts[c]
 	}
 
-	suggested, err := s.loadSuggestedSplitKg(ctx, branchID, pigs)
+	// ⚠️ 逐猪算一次(建议成本单价要用**逐猪**的量,见 cutSplitWeights.SuggestedPerPig),
+	//   汇总口径与旧的 loadSuggestedSplitKg **逐字一致**。
+	perPig, err := s.loadSuggestedSplitPerPig(ctx, branchID, pigs)
 	if err != nil {
 		return nil, err
+	}
+	out.SuggestedPerPig = perPig
+	suggested := map[string]decimal.Decimal{}
+	for _, m := range perPig {
+		for c, v := range m {
+			suggested[c] = suggested[c].Add(v)
+		}
 	}
 	for c, v := range suggested {
 		if keep(c) {

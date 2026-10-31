@@ -43,6 +43,13 @@ type LLMResult struct {
 type PredictedCut struct {
 	CutType    model.CutType   `json:"cut_type"`
 	ExpectedKg decimal.Decimal `json:"expected_kg"`
+	// UnitPriceYuan 是该部位的**进货单价**(元/kg)—— LLM 顺带给的兜底价。
+	//
+	// ⚠️ **可选**:LLM 不给就不给(指针 nil)⇒ 退取链继续往下走
+	//   (门店整店加权平均价 → LLM 缓存单价 → LLM 重新给价)。
+	// ⚠️ 只接受 0 < price < maxLLMUnitPriceYuan 的值(见 forecast_price.go)
+	//   ⇒ LLM 幻觉出来的离谱价不会污染缓存。
+	UnitPriceYuan *decimal.Decimal `json:"unit_price_yuan,omitempty"`
 }
 
 // PredictFn 是 service.Service.predictFn 的签名(便于单测注入 fake)。
@@ -162,7 +169,8 @@ func ptrStr(s string) *string { return &s }
 func buildSystemPrompt() string {
 	var sb strings.Builder
 	sb.WriteString("你是猪分割顾问。根据用户给定的整猪毛重、历史同段重量的猪拆分记录,\n")
-	sb.WriteString("输出 JSON 数组 cuts,每个元素含 cut_type 与 expected_kg(预期部位产出 kg)。\n")
+	sb.WriteString("输出 JSON 数组 cuts,每个元素含 cut_type、expected_kg(预期部位产出 kg)\n")
+	sb.WriteString("与 unit_price_yuan(该部位的进货单价,元/kg)。\n")
 	sb.WriteString("cut_type 只能取下面这些值(英文 wire + 中文名),不要自造:\n")
 	for _, c := range model.CarcassCutTypes {
 		fmt.Fprintf(&sb, "  - %s (%s)\n", c, model.CutLabel(c))
@@ -190,7 +198,7 @@ func buildUserPrompt(pig *model.WholePig, history []model.WholePig) string {
 	} else {
 		sb.WriteString("近 30 天 ±10% 重量段无历史猪。\n")
 	}
-	sb.WriteString("输出 JSON:{\"cuts\":[{\"cut_type\":\"...\",\"expected_kg\":...},...]}")
+	sb.WriteString("输出 JSON:{\"cuts\":[{\"cut_type\":\"...\",\"expected_kg\":...,\"unit_price_yuan\":...},...]}")
 	return sb.String()
 }
 

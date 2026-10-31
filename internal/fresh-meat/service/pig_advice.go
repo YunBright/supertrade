@@ -104,6 +104,16 @@ func (s *Service) generateAdvice(ctx context.Context, pigID, branchID string) {
 	if ds != model.DataSourceLLM && ds != model.DataSourceHistoryAvg {
 		ds = model.DataSourceHistoryAvg
 	}
+	// ⚠️ **LLM 顺带给的部位单价 ⇒ 写进缓存**(2026-10-31 owner 的退取链第②步)。
+	//
+	//	「今天没卖出过的部位」(搭赠等)⇒ 没有单价基线 ⇒ 建议成本单价取不到
+	//	⇒ 退取链用「LLM 缓存单价」兜底 ⇒ 而缓存正是这里写的。
+	//
+	//	⚠️ 失败**不影响建议本身**(建议已经拿到了)⇒ 只记日志。
+	if err := s.captureLLMCutPrices(ctx, branchID, result.Cuts); err != nil {
+		s.pubLogger.Warn("generateAdvice: 写 LLM 单价缓存失败(不影响分割建议)",
+			"pig_id", pigID, "err", err)
+	}
 	// ⚠️ 写回用**不带超时的** ctx:上面那个可能刚好到期,
 	//   写回是短操作,不该被 LLM 的超时连累(2026-10-26 就是这么丢的)。
 	writeCtx := context.WithoutCancel(ctx)

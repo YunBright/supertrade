@@ -12,6 +12,7 @@
 // # 特价分摊
 //
 // 特价(promo)是**部位级**的桶 ⇒ 分摊依据(各部位账面缺口)也用部位行算:
+//
 //	gap_c = 期初_c + 入库_c − 正常销量_c − 统收_c − 报损_c − 期末_c
 package service
 
@@ -44,19 +45,46 @@ func promoRowsOf(cutRows []CutDailyCost) []SkuDailyCost {
 	out := make([]SkuDailyCost, 0, len(cutRows))
 	for _, r := range cutRows {
 		out = append(out, SkuDailyCost{
-			CutType:      r.CutType,
-			OpeningKg:    r.OpeningKg,
-			ProducedKg:   r.ProducedKg,
-			SoldKg:       r.SoldKg,
-			SoldAmount:   r.SoldAmount,
-			BulkSoldKg:   r.BulkSoldKg,
-			WasteKg:      r.WasteKg,
-			ClosingKg:    r.ClosingKg,
-			RevenueYuan:  r.RevenueYuan,
-			DataSource:   r.DataSource,
+			CutType:     r.CutType,
+			OpeningKg:   r.OpeningKg,
+			ProducedKg:  r.ProducedKg,
+			SoldKg:      r.SoldKg,
+			SoldAmount:  r.SoldAmount,
+			BulkSoldKg:  r.BulkSoldKg,
+			WasteKg:     r.WasteKg,
+			ClosingKg:   r.ClosingKg,
+			RevenueYuan: r.RevenueYuan,
+			DataSource:  r.DataSource,
 		})
 	}
 	return out
+}
+
+// cutRollupMid 是部位行装配的**中间量**:
+// 除了对外字段,还留着"算日终剩余 / 售罄率 / 建议毛利"要用的原始数。
+//
+// ⚠️ 为什么要有中间层:这三项都要**跨部位**才算得出
+//
+//	(日终剩余金额要按部位折算进货单价,全店兜底价要等所有部位算完才知道)
+//	⇒ 不能在"造行"的循环里一次算完 ⇒ 先攒中间量,再回填。
+type cutRollupMid struct {
+	row PerCutGrossMargin
+	src CutDailyCost
+	// revenue 是**分摊完特价之后**的营收(零售 + 统收 + 分摊进来的特价)。
+	revenue decimal.Decimal
+	// soldKg 是**零售销量**(含分摊进来的特价);bulkKg 是统收销量。
+	soldKg decimal.Decimal
+	bulkKg decimal.Decimal
+	// salesCost / bulkCost / wasteCost / giftCost 与实际毛利**逐项平行**。
+	salesCost decimal.Decimal
+	bulkCost  decimal.Decimal
+	wasteCost decimal.Decimal
+	giftCost  decimal.Decimal
+	gm        decimal.Decimal
+	// gmBase 是毛利率的分母(营收 + 预售预期收入)。
+	gmBase decimal.Decimal
+	// presaleMargin 是预售结转的重估收益(实际毛利里含它)。
+	presaleMargin decimal.Decimal
 }
 
 // rollUpPerCutCuts 把**部位行**装配成对外的部位明细 + 全店合计。
@@ -65,25 +93,77 @@ func promoRowsOf(cutRows []CutDailyCost) []SkuDailyCost {
 //   - **分摊成功** ⇒ 部位行加上分摊进来的特价 kg/金额/成本,
 //     且**不再单列 promo 桶**(否则同一笔收入被算两次);
 //   - **分摊失败** ⇒ promo 桶原样保留(金额重量仍然可见,只是没分到部位)。
+//
+// # 三步(2026-10-31 owner 口径)
+//
+//	① 部位行 + 全店合计(账:移动加权链出来的实际毛利)
+//	② 日终剩余(kg/金额) + 售罄率(用**猪肉台日终盘点**,不用进货量)
+//	③ 建议毛利 / 建议毛利率(用**建议成本单价**重算一遍成本)
 func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation) ([]PerCutGrossMargin, TotalGrossMargin) {
-	allocByCut := promoAllocByCut(promoAlloc)
-	allocated := promoAlloc != nil && !promoAlloc.IsEstimated && len(promoAlloc.Allocated) > 0
+	mids := buildCutRollupMids(cutRows, promoAlloc)
 
-	perCut := make([]PerCutGrossMargin, 0, len(cutRows))
 	var tot TotalGrossMargin
-	// ---- 短卖(2026-10-30)----
-	//
-	// ⚠️ **先单独累加**:promo 桶在下面会被 `continue` 跳过
-	//   (特价已分摊到各部位 ⇒ 不能再单列)⇒ 若在循环里累加,会漏掉它那部分短卖。
-	var shortSellKg, carriedShortSellKg decimal.Decimal
+	tot.RevenueYuan = sumMid(mids, func(m cutRollupMid) decimal.Decimal { return m.revenue })
+	tot.SalesCostYuan = sumMid(mids, func(m cutRollupMid) decimal.Decimal { return m.salesCost })
+	tot.BulkCostYuan = sumMid(mids, func(m cutRollupMid) decimal.Decimal { return m.bulkCost })
+	tot.WasteCostYuan = sumMid(mids, func(m cutRollupMid) decimal.Decimal { return m.wasteCost })
+	tot.GiftCostYuan = sumMid(mids, func(m cutRollupMid) decimal.Decimal { return m.giftCost })
+	tot.GrossMarginYuan = sumMid(mids, func(m cutRollupMid) decimal.Decimal { return m.gm })
+	tot.PresaleMarginYuan = sumMid(mids, func(m cutRollupMid) decimal.Decimal { return m.presaleMargin })
+	tot.PresaleExpectedRevenueYuan = sumMid(mids, func(m cutRollupMid) decimal.Decimal {
+		return m.src.PresaleExpectedRevenueYuan
+	})
+	if !tot.RevenueYuan.Add(tot.PresaleExpectedRevenueYuan).IsZero() {
+		f, _ := tot.GrossMarginYuan.Mul(decimal.NewFromInt(100)).
+			Div(tot.RevenueYuan.Add(tot.PresaleExpectedRevenueYuan)).Float64()
+		tot.GrossMarginPct = f
+	}
+
+	// ② 日终剩余 + 售罄率;③ 建议毛利。两步都要**跨部位**算 ⇒ 放循环之后。
+	applyDayEndRemain(mids, &tot)
+	applySuggestedMargin(mids, &tot)
+
+	// ---- 短卖(2026-10-30):全店合计 ----
+	var shortSellKg decimal.Decimal
 	for _, r := range cutRows {
 		shortSellKg = shortSellKg.Add(r.ShortSellKg)
-		carriedShortSellKg = carriedShortSellKg.Add(r.CarriedShortSellKg)
 	}
 	// 累计短卖是**每天一个值**(所有部位行相同)⇒ 取一个代表值即可。
+	carriedShortSellKg := decimal.Zero
 	if len(cutRows) > 0 {
 		carriedShortSellKg = cutRows[0].CarriedShortSellKg
 	}
+	tot.ShortSellKg = shortSellKg
+	tot.CarriedShortSellKg = carriedShortSellKg
+	tot.ShortSell = shortSellKg.IsPositive()
+
+	perCut := make([]PerCutGrossMargin, 0, len(mids))
+	for _, m := range mids {
+		perCut = append(perCut, m.row)
+	}
+	sortPerCut(perCut)
+	return perCut, tot
+}
+
+// sumMid 把中间量的某个字段加总(decimal 求和的通用小工具)。
+func sumMid(mids []cutRollupMid, pick func(cutRollupMid) decimal.Decimal) decimal.Decimal {
+	var out decimal.Decimal
+	for _, m := range mids {
+		out = out.Add(pick(m))
+	}
+	return out
+}
+
+// buildCutRollupMids 造出部位行的中间量(账:实际毛利那一套)。
+//
+// ⚠️ **短卖要在这里单独累加**:promo 桶会被 `continue` 跳过
+//
+//	(特价已分摊到各部位 ⇒ 不能再单列)⇒ 若在循环里累加,会漏掉它那部分短卖。
+func buildCutRollupMids(cutRows []CutDailyCost, promoAlloc *PromoAllocation) []cutRollupMid {
+	allocByCut := promoAllocByCut(promoAlloc)
+	allocated := promoAlloc != nil && !promoAlloc.IsEstimated && len(promoAlloc.Allocated) > 0
+
+	mids := make([]cutRollupMid, 0, len(cutRows))
 	for _, r := range cutRows {
 		if allocated && r.CutType == model.CutPromo {
 			// 已分摊到各部位 ⇒ 这里不再计(否则重复)。
@@ -104,8 +184,8 @@ func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation) ([]Pe
 		}
 		// 毛利 = 收入 − 销售成本 − 统收成本 − 报损成本 − **搭赠成本** + 预期毛利(预售结转的重估)
 		gm := revenue.Sub(salesCost).Sub(bulkCost).Sub(wasteCost).Sub(giftCost).Add(r.PresaleMarginYuan)
-		var gmPct float64
 		gmBase := revenue.Add(r.PresaleExpectedRevenueYuan)
+		var gmPct float64
 		if !gmBase.IsZero() {
 			f, _ := gm.Mul(decimal.NewFromInt(100)).Div(gmBase).Float64()
 			gmPct = f
@@ -159,6 +239,10 @@ func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation) ([]Pe
 			CounterLoadKg:          r.CounterLoadKg,
 			SuggestedUnitCostYuan:  r.SuggestedUnitCostYuan,
 			ActualAvgUnitPriceYuan: r.ActualAvgUnitPriceYuan,
+			// ---- 成本单价(2026-10-31:基线单价 + 实际销售成本÷销量)----
+			SuggestedCostUnitPriceYuan: r.SuggestedCostUnitPriceYuan,
+			SuggestedCostPriceSource:   r.SuggestedCostPriceSource,
+			ActualCostUnitPriceYuan:    r.ActualCostUnitPriceYuan,
 			// ---- 短卖(2026-10-30)----
 			// ⚠️ 这是**分部位的账面不足**(只作提示,不进链);
 			//   "这天真短卖"看的是全店合计的 Total.ShortSellKg。
@@ -175,28 +259,22 @@ func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation) ([]Pe
 			row.ActualRemainKg = &actual
 			row.VarianceKg = &variance
 		}
-		perCut = append(perCut, row)
-
-		tot.RevenueYuan = tot.RevenueYuan.Add(revenue)
-		tot.SalesCostYuan = tot.SalesCostYuan.Add(salesCost)
-		tot.BulkCostYuan = tot.BulkCostYuan.Add(bulkCost)
-		tot.WasteCostYuan = tot.WasteCostYuan.Add(wasteCost)
-		tot.GiftCostYuan = tot.GiftCostYuan.Add(giftCost)
-		tot.GrossMarginYuan = tot.GrossMarginYuan.Add(gm)
-		tot.PresaleMarginYuan = tot.PresaleMarginYuan.Add(r.PresaleMarginYuan)
-		tot.PresaleExpectedRevenueYuan = tot.PresaleExpectedRevenueYuan.Add(r.PresaleExpectedRevenueYuan)
+		mids = append(mids, cutRollupMid{
+			row:           row,
+			src:           r,
+			revenue:       revenue,
+			soldKg:        soldKg,
+			bulkKg:        r.BulkSoldKg,
+			salesCost:     salesCost,
+			bulkCost:      bulkCost,
+			wasteCost:     wasteCost,
+			giftCost:      giftCost,
+			gm:            gm,
+			gmBase:        gmBase,
+			presaleMargin: r.PresaleMarginYuan,
+		})
 	}
-	if !tot.RevenueYuan.Add(tot.PresaleExpectedRevenueYuan).IsZero() {
-		f, _ := tot.GrossMarginYuan.Mul(decimal.NewFromInt(100)).
-			Div(tot.RevenueYuan.Add(tot.PresaleExpectedRevenueYuan)).Float64()
-		tot.GrossMarginPct = f
-	}
-	// ---- 短卖(2026-10-30):全店合计 ----
-	tot.ShortSellKg = shortSellKg
-	tot.CarriedShortSellKg = carriedShortSellKg
-	tot.ShortSell = shortSellKg.IsPositive()
-	sortPerCut(perCut)
-	return perCut, tot
+	return mids
 }
 
 // sortedCutKeys 把部位集合按字典序排出来(告警顺序稳定 ⇒ 门店每次看到一样的顺序)。
@@ -214,8 +292,9 @@ func sortedCutKeys(m map[string]decimal.Decimal) []string {
 // # ① 负库存(红字)
 //
 // ⚠️ 旧实现按 SKU 判(`r.CounterKg` / `r.ColdStoreKg`),而位置表是 **SKU 级**、
-//   日终结余快照是 **部位级** ⇒ 旧实现拿**两种粒度**比较 ⇒ 告警本身就是错的。
-//   ⇒ 现在两边都聚到**部位**再比。
+//
+//	日终结余快照是 **部位级** ⇒ 旧实现拿**两种粒度**比较 ⇒ 告警本身就是错的。
+//	⇒ 现在两边都聚到**部位**再比。
 //
 // # ② 余额与按营业日推导不一致(黄字)
 func (s *Service) buildCutMarginAlerts(ctx context.Context, branchID string, day time.Time,
@@ -256,8 +335,8 @@ func (s *Service) buildCutMarginAlerts(ctx context.Context, branchID string, day
 	for _, r := range cutRows {
 		if r.ExpectedClosingKg.IsNegative() {
 			out = append(out, MarginAlert{
-				Level:   MarginAlertLevelError,
-				Code:    MarginAlertNegativeInventory,
+				Level: MarginAlertLevelError,
+				Code:  MarginAlertNegativeInventory,
 				// ⚠️ 文案必须说清"**已经计了成本**"(2026-10-27 改):
 				//   旧口径把负数裁 0 ⇒ 卖超的部分**零成本** ⇒ 毛利虚高。
 				//   新口径负数不裁 ⇒ 短卖那部分**照摊当期移动加权成本** ⇒ 毛利不再虚高。
@@ -344,8 +423,8 @@ func (s *Service) buildCutMarginAlerts(ctx context.Context, branchID string, day
 			continue
 		}
 		out = append(out, MarginAlert{
-			Level:   MarginAlertLevelWarning,
-			Code:    MarginAlertBalanceMismatch,
+			Level: MarginAlertLevelWarning,
+			Code:  MarginAlertBalanceMismatch,
 			Message: fmt.Sprintf("%s 当前余额 %s kg 与按营业日推导的结余 %s kg 不一致(差 %s kg)",
 				cut, live.String(), derived.String(), diff.String()),
 			CubeProductID: cut,

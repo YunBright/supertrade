@@ -122,6 +122,14 @@ func initApp() error {
 		//   ⇒ 漏登记 ⇒ 盘点提交时写估计样本会报 "relation pig_cut_estimates does not exist"。
 		&model.PigCutEstimate{},
 		&model.PigForecastBaselineBorrow{},
+		// 2026-10-31:分割基线的**单价**通道(owner:「分割基线加入单价」)。
+		//
+		// ⚠️ 三张都是**新表** ⇒ 生产上第一次部署时由 AutoMigrate 建
+		// ⇒ 漏登记 ⇒ 第一次写单价样本就报
+		//   "relation pig_cut_price_samples does not exist" ⇒ **上线即炸**。
+		&model.PigCutPriceSample{},
+		&model.PigCutPriceBaseline{},
+		&model.CutUnitPriceCache{},
 	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
 	}

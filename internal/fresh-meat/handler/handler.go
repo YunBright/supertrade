@@ -191,6 +191,22 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	//   (404 会让人以为是 URL 写错了 ⇒ 410 + 说明才是"这条语义被换掉了")。
 	r.POST("/forecast-baselines/generate", requireBranch, h.GenerateForecastBaselines)
 
+	// ---- 单价通道(2026-10-31 owner:「分割基线加入单价」)----
+	//
+	// 与重量通道**同构**:样本库是一等公民,基线是派生结果。
+	// GET —— 列单价基线(店 × 部位)。
+	r.GET("/forecast-price-baselines", requireBranch, h.ListForecastPriceBaselines)
+	// POST —— 从单价日样本重算单价基线。
+	r.POST("/forecast-price-baselines/recompute", requireBranch, h.RecomputeForecastPriceBaselines)
+	// GET —— 列单价日样本(店 × 日 × 部位)。
+	r.GET("/forecast-price-samples", requireBranch, h.ListForecastPriceSamples)
+	// POST —— **按一天采集**单价样本(跑那天的引擎落样本;不自动重算)。
+	r.POST("/forecast-price-samples/collect", requireBranch, h.CollectForecastPriceSamples)
+	// DELETE —— 删除单价样本(打墓碑,不物理删):?date=&cut_type=
+	r.DELETE("/forecast-price-samples", requireBranch, h.DeleteForecastPriceSample)
+	// POST —— 退取链③:让 AI 重新给某个部位的进货单价(写进缓存,之后退取链②就能命中)。
+	r.POST("/cut-unit-prices/refresh", requireBranch, h.RefreshCutUnitPrice)
+
 	// 跨门店选用基线的配置(本店借用别店的基线)
 	r.GET("/forecast-baseline-borrows", requireBranch, h.ListForecastBaselineBorrows)
 	r.POST("/forecast-baseline-borrows", requireBranch, h.UpsertForecastBaselineBorrow)
@@ -1369,6 +1385,142 @@ func (h *Handler) GenerateForecastBaselines(c *gin.Context) {
 	}
 	writeError(c, http.StatusGone, "endpoint_removed",
 		"「按一天生成基线」已下线：请改用「按一天加入样本」(POST /forecast-samples/collect) + 「重算」(POST /forecast-baselines/recompute)")
+}
+
+// ---- 单价通道(2026-10-31 owner:「分割基线加入单价」)----
+
+// ListForecastPriceBaselines GET /forecast-price-baselines
+//
+// 列**单价基线**(店 × 部位)。
+//
+// ⚠️ 列表端点统一返**对象**(前端 `_expectMap` 统一解析)。
+func (h *Handler) ListForecastPriceBaselines(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	out, err := h.svc.ListForecastPriceBaselines(c.Request.Context(), branchID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"baselines": out})
+}
+
+// RecomputeForecastPriceBaselines POST /forecast-price-baselines/recompute
+//
+// 从**单价日样本**重算单价基线(覆盖所有部位)。
+func (h *Handler) RecomputeForecastPriceBaselines(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	n, err := h.svc.RecomputeCutPriceBaselines(c.Request.Context(), branchID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"baselines": n})
+}
+
+// ListForecastPriceSamples GET /forecast-price-samples?date=
+//
+// 列**单价日样本**(店 × 日 × 部位)。
+func (h *Handler) ListForecastPriceSamples(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	out, err := h.svc.ListForecastPriceSamples(c.Request.Context(), branchID, c.Query("date"))
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"samples": out})
+}
+
+// CollectForecastPriceSamples POST /forecast-price-samples/collect
+//
+// 「按一天采集单价样本」:入参 {"date":"2026-10-29"}
+//
+// ⚠️ **不自动重算** —— 重算是另一个明确动作(与重量样本同口径)。
+func (h *Handler) CollectForecastPriceSamples(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	var in struct {
+		Date string `json:"date"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
+		return
+	}
+	res, err := h.svc.CollectCutPriceSamplesForDay(c.Request.Context(), branchID, in.Date)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, res)
+}
+
+// DeleteForecastPriceSample DELETE /forecast-price-samples?date=&cut_type=
+//
+// 删除不准确的单价样本(**打墓碑**,不物理删 —— 物理删会被引擎重跑复活)。
+func (h *Handler) DeleteForecastPriceSample(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	date := strings.TrimSpace(c.Query("date"))
+	cut := model.CutType(strings.TrimSpace(c.Query("cut_type")))
+	if !cut.Valid() {
+		writeError(c, http.StatusBadRequest, "invalid_cut_type",
+			"cut_type 必填且必须在枚举内")
+		return
+	}
+	n, err := h.svc.DeleteCutPriceSample(c.Request.Context(), branchID, date, cut)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"deleted":   n,
+		"date":      date,
+		"cut_type":  string(cut),
+		"branch_id": branchID,
+	})
+}
+
+// RefreshCutUnitPrice POST /cut-unit-prices/refresh
+//
+// 退取链③:让 AI **重新给**某个部位的进货单价(写进缓存,之后退取链②就能命中)。
+//
+// 入参 {"cut_type":"liver"}
+//
+// ⚠️ 这一步要调 LLM(10~30s)⇒ 只在**门店主动触发**时跑,
+//   绝不放进报表路径(会把毛利看板拖到超时)。
+func (h *Handler) RefreshCutUnitPrice(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	var in struct {
+		CutType model.CutType `json:"cut_type"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
+		return
+	}
+	price, err := h.svc.RefreshCutUnitPriceFromLLM(c.Request.Context(), branchID, in.CutType)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"cut_type":       string(in.CutType),
+		"unit_price_yuan": price,
+	})
 }
 
 // ListForecastSamples GET /forecast-samples?date=&weight_band=&include_excluded=

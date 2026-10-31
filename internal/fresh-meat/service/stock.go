@@ -777,6 +777,17 @@ func (s *Service) persistCutCostDaily(ctx context.Context, branchID string, day 
 		s.pubLogger.Warn("persistCutCostDaily: 估计样本重建失败(不影响成本快照)",
 			"branch_id", branchID, "biz_date", bizKey, "err", estErr)
 	}
+	// ---- 单价日样本(2026-10-31 owner:「分割基线加入单价」)----
+	//
+	// 这一天算完了 ⇒ 当日的**整体毛利率**与各部位的**零售单价**都定了
+	// ⇒ 倒推出的**部位进货单价**落库 ⇒ 之后「重算单价基线」就能用它。
+	//
+	// ⚠️ **失败不阻断**:单价样本只是"喂基线"的材料
+	//   ⇒ 挂了就挂了(下次重算/物化时再补)⇒ 不能让盘点提交整个失败。
+	if _, priceErr := s.CollectCutPriceSamples(ctx, branchID, day, rows); priceErr != nil {
+		s.pubLogger.Warn("persistCutCostDaily: 单价样本采集失败(不影响成本快照)",
+			"branch_id", branchID, "biz_date", bizKey, "err", priceErr)
+	}
 	return len(rows), nil
 }
 

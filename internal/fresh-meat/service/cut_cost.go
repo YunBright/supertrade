@@ -177,6 +177,31 @@ type CutDailyCost struct {
 	// 口径 = (期初金额 + 今日入库金额按**建议**比例摊到的部分) ÷ (期初kg + 建议分割kg)
 	// ⚠️ nil = **没有建议分割**(当天没进猪 ⇒ Σ建议=0)⇒ 前端显示「—」,不显示 0。
 	SuggestedUnitCostYuan *decimal.Decimal
+	// SuggestedCostUnitPriceYuan 是**建议成本单价**(元/kg)——
+	// 「按**单价基线**切出来的这刀货,每个部位应该值多少钱」。
+	//
+	// ⚠️ 口径(2026-10-31 owner:「分割基线加入单价」):
+	//
+	//	单价基线(部位进货单价) × (这头猪的进价 ÷ 基线的参考猪进价)
+	//	⇒ 基线是 14.6/kg 的猪、今天这头是 16/kg ⇒ 各部位单价按比例上涨。
+	//
+	// ⚠️ **与 [SuggestedUnitCostYuan] 不是一回事**:
+	//	后者是"按建议分割摊出来的**移动加权**成本单价(含期初)";
+	//	前者是"基线算出来的**部位进货单价**"(owner 要的新列)。
+	//
+	// ⚠️ nil = 这个部位**取不到价**(没有基线 / 整店均价 / LLM 缓存都没有)
+	//   ⇒ 前端显示「—」(不是 0)。
+	SuggestedCostUnitPriceYuan *decimal.Decimal
+	// SuggestedCostPriceSource 是建议成本单价的**来源**
+	// (baseline | store_avg | llm_cache | none)—— 门店要看得见这个价怎么来的。
+	SuggestedCostPriceSource string
+	// ActualCostUnitPriceYuan 是**实际成本单价**(元/kg)= 销售成本 ÷ 销量。
+	//
+	// ⚠️ 分母用**总销量**(零售 + 统收)⇒ 与「零售单价」同一分母
+	//   ⇒ 门店能自己验算:成本单价 × 销量 = 销售成本。
+	//
+	// ⚠️ nil = 当天这个部位**没卖**⇒ 前端显示「—」。
+	ActualCostUnitPriceYuan *decimal.Decimal
 	// ActualAvgUnitPriceYuan 是**实际均价**(元/kg)—— 当日这个部位**实际卖出**的平均单价。
 	//
 	// 口径 = 营收 ÷ 销量(零售来自思迅日汇总表 t_rm_daysum;统收是本地登记,一并计入)
@@ -826,6 +851,30 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 		return nil, nil, nil, nil, err
 	}
 
+	// ---- 8b-2. 建议成本单价(2026-10-31 owner:「分割基线加入单价」)----
+	//
+	// ⚠️ **逐猪**算:每头猪的进价不同 ⇒ 各部位的单价要按比例缩放
+	//   (owner:「基线是 14.6/kg 的,那 16/kg 的猪每个部位单价都要按比例上涨」)
+	//   ⇒ 再按**建议分割 kg** 加权汇总成部位口径。
+	//
+	// ⚠️ 单价基线只用**该营业日之前**的日样本 ⇒ 今天的建议不依赖今天的链
+	//   ⇒ 结构性断环(见 forecast_price.go 的包注释)。
+	//
+	// ⚠️ 取不到价的部位**不出现在结果里** ⇒ 报表显示「—」(不是 0)。
+	suggestedCostUnit, suggestedCostSource, err := s.suggestedCutUnitPrices(ctx, branchID, pigs,
+		split.SuggestedPerPig, bizDate)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	suggestedCostUnitPtr := map[string]*decimal.Decimal{}
+	for c, v := range suggestedCostUnit {
+		if !v.IsPositive() {
+			continue
+		}
+		val := v
+		suggestedCostUnitPtr[c] = &val
+	}
+
 	// ---- 8c. 入库量/入库金额按 W 重算 ----
 	//
 	// ⚠ ΣW == 0(没有建议分割)⇒ 完全不接管 ⇒ 与今天逐字一致(见 applySplitWeights)。
@@ -1096,6 +1145,16 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 			v := revenue.Div(soldTotalKg)
 			actualAvgUnitPrice = &v
 		}
+		// ④ 实际成本单价(元/kg)= 销售成本 ÷ 总销量(零售 + 统收)。
+		//
+		//	⚠️ 分母与「零售单价」一致 ⇒ 门店能自己验算:
+		//	  零售单价 × 销量 = 营收;成本单价 × 销量 = 销售成本。
+		//	⚠️ nil = 当天这个部位**没卖**⇒ 前端显示「—」(不是 0)。
+		var actualCostUnit *decimal.Decimal
+		if soldTotalKg.IsPositive() {
+			v := salesCost.Div(soldTotalKg)
+			actualCostUnit = &v
+		}
 		out = append(out, CutDailyCost{
 			BranchID:       branchID,
 			CutType:        cut,
@@ -1143,7 +1202,11 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 			CounterLoadKg:          counterLoadKg,
 			SuggestedUnitCostYuan:  suggestedUnitCost,
 			ActualAvgUnitPriceYuan: actualAvgUnitPrice,
-			SplitWeightNote:        split.Note,
+			// ---- 2026-10-31:成本单价(建议 = 单价基线;实际 = 销售成本÷销量)----
+			SuggestedCostUnitPriceYuan: suggestedCostUnitPtr[c],
+			SuggestedCostPriceSource:   suggestedCostSource[c],
+			ActualCostUnitPriceYuan:    actualCostUnit,
+			SplitWeightNote:            split.Note,
 			// ---- 短卖(2026-10-30)----
 			CutShortSellKg:     cutShortSellKg,
 			CarriedShortSellKg: carriedShortSellKg,

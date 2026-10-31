@@ -88,3 +88,47 @@ func ProducedBySkuForTest(ctx context.Context, s *Service, branchID string,
 ) {
 	return s.computeProducedBySku(ctx, branchID, start, end, pigs, pigCost)
 }
+
+// SuggestedCutUnitPricesForTest 暴露 [suggestedCutUnitPrices](建议成本单价 + 来源)。
+//
+// ⚠️ 为什么值得单独暴露:「基线单价 × 单猪进价缩放 + 封顶 + 退取链」这条链
+//
+//	**只在这里**发生 ⇒ 不导出就没法从外部测试包锁它
+//	⇒ owner 给的两条边界(各部位合计价值 ≤ 猪总进货金额)会被静默破坏。
+func SuggestedCutUnitPricesForTest(ctx context.Context, s *Service, branchID string,
+	pigs []model.WholePig, splitPerPig map[string]map[string]decimal.Decimal, bizDate time.Time) (
+	unit map[string]decimal.Decimal, source map[string]string, err error,
+) {
+	return s.suggestedCutUnitPrices(ctx, branchID, pigs, splitPerPig, bizDate)
+}
+
+// PriceMarginRateOfRowsForTest 暴露 [priceMarginRateOfRows](整体毛利率 + 是否可用于倒推)。
+//
+// ⚠️ 为什么值得单独暴露:「毛利率越界 ⇒ 整天不产样本」这条判定
+//
+//	在端到端场景里很难构造(引擎给的毛利率通常正常)⇒ 直接锁判据更可靠。
+func PriceMarginRateOfRowsForTest(rows []CutDailyCost) (decimal.Decimal, bool) {
+	return priceMarginRateOfRows(rows)
+}
+
+// CollectCutPriceSamplesForTest 暴露 [CollectCutPriceSamples](采集单价日样本)。
+//
+// ⚠️ 为什么值得单独暴露:倒推口径(零售价 × (1 − 毛利率))与
+//
+//	「没有销售记录的部位不产样本」这两条**只在采集时**发生。
+func CollectCutPriceSamplesForTest(ctx context.Context, s *Service, branchID string, day time.Time,
+	rows []CutDailyCost) (*CutPriceSampleResult, error) {
+	return s.CollectCutPriceSamples(ctx, branchID, day, rows)
+}
+
+// RollUpPerCutCutsForTest 暴露 [rollUpPerCutCuts](部位行装配)。
+//
+// ⚠️ 为什么值得单独暴露:「日终剩余 / 售罄率 / 建议毛利」三项
+//
+//	**全部**在这个函数里算出来(它们要跨部位才算得出)
+//	⇒ 不导出就没法从外部测试包锁它们的口径。
+func RollUpPerCutCutsForTest(rows []CutDailyCost, promoAlloc *PromoAllocation) (
+	[]PerCutGrossMargin, TotalGrossMargin,
+) {
+	return rollUpPerCutCuts(rows, promoAlloc)
+}

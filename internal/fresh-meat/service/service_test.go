@@ -116,6 +116,10 @@ func setupTestServiceMode(t *testing.T, syncAdvice bool) (*service.Service, *rec
 		// 2026-10-30:分割基线的估计样本(A 方案)+ 跨门店选用预留表。
 		&model.PigCutEstimate{},
 		&model.PigForecastBaselineBorrow{},
+		// 2026-10-31:分割基线的**单价**通道(日样本 + 单价基线 + LLM 单价缓存)。
+		&model.PigCutPriceSample{},
+		&model.PigCutPriceBaseline{},
+		&model.CutUnitPriceCache{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
