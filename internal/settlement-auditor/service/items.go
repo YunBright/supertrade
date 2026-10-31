@@ -64,19 +64,21 @@ const (
 	//
 	// 2026-10-30 用户口径：门店实际还会付运费、肉类加工费、设备维护费、
 	// 耗材、招待费、燃气费、福利 ⇒ 一并进下拉,避免店长全填「其它」。
-	PaymentTypeUtility         = "水电费"
-	PaymentTypeRent            = "租金"
-	PaymentTypeProperty        = "物业费"
-	PaymentTypeTrash           = "垃圾处理费"
-	PaymentTypeSoftware        = "软件服务费"
-	PaymentTypeFreight         = "运费"
-	PaymentTypeMeatProcessing  = "肉类加工费"
+	// 2026-10-31 追加「电信费」(宽带/电话/流量)。
+	PaymentTypeUtility          = "水电费"
+	PaymentTypeRent             = "租金"
+	PaymentTypeProperty         = "物业费"
+	PaymentTypeTrash            = "垃圾处理费"
+	PaymentTypeSoftware         = "软件服务费"
+	PaymentTypeFreight          = "运费"
+	PaymentTypeMeatProcessing   = "肉类加工费"
 	PaymentTypeEquipMaintenance = "设备维护费"
-	PaymentTypeConsumable      = "耗材"
-	PaymentTypeEntertainment   = "招待费"
-	PaymentTypeGas             = "燃气费"
-	PaymentTypeWelfare         = "福利"
-	PaymentTypeOther           = "其它"
+	PaymentTypeConsumable       = "耗材"
+	PaymentTypeEntertainment    = "招待费"
+	PaymentTypeGas              = "燃气费"
+	PaymentTypeTelecom          = "电信费"
+	PaymentTypeWelfare          = "福利"
+	PaymentTypeOther            = "其它"
 )
 
 // ReceiptTypeOptions 是收款项下拉选项（前端同款，改这里要同步改前端）。
@@ -93,7 +95,7 @@ func PaymentTypeOptions() []string {
 		PaymentTypeUtility, PaymentTypeRent, PaymentTypeProperty,
 		PaymentTypeTrash, PaymentTypeSoftware,
 		PaymentTypeFreight, PaymentTypeMeatProcessing, PaymentTypeEquipMaintenance,
-		PaymentTypeConsumable, PaymentTypeEntertainment, PaymentTypeGas, PaymentTypeWelfare,
+		PaymentTypeConsumable, PaymentTypeEntertainment, PaymentTypeGas, PaymentTypeTelecom, PaymentTypeWelfare,
 		PaymentTypeOther,
 	}
 }
@@ -164,10 +166,10 @@ type ItemTotals struct {
 // computeTotals 汇总三笔账并算出应付金额。
 func computeTotals(goods, payment, receipt decimal.Decimal) ItemTotals {
 	t := ItemTotals{
-		GoodsTotalYuan:    goods,
-		PaymentTotalYuan:  payment,
-		ReceiptTotalYuan:  receipt,
-		NetYuan:           goods.Add(payment).Sub(receipt),
+		GoodsTotalYuan:   goods,
+		PaymentTotalYuan: payment,
+		ReceiptTotalYuan: receipt,
+		NetYuan:          goods.Add(payment).Sub(receipt),
 	}
 	if t.NetYuan.GreaterThan(decimal.Zero) {
 		t.PayableYuan = t.NetYuan
