@@ -288,6 +288,16 @@ type PerCutGrossMargin struct {
 	//
 	// ⚠️ 同上:原来报损的成本**凭空消失**(不进损益)⇒ 报损不体现为损失。
 	WasteCostYuan    decimal.Decimal `json:"waste_cost_yuan"`
+	// GiftKg 是**搭赠**的量(kg)—— 2026-10-31 owner 拍板。
+	//
+	// ⚠️ 搭赠 = 买肉送猪肝这类「有成本、无收入」的出库(**没过称、没过账**):
+	//	它是链上的**第四个出口** ⇒ 不记它,账上就成了"盘亏/短卖"。
+	GiftKg decimal.Decimal `json:"gift_kg"`
+	// GiftCostYuan 是**搭赠成本**(元)。
+	//
+	// ⚠️ 它**不在** SalesCostYuan 里(销售成本只含"真卖掉的货"的成本)
+	//	⇒ 毛利 = 营收 − 销售成本 − 统收成本 − 报损成本 − **搭赠成本**。
+	GiftCostYuan      decimal.Decimal `json:"gift_cost_yuan"`
 	GrossMarginYuan   decimal.Decimal `json:"gross_margin_yuan"`
 	GrossMarginPct    float64         `json:"gross_margin_pct"`
 	// CostIncomplete = true ⇒ 该部位当天**成本算不出来**
@@ -315,6 +325,8 @@ type TotalGrossMargin struct {
 	// BulkCostYuan / WasteCostYuan 与部位行同义(统收成本 / 报损成本)。
 	BulkCostYuan     decimal.Decimal `json:"bulk_cost_yuan"`
 	WasteCostYuan    decimal.Decimal `json:"waste_cost_yuan"`
+	// GiftCostYuan 是**搭赠成本**(元)—— 2026-10-31 owner 拍板(扣毛利、单列一行)。
+	GiftCostYuan      decimal.Decimal `json:"gift_cost_yuan"`
 	GrossMarginYuan  decimal.Decimal `json:"gross_margin_yuan"`
 	GrossMarginPct   float64         `json:"gross_margin_pct"`
 	// PresaleMarginYuan / PresaleExpectedRevenueYuan 与部位行同义(预期毛利结转)。

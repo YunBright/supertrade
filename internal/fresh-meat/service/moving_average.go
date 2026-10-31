@@ -113,7 +113,8 @@ type SkuDailyCost struct {
 
 // ReconciliationRow 成本对账行 —— **整猪/整店毛利准不准,一眼可判**。
 //
-// 恒等式:期初存货金额 + 本期入库金额 + **短卖金额** == 销售成本 + 统收成本 + 报损成本 + 期末存货金额
+// 恒等式:期初存货金额 + 本期入库金额 + **短卖金额** ==
+// 销售成本 + 统收成本 + 报损成本 + **搭赠成本** + 期末存货金额
 //
 // DiffYuan 是差额。正常应为 0;不为 0 说明有**未显式化**的损耗
 // (切分损耗 / 隔夜失重 / 盘亏),报表会把它们单列,而不是让它们凭空消失。
@@ -123,6 +124,11 @@ type ReconciliationRow struct {
 	SalesCostYuan            decimal.Decimal `json:"sales_cost_yuan"`
 	BulkCostYuan             decimal.Decimal `json:"bulk_cost_yuan"`
 	WasteCostYuan            decimal.Decimal `json:"waste_cost_yuan"`
+	// GiftCostYuan 是**搭赠成本**(元)—— 2026-10-31 owner 拍板。
+	//
+	// ⚠️ 它**不在** SalesCostYuan 里(销售成本只含"真卖掉的货"的成本)
+	//	⇒ 对账恒等式的**流出侧**要单独减掉它 ⇒ 差额才闭合。
+	GiftCostYuan            decimal.Decimal `json:"gift_cost_yuan"`
 	ClosingInventoryCostYuan decimal.Decimal `json:"closing_inventory_cost_yuan"`
 	// ShortSellKg 是本期**计入成本的**账面不足合计(kg)——
 	// = 各部位 max(0, 卖出+统收+报损 + 期末 − 可售量) 之和。
@@ -356,10 +362,15 @@ func (s *Service) pigTotalProducedKg(perPig map[string]decimal.Decimal) decimal.
 	return total
 }
 
-// loadSkuFlows 拉当日卖出 / 统收 / 报损,按 SKU 归集。
+// loadSkuFlows 拉当日卖出 / 统收 / 报损 / **搭赠**,按 SKU 归集。
 //
 // ⚠️ 报损**只回数量**,金额留到主循环里按当期移动加权单价算
 // (那时单价才是正确的 —— 报损货的成本就是当期的加权成本)。
+//
+// ⚠️ **搭赠(2026-10-31)单独一桶**:搭赠是「有成本、无收入」的出库
+// (买肉送猪肝这类**没过称、没过账**的)⇒ 它在链上是**第四个出口**,
+// 要单独一条成本线(搭赠成本)并扣毛利 ⇒ 不能混进报损。
+// 混进报损会污染「切分损耗 / 隔夜失重」的损耗统计。
 //
 // cutFromSales 是"从销售行反推的部位":**没有部位映射的 SKU**(如特价档)
 // 在 branch_cut_mappings 里查不到部位,但销售行自带 cut_type ⇒ 用它兜底,
@@ -382,7 +393,7 @@ func (s *Service) pigTotalProducedKg(perPig map[string]decimal.Decimal) decimal.
 // ⚠️ **统收(bulk)在有源门店拿不到**:cube 的 sales_report 只有零售货号维度,
 //   没有"大宗/统收"标记 ⇒ 有源门店的统收仍走本地手工登记(统收结算)。
 func (s *Service) loadSkuFlows(ctx context.Context, branchID string, startOfDay, endOfDay time.Time) (
-	soldKg, soldAmount, bulkKg, bulkAmount, wasteKg map[string]decimal.Decimal,
+	soldKg, soldAmount, bulkKg, bulkAmount, wasteKg, giftKg map[string]decimal.Decimal,
 	cutFromSales map[string]model.CutType, err error,
 ) {
 	soldKg = map[string]decimal.Decimal{}
@@ -390,6 +401,7 @@ func (s *Service) loadSkuFlows(ctx context.Context, branchID string, startOfDay,
 	bulkKg = map[string]decimal.Decimal{}
 	bulkAmount = map[string]decimal.Decimal{}
 	wasteKg = map[string]decimal.Decimal{}
+	giftKg = map[string]decimal.Decimal{}
 	cutFromSales = map[string]model.CutType{}
 
 	// ---- 销售:按数据源分流 ----
@@ -409,12 +421,12 @@ func (s *Service) loadSkuFlows(ctx context.Context, branchID string, startOfDay,
 	//   但它的统收/报损仍是**本地数据** ⇒ 统一走 cube 必然读不到。
 	useCube, err := s.salesReadPath(ctx, branchID)
 	if err != nil {
-		return nil, nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, nil, err
 	}
 	// ---- 零售 ----
 	if useCube {
 		if err := s.loadCubeSalesInto(ctx, branchID, startOfDay, soldKg, soldAmount, cutFromSales); err != nil {
-			return nil, nil, nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, nil, nil, err
 		}
 	}
 	// ---- 本地销售行(零售事件 + 统收)----
@@ -434,7 +446,7 @@ func (s *Service) loadSkuFlows(ctx context.Context, branchID string, startOfDay,
 	if err := s.db.WithContext(ctx).
 		Where("branch_id = ? AND "+s.fmSaleDateExpr(), branchID, dayKey).
 		Find(&sales).Error; err != nil {
-		return nil, nil, nil, nil, nil, nil, fmt.Errorf("query line_sales_by_pig: %w", err)
+		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("query line_sales_by_pig: %w", err)
 	}
 	for _, sa := range sales {
 		if sa.OrderStatus != "S" || sa.QtyKg.IsZero() || sa.QtyKg.IsNegative() {
@@ -467,16 +479,25 @@ func (s *Service) loadSkuFlows(ctx context.Context, branchID string, startOfDay,
 	if err := s.db.WithContext(ctx).
 		Where("branch_id = ? AND recorded_at >= ? AND recorded_at < ?", branchID, startOfDay, endOfDay).
 		Find(&wasteRows).Error; err != nil {
-		return nil, nil, nil, nil, nil, nil, fmt.Errorf("query waste_logs: %w", err)
+		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("query waste_logs: %w", err)
 	}
 	for _, w := range wasteRows {
 		sku := strings.TrimSpace(w.CubeProductID)
 		if sku == "" {
 			continue
 		}
+		// ⚠️ **报损与搭赠必须分开归集**(2026-10-31)。
+		//
+		//	搭赠是「有成本、无收入」的出库 ⇒ 它在链上是**第四个出口**,
+		//	要单独一条成本线(搭赠成本)并扣毛利。
+		//	⇒ 混进报损会污染损耗统计、也会让「报损」口径失真。
+		if w.WasteType == model.WasteTypeGift {
+			giftKg[sku] = giftKg[sku].Add(w.QtyKg)
+			continue
+		}
 		wasteKg[sku] = wasteKg[sku].Add(w.QtyKg)
 	}
-	return soldKg, soldAmount, bulkKg, bulkAmount, wasteKg, cutFromSales, nil
+	return soldKg, soldAmount, bulkKg, bulkAmount, wasteKg, giftKg, cutFromSales, nil
 }
 
 // salesReadPath 判定该门店的销售该走哪条路。

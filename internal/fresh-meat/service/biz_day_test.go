@@ -199,7 +199,7 @@ func TestBizDay_OpeningDateNeedsNoStocktake(t *testing.T) {
 	svc, ctx, _ := fmBizSetup(t)
 
 	// ⚠️ 先在 **09-30** 盘过一次(上线前最后一次盘)⇒ lastComplete = 09-30
-	//    ⇒ 没有豁免的话,录 10-02 的猪会报"10-01 未盘点"（门��的第一期就被挡住）。
+	//    ⇒ 没有豁免的话,录 10-02 的猪会报"10-01 未盘点"（门槛的第一期就被挡住）。
 	if _, err := svc.RecordPorkCutsStocktake(ctx, "S001", model.RecordPorkCutsStocktakeInput{
 		IsComplete: true,
 		TakenDate:  "2026-09-30",

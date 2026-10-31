@@ -208,8 +208,12 @@ func (s *Service) ComputePeriodMargin(ctx context.Context, branchID, from, to, g
 			cutOf[aggKey] = r.CutType
 			// 营收 = 零售 + 统收。
 			row.RevenueYuan = row.RevenueYuan.Add(r.RevenueYuan)
-			// 成本三块:销售 + 统收 + 报损(都在损益里)。
-			row.SalesCostYuan = row.SalesCostYuan.Add(r.SalesCostYuan).Add(r.BulkCostYuan).Add(r.WasteCostYuan)
+			// 成本四块:销售 + 统收 + 报损 + **搭赠**(都在损益里)。
+			//
+			// ⚠️ 搭赠(2026-10-31)也要进损益:它是「有成本、无收入」的出库
+			//	⇒ 不扣它 ⇒ 期间毛利会比每日毛利之和**偏高** ⇒ 长期毛利 = 每日毛利之和 这个不变量会破。
+			row.SalesCostYuan = row.SalesCostYuan.Add(r.SalesCostYuan).Add(r.BulkCostYuan).
+				Add(r.WasteCostYuan).Add(r.GiftCostYuan)
 			row.SoldKg = row.SoldKg.Add(r.SoldKg).Add(r.BulkSoldKg)
 			row.ProducedKg = row.ProducedKg.Add(r.ProducedKg)
 			row.OpeningKg = row.OpeningKg.Add(r.OpeningKg)

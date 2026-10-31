@@ -93,6 +93,10 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	// 报损
 	r.POST("/waste-logs", requireBranch, h.RecordWasteLog)
 
+	// **搭赠**(2026-10-31):买肉送猪肝这类「有成本、无收入、没过称」的出库。
+	// GET —— 列当天**疑似搭赠**的部位(倒推建议值,门店确认用)。
+	r.GET("/gift-suggestions", requireBranch, h.ListGiftSuggestions)
+
 	// 销售聚合
 	r.GET("/line-sales-by-pig", requireBranch, h.ListLineSalesByPig)
 
@@ -538,6 +542,33 @@ func (h *Handler) GetPorkCutsStocktake(c *gin.Context) {
 		return
 	}
 	out, err := h.svc.GetPorkCutsStocktake(c.Request.Context(), branchID, id)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ---- 搭赠(2026-10-31)----
+
+// ListGiftSuggestions GET /gift-suggestions?date=YYYY-MM-DD
+//
+// 列出当天**疑似搭赠**的部位:账面应有 − 实盘 > 0 的部分。
+//
+// ⚠️ 它是**建议**:缺口 = 搭赠 + 真盘亏 ⇒ 必须门店确认。
+//
+//	确认成搭赠 ⇒ POST /waste-logs(waste_type='gift')⇒ 缺口归零、不再提示。
+func (h *Handler) ListGiftSuggestions(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	day, err := h.parseDay(c.Query("date"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "bad_date", err.Error())
+		return
+	}
+	out, err := h.svc.ListGiftSuggestions(c.Request.Context(), branchID, day)
 	if err != nil {
 		mapErr(c, err)
 		return

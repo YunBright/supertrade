@@ -74,6 +74,17 @@ type dailyBalanceTerms struct {
 	bulkOut map[string]decimal.Decimal
 	// bulkIn 是**大宗手工进冷库** ⇒ +。
 	bulkIn map[string]decimal.Decimal
+	// giftOut 是**搭赠出库**(2026-10-31)⇒ −。
+	//
+	// ⚠️ 为什么搭赠要进**冷库链**(链是"店里还剩多少货"的物理账):
+	//	搭赠的货**真的离店了** ⇒ 冷库余额必须减
+	//	⇒ 不减 ⇒ 链上一直留着这批货 ⇒ **次日期初虚高** ⇒ 成本链被污染
+	//	  (那批送出去的货会一直"存在"店里,越滚越大)。
+	//
+	// ⚠️ **裁 0**(与 R1「链上永远是 ≥0」一致):
+	//	链**不记分割产出** ⇒ 刚切出来就送掉的货(猪肝)在链上本来就没有
+	//	⇒ 减完会是负数 ⇒ 裁 0(不制造"冷库余额为负"的假告警)。
+	giftOut map[string]decimal.Decimal
 }
 
 func newDailyBalanceTerms() *dailyBalanceTerms {
@@ -83,6 +94,7 @@ func newDailyBalanceTerms() *dailyBalanceTerms {
 		counterLoad: map[string]decimal.Decimal{},
 		bulkOut:     map[string]decimal.Decimal{},
 		bulkIn:      map[string]decimal.Decimal{},
+		giftOut:     map[string]decimal.Decimal{},
 	}
 }
 
@@ -217,6 +229,28 @@ func (s *Service) loadDailyTerms(ctx context.Context, branchID string) (map[stri
 	for _, r := range bulkIns {
 		t := get(dateKey(r.OriginDate))
 		t.add(t.bulkIn, cutOfSku[r.CubeProductID], r.QtyKg)
+	}
+
+	// ---- ⑤ **搭赠出库**(2026-10-31)----
+	//
+	// ⚠️ 只取 waste_type='gift' 的行(报损**不进链** —— 报损是损耗,
+	//   链的余额由**下一次盘点**的实盘纠正,不需要单独扣)。
+	//
+	// ⚠️ 按**部位**记(链的 terms 一律以 cut_type 为键)⇒ 只给货号的搭赠
+	//   用 sku → cut 映射反查(RecordWasteLog 已经把部位补齐了,这里兜底)。
+	var gifts []model.WasteLog
+	if err := s.db.WithContext(ctx).
+		Where("branch_id = ? AND waste_type = ?", branchID, model.WasteTypeGift).
+		Find(&gifts).Error; err != nil {
+		return nil, fmt.Errorf("query waste_logs(gift, daily terms): %w", err)
+	}
+	for _, g := range gifts {
+		cut := g.CutType
+		if cut == "" {
+			cut = cutOfSku[g.CubeProductID]
+		}
+		t := get(g.RecordedAt.In(s.bizTZOrUTC()).Format("2006-01-02"))
+		t.add(t.giftOut, cut, g.QtyKg)
 	}
 
 	return out, nil
@@ -410,6 +444,16 @@ func (s *Service) deriveColdChain(ctx context.Context, branchID string,
 		}
 		for cut, v := range t.bulkIn {
 			cur[cut] = cur[cut].Add(v)
+		}
+		// **搭赠出库**(2026-10-31):货真的离店了 ⇒ 冷库余额 −。
+		//
+		// ⚠️ **裁 0**(与 R1「链上永远是 ≥0」一致):链不记分割产出
+		//   ⇒ 刚切出来就送掉的货(猪肝)在链上本来就没有 ⇒ 减完会负 ⇒ 裁 0。
+		for cut, v := range t.giftOut {
+			cur[cut] = cur[cut].Sub(v)
+			if cur[cut].IsNegative() {
+				cur[cut] = decimal.Zero
+			}
 		}
 		out[d] = cur
 		prev = cur

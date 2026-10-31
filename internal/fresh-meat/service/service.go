@@ -1039,14 +1039,23 @@ func openingStringMap(in map[model.CutType]decimal.Decimal) map[string]decimal.D
 
 // ---- 报损(RecordWasteLog) ----
 
-// RecordWasteLog 录入报损。
+// RecordWasteLog 录入**出口**:报损(loss)或搭赠(gift)。
 //
 // Tx:INSERT waste_logs → publish waste.log.recorded;任一失败全滚。
 // 字段:log_id / branch_id / pig_id(可空)/ cut_type(可空)/ cube_product_id(可空)/
-// qty_kg / reason / recorded_at / operator_id。
-//   - 本仓内表 `fresh_meat.waste_logs`(9 字段 + 时间)由 AutoMigrate 建。
+// qty_kg / reason / waste_type / recorded_at / operator_id。
+//   - 本仓内表 `fresh_meat.waste_logs`(10 字段 + 时间)由 AutoMigrate 建。
 //
-// 验参:branch_id / operator_id / qty_kg > 0 / reason 非空 / cut_type(若填)Valid。
+// 验参:branch_id / operator_id / qty_kg > 0 / reason 非空 / cut_type(若填)Valid /
+// waste_type ∈ {loss,gift}(空 = loss)。
+//
+// # 为什么搭赠要在这里自动补货号(2026-10-31)
+//
+//	搭赠的货**没过称也没过账** ⇒ 门店录的时候通常只有「哪个部位、多少 kg」
+//	(货号是系统里的东西,门店不认)。
+//	⚠️ 而链上认货号:`loadSkuFlows` 按 cube_product_id 归集报损/搭赠的 kg
+//	⇒ **没有货号的行会被静默丢掉**(不进链 ⇒ 门店以为记了,账上却没少)
+//	⇒ 所以这里**必须替门店补上**该部位的主货号。
 func (s *Service) RecordWasteLog(ctx context.Context, branchID string, in model.RecordWasteLogInput, operatorID string) (*model.WasteLog, error) {
 	if branchID == "" {
 		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
@@ -1063,6 +1072,14 @@ func (s *Service) RecordWasteLog(ctx context.Context, branchID string, in model.
 	if in.CutType != "" && !in.CutType.Valid() {
 		return nil, fmt.Errorf("%w: cut_type %q 不在 %d 类枚举内", ErrInvalidInput, in.CutType, len(model.AllCutTypes))
 	}
+	wasteType := strings.TrimSpace(in.WasteType)
+	if wasteType == "" {
+		wasteType = model.WasteTypeLoss // 老客户端没这个字段 ⇒ 当报损
+	}
+	if !model.ValidWasteType(wasteType) {
+		return nil, fmt.Errorf("%w: waste_type %q 只能是 %s / %s",
+			ErrInvalidInput, wasteType, model.WasteTypeLoss, model.WasteTypeGift)
+	}
 
 	now := s.now()
 	logID := generateID(now, "WL")
@@ -1075,14 +1092,44 @@ func (s *Service) RecordWasteLog(ctx context.Context, branchID string, in model.
 		return nil, err
 	}
 
+	sku := strings.TrimSpace(in.CubeProductID)
+	cutType := in.CutType
+	// 搭赠:没给货号 ⇒ 用该部位的**主货号**补上(否则这行不进链,静默丢失)。
+	if wasteType == model.WasteTypeGift && sku == "" && cutType != "" {
+		primary, perr := s.primarySkuPerCut(ctx, branchID)
+		if perr == nil {
+			if v, ok := primary[cutType]; ok {
+				sku = v
+			}
+		}
+	}
+	// 搭赠既没货号也没部位 ⇒ 无法归集到链上 ⇒ 直接拒绝(别让它静默消失)。
+	if wasteType == model.WasteTypeGift && sku == "" && cutType == "" {
+		return nil, fmt.Errorf("%w: 搭赠必须给 cut_type(部位)或 cube_product_id(货号)", ErrInvalidInput)
+	}
+	// 搭赠:只给了货号 ⇒ 反查部位。
+	//
+	// ⚠️ 为什么必须有部位:冷库余额链是**按部位**记的
+	// (链的 terms 全部以 cut_type 为键)⇒ 没有部位的搭赠扣不掉冷库余额
+	// ⇒ 次日期初会虚高 ⇒ 那批"送出去的货"还在链上。
+	if wasteType == model.WasteTypeGift && cutType == "" && sku != "" {
+		catalog, _, cerr := s.loadSkuCatalog(ctx, branchID, nil)
+		if cerr == nil {
+			if c, ok := catalog[sku]; ok && c != "" {
+				cutType = c
+			}
+		}
+	}
+
 	rec := &model.WasteLog{
 		ID:            logID,
 		BranchID:      branchID,
 		PigID:         strings.TrimSpace(in.PigID),
-		CutType:       in.CutType,
-		CubeProductID: strings.TrimSpace(in.CubeProductID),
+		CutType:       cutType,
+		CubeProductID: sku,
 		QtyKg:         in.QtyKg,
 		Reason:        strings.TrimSpace(in.Reason),
+		WasteType:     wasteType,
 		RecordedAt:    recordedAt,
 		OperatorID:    operatorID,
 		CreatedAt:     now,
@@ -1103,8 +1150,9 @@ func (s *Service) RecordWasteLog(ctx context.Context, branchID string, in model.
 			CubeProductID: rec.CubeProductID,
 			QtyKg:         rec.QtyKg,
 			Reason:        rec.Reason,
+			WasteType:     rec.WasteType,
 			RecordedAt:    rec.RecordedAt,
-			OperatorID:    operatorID,
+			OperatorID:    rec.OperatorID,
 		})
 		return nil
 	})

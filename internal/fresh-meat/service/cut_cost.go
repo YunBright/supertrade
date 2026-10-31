@@ -71,6 +71,21 @@ type CutDailyCost struct {
 	BulkSoldAmount decimal.Decimal
 	WasteKg        decimal.Decimal
 	WasteAmount    decimal.Decimal
+	// GiftKg 是**搭赠**的量(kg)—— 2026-10-31 owner 拍板。
+	//
+	// ⚠️ 搭赠是「有成本、无收入」的出库(买肉送猪肝这类**没过称、没过账**的):
+	//	它是链上的**第四个出口**(销售/统收/报损之外),
+	//	要① 从可售量里扣掉(否则被当成盘亏/短卖)② 单独计成本(扣毛利、单列一行)。
+	GiftKg       decimal.Decimal
+	GiftCostYuan decimal.Decimal
+	// GiftGapKg 是**账面应有 − 实盘**的缺口(kg)—— **疑似搭赠**(2026-10-31)。
+	//
+	// ⚠️ 判据是**该部位被盘过**(盘点单里出现过)⇒ 没盘过的部位没有缺口可言。
+	// ⚠️ 它 = 搭赠 + 真盘亏 ⇒ **必须让门店确认**(见 service.ListGiftSuggestions)。
+	//   确认成搭赠 ⇒ 记一条 waste_logs(waste_type='gift')⇒ 缺口归零 ⇒ 不再提示。
+	GiftGapKg decimal.Decimal
+	// GiftGapActualKg 是上面那个缺口对应的**实盘量**(kg,柜台实盘 + 冷库量)。
+	GiftGapActualKg decimal.Decimal
 
 	// ExpectedClosingKg 是**账面应有**期末量(**不裁 0** ⇒ 负数 = 账面短卖)。
 	//
@@ -567,8 +582,8 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 		return nil, nil, nil, nil, err
 	}
 
-	// ---- 3. 卖出 / 统收 / 报损(SKU 级读,后面汇总到部位) ----
-	soldKg, soldAmount, bulkKg, bulkAmount, wasteKg, cutFromSales, err :=
+	// ---- 3. 卖出 / 统收 / 报损 / 搭赠(SKU 级读,后面汇总到部位) ----
+	soldKg, soldAmount, bulkKg, bulkAmount, wasteKg, giftKg, cutFromSales, err :=
 		s.loadSkuFlows(ctx, branchID, startOfDay, endOfDay)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -652,6 +667,12 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 	partBulkKg := map[string]decimal.Decimal{}
 	partBulkAmount := map[string]decimal.Decimal{}
 	partWasteKg := map[string]decimal.Decimal{}
+	// partGiftKg 是**搭赠**的量(kg,按部位)—— 2026-10-31 owner 拍板。
+	//
+	// ⚠️ 搭赠是「有成本、无收入」的出库 ⇒ 链上的**第四个出口**:
+	//	从可售量里扣掉(否则账面推演比实盘多 ⇒ 被当成盘亏/短卖),
+	//	并且**单独计成本**(搭赠成本)⇒ 扣毛利但单列一行。
+	partGiftKg := map[string]decimal.Decimal{}
 	cutOf := func(sku string) string {
 		if c := string(cutOfSku[sku]); c != "" {
 			return c
@@ -672,6 +693,9 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 	}
 	for sku, v := range wasteKg {
 		partWasteKg[cutOf(sku)] = partWasteKg[cutOf(sku)].Add(v)
+	}
+	for sku, v := range giftKg {
+		partGiftKg[cutOf(sku)] = partGiftKg[cutOf(sku)].Add(v)
 	}
 
 	// ---- 4. 期初(部位) ----
@@ -764,6 +788,9 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 		cuts[c] = struct{}{}
 	}
 	for c := range partWasteKg {
+		cuts[c] = struct{}{}
+	}
+	for c := range partGiftKg {
 		cuts[c] = struct{}{}
 	}
 	for c := range openKg {
@@ -924,15 +951,42 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 		//	⇒ 显式标记,让报表层能说"这天的**成本不知道**",
 		//	  而不是把 0 当成成本报给门店。
 		costUncomputable := false
-		soldTotal := partSoldKg[c].Add(partBulkKg[c]).Add(partWasteKg[c])
-		// 当日总量口径(R3)的累加:Σ(期初+进货) / Σ(卖出+统收+报损)。
+		// ⚠️ **搭赠计入"流出"**(2026-10-31 owner 拍板)。
+		//
+		//	搭赠的货**从库存里出去了**(只是没过称、没过账)
+		//	⇒ 它是**正常出库**,不是"卖超了账面库存"
+		//	⇒ 必须计入 soldTotal ⇒ 否则:
+		//	  ① 账面推演比实盘多 ⇒ 被当成**盘亏**;
+		//	  ② 计入**短卖** ⇒ 描红 + **审计结转被拒**(误伤门店)。
+		//
+		//	生产实测(店 00 2026-10-30 猪肝):产出 3.030kg 全部搭赠、
+		//	没进任何销售记录 ⇒ 盘成 0 ⇒ 账上成了"短卖 3.03kg"。
+		soldTotal := partSoldKg[c].Add(partBulkKg[c]).Add(partWasteKg[c]).Add(partGiftKg[c])
+		// 当日总量口径(R3)的累加:Σ(期初+进货) / Σ(卖出+统收+报损+搭赠)。
 		availTotalKg = availTotalKg.Add(availKg)
 		outTotalKg = outTotalKg.Add(soldTotal)
 		if !movingAvg.IsPositive() && soldTotal.IsPositive() {
 			costUncomputable = true
 		}
 		expectedCloseKg := availKg.
-			Sub(partSoldKg[c]).Sub(partBulkKg[c]).Sub(partWasteKg[c])
+			Sub(partSoldKg[c]).Sub(partBulkKg[c]).Sub(partWasteKg[c]).Sub(partGiftKg[c])
+		// ---- 疑似搭赠的缺口(2026-10-31)----
+		//
+		//	缺口 = 账面应有(全店) − 实盘(柜台实盘 + 冷库量)
+		//	⇒ **只有"被盘过的部位"才有意义**(没盘过 ⇒ 无从比较)。
+		//
+		//	⚠️ 缺口 = 搭赠 + 真盘亏 ⇒ 它只是**建议值**,必须让门店确认。
+		//	⚠️ expectedCloseKg 已经减掉了**已确认的搭赠** ⇒
+		//	  确认完搭赠再算 ⇒ 缺口归零 ⇒ 不再提示(不会反复催)。
+		giftGapKg := decimal.Zero
+		giftGapActualKg := decimal.Zero
+		if _, counted := split.CounterActual[c]; counted {
+			giftGapActualKg = split.CounterActual[c].Add(split.Cold[c])
+			giftGapKg = expectedCloseKg.Sub(giftGapActualKg)
+			if giftGapKg.IsNegative() {
+				giftGapKg = decimal.Zero
+			}
+		}
 		// ---- 期末量(R1,2026-10-30 owner:「期初不能有负数」)----
 		//
 		//	① **盘到的部位(含 0 kg)** ⇒ 期末量 = **实盘**(盘点单里的数);
@@ -961,6 +1015,12 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 		closeAmtBasis := closeK.Mul(movingAvg)
 		bulkCost := partBulkKg[c].Mul(movingAvg)
 		wasteCost := partWasteKg[c].Mul(movingAvg)
+		// ---- 搭赠成本(2026-10-31 owner 拍板)----
+		//
+		//	搭赠是「有成本、无收入」⇒ 它的成本**必须计上去**(否则毛利虚高),
+		//	但要**单列一行**、并从「销售成本」里**剥出去**
+		//	(销售成本只该含"真卖掉的那些货"的成本)。
+		giftCost := partGiftKg[c].Mul(movingAvg)
 		// ---- 账面不足(R2)与"短卖必须计成本"(R5)----
 		//
 		//	cut_short_sell_kg = max(0, 卖出+统收+报损 + 期末 − 可售量)
@@ -975,7 +1035,10 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 			cutShortSellKg = decimal.Zero
 		}
 		shortSellCost := cutShortSellKg.Mul(movingAvg)
-		salesCost := availAmt.Sub(closeAmtBasis).Sub(bulkCost).Sub(wasteCost).Add(shortSellCost)
+		// ⚠️ **减掉搭赠成本**(2026-10-31):搭赠不是"卖掉的",
+		//	它的成本不该被算成「销售成本」⇒ 销售成本只留"真卖掉的"。
+		//	⇒ 搭赠成本单独成列(见 giftCost),并在毛利里扣掉。
+		salesCost := availAmt.Sub(closeAmtBasis).Sub(bulkCost).Sub(wasteCost).Sub(giftCost).Add(shortSellCost)
 		if salesCost.IsNegative() {
 			// 期末实盘 > 可售金额(盘盈)⇒ 成本不能为负,裁到 0 并记日志。
 			s.pubLogger.Warn("computeCutDailyCosts: 销售成本为负(盘盈),已裁 0",
@@ -996,7 +1059,8 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 			revaluation = closeK.Mul(unit.Sub(movingAvg))
 			presaleRevenue = closeK.Mul(unit)
 		}
-		gm := revenue.Sub(salesCost).Sub(bulkCost).Sub(wasteCost).Add(revaluation)
+		// ⚠️ 毛利里**扣掉搭赠成本**(owner 2026-10-31 拍板:扣毛利、单列一行)。
+		gm := revenue.Sub(salesCost).Sub(bulkCost).Sub(wasteCost).Sub(giftCost).Add(revaluation)
 		var gmPct float64
 		gmBase := revenue.Add(presaleRevenue)
 		if !gmBase.IsZero() {
@@ -1033,18 +1097,23 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 			actualAvgUnitPrice = &v
 		}
 		out = append(out, CutDailyCost{
-			BranchID:                   branchID,
-			CutType:                    cut,
-			OpeningKg:                  openK,
-			OpeningAmount:              openA,
-			ProducedKg:                 prodK,
-			ProducedAmount:             prodA,
-			SoldKg:                     partSoldKg[c],
-			SoldAmount:                 partSoldAmount[c],
-			BulkSoldKg:                 partBulkKg[c],
-			BulkSoldAmount:             partBulkAmount[c],
-			WasteKg:                    partWasteKg[c],
-			WasteAmount:                partWasteKg[c].Mul(movingAvg),
+			BranchID:       branchID,
+			CutType:        cut,
+			OpeningKg:      openK,
+			OpeningAmount:  openA,
+			ProducedKg:     prodK,
+			ProducedAmount: prodA,
+			SoldKg:         partSoldKg[c],
+			SoldAmount:     partSoldAmount[c],
+			BulkSoldKg:     partBulkKg[c],
+			BulkSoldAmount: partBulkAmount[c],
+			WasteKg:        partWasteKg[c],
+			WasteAmount:    partWasteKg[c].Mul(movingAvg),
+			// ---- 搭赠(2026-10-31)----
+			GiftKg:                     partGiftKg[c],
+			GiftCostYuan:               giftCost,
+			GiftGapKg:                  giftGapKg,
+			GiftGapActualKg:            giftGapActualKg,
 			ExpectedClosingKg:          expectedCloseKg,
 			ClosingKg:                  closeK,
 			ClosingAmount:              closeAmtBasis,
@@ -1086,6 +1155,7 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 		recon.SalesCostYuan = recon.SalesCostYuan.Add(salesCost)
 		recon.BulkCostYuan = recon.BulkCostYuan.Add(bulkCost)
 		recon.WasteCostYuan = recon.WasteCostYuan.Add(wasteCost)
+		recon.GiftCostYuan = recon.GiftCostYuan.Add(giftCost)
 		recon.ClosingInventoryCostYuan = recon.ClosingInventoryCostYuan.Add(closeAmtBasis)
 		recon.RevaluationYuan = recon.RevaluationYuan.Add(revaluation)
 		// ⚠️ 对账行的**短卖分量** = 各部位"账面不足"的合计(= 实际计入成本的那部分)。
@@ -1127,11 +1197,16 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 		}
 	}
 
-	// 对账行:差额 = (期初 + 入库 + **短卖**) − (销售 + 统收 + 报损 + 期末)
+	// 对账行:差额 = (期初 + 入库 + **短卖**) − (销售 + 统收 + 报损 + **搭赠** + 期末)
 	//
 	// ⚠️ **加了短卖分量后恒等式必须仍然闭合**(owner 2026-10-30):
 	//	短卖的那部分货**照当期可用单价计了成本**(进了 SalesCostYuan)
 	//	⇒ 左边必须把同一笔金额补回来 ⇒ 差额仍然是 0。
+	//
+	// ⚠️ **搭赠同理,但在右边**(2026-10-31):
+	//	搭赠成本**已经从 SalesCostYuan 里减掉了**(销售成本只含"真卖掉的")
+	//	⇒ 它是**流出侧**的一个独立分量 ⇒ 必须从右边减掉才能闭合。
+	//	⚠️ 放错边(加到左边)会让差额变成 **2 × 搭赠成本**。
 	//
 	// ⚠️ **要 round**:移动加权单价是"金额 ÷ kg"除出来的 ⇒ 尾数 1e-16
 	//   ⇒ 显示成 "-0.0000000000000001" 会让人以为**对账不平**。
@@ -1143,7 +1218,8 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 	recon.DiffYuan = recon.OpeningInventoryCostYuan.Add(recon.ProducedCostYuan).
 		Add(recon.ShortSellYuan).
 		Sub(recon.SalesCostYuan).Sub(recon.BulkCostYuan).
-		Sub(recon.WasteCostYuan).Sub(recon.ClosingInventoryCostYuan).
+		Sub(recon.WasteCostYuan).Sub(recon.GiftCostYuan).
+		Sub(recon.ClosingInventoryCostYuan).
 		Round(4)
 	recon.CuttingLossKg = cuttingLossKg
 
@@ -1243,7 +1319,7 @@ func buildSkuSalesRows(
 // ⚠️ 权重优先用**当日营收**(SKU 粒度里最可靠的量:销售是实打实的);
 //
 //	某货号当日没营收 ⇒ 退回**当日销量**;部位当期完全没动销 ⇒ 用该部位
-//	预售货号的**简单平均**(权���无意义时至少给个可解释的数)。
+//	预售货号的**简单平均**(权重无意义时至少给个可解释的数)。
 func (s *Service) cutPresaleUnits(
 	presaleUnits map[string]decimal.Decimal,
 	cutOfSku map[string]model.CutType,

@@ -287,7 +287,7 @@ type PigCut struct {
 	PigID string `gorm:"column:pig_id;type:varchar(64);not null;index;uniqueIndex:idx_pig_cut,priority:1" json:"pig_id"`
 	// ⚠️ 2026-10-23 修正:`idx_pig_cut` 原来**只含 cut_type 一列**
 	// (PigID 上写的是普通 `index`,不是 `uniqueIndex`)⇒ 唯一索引变成 UNIQUE(cut_type)
-	// ⇒ **整个系统每���部位只能补录一行**(第二头猪的同部位直接被拒)。
+	// ⇒ **整个系统每个部位只能补录一行**(第二头猪的同部位直接被拒)。
 	// 意图是 UNIQUE(pig_id, cut_type)("同一头猪的同一部位不重复补录")。
 	// ⇒ PigID 必须进同一个唯一索引(priority 1),cut_type 是 priority 2。
 	CutType   CutType         `gorm:"column:cut_type;type:varchar(32);not null;uniqueIndex:idx_pig_cut,priority:2" json:"cut_type"`
@@ -500,6 +500,20 @@ func (PromoSku) TableName() string { return "promo_skus" }
 // (PigID, CutType) 可空:报损可能是批量处理(如批次过期)、不是单 SKU。
 // CubeProductID 可空;若填,直接记实际报废的 cube SKU。
 // RecordedAt 由 caller 传(saleDate-like);若空,service 用 ttl=now。
+//
+// # WasteType:报损 vs **搭赠**(2026-10-31 owner)
+//
+//   - `loss`(默认):真损耗(过期、破损、加工废料)⇒ 计入「报损成本」。
+//   - `gift`:**搭赠**——买肉送猪肝这类「有成本、无收入」的出库。
+//
+// ⚠️ 为什么必须分开(而不是复用 reason 文本):
+//
+//	搭赠**不是损耗**。混进报损会污染「切分损耗 / 隔夜失重」的损耗统计,
+//	也会让「报损」这个口径失真(门店看报损金额会以为在亏损耗)。
+//	⇒ 它需要**自己的一条成本线**(搭赠成本),并**扣毛利**(owner 2026-10-31 拍板)。
+//
+// ⚠️ 搭赠为什么必须有:搭赠的货**从库存里出去了但没有任何销售记录**
+// (没过称、没过账)⇒ 链上看就是「盘亏」⇒ 会被误判成短卖 ⇒ 审计结转被拒。
 type WasteLog struct {
 	ID            string          `gorm:"primaryKey;column:id;type:varchar(64)" json:"id"`
 	BranchID      string          `gorm:"column:branch_id;type:varchar(64);not null;index:idx_branch_recorded,priority:1" json:"branch_id"`
@@ -508,9 +522,31 @@ type WasteLog struct {
 	CubeProductID string          `gorm:"column:cube_product_id;type:varchar(64)" json:"cube_product_id,omitempty"`
 	QtyKg         decimal.Decimal `gorm:"column:qty_kg;type:decimal(10,3);not null" json:"qty_kg"`
 	Reason        string          `gorm:"column:reason;type:varchar(255);not null" json:"reason"`
-	RecordedAt    time.Time       `gorm:"column:recorded_at;not null;index:idx_branch_recorded,priority:2" json:"recorded_at"`
-	OperatorID    string          `gorm:"column:operator_id;type:varchar(64);not null" json:"operator_id"`
-	CreatedAt     time.Time       `gorm:"column:created_at;not null" json:"created_at"`
+	// WasteType 是**出口类型**:`loss`(报损,默认) | `gift`(搭赠)。
+	//
+	// ⚠️ 默认值给 'loss' ⇒ 老行不用回填(它们全是报损)⇒ 加列安全。
+	WasteType  string    `gorm:"column:waste_type;type:varchar(16);not null;default:'loss'" json:"waste_type"`
+	RecordedAt time.Time `gorm:"column:recorded_at;not null;index:idx_branch_recorded,priority:2" json:"recorded_at"`
+	OperatorID string    `gorm:"column:operator_id;type:varchar(64);not null" json:"operator_id"`
+	CreatedAt  time.Time `gorm:"column:created_at;not null" json:"created_at"`
+}
+
+// ---- waste_logs 的出口类型 ----
+
+const (
+	// WasteTypeLoss 报损(真损耗)。老数据与默认值。
+	WasteTypeLoss = "loss"
+	// WasteTypeGift 搭赠(买肉送猪肝这类「有成本、无收入」的出库)。
+	WasteTypeGift = "gift"
+)
+
+// ValidWasteType 判断出口类型是否合法(空 = loss,兼容老客户端)。
+func ValidWasteType(t string) bool {
+	switch t {
+	case "", WasteTypeLoss, WasteTypeGift:
+		return true
+	}
+	return false
 }
 
 // TableName 显式表名。
@@ -1495,7 +1531,7 @@ func (SkuStockOpening) TableName() string { return "sku_stock_openings" }
 //
 // ⇒ 三段语义:
 //
-//	审计前:实时算(不快照)⇒ 补录往��� ⇒ **后续日期的毛利跟着变**(这是特性,不是 bug);
+//	审计前:实时算(不快照)⇒ 补录往后 ⇒ **后续日期的毛利跟着变**(这是特性,不是 bug);
 //	审计时:截止日期之前的每日日终盘点必须齐全 ⇒ 否则拒绝;通过 ⇒ **落快照(=结转)**;
 //	审计后:截止日期及之前**冻结** ⇒ 不能再改(补录/改单/撤单都不行)。
 //
@@ -1757,7 +1793,11 @@ type RecordWasteLogInput struct {
 	CubeProductID string          `json:"cube_product_id"` // 可选;实际报废的 cube SKU
 	QtyKg         decimal.Decimal `json:"qty_kg" binding:"required"`
 	Reason        string          `json:"reason" binding:"required"`
-	RecordedAt    time.Time       `json:"recorded_at"` // 可选;空则用 service.now()
+	// WasteType 是**出口类型**:`loss`(报损,默认) | `gift`(搭赠)。
+	//
+	// ⚠️ 空 = loss(老客户端兼容)⇒ 不用改前端也能照旧录报损。
+	WasteType  string    `json:"waste_type"`
+	RecordedAt time.Time `json:"recorded_at"` // 可空;空则用 service.now()
 }
 
 // CreateBranchCutMappingInput POST /branch-cut-mappings 入参。
@@ -1802,6 +1842,9 @@ type WasteLogRecordedEventData struct {
 	CubeProductID string          `json:"cube_product_id,omitempty"`
 	QtyKg         decimal.Decimal `json:"qty_kg"`
 	Reason        string          `json:"reason"`
-	RecordedAt    time.Time       `json:"recorded_at"`
-	OperatorID    string          `json:"operator_id"`
+	// WasteType 让下游能区分「报损」与「搭赠」(2026-10-31)。
+	// ⚠️ omitempty:老事件没有这个键 ⇒ 下游读到空 = 报损(行为不变)。
+	WasteType  string    `json:"waste_type,omitempty"`
+	RecordedAt time.Time `json:"recorded_at"`
+	OperatorID string    `json:"operator_id"`
 }

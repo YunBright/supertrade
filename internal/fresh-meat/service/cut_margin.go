@@ -94,14 +94,16 @@ func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation) ([]Pe
 		salesCost := r.SalesCostYuan
 		bulkCost := r.BulkCostYuan
 		wasteCost := r.WasteCostYuan
+		// ⚠️ 搭赠成本**单列**(2026-10-31 owner 拍板:扣毛利、单列一行)。
+		giftCost := r.GiftCostYuan
 		// 分摊进来的特价:重量 + 收入 + 成本(成本 = kg × 该部位移动加权单价)
 		if pa, ok := allocByCut[r.CutType]; ok {
 			soldKg = soldKg.Add(pa.PromoKg)
 			revenue = revenue.Add(pa.PromoAmount)
 			salesCost = salesCost.Add(pa.PromoKg.Mul(r.MovingAvgUnitCost))
 		}
-		// 毛利 = 收入 − 销售成本 − 统收成本 − 报损成本 + 预期毛利(预售结转的重估)
-		gm := revenue.Sub(salesCost).Sub(bulkCost).Sub(wasteCost).Add(r.PresaleMarginYuan)
+		// 毛利 = 收入 − 销售成本 − 统收成本 − 报损成本 − **搭赠成本** + 预期毛利(预售结转的重估)
+		gm := revenue.Sub(salesCost).Sub(bulkCost).Sub(wasteCost).Sub(giftCost).Add(r.PresaleMarginYuan)
 		var gmPct float64
 		gmBase := revenue.Add(r.PresaleExpectedRevenueYuan)
 		if !gmBase.IsZero() {
@@ -122,24 +124,26 @@ func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation) ([]Pe
 			expected = r.ExpectedClosingKg.Sub(r.ColdStoreKg)
 		}
 		row := PerCutGrossMargin{
-			CutType:           r.CutType,
-			OpeningKg:         r.OpeningKg,
-			PurchasedKg:       r.ProducedKg,
-			SoldKg:            soldKg,
-			BulkSoldKg:        r.BulkSoldKg,
-			WasteKg:           r.WasteKg,
+			CutType:     r.CutType,
+			OpeningKg:   r.OpeningKg,
+			PurchasedKg: r.ProducedKg,
+			SoldKg:      soldKg,
+			BulkSoldKg:  r.BulkSoldKg,
+			WasteKg:     r.WasteKg,
 			// ⚠️ 应有 = **账面推演**(不裁 0)⇒ 负数 = **账面短卖**。
 			//   旧实现是"逐 SKU 裁剪后再求和"⇒ 缺口被抹掉 ⇒ 门店看到的行自相矛盾。
-			ExpectedRemainKg: expected,
-			RevenueYuan:       revenue,
-			SalesCostYuan:     salesCost,
-			BulkCostYuan:      bulkCost,
-			WasteCostYuan:     wasteCost,
-			GrossMarginYuan:   gm,
-			GrossMarginPct:    gmPct,
-			PresaleMarginYuan: r.PresaleMarginYuan,
+			ExpectedRemainKg:           expected,
+			RevenueYuan:                revenue,
+			SalesCostYuan:              salesCost,
+			BulkCostYuan:               bulkCost,
+			WasteCostYuan:              wasteCost,
+			GiftKg:                     r.GiftKg,
+			GiftCostYuan:               giftCost,
+			GrossMarginYuan:            gm,
+			GrossMarginPct:             gmPct,
+			PresaleMarginYuan:          r.PresaleMarginYuan,
 			PresaleExpectedRevenueYuan: r.PresaleExpectedRevenueYuan,
-			MovingAvgUnitCost: r.MovingAvgUnitCost,
+			MovingAvgUnitCost:          r.MovingAvgUnitCost,
 			// ⚠️ 该部位当天成本**算不出来**(不是成本为 0)⇒ 行级标注。
 			CostIncomplete: r.CostUncomputable,
 			// ---- 部位级分割数据(owner 定案)----
@@ -177,6 +181,7 @@ func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation) ([]Pe
 		tot.SalesCostYuan = tot.SalesCostYuan.Add(salesCost)
 		tot.BulkCostYuan = tot.BulkCostYuan.Add(bulkCost)
 		tot.WasteCostYuan = tot.WasteCostYuan.Add(wasteCost)
+		tot.GiftCostYuan = tot.GiftCostYuan.Add(giftCost)
 		tot.GrossMarginYuan = tot.GrossMarginYuan.Add(gm)
 		tot.PresaleMarginYuan = tot.PresaleMarginYuan.Add(r.PresaleMarginYuan)
 		tot.PresaleExpectedRevenueYuan = tot.PresaleExpectedRevenueYuan.Add(r.PresaleExpectedRevenueYuan)
