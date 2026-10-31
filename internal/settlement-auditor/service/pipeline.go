@@ -714,10 +714,18 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 	//   没有证据 ⇒ 保持原来的 block。方向是**更严**,而不是把审批卡成 failed。
 	// ⚠️ 有源门店走 cube、无源门店查本域 PG —— 分流在 LossService 里(见 loss.go)。
 	lossByProduct := make(map[string]decimal.Decimal)
+	// lossNote 是**推理日志可见**的盘损核对结论(2026-10-31 用户要求)。
+	//
+	// ⚠️ 只写 logger 是不够的:审批详情页的推理时间线读的是 audit_logs,
+	// 用户在页面上看不到"这一单到底查没查盘损、查到什么"就会认为流水线跳过了这一步。
+	lossNote := "盘损核对:未启用(未装配读取端)"
 	if s.loss != nil {
+		lossNote = "盘损核对:无命中"
+		var lossErr error
 		for _, g := range groups {
 			losses, err := s.loss.SumLossByProduct(ctx, ap.BranchID, g.Products, g.From, toDate)
 			if err != nil {
+				lossErr = err
 				s.logger.Warn("settlement-auditor: 取盘损失败,数量信号按无盘损判定",
 					"approval_id", ap.ID, "from", g.From, "err", err)
 				break
@@ -725,6 +733,17 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 			for pid, q := range losses {
 				lossByProduct[pid] = lossByProduct[pid].Add(q)
 			}
+		}
+		switch {
+		case lossErr != nil:
+			lossNote = "盘损核对失败(" + lossErr.Error() + "),数量信号按无盘损判定"
+		case len(lossByProduct) > 0:
+			total := decimal.Zero
+			for _, q := range lossByProduct {
+				total = total.Add(q)
+			}
+			lossNote = fmt.Sprintf("盘损核对:命中 %d 个商品,合计 %s",
+				len(lossByProduct), total.Round(3).String())
 		}
 	}
 
@@ -788,8 +807,8 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 	s.logStep(ctx, ap, StepCheckQuantity,
 		fmt.Sprintf("PI 单 %d 张,商品 %d 种,窗口 %s~%s(按各商品最后一次采购入库日起算,取不到则回退 %s)",
 			len(piSheets), len(products), groups[0].From, toDate, fallbackFrom),
-		fmt.Sprintf("新增 %d 条数量信号;窗口毛利估算 %s 元(成本口径:库存加权平均成本价 %d 个商品,回退本次进货均价 %d 个),补差价额度 %s 元,毛利为负的商品 %d 个;实现毛利为负的商品 %d 个",
-			len(*signals)-before, yuanText(gm.AmountYuan), avgCnt, purchaseCnt,
+		fmt.Sprintf("新增 %d 条数量信号;%s;窗口毛利估算 %s 元(成本口径:库存加权平均成本价 %d 个商品,回退本次进货均价 %d 个),补差价额度 %s 元,毛利为负的商品 %d 个;实现毛利为负的商品 %d 个",
+			len(*signals)-before, lossNote, yuanText(gm.AmountYuan), avgCnt, purchaseCnt,
 			yuanText(allowance.PriceDiffYuan),
 			len(negGross),
 			len(realizedNeg)),

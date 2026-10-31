@@ -53,8 +53,20 @@ type BranchSource struct {
 // ⚠️ 错误一律原样上抛:调用方必须区分"没配"(正常)与"问不到"(链路故障),
 // 两者混在一起会让一次故障显示成"该门店没有会员"。
 func (c *DaprCubeClient) ResolveBranchSource(ctx context.Context, branchID string) (BranchSource, error) {
-	if strings.TrimSpace(branchID) == "" {
+	branchID = strings.TrimSpace(branchID)
+	if branchID == "" {
 		return BranchSource{}, fmt.Errorf("cubeclient: branch_id 必填")
+	}
+	// ⚠️ **必须把参数里的门店写进 ctx**:cube-router 的 /v1/branch-source 是从
+	// X-Branch-ID header 取门店的(取不到直接 400 branch_required),
+	// 而 invoke 只从 ctx 读门店 —— 后台流水线(runAudit 用 context.Background())的
+	// ctx 里没有门店 ⇒ 每次解析都 400,所有"先问数据源再读"的路径全废
+	// (2026-10-31 生产实踩:盘损失败 = 数据源路由暂不可用: Internal: Bad Request)。
+	//
+	// 已有值时**不覆盖**:HTTP 路径上 middleware 写入的是 header 原值
+	// (可能是 "01,02" 多店形式),应收窄由下游权限判定做,这里不能改。
+	if branchFromCtx(ctx) == "" {
+		ctx = WithBranchID(ctx, branchID)
 	}
 	body, err := c.invoke(ctx, BranchSourcePath, map[string]any{})
 	if err != nil {

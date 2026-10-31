@@ -23,6 +23,7 @@ import (
 	dapr "github.com/dapr/go-sdk/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/metadata"
 )
 
 // TestListMembers_QueryShape 锁"会员列表查询的 body 形状"。
@@ -125,6 +126,49 @@ func TestResolveBranchSource(t *testing.T) {
 	assert.True(t, src.Configured)
 	assert.True(t, src.Enabled)
 	assert.Equal(t, "cube-sixun-ysx-fb", src.CubeSourceName)
+}
+
+// TestResolveBranchSource_InjectsBranchHeader 锁"解析数据源会把参数门店带成 X-Branch-ID"。
+//
+// ⚠️ 后台流水线(runAudit)用 context.Background() 启动,ctx 里没有门店;
+// 若这里不注入,cube-router 的 /v1/branch-source 一律 400 branch_required,
+// 有源门店的盘损/其它辅助读全部降级(2026-10-31 生产实踩)。
+func TestResolveBranchSource_InjectsBranchHeader(t *testing.T) {
+	inv := &metaCaptureInvoker{body: []byte(`{"branch_id":"00","configured":true,"enabled":true}`)}
+	c := NewDaprCubeClient(inv, "supertrade-cube-router", "v1/load")
+
+	_, err := c.ResolveBranchSource(context.Background(), " 00 ")
+	require.NoError(t, err)
+	assert.Equal(t, "00", inv.branchHeader, "必须把参数门店(去空白)写进 x-branch-id")
+}
+
+// TestResolveBranchSource_KeepsExistingBranch 锁"ctx 已有门店时不覆盖"。
+//
+// ⚠️ HTTP 路径上 middleware 写入的是 header 原值(可能是 "01,02" 多店形式),
+// 不能被这里收窄成单店(否则权限判定会看到与请求头不一致的门店)。
+func TestResolveBranchSource_KeepsExistingBranch(t *testing.T) {
+	inv := &metaCaptureInvoker{body: []byte(`{"branch_id":"00","configured":true,"enabled":true}`)}
+	c := NewDaprCubeClient(inv, "supertrade-cube-router", "v1/load")
+
+	_, err := c.ResolveBranchSource(WithBranchID(context.Background(), "01,02"), "00")
+	require.NoError(t, err)
+	assert.Equal(t, "01,02", inv.branchHeader, "ctx 已有门店时不得被参数覆盖")
+}
+
+// metaCaptureInvoker 记录 outgoing metadata 里的 x-branch-id。
+type metaCaptureInvoker struct {
+	body         []byte
+	branchHeader string
+}
+
+func (m *metaCaptureInvoker) InvokeMethodWithContent(ctx context.Context, _, _, _ string,
+	_ *dapr.DataContent) ([]byte, error) {
+	if md, ok := metadata.FromOutgoingContext(ctx); ok {
+		if v := md.Get("x-branch-id"); len(v) > 0 {
+			m.branchHeader = v[0]
+		}
+	}
+	return m.body, nil
 }
 
 // jsonInvoker 固定返回一段 JSON(给非查询类调用用)。
