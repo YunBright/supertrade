@@ -45,12 +45,26 @@ func (s *Service) OnStatusChanged(ctx context.Context, ev *WecomStatusChanged) e
 	if newStatus != ap.Status {
 		updates["status"] = newStatus
 	}
-	if err := s.db.WithContext(ctx).Model(&model.ApprovalInstance{}).
-		Where("id = ?", ap.ID).Updates(updates).Error; err != nil {
+	// 审批状态与其月度投影必须原子更新：月度总表是机器审核与 cash-recon
+	// 付款台账的唯一读源，漂移一次就会让「每月一单」和应付数字永久偏掉。
+	now := s.now()
+	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&model.ApprovalInstance{}).
+			Where("id = ?", ap.ID).Updates(updates).Error; err != nil {
+			return err
+		}
+		return syncMonthlyStatusTx(tx, ap.ID, ev.SpStatus, newStatus,
+			decidedAtOf(ev.SpStatus, now), now)
+	}); err != nil {
 		return err
 	}
 	ap.SpStatus = ev.SpStatus
 	ap.Status = newStatus
+	// 该门店首次出现审批回调时顺手补齐历史月度行（幂等、只跑一次）。
+	// 失败只 log：回调已经生效，重试会在下一次读取时再补。
+	if err := s.EnsureMonthlyBackfill(ctx, ap.BranchID); err != nil {
+		s.logger.Warn("monthly-items: 懒回填失败", "branch_id", ap.BranchID, "err", err)
+	}
 	// 终审通过 = 这批结算单的付款被批准了。落付款台账(set_method=approval),
 	// 让它们不再出现在发起审批的勾选列表里。
 	//

@@ -44,11 +44,11 @@ const (
 	//
 	// ⚠️ 与 StepLLMVerdict 分开记：审批详情页的时间线上必须能看出
 	//    "这一单没问机器人，是配置放行的"，否则店长会误以为机器人审过了。
-	StepFlowDecision    = "flow_decision"
+	StepFlowDecision = "flow_decision"
 	// StepAdminApprove 是**管理员人工放行**的审计步骤（2026-10-28 用户口径）。
-	StepAdminApprove    = "admin_approve"
-	StepStocktake        = "stocktake"
-	StepFinish           = "finish"
+	StepAdminApprove = "admin_approve"
+	StepStocktake    = "stocktake"
+	StepFinish       = "finish"
 )
 
 // SubmitInput 提交审批入参(handler 已从 claims 取 ApplicantUserID)。
@@ -392,7 +392,7 @@ func (s *Service) runAudit(ctx context.Context, approvalID string) {
 	}
 
 	// step 7(可选): 建议盘点 → 建 plan 单 + 绑定 + taskcard
-	s.stepStocktake(ctx, ap, verdict)
+	s.stepStocktake(ctx, ap, verdict, signals)
 
 	// finish: pass → apply_event;reject → notify_text
 	s.stepFinish(ctx, ap, verdict, signals, settlements, items)
@@ -824,8 +824,9 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 // 终点 = 发起付款审批当天（开区间到明天 ⇒ 当天的销售也算在内，与窗口毛利一致）。
 //
 // ⚠️ 与窗口毛利的窗口**不是同一个**：窗口毛利取**最晚**采购日起算
-//    （"这批货进来到今天卖了多少"），实现毛利取**最早**采购日起算
-//    （"这批货从进店那天起一共卖了多少钱/多少量"）。
+//
+//	（"这批货进来到今天卖了多少"），实现毛利取**最早**采购日起算
+//	（"这批货从进店那天起一共卖了多少钱/多少量"）。
 //
 // # 性能
 //
@@ -867,8 +868,9 @@ func (s *Service) realizedWindowSales(
 // 口径:Σ(该商品各行进货金额) ÷ Σ(该商品各行收货量)。
 //
 // ⚠️ **它不再是毛利估算的主口径**(2026-10-29):主口径是库存加权平均成本价
-//    (stock.avg_cost),这里只作为**回退**(拿不到库存成本时用)。
-//    理由见 service/allowance.go 的 GrossMargin 注释(生产实踩)。
+//
+//	(stock.avg_cost),这里只作为**回退**(拿不到库存成本时用)。
+//	理由见 service/allowance.go 的 GrossMargin 注释(生产实踩)。
 //
 // ⚠️ 只用于**毛利估算**(相对判断),不是财务成本口径 —— 引擎没有历史成本。
 func unitCostByProduct(lines []SheetLineRow) map[string]decimal.Decimal {
@@ -900,8 +902,9 @@ func unitCostByProduct(lines []SheetLineRow) map[string]decimal.Decimal {
 // 本批次进货均价 = 这一笔进货的价格,只在该商品**没有库存成本记录**时回退。
 //
 // ⚠️ "没有库存成本记录"有两种:① cube 里查不到这个商品(没维护/没同步);
-//    ② avg_cost = 0(库存为 0 或成本没维护)—— 两种都要回退,否则该 SKU
-//    会因为"没成本"而**整个不进毛利口径**(静默少算一个商品)。
+//
+//	② avg_cost = 0(库存为 0 或成本没维护)—— 两种都要回退,否则该 SKU
+//	会因为"没成本"而**整个不进毛利口径**(静默少算一个商品)。
 func mergeCostBasis(batch map[string]decimal.Decimal, avgCost map[string]decimal.Decimal) map[string]CostBasis {
 	out := make(map[string]CostBasis, len(batch)+len(avgCost))
 	for pid, c := range avgCost {
@@ -928,7 +931,8 @@ func mergeCostBasis(batch map[string]decimal.Decimal, avgCost map[string]decimal
 // 拉不到(查不到该商品 / cube 报错)时回退本批次进货均价。
 //
 // ⚠️ 拉库存成本失败**只告警不阻断**:毛利信号本来就是"估算 + 永不 block",
-//    因一个旁路查询失败就让整单审核失败是本末倒置。
+//
+//	因一个旁路查询失败就让整单审核失败是本末倒置。
 func (s *Service) costBasisFor(ctx context.Context, branchID string, products []string, lines []SheetLineRow) map[string]CostBasis {
 	batch := unitCostByProduct(lines)
 	avgCost := make(map[string]decimal.Decimal)
@@ -1038,8 +1042,9 @@ func (s *Service) stepLLMVerdict(ctx context.Context, ap *model.ApprovalInstance
 // saveVerdict 落 llm_verdicts（一审批一条，重跑先删旧）+ 记一条 step 日志。
 //
 // ⚠️ **流程定制与 LLM 研判共用这张表**：靠 source 区分（llm / rule_fallback /
-//    flow_config）。这样"这一单当时是怎么得出结论的"在审批详情页只有一个出处，
-//    不会出现"详情页显示 LLM 结论、但实际是配置放行"这种对不上的情况。
+//
+//	flow_config）。这样"这一单当时是怎么得出结论的"在审批详情页只有一个出处，
+//	不会出现"详情页显示 LLM 结论、但实际是配置放行"这种对不上的情况。
 func (s *Service) saveVerdict(ctx context.Context, ap *model.ApprovalInstance, verdict *VerdictResult, trace, step string, signalCount int, durMs int64) error {
 	// 一审批一条:重跑先删旧。
 	if err := s.db.WithContext(ctx).
@@ -1161,7 +1166,7 @@ const stocktakeStatusApproved = "approved"
 //
 // 幂等:同一审批已有 approval_stocktake_links 时直接跳过(重跑/RescanStuck
 // 不会重复建单、不会重复推卡片)。
-func (s *Service) stepStocktake(ctx context.Context, ap *model.ApprovalInstance, verdict *VerdictResult) {
+func (s *Service) stepStocktake(ctx context.Context, ap *model.ApprovalInstance, verdict *VerdictResult, signals []signalDraft) {
 	start := time.Now()
 	st := verdict.SuggestStocktake
 	if st == nil || len(st.IDs) == 0 {
@@ -1180,17 +1185,24 @@ func (s *Service) stepStocktake(ctx context.Context, ap *model.ApprovalInstance,
 			"", time.Since(start).Milliseconds())
 		return
 	}
+	productIDs, derived := stocktakePlanProductIDs(st, signals)
+	// 计划单商品是**必填语义**:没有商品就是一张空计划单,
+	// 盘点人打开只看到"无计划项",等于这次建单完全没意义(2026-10-31 生产事故:
+	// ST20261031501addf7 建出来 0 个计划项)。⇒ 宁可跳过并留痕,也不建空单。
+	if len(productIDs) == 0 {
+		s.logStep(ctx, ap, StepStocktake, "",
+			fmt.Sprintf("建议盘点(scope=%s)但没有可落地的计划商品,跳过建单", st.Scope),
+			"", time.Since(start).Milliseconds())
+		return
+	}
 	settlementIDs := s.settlementIDsOf(ctx, ap.ID)
-	remark := fmt.Sprintf("结算付款审批 %s 机器审核建议盘点(scope=%s;结算单 %s)",
-		ap.ID, st.Scope, strings.Join(settlementIDs, ","))
+	remark := fmt.Sprintf("结算付款审批 %s 机器审核建议盘点(scope=%s;结算单 %s;计划商品 %d 个%s)",
+		ap.ID, st.Scope, strings.Join(settlementIDs, ","), len(productIDs), derived)
 	in := StocktakeCreatePlanInput{
 		BranchID:   ap.BranchID,
 		OperatorID: ap.ApplicantUserID,
 		Remark:     truncate(remark, 500),
-	}
-	// 仅 product scope 能直接落成计划商品;supplier/category 由盘点人自行圈品。
-	if st.Scope == "product" {
-		in.ProductIDs = st.IDs
+		ProductIDs: productIDs,
 	}
 	// 透传申请人 JWT **和门店** 给 stocktake:
 	//   - Authorization:AddPlanItems 从 cube 现拉商品名/条码时 cube 侧要认这个凭证;
@@ -1262,6 +1274,34 @@ func (s *Service) stepStocktake(ctx context.Context, ap *model.ApprovalInstance,
 	s.logStep(ctx, ap, StepStocktake, remark,
 		fmt.Sprintf("盘点计划单 %s 已创建(通知:%s)", header.ID, notifyTargetText(group, s.cfg.StocktakeNotifyUsers)),
 		"", time.Since(start).Milliseconds())
+}
+
+// stocktakePlanProductIDs 把 LLM 的盘点建议折算成**要落进计划单的商品 id**。
+//
+// scope 语义:
+//   - product:ids 就是商品 id,直接落单;
+//   - supplier / category:ids 是供应商/分类 id,**不是商品** ——
+//     但它不该变成"空计划单":数量类信号(product 级)早已点名了可疑商品,
+//     把这些商品带进计划单,盘点人才有明确的清点对象。
+//
+// 返回计划商品 id(去重保序)与一句来源说明(写进 remark,便于事后追溯)。
+func stocktakePlanProductIDs(st *StocktakeSuggestion, signals []signalDraft) ([]string, string) {
+	if st == nil {
+		return nil, ""
+	}
+	if st.Scope == "product" {
+		return dedupeStrings(st.IDs), "(来自 LLM 建议商品)"
+	}
+	ids := make([]string, 0, len(signals))
+	for _, sig := range signals {
+		switch sig.SignalType {
+		case SigQtyDeviation, SigPurchaseWithoutSales:
+			if sig.ProductID != "" {
+				ids = append(ids, sig.ProductID)
+			}
+		}
+	}
+	return dedupeStrings(ids), "(由数量异常信号派生)"
 }
 
 // notifyTargetText 描述本次通知发给了谁(写进 step 日志,便于排查"没收到通知")。
@@ -1344,9 +1384,10 @@ func (s *Service) stepFinish(ctx context.Context, ap *model.ApprovalInstance, ve
 // publishApplyEvent 组装并下发企微 apply_event 命令。
 //
 // ⚠️ **机器通过**与**管理员人工放行**共用这一段 ——
-//    两者的企微单长得一样（同样的控件、同样的流程人），
-//    差别只在「AI审核结论」控件的**首行**（放行时是"已转人工审核并通过"）。
-//    ⇒ 拆成两段就会漂移：改了一处忘了另一处 ⇒ 两类单的企微单长得不一样。
+//
+//	两者的企微单长得一样（同样的控件、同样的流程人），
+//	差别只在「AI审核结论」控件的**首行**（放行时是"已转人工审核并通过"）。
+//	⇒ 拆成两段就会漂移：改了一处忘了另一处 ⇒ 两类单的企微单长得不一样。
 func (s *Service) publishApplyEvent(ctx context.Context, ap *model.ApprovalInstance, verdict *VerdictResult, signals []signalDraft, settlements []SettlementRow, items []model.ApprovalItem) (string, error) {
 	// ⚠️ 收款账号快照在**这里**读出来(而不是从 AuditInput 拿):
 	// 它必须待在 LLM 输入面之外(见 service/payee_account.go 的结构隔离说明)。
@@ -1652,8 +1693,8 @@ func (s *Service) RescanStuck(ctx context.Context) (int, error) {
 
 // ApprovalDetail 审批详情(实例 + 快照 + 信号 + 结论 + 盘点绑定)。
 type ApprovalDetail struct {
-	Approval    *model.ApprovalInstance       `json:"approval"`
-	Settlements []model.ApprovalSettlement    `json:"settlements"`
+	Approval    *model.ApprovalInstance    `json:"approval"`
+	Settlements []model.ApprovalSettlement `json:"settlements"`
 	// Items 是手工收付款明细(2026-10-25):重新发起时用它预填两张明细表。
 	Items   []model.ApprovalItem          `json:"items"`
 	Signals []model.AuditSignal           `json:"signals"`
@@ -1698,7 +1739,9 @@ func (s *Service) ListApprovals(ctx context.Context, branchID, status, from, to 
 		limit = 50
 	}
 	var items []model.ApprovalInstance
-	if err := q.Order("created_at DESC").Limit(limit).Offset(offset).Find(&items).Error; err != nil {
+	// 排序契约(H5 审批记录页):created_at 倒序,同一时间按 id 倒序。
+	// ⚠️ id 是 varchar(32) ⇒ 同时间戳内按**字符串**倒序,前端翻页时不会漏/重。
+	if err := q.Order("created_at DESC, id DESC").Limit(limit).Offset(offset).Find(&items).Error; err != nil {
 		return nil, 0, err
 	}
 	// 列表卡片摘要（供应商名 / 付款项名）—— 2026-10-29 用户口径。

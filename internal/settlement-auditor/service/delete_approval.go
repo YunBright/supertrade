@@ -92,6 +92,9 @@ func (s *Service) DeleteApproval(ctx context.Context, id string) error {
 			&model.AuditLog{},
 			&model.LLMVerdict{},
 			&model.ApprovalStocktakeLink{},
+			// 月度总表(计划 §9):派生自 approval_items,删审批必须同步删,
+			// 否则残留行会让「每月有且仅有一单」把已删审批的笔数一直算进去。
+			&model.ApprovalMonthlyItem{},
 			// 收款账号快照(2026-10-28):独立表 ⇒ 删审批时要一起删,
 			// 否则留下一行指向已不存在的审批的孤儿快照。
 			&model.ApprovalPayeeAccount{},

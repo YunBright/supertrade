@@ -28,6 +28,7 @@ func newFlowTestService(t *testing.T) (*Service, *gorm.DB, *fakeCube, *fakePubli
 		&model.SettlementPayState{}, &model.StocktakeNotifyGroup{},
 		&model.ApprovalItem{}, &model.ApprovalPayeeAccount{},
 		&model.AuditSupplierFlow{}, &model.AuditPaymentItemFlow{}, &model.AuditRegexPattern{},
+		&model.ApprovalMonthlyItem{}, &model.ApprovalMonthlyBackfill{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -649,7 +650,8 @@ func TestBuildFlowVerdict_QtySignalDoesNotStop(t *testing.T) {
 // 2026-10-28 用户口径：「按流程逻辑通过的不需要触发盘点联动」。
 //
 // ⚠️ 判别力自检：把 buildFlowVerdict 里的 SuggestStocktake 改回
-//    stocktakeSuggestionFromSignals(signals) ⇒ 本用例立刻红。
+//
+//	stocktakeSuggestionFromSignals(signals) ⇒ 本用例立刻红。
 //
 // 为什么：命中流程定制 ⇒ 这一单**根本没问机器人** ⇒ 「盘点联动」是机器人
 // 研判的副产物，无中生有地建一个盘点计划 = 让人去盘一台机器没怀疑过的货。

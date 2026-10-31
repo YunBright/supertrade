@@ -533,20 +533,20 @@ func (h *Handler) Submit(c *gin.Context) {
 		return
 	}
 	ap, err := h.svc.SubmitApproval(c.Request.Context(), branchID, service.SubmitInput{
-		ApplicantUserID:  cl.Sub,
-		ApplicantWecomID: req.ApplicantWecomID,
-		ApplicantBearer:  c.Request.Header.Get("Authorization"),
-		SettlementIDs:    req.SettlementIDs,
-		ManualAmountYuan: amount,
-		Remark:           req.Remark,
-		FlowSelections:   service.FlowSelections(req.FlowSelections),
-		ApproverUserIDs:  req.ApproverUserIDs,
-		HandlerUserIDs:   req.HandlerUserIDs,
-		CcUserIDs:        req.CcUserIDs,
-		Attachments:      attachments,
-		ReceiptItems:     receiptItems,
-		PaymentItems:     paymentItems,
-		BankAccountID:    req.BankAccountID,
+		ApplicantUserID:    cl.Sub,
+		ApplicantWecomID:   req.ApplicantWecomID,
+		ApplicantBearer:    c.Request.Header.Get("Authorization"),
+		SettlementIDs:      req.SettlementIDs,
+		ManualAmountYuan:   amount,
+		Remark:             req.Remark,
+		FlowSelections:     service.FlowSelections(req.FlowSelections),
+		ApproverUserIDs:    req.ApproverUserIDs,
+		HandlerUserIDs:     req.HandlerUserIDs,
+		CcUserIDs:          req.CcUserIDs,
+		Attachments:        attachments,
+		ReceiptItems:       receiptItems,
+		PaymentItems:       paymentItems,
+		BankAccountID:      req.BankAccountID,
 		StocktakeHeaderIDs: req.StocktakeHeaderIDs,
 	})
 	if err != nil {
@@ -603,7 +603,13 @@ func (h *Handler) List(c *gin.Context) {
 		mapErr(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"items": items, "total": total})
+	// has_more 是 H5 契约里的可选字段(§7):本页之后是否还有数据。
+	// 前端拿不到 total/has_more 时只能按"本页满了就还有"推断,给出来更准。
+	c.JSON(http.StatusOK, gin.H{
+		"items":    items,
+		"total":    total,
+		"has_more": int64(offset)+int64(len(items)) < total,
+	})
 }
 
 // Get GET /settlement-approvals/:id
@@ -736,7 +742,8 @@ func (h *Handler) ListCubeSettlements(c *gin.Context) {
 //	q   —— 关键字（单号 / 供应商编号 / 供应商名称），与 ids 二选一。
 //
 // ⚠️ scope 用 settlement:view（与列表同级）：这是**只读诊断**，
-//    不涉及任何状态变更 ⇒ 不需要 settlement:audit。
+//
+//	不涉及任何状态变更 ⇒ 不需要 settlement:audit。
 func (h *Handler) ListSettlementStatuses(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "settlement:view") {

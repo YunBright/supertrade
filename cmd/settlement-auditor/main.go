@@ -111,6 +111,10 @@ func initApp() error {
 		&model.AuditSupplierFlow{},
 		&model.AuditPaymentItemFlow{},
 		&model.AuditRegexPattern{},
+		// 企微审批月度总表(计划 §9):approval_items 的派生投影,读侧走索引
+		// 统计「每月有且仅有一单」,不再实时 JOIN 扫全表。
+		&model.ApprovalMonthlyItem{},
+		&model.ApprovalMonthlyBackfill{},
 	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
 	}
@@ -331,6 +335,8 @@ func registerRoutes(r *gin.Engine) {
 func registerDaprRoutes(r *gin.Engine) {
 	h := handler.New(appSvc)
 	h.RegisterSubscribeRoutes(r, slog.Default())
+	// 月度总表重建(改正则/补日期写法后手动跑一次)。
+	h.RegisterMonthlyInternalRoutes(r)
 	// 兜底清理端点。收尾清理时未必持有 token，所以必须在这个
 	// **免鉴权窗口**注册；公网安全靠 nginx 的
 	// `location ^~ /api/v1/settlement-auditor/internal/ { return 404; }`。

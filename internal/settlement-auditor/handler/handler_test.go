@@ -230,6 +230,7 @@ func buildTestHandler(t *testing.T, withCube bool) (*gin.Engine, *gorm.DB, *fake
 		&model.SettlementPayState{}, &model.ApprovalItem{},
 		&model.ApprovalPayeeAccount{},
 		&model.AuditSupplierFlow{}, &model.AuditPaymentItemFlow{}, &model.AuditRegexPattern{},
+		&model.ApprovalMonthlyItem{}, &model.ApprovalMonthlyBackfill{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

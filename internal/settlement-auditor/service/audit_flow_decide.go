@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -218,6 +219,7 @@ func (s *Service) findItemFlow(ctx context.Context, branchID, itemType string) (
 //	用户口径③是「**逐个评估**」⇒ 每个主体只评估自己的那份数据。
 //
 // ⚠️ 单据归属用**结算单上的供应商**（审批人勾的那几张单），
+//
 //	而不是采购单自己的供应商字段 ——
 //	两者不一致时 checkSheets 会出 supplier_mismatch 硬拦信号，整单已被拒，
 //	这里怎么取都不影响结论。
@@ -287,6 +289,7 @@ func (s *Service) evaluateSupplierFlow(cfg *model.AuditSupplierFlow, sheets []Pu
 //	  条件 = 每个日期分组里恰好 1 张采购单。
 //
 // ⚠️ 入参 sheets 已经由调用方**按供应商主体隔离**（见 sheetsOfSupplier）——
+//
 //	本函数只负责"给的这组采购单里，同一天有没有超过 1 张"。
 //
 // # 边界
@@ -416,7 +419,7 @@ func (s *Service) evaluateMonthlySingle(ctx context.Context, ap *model.ApprovalI
 		}
 		counts[yearMonth{y, m}]++
 	}
-	hist, unmatched, err := s.countHistoricalMonthlyItems(ctx, ap, cfg, re, groupIndex)
+	hist, unmatched, err := s.countHistoricalMonthlyItems(ctx, ap, cfg)
 	if err != nil {
 		return false, "", err
 	}
@@ -475,51 +478,72 @@ type histItemRow struct {
 
 // countHistoricalMonthlyItems 统计**其它审批单**里该付款项类型的「所属年/月」笔数。
 //
+// # 读月度总表，不再实时 JOIN
+//
+// 原来每次审核都要 JOIN `approval_items` + `approval_instances` 扫全表，
+// 审批单累积到 10 万行级后是审核流水线的主要延迟来源。
+// 现在读 `approval_monthly_items`（索引 branch_id + item_type + year_month），
+// 投影行在写入与状态变更时已同步好。
+//
 // ⚠️ **只算还在生效的审批单**（rejected / failed / cancelled 不算）：
 //
 //	机器拒绝过的单子**没有付过款** ⇒ 不该占掉该月的额度。
 //	否则「拒了 → 改好再提交」会永远卡在"该月已有 1 笔"上（无限循环）。
 //
-// ⚠️ 本单被排除（excludeApprovalID）⇒ 重跑/重审不会把自己算两遍。
+// ⚠️ 本单被排除（approval_id <> ap.ID）⇒ 重跑/重审不会把自己算两遍。
 //
 // ⚠️ 提不出「所属年月」的行**不计数、但会返回给调用方并导致拒绝**（2026-10-31
-// 用户口径）：以前是静默跳过，等于把可能的重复付款从统计里抹掉 ⇒ 会漏放。
+// 用户口径）：静默跳过等于把可能的重复付款从统计里抹掉 ⇒ 会漏放。
 // unmatched 是这些行的可读描述（审批单 id + 备注 + 提取结果）。
 func (s *Service) countHistoricalMonthlyItems(ctx context.Context, ap *model.ApprovalInstance,
-	cfg *model.AuditPaymentItemFlow, re *regexp.Regexp, groupIndex int,
+	cfg *model.AuditPaymentItemFlow,
 ) (map[yearMonth]int, []string, error) {
-	var rows []histItemRow
-	err := s.db.WithContext(ctx).Model(&model.ApprovalItem{}).
-		Select(`approval_items.approval_id AS approval_id,
-			approval_items.remark AS remark,
-			approval_instances.created_at AS approval_created_at`).
-		Joins("JOIN approval_instances ON approval_instances.id = approval_items.approval_id").
-		Where(`approval_items.branch_id = ? AND approval_items.direction = ?
-			AND approval_items.item_type = ? AND approval_items.approval_id <> ?
-			AND approval_instances.status NOT IN ?`,
+	// 历史行可能还没进月度总表（首次审核新门店）⇒ 先补齐（幂等、只跑一次）。
+	if err := s.EnsureMonthlyBackfill(ctx, ap.BranchID); err != nil {
+		return nil, nil, err
+	}
+	var rows []model.ApprovalMonthlyItem
+	err := s.db.WithContext(ctx).
+		Select("approval_id, remark, item_type, year_month, parse_status").
+		Where(`branch_id = ? AND direction = ? AND item_type = ? AND approval_id <> ?
+			AND instance_status NOT IN ?`,
 			ap.BranchID, ItemDirectionPayment, cfg.ItemType, ap.ID,
 			[]string{model.StatusRejected, model.StatusFailed, model.StatusCancelled}).
-		Scan(&rows).Error
+		Find(&rows).Error
 	if err != nil {
 		return nil, nil, fmt.Errorf("count historical monthly items: %w", err)
 	}
 	out := map[yearMonth]int{}
 	var unmatched []string
 	for _, r := range rows {
-		text, ok := matchRegexGroup(re, groupIndex, r.Remark)
-		if !ok {
-			unmatched = append(unmatched, fmt.Sprintf("审批单 %s 备注 %q(正则未匹配)", r.ApprovalID, r.Remark))
+		if r.ParseStatus != model.MonthlyParseOK {
+			unmatched = append(unmatched, fmt.Sprintf(
+				"审批单 %s 备注 %q(提取不出所属年月)", r.ApprovalID, r.Remark))
 			continue
 		}
-		y, m, ok := parsePeriodText(text, r.ApprovalCreatedAt.Year())
+		y, m, ok := parseStoredYearMonth(r.YearMonth)
 		if !ok {
 			unmatched = append(unmatched, fmt.Sprintf(
-				"审批单 %s 备注 %q(提取结果 %q 解析不出年/月)", r.ApprovalID, r.Remark, text))
+				"审批单 %s 备注 %q(月度记录 %q 解析不出年/月)", r.ApprovalID, r.Remark, r.YearMonth))
 			continue
 		}
 		out[yearMonth{y, m}]++
 	}
 	return out, unmatched, nil
+}
+
+// parseStoredYearMonth 解析月度总表里的 yyyy-mm。
+func parseStoredYearMonth(v string) (int, int, bool) {
+	parts := strings.Split(strings.TrimSpace(v), "-")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	y, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+	m, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err1 != nil || err2 != nil || y == 0 || m < 1 || m > 12 {
+		return 0, 0, false
+	}
+	return y, m, true
 }
 
 // loadRegex 取该门店的正则（没配 / 不存在 / 已停用 / 非法 ⇒ nil）。

@@ -34,6 +34,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
+	"gorm.io/gorm"
 
 	"github.com/YunBright/supertrade/internal/settlement-auditor/model"
 )
@@ -227,29 +228,39 @@ func directionLabel(direction string) string {
 // storeItems 落库手工收付款明细。
 //
 // 机器审核是异步的(go s.runAudit)⇒ 审核时要读得到这些行,必须先落库。
+//
+// 同一事务内同时写 `approval_monthly_items`（月度总表，计划 §9）：
+// 明细与投影必须原子落库，否则"明细写了、总表没写"会让月度统计静默漏行。
 func (s *Service) storeItems(ctx context.Context, ap *model.ApprovalInstance, receipts, payments []ItemInput) error {
-	appendDir := func(direction string, items []ItemInput) error {
-		for _, in := range items {
-			row := &model.ApprovalItem{
-				ID:              uuid.NewString(),
-				ApprovalID:      ap.ID,
-				BranchID:        ap.BranchID,
-				ApplicantUserID: ap.ApplicantUserID,
-				Direction:       direction,
-				ItemType:        in.Type,
-				Remark:          in.Remark,
-				AmountYuan:      in.AmountYuan,
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		rows := make([]model.ApprovalItem, 0, len(receipts)+len(payments))
+		appendDir := func(direction string, items []ItemInput) error {
+			for _, in := range items {
+				row := &model.ApprovalItem{
+					ID:              uuid.NewString(),
+					ApprovalID:      ap.ID,
+					BranchID:        ap.BranchID,
+					ApplicantUserID: ap.ApplicantUserID,
+					Direction:       direction,
+					ItemType:        in.Type,
+					Remark:          in.Remark,
+					AmountYuan:      in.AmountYuan,
+				}
+				if err := tx.Create(row).Error; err != nil {
+					return fmt.Errorf("create approval_item %s: %w", in.Type, err)
+				}
+				rows = append(rows, *row)
 			}
-			if err := s.db.WithContext(ctx).Create(row).Error; err != nil {
-				return fmt.Errorf("create approval_item %s: %w", in.Type, err)
-			}
+			return nil
 		}
-		return nil
-	}
-	if err := appendDir(ItemDirectionReceipt, receipts); err != nil {
-		return err
-	}
-	return appendDir(ItemDirectionPayment, payments)
+		if err := appendDir(ItemDirectionReceipt, receipts); err != nil {
+			return err
+		}
+		if err := appendDir(ItemDirectionPayment, payments); err != nil {
+			return err
+		}
+		return writeMonthlyItemsTx(tx, ap, rows, s.now())
+	})
 }
 
 // loadApprovalItems 读出本次审批的手工收付款明细(按创建顺序)。

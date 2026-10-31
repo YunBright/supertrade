@@ -311,6 +311,7 @@ func newTestService(t *testing.T) (*Service, *gorm.DB, *fakeCube, *fakePublisher
 		&model.ApprovalItem{},
 		&model.ApprovalPayeeAccount{},
 		&model.AuditSupplierFlow{}, &model.AuditPaymentItemFlow{}, &model.AuditRegexPattern{},
+		&model.ApprovalMonthlyItem{}, &model.ApprovalMonthlyBackfill{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -776,7 +777,7 @@ func TestStepStocktake_PublishesToConfiguredGroup(t *testing.T) {
 	db.Create(&model.ApprovalSettlement{ID: "x1", ApprovalID: ap.ID, SettlementID: "CP1"})
 	svc.stepStocktake(context.Background(), ap, &VerdictResult{
 		SuggestStocktake: &StocktakeSuggestion{Scope: "product", IDs: []string{"02000116"}},
-	})
+	}, nil)
 	if st.calls != 1 {
 		t.Fatalf("建单应调 1 次, got %d", st.calls)
 	}
@@ -796,6 +797,81 @@ func TestStepStocktake_PublishesToConfiguredGroup(t *testing.T) {
 	}
 	if len(payload.ToUser) != 0 {
 		t.Errorf("配了群就不该再发成员, got %v", payload.ToUser)
+	}
+}
+
+// TestStepStocktake_SupplierScope_DerivesProductsFromSignals 锁 2026-10-31 生产事故:
+// LLM 给 scope=supplier(ids 是供应商 id),计划单必须有**具体商品**,
+// 否则盘点人打开就是"没有盘点计划项"。⇒ 从数量类信号里派生商品。
+func TestStepStocktake_SupplierScope_DerivesProductsFromSignals(t *testing.T) {
+	svc, db, _, _, st := newTestService(t)
+	ap := &model.ApprovalInstance{
+		ID: "ap-supplier", CorpID: "wcorp-test", BranchID: "B1",
+		ApplicantUserID: "u-1", ApplicantWecomID: "wecom-u1", Status: model.StatusAuditing,
+	}
+	if err := db.Create(ap).Error; err != nil {
+		t.Fatalf("create ap: %v", err)
+	}
+	db.Create(&model.ApprovalSettlement{ID: "x1", ApprovalID: ap.ID, SettlementID: "CP002609014323"})
+	verdict := &VerdictResult{
+		SuggestStocktake: &StocktakeSuggestion{Scope: "supplier", IDs: []string{"115"}},
+	}
+	signals := []signalDraft{
+		newSignal(model.SignalWarn, SigQtyDeviation, "", "P1", "偏离", nil),
+		newSignal(model.SignalBlock, SigPurchaseWithoutSales, "", "P2", "无销售", nil),
+		newSignal(model.SignalBlock, SigQtyDeviation, "", "P1", "重复商品", nil), // 去重
+		newSignal(model.SignalWarn, "other_signal", "", "P9", "非数量类", nil),   // 不参与
+	}
+
+	svc.stepStocktake(context.Background(), ap, verdict, signals)
+
+	if st.calls != 1 {
+		t.Fatalf("建单应调 1 次, got %d", st.calls)
+	}
+	st.mu.Lock()
+	got := st.got
+	st.mu.Unlock()
+	if got == nil {
+		t.Fatal("应调 stocktake 建单")
+	}
+	want := []string{"P1", "P2"}
+	if len(got.ProductIDs) != len(want) {
+		t.Fatalf("计划商品 = %v, want %v", got.ProductIDs, want)
+	}
+	for i := range want {
+		if got.ProductIDs[i] != want[i] {
+			t.Errorf("计划商品[%d] = %q, want %q", i, got.ProductIDs[i], want[i])
+		}
+	}
+	if !strings.Contains(got.Remark, "计划商品 2 个") {
+		t.Errorf("remark 应写明计划商品数, got %q", got.Remark)
+	}
+}
+
+// TestStepStocktake_NoProducts_SkipsCreate 无任何可落地商品时**不建空计划单**。
+func TestStepStocktake_NoProducts_SkipsCreate(t *testing.T) {
+	svc, db, _, _, st := newTestService(t)
+	ap := &model.ApprovalInstance{
+		ID: "ap-no-products", CorpID: "wcorp-test", BranchID: "B1",
+		ApplicantUserID: "u-1", ApplicantWecomID: "wecom-u1", Status: model.StatusAuditing,
+	}
+	if err := db.Create(ap).Error; err != nil {
+		t.Fatalf("create ap: %v", err)
+	}
+	verdict := &VerdictResult{
+		SuggestStocktake: &StocktakeSuggestion{Scope: "category", IDs: []string{"cat-1"}},
+	}
+	svc.stepStocktake(context.Background(), ap, verdict, nil)
+
+	if st.calls != 0 {
+		t.Fatalf("没有计划商品不应建单, got %d 次", st.calls)
+	}
+	var skipLog model.AuditLog
+	if err := db.First(&skipLog, "approval_id = ? AND step = ?", ap.ID, StepStocktake).Error; err != nil {
+		t.Fatalf("应写跳过建单的 step 日志: %v", err)
+	}
+	if !strings.Contains(skipLog.OutputSummary, "跳过建单") {
+		t.Errorf("日志应说明跳过建单, got %q", skipLog.OutputSummary)
 	}
 }
 
@@ -1019,8 +1095,8 @@ func TestStepStocktake_Idempotent(t *testing.T) {
 	db.Create(&model.ApprovalSettlement{ID: "x1", ApprovalID: ap.ID, SettlementID: "CP002610104463"})
 	verdict := &VerdictResult{SuggestStocktake: &StocktakeSuggestion{Scope: "product", IDs: []string{"PR1"}}}
 
-	svc.stepStocktake(context.Background(), ap, verdict)
-	svc.stepStocktake(context.Background(), ap, verdict) // 模拟重跑
+	svc.stepStocktake(context.Background(), ap, verdict, nil)
+	svc.stepStocktake(context.Background(), ap, verdict, nil) // 模拟重跑
 
 	if st.calls != 1 {
 		t.Fatalf("CreatePlanHeader 应只调 1 次(幂等), got %d", st.calls)

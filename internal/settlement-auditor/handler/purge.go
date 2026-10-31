@@ -15,7 +15,7 @@
 // 成功的审核变成 failed——**清理反而制造了新的脏数据**。所以这里必须跳过在途
 // 状态，与 service.DeleteApproval 的 terminalStatuses 保持同一套判据。
 //
-// 主表 + 5 张从表都被旁表**独立记账**，清理按各自记下的主键删，registry 的顺序
+// 主表 + 6 张从表都被旁表**独立记账**，清理按各自记下的主键删，registry 的顺序
 // 不再是语义。
 //
 // approval_approver_preferences **不在范围内**：主键是
@@ -57,7 +57,7 @@ var deletableStatuses = []string{
 	model.StatusCancelled,
 }
 
-// childOfDeletableApproval 是 5 张从表共用的"只删可删审批的行"条件。
+// childOfDeletableApproval 是 6 张从表共用的"只删可删审批的行"条件。
 //
 // # 为什么从表不能只靠自己的账
 //
@@ -81,6 +81,9 @@ func PurgeRegistry() *purge.Registry {
 		purge.Model{Table: "audit_logs", Model: &model.AuditLog{}, KeepSQL: childSQL, KeepArg: childArg},
 		purge.Model{Table: "llm_verdicts", Model: &model.LLMVerdict{}, KeepSQL: childSQL, KeepArg: childArg},
 		purge.Model{Table: "approval_stocktake_links", Model: &model.ApprovalStocktakeLink{}, KeepSQL: childSQL, KeepArg: childArg},
+		// 月度总表是审批明细的派生投影：主表被删后它若不跟着删，
+		// 残留行会让「每月有且仅有一单」把已删审批的付款笔数一直算进去。
+		purge.Model{Table: "approval_monthly_items", Model: &model.ApprovalMonthlyItem{}, KeepSQL: childSQL, KeepArg: childArg},
 		purge.Model{
 			Table:   "approval_instances",
 			Model:   &model.ApprovalInstance{},

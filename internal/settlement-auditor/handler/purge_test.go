@@ -31,6 +31,7 @@ func newPurgeDB(t *testing.T) *gorm.DB {
 	require.NoError(t, db.AutoMigrate(
 		&model.ApprovalInstance{}, &model.ApprovalSettlement{}, &model.ApprovalAttachment{}, &model.AuditSignal{},
 		&model.AuditLog{}, &model.LLMVerdict{}, &model.ApprovalStocktakeLink{},
+		&model.ApprovalMonthlyItem{},
 		&model.SettlementPayState{},
 	))
 	require.NoError(t, testrun.RegisterGorm(db))
@@ -78,12 +79,19 @@ func seedApproval(t *testing.T, db *gorm.DB, id, status, runID string) {
 		&model.ApprovalStocktakeLink{
 			ID: id + "-K1", ApprovalID: id, StocktakeHeaderID: "ST-1", CreatedAt: now,
 		},
+		&model.ApprovalMonthlyItem{
+			ID: id + "-M1", BranchID: "B1", ApprovalID: id, ItemID: id + "-I1",
+			Direction: "payment", ItemType: "水电费", AmountYuan: decimal.RequireFromString("100.00"),
+			YearMonth: "2026-09", ParseStatus: model.MonthlyParseOK,
+			InstanceStatus: status, PayState: model.PayStateUnpaid,
+			CreatedAt: now, UpdatedAt: now,
+		},
 	} {
 		create(t, db, runID, row)
 	}
 }
 
-// childModels 是审批的 5 张从表（approval_id 无外键，必须显式级联）。
+// childModels 是审批的 6 张从表（approval_id 无外键，必须显式级联）。
 func childModels() map[string]any {
 	return map[string]any{
 		"approval_settlements":     &model.ApprovalSettlement{},
@@ -91,6 +99,7 @@ func childModels() map[string]any {
 		"audit_logs":               &model.AuditLog{},
 		"llm_verdicts":             &model.LLMVerdict{},
 		"approval_stocktake_links": &model.ApprovalStocktakeLink{},
+		"approval_monthly_items":   &model.ApprovalMonthlyItem{},
 	}
 }
 
@@ -230,6 +239,7 @@ func TestPurgeRegistry_TableSetIsExact(t *testing.T) {
 		"audit_logs",
 		"llm_verdicts",
 		"approval_stocktake_links",
+		"approval_monthly_items",
 		"approval_instances",
 	}
 	got := handler.PurgeRegistry().Tables()
