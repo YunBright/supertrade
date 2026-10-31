@@ -144,6 +144,34 @@ const (
 	PaymentSourceManual = "manual"
 )
 
+// ---- 现金实盘状态 ----
+const (
+	CashCountStatusOpen      = "open"
+	CashCountStatusConfirmed = "confirmed"
+)
+
+// ---- 长短款方向（相对应收现金） ----
+const (
+	// VarianceKindOver 长款：实盘 > 应收。
+	VarianceKindOver = "over"
+	// VarianceKindShort 短款：实盘 < 应收。
+	VarianceKindShort = "short"
+)
+
+// ---- 长短款台账状态 ----
+const (
+	CashVarianceStatusOpen      = "open"
+	CashVarianceStatusConfirmed = "confirmed"
+)
+
+// ---- 其他收款 ----
+const (
+	ReceiptStatusDraft     = "draft"
+	ReceiptStatusConfirmed = "confirmed"
+	ReceiptSourceManual    = "manual"
+	ReceiptSourceImport    = "import"
+)
+
 // ---- 导入类型 ----
 const (
 	ImportKindBank    = "bank"
@@ -348,11 +376,13 @@ func (ReconCashCount) TableName() string { return "recon_cash_counts" }
 
 // ReconCashVariance 是长短款台账（按收银员可汇总）。
 type ReconCashVariance struct {
-	ID         string          `gorm:"primaryKey;column:id;type:varchar(36)" json:"id"`
-	BranchID   string          `gorm:"column:branch_id;type:varchar(32);not null;index:idx_variance_branch_date,priority:1" json:"branch_id"`
-	BizDate    time.Time       `gorm:"column:biz_date;type:date;not null;index:idx_variance_branch_date,priority:2" json:"biz_date"`
-	CashierID  string          `gorm:"column:cashier_id;type:varchar(32);not null;index:idx_variance_cashier" json:"cashier_id"`
-	Kind       string          `gorm:"column:kind;type:varchar(8);not null" json:"kind"`
+	ID        string    `gorm:"primaryKey;column:id;type:varchar(36)" json:"id"`
+	BranchID  string    `gorm:"column:branch_id;type:varchar(32);not null;index:idx_variance_branch_date,priority:1;uniqueIndex:ux_variance,priority:1" json:"branch_id"`
+	BizDate   time.Time `gorm:"column:biz_date;type:date;not null;index:idx_variance_branch_date,priority:2;uniqueIndex:ux_variance,priority:2" json:"biz_date"`
+	CashierID string    `gorm:"column:cashier_id;type:varchar(32);not null;index:idx_variance_cashier;uniqueIndex:ux_variance,priority:3" json:"cashier_id"`
+	// Kind ∈ over / short；ux_variance(branch,biz_date,cashier,kind) 保证同日同人
+	// 同方向只有一行 —— 重复录入时按它 upsert，不会堆出多条台账。
+	Kind       string          `gorm:"column:kind;type:varchar(8);not null;uniqueIndex:ux_variance,priority:4" json:"kind"`
 	Amount     decimal.Decimal `gorm:"column:amount;type:numeric(18,4);not null;default:0" json:"amount"`
 	ReasonCode string          `gorm:"column:reason_code;type:varchar(32)" json:"reason_code"`
 	Status     string          `gorm:"column:status;type:varchar(16);not null;default:open;index" json:"status"`

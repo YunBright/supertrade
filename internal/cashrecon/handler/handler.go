@@ -116,6 +116,9 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/opening-balances/check", requireBranch, guard(ScopeView), h.CheckOpenings)
 	r.POST("/opening-balances", requireBranch, guard(ScopeAudit), h.CreateOpenings)
 	r.POST("/opening-balances/:id/void", requireBranch, guard(ScopeAudit), h.VoidOpening)
+
+	// ---- S3：长短款 / 其他收款 / 付款核销 / 供应商应付 ----
+	h.registerRoutesS3(r, requireBranch, guard)
 }
 
 // errBody 是错误响应体(与 settlement-auditor 同形:code + message)。

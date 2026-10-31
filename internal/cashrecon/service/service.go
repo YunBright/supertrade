@@ -43,11 +43,16 @@ type Config struct {
 	DefaultToleranceDays int
 	// DefaultCashTolerance decimal 是长短款容差默认值(元)。
 	DefaultCashTolerance decimal.Decimal
+	// AttachmentMaxBytes 是单个收款附件的上限(默认 5MB)。
+	AttachmentMaxBytes int64
 	// Logger 可注入(测试用);nil ⇒ slog.Default()。
 	Logger *slog.Logger
 	// Clock 可注入(测试用);nil ⇒ time.Now。
 	Clock func() time.Time
 }
+
+// DefaultAttachmentMaxBytes 是附件单文件上限(计划 §13 的默认值)。
+const DefaultAttachmentMaxBytes int64 = 5 << 20
 
 // DefaultConfig 返回默认配置。
 func DefaultConfig() Config {
@@ -57,6 +62,7 @@ func DefaultConfig() Config {
 		CacheTTL:             5 * time.Minute,
 		DefaultToleranceDays: 1,
 		DefaultCashTolerance: decimal.NewFromInt(5),
+		AttachmentMaxBytes:   DefaultAttachmentMaxBytes,
 	}
 }
 
@@ -95,6 +101,9 @@ func NewWithConfig(db *gorm.DB, cfg Config) *Service {
 	}
 	if cfg.DefaultCashTolerance.IsZero() {
 		cfg.DefaultCashTolerance = decimal.NewFromInt(5)
+	}
+	if cfg.AttachmentMaxBytes <= 0 {
+		cfg.AttachmentMaxBytes = DefaultAttachmentMaxBytes
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
