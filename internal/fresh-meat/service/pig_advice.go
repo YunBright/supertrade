@@ -169,6 +169,13 @@ func (s *Service) RegeneratePigAdvice(ctx context.Context, branchID, pigID strin
 	if err := s.assertNotAudited(ctx, branchID, pig.ArrivedAt, "重新生成分割建议"); err != nil {
 		return nil, err
 	}
+	// ⚠️ 「只用基线」的猪**不生成 AI 建议**(2026-10-31 owner)
+	//   ⇒ 这里必须**明确拒绝**,不能让门店点一下就白花一次 LLM 调用,
+	//   更不能让 ai_advice_json 里有数、成本链却不用(看着像"建议已生成",
+	//   实际没用上 ⇒ 门店会以为"AI 建议生效了")。
+	if adviceModeOf(pig) == model.AdviceModeBaseline {
+		return nil, fmt.Errorf("%w: 这头猪的分割建议方式是「只用基线」,不需要 AI 建议", ErrInvalidInput)
+	}
 	// 先置 generating ⇒ 前端立刻能显示"生成中"并开始轮询。
 	if err := s.db.WithContext(ctx).Model(&model.WholePig{}).
 		Where("id = ?", pigID).

@@ -358,6 +358,32 @@ func (s *Service) RecordWholePig(ctx context.Context, branchID string, in model.
 	if in.ArrivedAt.IsZero() {
 		return nil, fmt.Errorf("%w: arrived_at 必填", ErrInvalidInput)
 	}
+	// ---- 建议生成方式(auto / baseline / llm;空 = auto)----
+	//
+	// ⚠️ 2026-10-31 owner:录猪时要能选「用什么方式生成建议」。
+	//   空 = auto ⇒ 老前端不受影响(基线优先,基线没覆盖的部位才用 LLM)。
+	adviceMode := strings.TrimSpace(in.AdviceMode)
+	if adviceMode == "" {
+		adviceMode = model.AdviceModeAuto
+	}
+	if !model.ValidAdviceMode(adviceMode) {
+		return nil, fmt.Errorf("%w: advice_mode 只能是 auto / baseline / llm", ErrInvalidInput)
+	}
+	// ⚠️ 「只用基线」但这个体重段**没有可用基线** ⇒ 在录猪时就说清(2026-10-31 owner)。
+	//
+	//	否则这头猪**一条建议都没有** ⇒ 当天产出凭空少一整头猪
+	//	⇒ 到处是"缺口 / 短卖 / 幻影搭赠" ⇒ 比当场报错糟糕得多。
+	if adviceMode == model.AdviceModeBaseline {
+		has, err := s.hasUsableBaselineBand(ctx, branchID, in.GrossWeightKg)
+		if err != nil {
+			return nil, err
+		}
+		if !has {
+			return nil, fmt.Errorf(
+				"%w: 这个体重段（%s）还没有可用的分割基线，请改用「自动」或「只用 AI」",
+				ErrInvalidInput, WeightBandOf(in.GrossWeightKg))
+		}
+	}
 
 	// ---- 链的起点:归属日不得早于期初结转的生效日(2026-10-25 门店反馈)----
 	//
@@ -404,13 +430,20 @@ func (s *Service) RecordWholePig(ctx context.Context, branchID string, in model.
 		ArrivedAt:             in.ArrivedAt,
 		RecordedBy:            operatorID,
 		DataSource:            model.DataSourceStub,
-		// 建议是**异步**生成的 ⇒ 落库时就是"生成中"。
-		AdviceStatus:          model.AdviceStatusGenerating,
+		AdviceMode:            adviceMode,
 		HalfPig:               in.HalfPig,
 		OffalIncluded:         in.OffalIncluded,
 		PurchaseGroupID:       strings.TrimSpace(in.PurchaseGroupID),
 		CreatedAt:             now,
 		UpdatedAt:             now,
+	}
+	// ⚠️ 「只用基线」⇒ **不生成 LLM 建议**(2026-10-31 owner)
+	//   ⇒ 状态落 none(不是 generating)⇒ 前端不会一直显示"生成中"。
+	if adviceMode == model.AdviceModeBaseline {
+		pig.AdviceStatus = model.AdviceStatusNone
+	} else {
+		// 建议是**异步**生成的 ⇒ 落库时就是"生成中"。
+		pig.AdviceStatus = model.AdviceStatusGenerating
 	}
 	if err := s.db.WithContext(ctx).Create(pig).Error; err != nil {
 		return nil, fmt.Errorf("create whole_pig: %w", err)
@@ -431,6 +464,14 @@ func (s *Service) RecordWholePig(ctx context.Context, branchID string, in model.
 	//
 	// ⇒ 现在:猪先落库、**立即返回**;建议在后台用**独立 ctx**生成
 	//   (客户端断网/超时都不影响它落库)⇒ 见 service/pig_advice.go。
+	//
+	// ⚠️ 「只用基线」⇒ **不调 LLM**(2026-10-31 owner):
+	//   门店自己选了 ⇒ 别花钱、别让门店等 ⇒ 建议由基线在成本链里现算。
+	if adviceMode == model.AdviceModeBaseline {
+		s.pubLogger.Info("RecordWholePig: 建议方式=只用基线 ⇒ 不调用 LLM",
+			"branch_id", branchID, "pig_id", pig.ID)
+		return pig, nil
+	}
 	s.kickAdviceGeneration(ctx, pig.ID, branchID)
 	return pig, nil
 }

@@ -118,6 +118,17 @@ type cutSplitWeights struct {
 //	(这与 `computeProducedBySku` 的产出优先级**故意不同** ⇒ 别把那段逻辑搬过来。)
 //
 // ⚠ 基线是**按体重段 × 部位**分层的(见 forecast.go)⇒ 换体重段建议就变。
+//
+// # ⚠️ 逐猪看「建议生成方式」(2026-10-31 owner)
+//
+//	门店在录猪时能选「用什么方式生成建议」⇒ **每头猪各自**的模式不同
+//	(同一天可能一头用基线、一头用 AI)⇒ 必须**逐猪**判断,不能按天统一取:
+//
+//	| 模式       | 基线覆盖的部位 | 基线没覆盖的部位 | 要不要调 LLM |
+//	|------------|----------------|------------------|--------------|
+//	| auto       | 用基线 p50     | 用 LLM 建议      | 要           |
+//	| baseline   | 用基线 p50     | **没有建议**     | **不要**     |
+//	| llm        | **不看基线**   | 用 LLM 建议      | 要           |
 func (s *Service) loadSuggestedSplitKg(ctx context.Context, branchID string, pigs []model.WholePig) (
 	map[string]decimal.Decimal, error) {
 	out := map[string]decimal.Decimal{}
@@ -129,34 +140,163 @@ func (s *Service) loadSuggestedSplitKg(ctx context.Context, branchID string, pig
 		return nil, err
 	}
 	for _, p := range pigs {
+		mode := adviceModeOf(p)
 		band := WeightBandOf(p.GrossWeightKg)
 		// ① 统计基线 p50 优先(基线是从真实补录样本拟合出来的 ⇒ 比 LLM 准)。
+		//    ⚠️ 「只用 AI」模式**不查基线**(门店明确不要基线)。
 		covered := map[model.CutType]bool{}
-		for _, b := range baselines {
-			if b.WeightBand != band || !b.Usable() || !b.P50Kg.IsPositive() {
-				continue
+		perPig := map[string]decimal.Decimal{}
+		if mode != model.AdviceModeLLM {
+			for _, b := range baselines {
+				if b.WeightBand != band || !b.Usable() || !b.P50Kg.IsPositive() {
+					continue
+				}
+				perPig[string(b.CutType)] = perPig[string(b.CutType)].Add(b.P50Kg)
+				covered[b.CutType] = true
 			}
-			out[string(b.CutType)] = out[string(b.CutType)].Add(b.P50Kg)
-			covered[b.CutType] = true
 		}
 		// ② LLM 兜底(基线没覆盖到的部位)。
-		if len(p.LLMAdviceJSON) == 0 {
-			continue
-		}
-		var advice struct {
-			Cuts []PredictedCut `json:"cuts"`
-		}
-		if err := json.Unmarshal(p.LLMAdviceJSON, &advice); err != nil {
-			continue
-		}
-		for _, c := range advice.Cuts {
-			if covered[c.CutType] || !c.ExpectedKg.IsPositive() {
-				continue
+		//    ⚠️ 「只用基线」模式**不取 LLM**(没调过 ⇒ 反正也没有)。
+		if mode != model.AdviceModeBaseline && len(p.LLMAdviceJSON) > 0 {
+			var advice struct {
+				Cuts []PredictedCut `json:"cuts"`
 			}
-			out[string(c.CutType)] = out[string(c.CutType)].Add(c.ExpectedKg)
+			if err := json.Unmarshal(p.LLMAdviceJSON, &advice); err == nil {
+				for _, c := range advice.Cuts {
+					if covered[c.CutType] || !c.ExpectedKg.IsPositive() {
+						continue
+					}
+					perPig[string(c.CutType)] = perPig[string(c.CutType)].Add(c.ExpectedKg)
+				}
+			}
+		}
+		// ③ ⚠️ **不得超过这头猪的重量**(见 scaleSplitToPigWeight)。
+		if scaleSplitToPigWeight(perPig, p.GrossWeightKg) {
+			s.pubLogger.Warn("建议分割超过猪重,已按比例缩到猪重(防账面凭空多出货)",
+				"branch_id", branchID,
+				"pig_id", p.ID,
+				"gross_weight_kg", p.GrossWeightKg.String(),
+				"suggested_sum_kg", sumKgOf(perPig).String())
+		}
+		for c, v := range perPig {
+			out[c] = out[c].Add(v)
 		}
 	}
 	return out, nil
+}
+
+// hasUsableBaselineBand 这个体重段有没有**可用**的基线（任一部位可用就算有）。
+//
+// ⚠️ 为什么要在**录猪时**就拦（2026-10-31 owner）：
+//
+//	门店选了「只用基线」,但这个体重段压根没有基线
+//	⇒ 这头猪**一条建议都没有** ⇒ 当天产出凭空少一整头猪
+//	⇒ 到处是「缺口 / 短卖 / 幻影搭赠」⇒ 门店会以为系统算错了
+//	⇒ 比当场说清「这个体重段还没有基线，请换个方式」糟糕得多。
+func (s *Service) hasUsableBaselineBand(ctx context.Context, branchID string, grossKg decimal.Decimal) (bool, error) {
+	all, err := s.loadForecastBaselines(ctx, branchID)
+	if err != nil {
+		return false, err
+	}
+	band := WeightBandOf(grossKg)
+	for _, b := range all {
+		if b.WeightBand == band && b.Usable() && b.P50Kg.IsPositive() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// adviceModeOf 取这头猪的**建议生成方式**。
+//
+// ⚠️ 空 / 未知值 ⇒ auto(兼容 2026-10-31 之前录的猪:那时没有这个字段)。
+func adviceModeOf(p model.WholePig) string {
+	switch p.AdviceMode {
+	case model.AdviceModeBaseline, model.AdviceModeLLM:
+		return p.AdviceMode
+	default:
+		return model.AdviceModeAuto
+	}
+}
+
+// sumKgOf 求 map 里所有值的和。
+func sumKgOf(m map[string]decimal.Decimal) decimal.Decimal {
+	var total decimal.Decimal
+	for _, v := range m {
+		total = total.Add(v)
+	}
+	return total
+}
+
+// scaleSplitToPigWeight 把某头猪的**建议分割**按比例缩到「不超过猪重」。
+//
+// # 为什么必须有这一步(2026-10-31 生产实测,店 00)
+//
+//	基线的 P50 是**绝对 kg**(从历史样本拟合出来的"每头猪切出多少")，
+//	⇒ 它隐含的是**历史样本猪**的重量(店 00 的 100-149 段 ⇒ 隐含 119.273kg),
+//	⇒ 而今天的猪可能只有 111kg ⇒ 直接当绝对 kg 用 ⇒ **建议之和 > 猪重**。
+//
+//	实测(店 00):
+//		10-29: 猪 100.2+98 = 198.2kg ⇒ 进货 238.04kg(+20.1%)
+//		10-30: 猪 116.1+111 = 227.1kg ⇒ 进货 261.47kg(+15.1%)
+//		10-31: 猪 111kg ⇒ 进货 130.47kg(+17.5%)
+//
+//	⇒ **账面凭空多出 19.47kg 的货**(= 一头猪切不出来的量):
+//	  ① 产出量虚高 ⇒ 每个部位的「应有」虚高 ⇒ 到处是"缺口"(幻影搭赠/盘亏);
+//	  ② 入库金额仍然是猪的**真实**成本 ⇒ 每公斤入库成本被摊薄
+//	     (10-31: 1620.6 ÷ 130.473 = 12.42 元/kg,而进价是 14.6)
+//	     ⇒ **移动加权单价偏低 ⇒ 销售成本偏低 ⇒ 毛利虚高**;
+//	  ③ `切分损耗 = 猪重 − 产出` 变成负数 ⇒ 被**裁成 0** ⇒ 这笔多出来的货完全隐形。
+//
+// # 口径
+//
+//	**只往下缩,不往上撑**:
+//	Σ S_c > 猪重 ⇒ 按比例缩到**恰好等于猪重**;
+//	Σ S_c ≤ 猪重 ⇒ **原样不动**(差额是真实的切分损耗: 血水/骨渣/修整)。
+//
+//	⚠️ 不能往上撑:基线只覆盖了部分部位时 Σ 可能小于猪重,
+//	  那时差额**就是**切分损耗 ⇒ 撑上去等于凭空造货。
+//
+// # ⚠️ 这同时**掐断了基线的自我放大**
+//
+//	倒推样本(stocktake_derived)是从账面推的 ⇒ 账面虚高 ⇒ 样本虚高
+//	⇒ 下一版基线更高 ⇒ 账面更虚高(店 00 的 10-30 样本已经是 1.0512 倍)。
+//	修好之后 入库量 = 猪重 ⇒ 样本回到 1.0 附近 ⇒ 循环断掉。
+//
+// 返回 true = 触发了缩放。
+func scaleSplitToPigWeight(
+	perPig map[string]decimal.Decimal, grossKg decimal.Decimal,
+) bool {
+	if !grossKg.IsPositive() {
+		return false
+	}
+	sum := sumKgOf(perPig)
+	if !sum.IsPositive() || !sum.GreaterThan(grossKg) {
+		return false // 合计 ≤ 猪重 ⇒ 原样不动(差额是真实的切分损耗)
+	}
+	// 按比例缩放;余数给**最大的那个部位** ⇒ Σ 精确等于猪重。
+	keys := make([]string, 0, len(perPig))
+	for c := range perPig {
+		keys = append(keys, c)
+	}
+	sort.Strings(keys)
+	largest := ""
+	for _, c := range keys {
+		if largest == "" || perPig[c].GreaterThan(perPig[largest]) {
+			largest = c
+		}
+	}
+	factor := grossKg.Div(sum)
+	acc := decimal.Zero
+	for _, c := range keys {
+		if c == largest {
+			continue
+		}
+		perPig[c] = perPig[c].Mul(factor)
+		acc = acc.Add(perPig[c])
+	}
+	perPig[largest] = grossKg.Sub(acc)
+	return true
 }
 
 // loadRecordedSplitKg 算各部位的**实际分割实录**(kg)。

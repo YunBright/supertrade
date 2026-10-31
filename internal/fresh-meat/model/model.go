@@ -238,6 +238,40 @@ const (
 	AdviceStatusFailed = "failed"
 )
 
+// ---- 分割建议的**生成方式**(owner 2026-10-31)----
+//
+// 门店反馈:「提交录入并生成分割建议时,要在提交**前**选用什么方式生成,
+// 有基线时默认用基线,其次 LLM。」
+//
+// ⇒ 这里把「用什么方式」**落库到每头猪**上 ⇒ 成本链按**每头猪各自的模式**取数。
+//
+// ⚠️ 不能按天统一取：同一天可能一头用基线、一头用 AI。
+const (
+	// AdviceModeAuto = 自动:**基线优先**,基线没覆盖到的部位才用 LLM 建议。
+	//
+	// ⚠️ 为什么 auto 还要留 LLM 兜底(别把它做成"有基线就完全不调 AI"):
+	//   店 00 实测(2026-10-31):基线 `100-149` 段只覆盖 **25** 个部位,
+	//   而 LLM 建议覆盖 **32** 个部位 ⇒ 有 7 个部位**只有** LLM 有数
+	//   ⇒ 一旦砍掉,那 7 个部位的产出直接归零 ⇒ 账面凭空缺货 ⇒ 假短卖。
+	AdviceModeAuto = "auto"
+	// AdviceModeBaseline = 只用基线:基线覆盖的部位用基线 p50,
+	// **基线没覆盖的部位没有建议**。
+	//
+	// ⇒ 这个模式**不调 LLM**(省一次调用 + 省一次等待)⇒ 录猪时状态直接落 none。
+	AdviceModeBaseline = "baseline"
+	// AdviceModeLLM = 只用 AI:只用这头猪自己的 LLM 建议(**完全不查基线**)。
+	AdviceModeLLM = "llm"
+)
+
+// ValidAdviceMode 校验建议生成方式(空 = auto ⇒ 兼容老前端)。
+func ValidAdviceMode(m string) bool {
+	switch m {
+	case "", AdviceModeAuto, AdviceModeBaseline, AdviceModeLLM:
+		return true
+	}
+	return false
+}
+
 // ---- 表1:whole_pig ----
 
 // WholePig 整猪录入(早盘,一头一行)。
@@ -262,6 +296,11 @@ type WholePig struct {
 	// ⚠️ 录猪后建议是**异步**生成的(2026-10-26)⇒ 前端靠它区分
 	//「生成中 / 已就绪 / 失败」——光看 llm_advice_json 是否为空分不出来。
 	AdviceStatus string `gorm:"column:advice_status;type:varchar(16);not null;default:'none'" json:"advice_status"`
+	// AdviceMode 是**分割建议的生成方式**(见上面的 AdviceMode* 常量)。
+	//
+	// ⚠️ 2026-10-31 owner:录猪时要能选「用什么方式生成建议」
+	//   ⇒ 落库到**每头猪**上(不是按天)⇒ 成本链逐猪取数。
+	AdviceMode string `gorm:"column:advice_mode;type:varchar(16);not null;default:'auto'" json:"advice_mode"`
 	// 场景一/二/三区分:
 	HalfPig         bool      `gorm:"column:half_pig;not null;default:false" json:"half_pig"`                                                         // 半头猪
 	OffalIncluded   bool      `gorm:"column:offal_included;not null;default:false" json:"offal_included"`                                             // 带全猪下水
@@ -1733,6 +1772,11 @@ type RecordWholePigInput struct {
 	HalfPig               bool            `json:"half_pig"`
 	OffalIncluded         bool            `json:"offal_included"`
 	PurchaseGroupID       string          `json:"purchase_group_id"`
+	// AdviceMode 是**分割建议的生成方式**(auto / baseline / llm;空 = auto)。
+	//
+	// ⚠️ 2026-10-31 owner:录猪时门店要能选「用什么方式生成建议」
+	//   ⇒ 选「只用基线」时后端**不调 LLM**(省一次调用 + 省一次等待)。
+	AdviceMode string `json:"advice_mode"`
 }
 
 // RecordPigCutInput POST /pig-cuts 入参。

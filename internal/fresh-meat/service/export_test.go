@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/YunBright/supertrade/internal/fresh-meat/model"
 	"github.com/shopspring/decimal"
 )
 
@@ -53,4 +54,18 @@ func ClampNonNegativeForTest(kg, amount decimal.Decimal) (decimal.Decimal, decim
 // 返回:空串 = 不缺;非空 = 缺口文案(门店看到的原话)。
 func ForecastSplitSampleGapForTest(recordedN, estimatedN int) string {
 	return forecastSplitSampleGap(recordedN, estimatedN)
+}
+
+// SuggestedSplitKgForTest 暴露 [loadSuggestedSplitKg](逐猪按「建议生成方式」取数)。
+//
+// ⚠️ 为什么它值得单独暴露:
+//
+//	「auto / baseline / llm」三种模式的差别**只发生在**这个函数里
+//	(基线覆盖的部位取谁、基线没覆盖的部位取谁、要不要看 LLM)
+//	⇒ 不导出就没法从外部测试包锁它
+//	⇒ 门店"选了没用"(选项摆在那儿、后端照旧)会**静默**发生 ⇒ 比没有这个选项更坏。
+func SuggestedSplitKgForTest(ctx context.Context, s *Service, branchID string, pigs []model.WholePig) (
+	map[string]decimal.Decimal, error,
+) {
+	return s.loadSuggestedSplitKg(ctx, branchID, pigs)
 }
