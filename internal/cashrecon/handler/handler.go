@@ -119,6 +119,9 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 
 	// ---- S3：长短款 / 其他收款 / 付款核销 / 供应商应付 ----
 	h.registerRoutesS3(r, requireBranch, guard)
+
+	// ---- S4：审核冻结 / 期末快照 / 日报 / 看板 / 导出 ----
+	h.registerRoutesS4(r, requireBranch, guard)
 }
 
 // errBody 是错误响应体(与 settlement-auditor 同形:code + message)。

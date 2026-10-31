@@ -47,6 +47,11 @@ func newTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("automigrate: %v", err)
 	}
+	// SQLite :memory: 是**每连接**一个库；连接池开出第二个连接就会"表不存在"。
+	// 固定单连接，避免单测偶发失败。
+	if sqlDB, err := db.DB(); err == nil {
+		sqlDB.SetMaxOpenConns(1)
+	}
 	return db
 }
 
