@@ -1430,6 +1430,55 @@ func TestBuildApplyData(t *testing.T) {
 	}
 }
 
+// TestBuildApplyData_PureExpenseFillsSettlementControl 锁「纯支出审批」的必填控件。
+//
+// ⚠️ 2026-10-31 生产实踩:没有结算单(纯支出)时「结算单号」控件被写成空串,
+// 企微 applyevent 直接拒单:`errcode=301025 errmsg=get approval param error:
+// Text-1791653939435 is required` ⇒ 该控件必须有非空占位。
+func TestBuildApplyData_PureExpenseFillsSettlementControl(t *testing.T) {
+	svc, db, _, _, _ := newTestService(t)
+	svc.cfg.ApplyControlIDs = [3]string{"Text-1791653939435", "Text-1791654387111", "item-1494251203122"}
+	svc.cfg.ApplyControlTypes = [3]string{"Text", "Text", "Textarea"}
+	db.Create(&model.ApprovalInstance{
+		ID: "ap-pe", BranchID: "B1", Status: model.StatusApproved,
+		ManualAmountYuan: dec("7013.2"), Remark: "招待费",
+	})
+	var ap model.ApprovalInstance
+	db.First(&ap, "id = ?", "ap-pe")
+
+	applyData, summary := svc.buildApplyData(context.Background(), &ap, nil, nil, nil, nil, nil)
+	var parsed struct {
+		Contents []struct {
+			ID    string `json:"id"`
+			Value struct {
+				Text string `json:"text"`
+			} `json:"value"`
+		} `json:"contents"`
+	}
+	if err := json.Unmarshal(applyData, &parsed); err != nil {
+		t.Fatalf("apply_data 解析失败: %v", err)
+	}
+	found := false
+	for _, c := range parsed.Contents {
+		if c.ID != "Text-1791653939435" {
+			continue
+		}
+		found = true
+		if strings.TrimSpace(c.Value.Text) == "" {
+			t.Fatalf("结算单号控件是空文本 ⇒ 企微 301025 拒单: %s", applyData)
+		}
+		if !strings.Contains(c.Value.Text, "纯支出") {
+			t.Errorf("结算单号占位应写明纯支出: %q", c.Value.Text)
+		}
+	}
+	if !found {
+		t.Fatalf("apply_data 缺少必填的结算单号控件: %s", applyData)
+	}
+	if !strings.Contains(string(summary), "纯支出") {
+		t.Errorf("纯支出的摘要不该写「结算单 0 张」: %s", summary)
+	}
+}
+
 // TestBuildApplyData_AIConclusion 验证「AI审核结论」控件接线:
 // 配置非空 + pass 结论 → apply_data 追加 Textarea 控件写入精简结论;
 // verdict 缺失 → 跳过控件不阻塞提交。

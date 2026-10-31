@@ -1461,7 +1461,17 @@ func (s *Service) buildApplyData(ctx context.Context, ap *model.ApprovalInstance
 	if warnCount > 0 {
 		remark = fmt.Sprintf("%s(机器一审通过,%d 条警告请关注)", remark, warnCount)
 	}
-	texts := []string{strings.Join(ids, ","), ap.ManualAmountYuan.StringFixed(2), remark}
+	// 「结算单号」是模板**必填**控件(企微按控件校验,空文本直接拒单)。
+	//
+	// ⚠️ 2026-10-31 生产实踩:纯支出审批(只填收/付款明细,一张结算单都不勾)
+	//    时 ids 为空 ⇒ 该控件写成空串 ⇒ applyevent 报
+	//    `errcode=301025 ... Text-1791653939435 is required`,整单提交失败。
+	//    ⇒ 没有结算单时必须写非空占位(审批人看得出"这单没有货款")。
+	settlementText := strings.Join(ids, ",")
+	if settlementText == "" {
+		settlementText = "无(纯支出)"
+	}
+	texts := []string{settlementText, ap.ManualAmountYuan.StringFixed(2), remark}
 	contents := make([]content, 0, 4)
 	for i, id := range s.cfg.ApplyControlIDs {
 		ctl := s.cfg.ApplyControlTypes[i]
@@ -1497,6 +1507,10 @@ func (s *Service) buildApplyData(ctx context.Context, ap *model.ApprovalInstance
 	// 摘要行:没有收付款明细时保持原样(纯货款审批的摘要不变),
 	// 有明细时把三笔账都写上 ⇒ 企微列表页一眼看清冲减关系。
 	summaryText := fmt.Sprintf("结算单 %d 张 / 付款 %s 元", len(ids), ap.ManualAmountYuan.StringFixed(2))
+	if len(ids) == 0 {
+		// 纯支出没有货款 ⇒ 不写"结算单 0 张"(那是噪音,也像故障)。
+		summaryText = fmt.Sprintf("纯支出 / 付款 %s 元", ap.ManualAmountYuan.StringFixed(2))
+	}
 	if len(items) > 0 {
 		t := totalsOf(settlements, items)
 		// 2026-10-30 用户口径:值为 0 的项**不写出来**
@@ -1513,8 +1527,12 @@ func (s *Service) buildApplyData(ctx context.Context, ap *model.ApprovalInstance
 			parts = append(parts, "- 收款项 "+yuanText(t.ReceiptTotalYuan))
 		}
 		if len(parts) > 0 {
-			summaryText = fmt.Sprintf("结算单 %d 张 / 付款 %s 元(%s)",
-				len(ids), ap.ManualAmountYuan.StringFixed(2), strings.Join(parts, " "))
+			head := fmt.Sprintf("结算单 %d 张", len(ids))
+			if len(ids) == 0 {
+				head = "纯支出"
+			}
+			summaryText = fmt.Sprintf("%s / 付款 %s 元(%s)",
+				head, ap.ManualAmountYuan.StringFixed(2), strings.Join(parts, " "))
 		}
 	}
 	summaryList, _ = json.Marshal(map[string]any{
