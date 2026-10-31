@@ -2,7 +2,7 @@
 #
 # 生产部署由 F:\go\src\github.com\YunBright\deployer\deploy-supertrade.ps1 驱动。
 # 该脚本的契约(必须严格满足):
-#   - 必须在 <SupertradeDir>/dist/ 下产出 22 个 .tar.gz 归档(每个二进制一个)
+#   - 必须在 <SupertradeDir>/dist/ 下产出 23 个 .tar.gz 归档(每个二进制一个)
 #   - 归档文件名 = <project>_<version>_<OS>_<arch>.tar.gz(被脚本当 leaf 传到 ssh tar -xzf)
 #   - 解压必须能在 <RemoteDir>/apps/<name>/ 下完成,extract 步骤是
 #     `cd <归档所在父目录> && tar -xzf <leaf>`,所以归档内部结构 = 生产 cwd 的内容
@@ -45,7 +45,7 @@
 # stocktake :8106, fresh-meat :8108, settlement-auditor :8109, sales-agg :8110,
 # pricing :8111, sales-insight :8112, member :8113, pos :8114, pos-gateway :8115,
 # cube-sync :8116, bank-account :8117, cube-async :8118, transaction :8119,
-# procurement :8120;
+# procurement :8120, cash-recon :8121;
 # 其它 binary 默认监听 :8080(其中 pos/pricing/procurement/sales-agg/
 # fresh-produce/fresh-meat/erp-connector/bi-gateway/master-data 当前
 # 只响应 /healthz placeholder;stocktake 需要 POSTGRES_DSN,真正使用 PG;
@@ -82,7 +82,7 @@ before:
     - go mod tidy
 
 builds:
-  # 22 个 binary,每个 build 的 id == binary 名。这样 `goreleaser --id stocktake`
+  # 23 个 binary,每个 build 的 id == binary 名。这样 `goreleaser --id stocktake`
   # 会只构建 stocktake 一个并产出 dist/apps/stocktake/stocktake_<ver>_Linux_x86_64.tar.gz,
   # 是 deploy-supertrade.ps1 -Service <name> 单服务部署的根基。
   - main: ./cmd/catalog
@@ -416,8 +416,33 @@ builds:
       - goos: linux
         goarch: 386
 
+  # 2026-10-31 新增:cash-recon(超市流水对账域)。
+  #
+  # ⚠️ 端口 8121:8101~8120 已占(procurement 8120 为当前最大)。
+  #    dapr http 3121 / grpc 6121(端口算术:app−5000 / app−2000)。
+  #
+  # ⚠️ 它**需要** POSTGRES_DSN:拥有 recon_* 共 17 张表(批次/匹配/差异/
+  #    银行流水/台账/期初/快照/审计日志)。缺 DSN ⇒ fail-fast 退出:
+  #    缺库却照常起来,症状是"对账批次永远为空"或"期初建不了",
+  #    而真因不在任何日志里。
+  #
+  # ⚠️ 它还需要 cube-router(解析门店数据源:有源查 cube、无源读 transaction
+  #    域的 pay_flows)⇒ systemd unit 里 Wants=/After=supertrade-cube-router.service。
+  - main: ./cmd/cash-recon
+    id: "cash-recon"
+    binary: "cash-recon"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
 archives:
-  # 22 个 archive,每个 binary 一份,name_template 用 apps/<name>/ 前缀,这样
+  # 23 个 archive,每个 binary 一份,name_template 用 apps/<name>/ 前缀,这样
   # deploy-supertrade.ps1 自动在远端 <RemoteDir>/apps/<name>/ 下建子目录 + scp + 解压,
   # 镜像 cube 的 semantic-layers/<family>/ 模式 —— 不同 binary 不互相覆盖同名二进制。
   # wrap_in_directory: false —— 避免 tarball 内多套一层同名目录,确保解压后
@@ -678,6 +703,17 @@ archives:
       - bank-account
     wrap_in_directory: false
     name_template: 'apps/bank-account/bank-account_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+
+  # 2026-10-31 新增:cash-recon(超市流水对账域)。
+  # 没有 files 块 —— 它不订阅任何 topic,也不带 dapr Component
+  # (只用共享的 authkey 组件读 JWKS,那是 --resources-path 指的
+  #  /opt/YunBright/.dapr/shared-components,不属于本归档)。
+  - id: "cash-recon"
+    format: tar.gz
+    builds:
+      - cash-recon
+    wrap_in_directory: false
+    name_template: 'apps/cash-recon/cash-recon_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
 
 checksum:
   name_template: 'checksums.txt'
