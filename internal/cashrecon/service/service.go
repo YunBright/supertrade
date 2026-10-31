@@ -133,29 +133,7 @@ type PreviewInput struct {
 // 收银流水实时查(cube / 本地 PG),银行流水读本域已导入的行。
 // 与 apply 共用 engine.Run ⇒ 预览看到的匹配与落库结果逐字段相同。
 func (s *Service) Preview(ctx context.Context, in PreviewInput) (engine.Output, error) {
-	if err := s.validateRange(in.BranchID, in.BizDateFrom, in.BizDateTo); err != nil {
-		return engine.Output{}, err
-	}
-	rules, err := s.LoadRules(ctx, in.BranchID)
-	if err != nil {
-		return engine.Output{}, err
-	}
-	cash, _, err := s.CashFlows(ctx, in.BranchID, in.BizDateFrom, in.BizDateTo, rules)
-	if err != nil {
-		return engine.Output{}, err
-	}
-	bank, err := s.bankFlows(ctx, in.BranchID, in.BizDateFrom, in.BizDateTo)
-	if err != nil {
-		return engine.Output{}, err
-	}
-	return engine.Run(engine.Input{
-		BranchID:    in.BranchID,
-		BizDateFrom: in.BizDateFrom,
-		BizDateTo:   in.BizDateTo,
-		Cash:        cash,
-		Bank:        bank,
-		Rules:       engine.RuleSet{ArrivalToleranceDays: rules.ArrivalToleranceDays},
-	}), nil
+	return s.runMatch(ctx, in.BranchID, in.BizDateFrom, in.BizDateTo)
 }
 
 // ListBatches 返回门店的批次列表(按创建时间倒序)。

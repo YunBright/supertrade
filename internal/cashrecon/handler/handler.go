@@ -22,6 +22,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +31,7 @@ import (
 	"github.com/YunBright/authkit/userinfo"
 	"github.com/gin-gonic/gin"
 
+	"github.com/YunBright/supertrade/internal/cashrecon/engine"
 	"github.com/YunBright/supertrade/internal/cashrecon/model"
 	"github.com/YunBright/supertrade/internal/cashrecon/service"
 	"github.com/YunBright/supertrade/pkg/middleware"
@@ -83,8 +85,17 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	}
 
 	r.POST("/batches/preview", requireBranch, guard(ScopeOperate), h.PreviewBatch)
+	r.POST("/batches", requireBranch, guard(ScopeOperate), h.ApplyBatch)
 	r.GET("/batches", requireBranch, guard(ScopeView), h.ListBatches)
 	r.GET("/batches/:id", requireBranch, guard(ScopeView), h.GetBatch)
+
+	// ---- S2：差异工作台 ----
+	r.GET("/diffs", requireBranch, guard(ScopeView), h.ListDiffs)
+	r.GET("/diffs/:id", requireBranch, guard(ScopeView), h.GetDiff)
+	r.POST("/diffs/:id/match", requireBranch, guard(ScopeReview), h.diffAction(service.DiffActionMatch))
+	r.POST("/diffs/:id/reason", requireBranch, guard(ScopeReview), h.diffAction(service.DiffActionReason))
+	r.POST("/diffs/:id/hang", requireBranch, guard(ScopeReview), h.diffAction(service.DiffActionHang))
+	r.POST("/diffs/:id/escalate", requireBranch, guard(ScopeReview), h.diffAction(service.DiffActionEscalate))
 
 	// ---- S1：取数 / 建账 / 导入 ----
 	r.GET("/flows/cash", requireBranch, guard(ScopeView), h.GetCashFlows)
@@ -183,8 +194,133 @@ type previewReq struct {
 type previewResp struct {
 	DryRun  bool           `json:"dry_run"`
 	Summary previewSummary `json:"summary"`
-	Matches []any          `json:"matches"`
-	Diffs   []any          `json:"diffs"`
+	Matches []matchItem    `json:"matches"`
+	Diffs   []diffItem     `json:"diffs"`
+}
+
+// matchItem 是一条匹配（金额字符串，fee 永远单列）。
+type matchItem struct {
+	Channel        string `json:"channel"`
+	BizDate        string `json:"biz_date"`
+	BankFlowID     string `json:"bank_flow_id"`
+	CashKey        string `json:"cash_key"`
+	ExpectedAmount string `json:"expected_amount"`
+	ActualAmount   string `json:"actual_amount"`
+	Fee            string `json:"fee"`
+	Kind           string `json:"kind"`
+}
+
+// diffItem 是一条差异。
+type diffItem struct {
+	ID             string     `json:"id,omitempty"`
+	BatchID        string     `json:"batch_id,omitempty"`
+	Kind           string     `json:"kind"`
+	Channel        string     `json:"channel"`
+	CashRef        string     `json:"cash_ref"`
+	BankRef        string     `json:"bank_ref"`
+	Expected       string     `json:"expected"`
+	Actual         string     `json:"actual"`
+	DiffAmount     string     `json:"diff_amount"`
+	Status         string     `json:"status,omitempty"`
+	ResolutionCode string     `json:"resolution_code,omitempty"`
+	ResolutionNote string     `json:"resolution_note,omitempty"`
+	HandledBy      string     `json:"handled_by,omitempty"`
+	HandledAt      *time.Time `json:"handled_at,omitempty"`
+	CreatedAt      *time.Time `json:"created_at,omitempty"`
+}
+
+// matchItemOf 把引擎匹配转成响应行。
+func matchItemOf(m engine.Match) matchItem {
+	return matchItem{
+		Channel:        m.Channel,
+		BizDate:        m.BizDate.Format("2006-01-02"),
+		BankFlowID:     m.BankFlowID,
+		CashKey:        m.CashKey,
+		ExpectedAmount: m.ExpectedAmount.String(),
+		ActualAmount:   m.ActualAmount.String(),
+		Fee:            m.Fee.String(),
+		Kind:           m.Kind,
+	}
+}
+
+// diffItemOf 把引擎差异转成响应行。
+func diffItemOf(d engine.Diff) diffItem {
+	return diffItem{
+		Kind:           d.Kind,
+		Channel:        d.Channel,
+		CashRef:        d.CashRef,
+		BankRef:        d.BankRef,
+		Expected:       d.Expected.String(),
+		Actual:         d.Actual.String(),
+		DiffAmount:     d.DiffAmount.String(),
+		Status:         d.Status,
+		ResolutionCode: d.ResolutionCode,
+		ResolutionNote: d.ResolutionNote,
+		HandledBy:      d.HandledBy,
+		HandledAt:      d.HandledAt,
+	}
+}
+
+// storedDiffItemOf 把已落库差异转成响应行。
+func storedDiffItemOf(r model.ReconDiff) diffItem {
+	created := r.CreatedAt
+	return diffItem{
+		ID:             r.ID,
+		BatchID:        r.BatchID,
+		Kind:           r.Kind,
+		Channel:        r.Channel,
+		CashRef:        r.CashRef,
+		BankRef:        r.BankRef,
+		Expected:       r.Expected.String(),
+		Actual:         r.Actual.String(),
+		DiffAmount:     r.DiffAmount.String(),
+		Status:         r.Status,
+		ResolutionCode: r.ResolutionCode,
+		ResolutionNote: r.ResolutionNote,
+		HandledBy:      r.HandledBy,
+		HandledAt:      r.HandledAt,
+		CreatedAt:      &created,
+	}
+}
+
+// batchView 是批次响应（金额字符串）。
+type batchView struct {
+	ID          string     `json:"id"`
+	BatchNo     string     `json:"batch_no"`
+	Kind        string     `json:"kind"`
+	Status      string     `json:"status"`
+	BizDateFrom string     `json:"biz_date_from"`
+	BizDateTo   string     `json:"biz_date_to"`
+	MatchRate   string     `json:"match_rate"`
+	DiffCount   int        `json:"diff_count"`
+	CashTotal   string     `json:"cash_total"`
+	BankTotal   string     `json:"bank_total"`
+	FeeTotal    string     `json:"fee_total"`
+	CreatedBy   string     `json:"created_by"`
+	FrozenAt    *time.Time `json:"frozen_at"`
+	CompletedAt *time.Time `json:"completed_at"`
+	CreatedAt   time.Time  `json:"created_at"`
+}
+
+// batchViewOf 转批次视图。
+func batchViewOf(b model.ReconBatch) batchView {
+	return batchView{
+		ID:          b.ID,
+		BatchNo:     b.BatchNo,
+		Kind:        b.Kind,
+		Status:      b.Status,
+		BizDateFrom: b.BizDateFrom.Format("2006-01-02"),
+		BizDateTo:   b.BizDateTo.Format("2006-01-02"),
+		MatchRate:   b.MatchRate.String(),
+		DiffCount:   b.DiffCount,
+		CashTotal:   b.CashTotal.String(),
+		BankTotal:   b.BankTotal.String(),
+		FeeTotal:    b.FeeTotal.String(),
+		CreatedBy:   b.CreatedBy,
+		FrozenAt:    b.FrozenAt,
+		CompletedAt: b.CompletedAt,
+		CreatedAt:   b.CreatedAt,
+	}
 }
 
 type previewSummary struct {
@@ -236,9 +372,27 @@ func (h *Handler) PreviewBatch(c *gin.Context) {
 			MatchedCount:  out.Summary.MatchedCount,
 			EligibleCount: out.Summary.EligibleCount,
 		},
-		Matches: []any{},
-		Diffs:   []any{},
+		Matches: matchItemsOf(out.Matches),
+		Diffs:   diffItemsOf(out.Diffs),
 	})
+}
+
+// matchItemsOf 批量转匹配行（nil ⇒ 空数组，便于前端稳定消费）。
+func matchItemsOf(rows []engine.Match) []matchItem {
+	out := make([]matchItem, 0, len(rows))
+	for _, m := range rows {
+		out = append(out, matchItemOf(m))
+	}
+	return out
+}
+
+// diffItemsOf 批量转引擎差异行。
+func diffItemsOf(rows []engine.Diff) []diffItem {
+	out := make([]diffItem, 0, len(rows))
+	for _, d := range rows {
+		out = append(out, diffItemOf(d))
+	}
+	return out
 }
 
 // ListBatches GET /batches
@@ -262,6 +416,128 @@ func (h *Handler) GetBatch(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, row)
+}
+
+// ---- S2：批次落库 / 差异工作台 ----
+
+// applyBatchResp 是 POST /batches 的响应体。
+type applyBatchResp struct {
+	Batch           batchView `json:"batch"`
+	InsertedMatches int       `json:"inserted_matches"`
+	InsertedDiffs   int       `json:"inserted_diffs"`
+	CarriedOver     int       `json:"carried_over"`
+}
+
+// ApplyBatch POST /batches
+//
+// 生成并落库一个 draft 批次：同一段引擎逻辑、幂等 upsert、人工结果保留。
+func (h *Handler) ApplyBatch(c *gin.Context) {
+	var req previewReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_request", "请求体必须是 JSON: {biz_date_from,biz_date_to}")
+		return
+	}
+	from, err := time.Parse("2006-01-02", req.BizDateFrom)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "bad_request", "biz_date_from 必须是 YYYY-MM-DD")
+		return
+	}
+	to, err := time.Parse("2006-01-02", req.BizDateTo)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "bad_request", "biz_date_to 必须是 YYYY-MM-DD")
+		return
+	}
+	actor := operatorOf(c)
+	if actor == "" {
+		writeError(c, http.StatusUnauthorized, "unauthenticated", "缺少调用者身份")
+		return
+	}
+	res, err := h.svc.ApplyBatch(c.Request.Context(), service.ApplyBatchInput{
+		BranchID:    branchIDOf(c),
+		BizDateFrom: from,
+		BizDateTo:   to,
+		Actor:       actor,
+	})
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, applyBatchResp{
+		Batch:           batchViewOf(res.Batch),
+		InsertedMatches: res.InsertedMatches,
+		InsertedDiffs:   res.InsertedDiffs,
+		CarriedOver:     res.CarriedOver,
+	})
+}
+
+// ListDiffs GET /diffs?batch_id=&status=&kind=&limit=&offset=
+func (h *Handler) ListDiffs(c *gin.Context) {
+	limit, _ := strconv.Atoi(strings.TrimSpace(c.Query("limit")))
+	offset, _ := strconv.Atoi(strings.TrimSpace(c.Query("offset")))
+	res, err := h.svc.ListDiffs(c.Request.Context(), service.DiffQuery{
+		BranchID: branchIDOf(c),
+		BatchID:  c.Query("batch_id"),
+		Status:   c.Query("status"),
+		Kind:     c.Query("kind"),
+		Limit:    limit,
+		Offset:   offset,
+	})
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	items := make([]diffItem, 0, len(res.Items))
+	for _, r := range res.Items {
+		items = append(items, storedDiffItemOf(r))
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items, "total": res.Total})
+}
+
+// GetDiff GET /diffs/:id（含审计轨迹）
+func (h *Handler) GetDiff(c *gin.Context) {
+	detail, err := h.svc.GetDiff(c.Request.Context(), branchIDOf(c), c.Param("id"))
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"diff":       storedDiffItemOf(detail.Diff),
+		"audit_logs": detail.AuditLogs,
+	})
+}
+
+// diffActionReq 是差异人工动作的请求体（reason 必填）。
+type diffActionReq struct {
+	Reason         string `json:"reason"`
+	ResolutionCode string `json:"resolution_code"`
+}
+
+// diffAction 构造某个动作的 handler（match/reason/hang/escalate）。
+func (h *Handler) diffAction(action string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req diffActionReq
+		if err := c.ShouldBindJSON(&req); err != nil {
+			writeError(c, http.StatusBadRequest, "bad_request", "请求体必须是 JSON: {reason,resolution_code}")
+			return
+		}
+		if strings.TrimSpace(req.Reason) == "" {
+			writeError(c, http.StatusBadRequest, "bad_request", "reason 必填（人工动作必须留痕）")
+			return
+		}
+		row, err := h.svc.ActDiff(c.Request.Context(), service.ActDiffInput{
+			BranchID:       branchIDOf(c),
+			DiffID:         c.Param("id"),
+			Action:         action,
+			Reason:         req.Reason,
+			ResolutionCode: req.ResolutionCode,
+			Actor:          operatorOf(c),
+		})
+		if err != nil {
+			mapErr(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, storedDiffItemOf(row))
+	}
 }
 
 // ---- S1：取数 ----
