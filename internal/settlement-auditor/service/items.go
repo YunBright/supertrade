@@ -4,8 +4,8 @@
 //
 // 「付款审批」不再只有"付供应商货款"这一种。门店实际还会发生：
 //
-//	付款项：水电费 / 租金 / 物业费 / 垃圾处理费 / 软件服务费 / 其它
-//	收款项：陈列费 / 堆头费 / 补差价 / 兑换 / 纸皮回收 / 其它
+//	付款项：水电费 / 租金 / 物业费 / 垃圾处理费 / 软件服务费 / … / 工资 / 其它
+//	收款项：陈列费 / 堆头费 / 补差价 / 兑换 / 纸皮回收 / 扣点 / 其它
 //
 // 供应商结算单归为**付款类型「货款」**。收款项**冲减**付款金额 ⇒
 //
@@ -59,7 +59,12 @@ const (
 	ReceiptTypePriceDiff   = "补差价"
 	ReceiptTypeExchange    = "兑换"
 	ReceiptTypePaperRecycl = "纸皮回收"
-	ReceiptTypeOther       = "其它"
+	// ReceiptTypeDeduction 是「扣点」（2026-10-31 用户口径）。
+	//
+	// 联营商户按销售额给门店的扣点收入（联营账款单上的 sup_ly_amount）；
+	// 它是一笔**收款**，冲减本次付款金额。
+	ReceiptTypeDeduction = "扣点"
+	ReceiptTypeOther     = "其它"
 
 	// 付款项类型。
 	//
@@ -79,14 +84,16 @@ const (
 	PaymentTypeGas              = "燃气费"
 	PaymentTypeTelecom          = "电信费"
 	PaymentTypeWelfare          = "福利"
-	PaymentTypeOther            = "其它"
+	// PaymentTypeSalary 是「工资」（2026-10-31 用户口径）。
+	PaymentTypeSalary = "工资"
+	PaymentTypeOther  = "其它"
 )
 
 // ReceiptTypeOptions 是收款项下拉选项（前端同款，改这里要同步改前端）。
 func ReceiptTypeOptions() []string {
 	return []string{
 		ReceiptTypeDisplay, ReceiptTypePromotion, ReceiptTypePriceDiff,
-		ReceiptTypeExchange, ReceiptTypePaperRecycl, ReceiptTypeOther,
+		ReceiptTypeExchange, ReceiptTypePaperRecycl, ReceiptTypeDeduction, ReceiptTypeOther,
 	}
 }
 
@@ -97,7 +104,7 @@ func PaymentTypeOptions() []string {
 		PaymentTypeTrash, PaymentTypeSoftware,
 		PaymentTypeFreight, PaymentTypeMeatProcessing, PaymentTypeEquipMaintenance,
 		PaymentTypeConsumable, PaymentTypeEntertainment, PaymentTypeGas, PaymentTypeTelecom, PaymentTypeWelfare,
-		PaymentTypeOther,
+		PaymentTypeSalary, PaymentTypeOther,
 	}
 }
 

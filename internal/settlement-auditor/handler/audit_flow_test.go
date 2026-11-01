@@ -135,6 +135,21 @@ func TestHandler_AdminApprove_200_Admin(t *testing.T) {
 	}
 }
 
+// ---- 手动生成计划盘点单端点（2026-11-01 用户口径）----
+
+// TestHandler_StocktakePlan_403_NoScope 没有 settlement:audit ⇒ 403。
+func TestHandler_StocktakePlan_403_NoScope(t *testing.T) {
+	r, _, _ := buildTestHandler(t, true)
+	w := doReq(t, r, http.MethodPost, "/settlement-approvals/ap-x/stocktake-plan", "",
+		map[string]string{
+			"X-Test-Claims": claimsHeaderWithRoles("u-nobody"),
+			"X-Branch-ID":   testBranchID,
+		})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403(无 scope), body=%s", w.Code, w.Body.String())
+	}
+}
+
 // ---- 流程配置端点：CRUD + 正则试跑 + 供应商字典 ----
 
 // TestHandler_AuditFlow_SupplierFlows_CRUD 走完一整轮。

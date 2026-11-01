@@ -72,6 +72,22 @@ type AuditInput struct {
 	// 有它 ⇒ 库存已被盘点核对过 ⇒ 数量类信号(无销售记录/数量偏离)
 	// 不作为拒绝理由(与陈列费/堆头费的放宽口径同构,见 allowance.go)。
 	Stocktakes []StocktakeVerification
+	// Stocking 是本次涉及的 SKU 的备货系数事实(2026-10-31 用户口径)。
+	//
+	// 每个 SKU 给:备货倍数/周期、采样天数、日平均销量、周期销售数、
+	// 当前库存、本次进货量、合理备货量、可售天数。
+	// ⚠️ 只放汇总事实,不放逐日曲线(几十个 SKU × 上百天会撑爆 prompt)。
+	Stocking []StockingFact
+	// Joint 是联营( LY )结算单的扣点核对事实(2026-10-31 用户口径)。
+	//
+	// 联营单的"货款"是**毛销售额**,扣点是**收款项**单独冲减 ⇒
+	// 应付 = 销售额 − 扣点。LLM 要判断"扣点是否随单申报、扣点率是否达标"。
+	Joint JointSummary
+	// Dx 是代销( DX )结算单的毛利核对事实(2026-11-01 用户口径)。
+	//
+	// 代销的毛利隐含在"零售额 − 结算额"的价差里 ⇒ LLM 要判断
+	// "整体实现毛利率是否达到最低要求(默认 10%)"。
+	Dx DxSummary
 }
 
 // MarginSummary 是引擎口径的毛利汇总(两个口径分开统计)。
@@ -98,6 +114,12 @@ type StocktakeVerification struct {
 type AuditExtras struct {
 	Margins    MarginSummary
 	Stocktakes []StocktakeVerification
+	// Stocking 是备货系数事实(2026-10-31 用户口径,见 AuditInput.Stocking)。
+	Stocking []StockingFact
+	// Joint 是联营扣点事实(2026-10-31 用户口径,见 AuditInput.Joint)。
+	Joint JointSummary
+	// Dx 是代销毛利事实(2026-11-01 用户口径,见 AuditInput.Dx)。
+	Dx DxSummary
 }
 
 // VerdictResult 是 VerdictFn 的返回值。
@@ -351,6 +373,16 @@ func buildAuditSystemPrompt() string {
   suggest_stocktake.scope 取 category|supplier|product,ids 填商品/分类/供应商 id 列表;
   无建议则省略该字段或置 null。
 
+联营帐款单与扣点(单据类型 LY,必须遵守):
+- 联营是「门店不买货、供应商在店里卖、门店按销售额抽成」:
+  联营单的「货款」是**毛销售额**,「扣点」是**收款项** ⇒ 实际应付 = 毛销售额 − 扣点;
+- 联营扣点必须随联营帐款单**一起在本笔付款审批里申报「扣点」收款项**;
+  引擎给出 joint_deduct_missing / joint_deduct_short(block)通常应 reject,
+  并在 reason 写明应扣点多少、本次申报多少;
+- 扣点率 = Σ扣点 / Σ销售额,低于该供应商最低扣点率时引擎给 joint_rate_low(warn):
+  若申请人备注/合同依据能解释(例如新品扶持期、临时促销),可 pass 并写明依据;
+  否则应 reject,并写明哪家供应商扣点率多少、最低要求多少。
+
 措辞(必须遵守,这条是给**发起人**看的):
 - 只陈述事实:哪个商品、进了多少、从哪天起没销售记录、金额差多少。
 - **不要推断动机、不要给发起人贴负面判断**。禁止出现
@@ -493,6 +525,15 @@ func buildAuditUserPrompt(in *AuditInput) string {
 		fmt.Fprintf(&sb, "已关联盘点单 %d 张且均审核通过(header_id=%s):库存已盘点核对,数量类信号不作为拒绝理由。\n",
 			len(in.Stocktakes), strings.Join(ids, ","))
 	}
+	// 备货系数(SKU 级事实,2026-10-31 用户口径)。
+	//
+	// 用来评估「本次进货量是否合理」:合理备货量 = 周期销售数 × 备货倍数,
+	// 周期销售数 = 日平均销量 × 备货周期(日均按采样天数口径,见 service/stocking.go)。
+	writeStockingFacts(&sb, in.Stocking)
+	// 联营扣点(2026-10-31 用户口径):扣点是否随单申报 + 扣点率是否达标。
+	writeJointFacts(&sb, in.Joint)
+	// 代销毛利(2026-11-01 用户口径):整体实现毛利率是否达标。
+	writeDxFacts(&sb, in.Dx)
 
 	fmt.Fprintf(&sb, "勾选结算单 %d 张:\n", len(in.Settlements))
 	for i, st := range in.Settlements {
@@ -523,6 +564,38 @@ func buildAuditUserPrompt(in *AuditInput) string {
 		fmt.Fprintf(&sb, "  - [%s][%s] %s\n", d.Level, d.SignalType, d.Message)
 	}
 	return sb.String()
+}
+
+// writeStockingFacts 把备货系数事实写进 user prompt（2026-10-31 用户口径）。
+//
+// 每个 SKU 一行，最多 20 个（其余省略）：这种逐 SKU 明细过多会冲淡
+// 真正需要 LLM 关注的信号。
+//
+func writeStockingFacts(sb *strings.Builder, facts []StockingFact) {
+	if len(facts) == 0 {
+		return
+	}
+	fmt.Fprintf(sb, "备货系数(SKU 级,共 %d 个;合理备货量 = 周期销售数 × 备货倍数,周期销售数 = 日平均销量 × 备货周期):\n",
+		len(facts))
+	for i, f := range facts {
+		if i >= 20 {
+			fmt.Fprintf(sb, "  ... 其余 %d 个 SKU 略\n", len(facts)-20)
+			break
+		}
+		label := f.ProductID
+		if name := strings.TrimSpace(f.ProductName); name != "" {
+			label = ProductLabel(map[string]string{f.ProductID: name}, f.ProductID)
+		}
+		estimated := ""
+		if f.Estimated {
+			estimated = ",系数=本次现算"
+		}
+		fmt.Fprintf(sb, "  - %s:倍数 %s,周期 %d 天,采样 %d 天,日均销量 %s,周期销售数 %s,当前库存 %s,本次进货 %s,合理备货量 %s,可售 %s 天%s\n",
+			label, f.Multiplier.StringFixed(2), f.PeriodDays, f.SampleDays,
+			f.AvgDailySales.StringFixed(3), f.PeriodSalesQty.StringFixed(3),
+			f.StockQty.StringFixed(3), f.ReceivedQty.StringFixed(3),
+			f.ReasonableQty.StringFixed(3), f.CoverageDays.StringFixed(1), estimated)
+	}
 }
 
 // marginTotalsSentence 生成引擎口径的**毛利合计句**(结论里必须出现的总和)。

@@ -69,6 +69,26 @@ func (f *fakeCube) ListAuditedSettlements(_ context.Context, _, _, _, _ string, 
 	return f.settlements, nil
 }
 
+// ListAuditedJointSettlements 联营结算单（handler 用例不涉及联营 ⇒ 恒空）。
+func (f *fakeCube) ListAuditedJointSettlements(_ context.Context, _, _, _, _ string, _ int) ([]service.SettlementRow, error) {
+	return nil, nil
+}
+
+// ListJointSettlementFacts 联营单扣点事实（handler 用例不涉及 ⇒ 恒空）。
+func (f *fakeCube) ListJointSettlementFacts(_ context.Context, _ string, _ []string) ([]service.JointFact, error) {
+	return nil, nil
+}
+
+// ListAuditedDxSettlements 代销结算单（handler 用例不涉及 ⇒ 恒空）。
+func (f *fakeCube) ListAuditedDxSettlements(_ context.Context, _, _, _, _ string, _ int) ([]service.SettlementRow, error) {
+	return nil, nil
+}
+
+// ListDxSettlementFacts 代销单毛利事实（handler 用例不涉及 ⇒ 恒空）。
+func (f *fakeCube) ListDxSettlementFacts(_ context.Context, _ string, _ []string) ([]service.DxFact, error) {
+	return nil, nil
+}
+
 func (f *fakeCube) ListPurchaseLines(_ context.Context, _, settlementID string) ([]service.SettlementLineRow, error) {
 	if settlementID == "S1" {
 		return []service.SettlementLineRow{

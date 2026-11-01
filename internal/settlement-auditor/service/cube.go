@@ -29,6 +29,24 @@ type CubeQuerier interface {
 	ListSettlements(ctx context.Context, branchID string, ids []string) ([]SettlementRow, error)
 	// ListAuditedSettlements 查时间段内已审核的采购结款单(H5 勾选数据源)。
 	ListAuditedSettlements(ctx context.Context, branchID, from, to, supplierID string, limit int) ([]SettlementRow, error)
+	// ListAuditedJointSettlements 查时间段内已审核的**联营帐款单**(H5 联营 tab 数据源)。
+	//
+	// ⚠️ 联营帐款单在思迅里是**独立表**(t_fm_recpay_ly_master),不在
+	//    t_fm_recpay_gx_master 的多态结款单里 ⇒ 必须单独查询(见 settlement_ly model)。
+	ListAuditedJointSettlements(ctx context.Context, branchID, from, to, supplierID string, limit int) ([]SettlementRow, error)
+	// ListJointSettlementFacts 取联营结算单的扣点事实(销售额 / 扣点额)。
+	//
+	// 扣点只能从明细 Σ sup_ly_amount 汇总(头表 dct_amount 恒 0,见 settlement_ly model)。
+	ListJointSettlementFacts(ctx context.Context, branchID string, ids []string) ([]JointFact, error)
+	// ListAuditedDxSettlements 查时间段内已审核的**代销帐款单**(H5 代销 tab 数据源)。
+	//
+	// ⚠️ 代销帐款单同样在**独立表**(t_fm_recpay_dx_master),必须单独查询
+	//    (见 settlement_dx model)。
+	ListAuditedDxSettlements(ctx context.Context, branchID, from, to, supplierID string, limit int) ([]SettlementRow, error)
+	// ListDxSettlementFacts 取代销结算单的毛利事实(零售额 / 结算额)。
+	//
+	// 必须从明细汇总:头表 sum_amount 只是结算额,零售额在明细 num1 上。
+	ListDxSettlementFacts(ctx context.Context, branchID string, ids []string) ([]DxFact, error)
 	// ListSupplierNames 取供应商字典(id → 名称)。
 	//
 	// ⚠️ 这是**另一个 cube model** 的数据,不是 settlement 上的列:settlement 是
@@ -39,7 +57,7 @@ type CubeQuerier interface {
 	ListSupplierNames(ctx context.Context, branchID string) (map[string]string, error)
 	// ListPurchaseLines 查一张结算单关联的采购进货/退货行(仅 PI/RO)。
 	ListPurchaseLines(ctx context.Context, branchID, settlementID string) ([]SettlementLineRow, error)
-	// ListPurchaseSheets 按 id 批量查采购单头(含制单日期,见 PurchaseSheetRow.CreatedAt)。
+	// ListPurchaseSheets 按 id 批量查采购单头(含制单日期与备注,见 PurchaseSheetRow)。
 	ListPurchaseSheets(ctx context.Context, branchID string, ids []string) ([]PurchaseSheetRow, error)
 	// ListSheetLines 按 sheet id 批量查采购单行(商品粒度)。
 	ListSheetLines(ctx context.Context, branchID string, sheetIDs []string) ([]SheetLineRow, error)
@@ -65,6 +83,70 @@ type CubeQuerier interface {
 	GetSettlementsByIDs(ctx context.Context, branchID string, ids []string) ([]SettlementRow, error)
 }
 
+// DocumentTypeJoint 是联营帐款单的单据类型（2026-10-31 用户口径）。
+//
+// ⚠️ 它**不在** gx_master 的 trans_no 里：联营单来自独立表 settlement_ly model,
+//    为了与 DP/CP 统一成同一套 SettlementRow,这里统一打标 "LY"。
+const DocumentTypeJoint = "LY"
+
+// DocumentTypeDelivery 是代销帐款单的单据类型（2026-11-01 用户口径）。
+//
+// ⚠️ 与联营同理：代销单**不在** gx_master 的 trans_no 里，来自独立表
+// settlement_dx model（t_fm_recpay_dx_master），这里统一打标 "DX"。
+const DocumentTypeDelivery = "DX"
+
+// 台账/勾选列表的数据源类别（2026-11-01 新增 DX）。
+//
+// ⚠️ 三类单在思迅里是**三张不同的源表**：
+//
+//	purchase → settlement      (t_fm_recpay_gx_master，DP/CP)
+//	joint    → settlement_ly   (t_fm_recpay_ly_master，LY)
+//	dx       → settlement_dx   (t_fm_recpay_dx_master，DX)
+const (
+	SettlementKindPurchase = "purchase"
+	SettlementKindJoint    = "joint"
+	SettlementKindDelivery = "dx"
+)
+
+// isJointOrDelivery 判断是否「非购销」的独立表结算单（LY/DX）。
+//
+// 这两类单都没有 PI/RO 明细行 ⇒ 单据自洽/金额勾稽的口径与购销单不同，
+// 见 checkAmounts 与 joint.go / dx.go 的口径说明。
+func isJointOrDelivery(documentType string) bool {
+	switch documentType {
+	case DocumentTypeJoint, DocumentTypeDelivery:
+		return true
+	}
+	return false
+}
+
+// DxFact 是一张代销结算单的毛利事实。
+//
+// 代销是"门店不买货，供应商把货放店里卖，按实际销售结算":
+//
+//	零售额  = Σ明细 num1        (门店卖给顾客的钱)
+//	结算额  = Σ明细 ac_amount   (门店应付供应商的钱)
+//	毛利额  = 零售额 − 结算额
+//	毛利率  = 毛利额 / 零售额   （**汇总后相除**，不是 AVG 逐行毛利率）
+type DxFact struct {
+	SettlementID string
+	// RetailYuan 是零售额合计（毛利率的分母）。
+	RetailYuan decimal.Decimal
+	// SettleYuan 是结算额合计（毛利额的减项）。
+	SettleYuan decimal.Decimal
+}
+
+// JointFact 是一张联营结算单的扣点事实。
+//
+// 扣点率 = DeductYuan / SalesYuan（**汇总后相除**，不是 AVG 逐行扣点率）。
+type JointFact struct {
+	SettlementID string
+	// SalesYuan 是账期内销售额合计（扣点率的分母）。
+	SalesYuan decimal.Decimal
+	// DeductYuan 是联营扣点金额合计（扣点率的分子）。
+	DeductYuan decimal.Decimal
+}
+
 // ---- 行 DTO ----
 
 // SettlementRow cube settlement 头行。
@@ -72,11 +154,21 @@ type SettlementRow struct {
 	ID             string
 	SupplierID     string
 	SupplierName   string // 供应商名称(Go 侧 join supplier 字典补上;查不到为空)
-	DocumentType   string // DP/CP
+	DocumentType   string // DP/CP/LY
 	ApproveStatus  string // "1"=已审核
 	PeriodStart    string
 	PeriodEnd      string
-	TotalGoodsYuan decimal.Decimal // 货款净额(勾稽用这个)
+	TotalGoodsYuan decimal.Decimal // 货款净额(勾稽用这个;联营单为毛销售额)
+	// Joint 是联营帐款单的扣点事实(DocumentType=LY 时才有值)。
+	//
+	// ⚠️ 联营单的「货款」是**毛销售额**:扣点作为收款项单独冲减
+	//    ⇒ 应付 = 销售额 − 扣点(见 service/joint.go 的口径说明)。
+	Joint *JointFact
+	// Dx 是代销帐款单的毛利事实（DocumentType=DX 时才有值）。
+	//
+	// ⚠️ 代销单的「货款」是**结算额**（应付供应商的钱），零售额与毛利
+	//   只在明细里（见 service/dx.go 的口径说明）。
+	Dx *DxFact
 }
 
 // SettlementLineRow cube settlement_line 行(仅 PI/RO)。
@@ -103,6 +195,12 @@ type PurchaseSheetRow struct {
 	// 源列 oper_date(思迅 t_pm_sheet_master)是**真 datetime**,
 	// cube 返回形如 "08 23 2026  4:19PM" ⇒ 用 normalizeCubeDate 规范化。
 	CreatedAt          string
+	// Remark 是采购单备注(源列 other1)。
+	//
+	// ⚠️ 备注里可能写着**实际收货日期**(如 "2026.9.18号收货")——
+	// 录单员休息/活动忙时会延后录入,制单日期不等于货到店日期。
+	// 销量窗口/流程判定一律先按 [effectiveDate] 提取实际收货日期,兜底才用 CreatedAt。
+	Remark             string
 	TotalAmountYuan    decimal.Decimal
 	TotalNetAmountYuan decimal.Decimal
 }
@@ -139,6 +237,25 @@ type StockRow struct {
 	ProductID string
 	Quantity  decimal.Decimal
 	AvgCost   decimal.Decimal
+}
+
+// DailySaleRow 是商品**某一天**的净销量(备货系数算法用)。
+//
+// ⚠️ 与 SaleRow 的区别:SaleRow 是一个窗口的汇总,这里是逐日明细 ——
+// 备货系数要看"日销量稳不稳"(变异系数),只有逐日数据算得出来。
+type DailySaleRow struct {
+	ProductID    string
+	BusinessDate string // YYYY-MM-DD
+	Quantity     decimal.Decimal
+}
+
+// ProductPurchaseDateRow 是商品某张采购单的**制单日期**(备货周期算法用)。
+//
+// ⚠️ 制单日期 ≠ 实际收货日期(延后录入场景见 receipt_date.go);
+// 这里算的是"进货频率",用制单日期的分布足够(同一个人录单的延迟是稳定的)。
+type ProductPurchaseDateRow struct {
+	ProductID string
+	SheetDate string // YYYY-MM-DD
 }
 
 // ---- DaprCubeQuerier ----
@@ -178,40 +295,88 @@ func rowDec(row map[string]any, key string) decimal.Decimal {
 	return cubeclient.ParseDecimal(row[key])
 }
 
-// ListSettlements 按 id in (...) 查 settlement。
+// ListSettlements 按 id in (...) 查结算单(**购销 DP/CP + 联营 LY 一起查**)。
+//
+// ⚠️ 联营单在独立表(settlement_ly model)里 ⇒ 两次查询合并返回,
+//    这样流水线不用区分单据来源(见 DocumentTypeJoint)。
 func (q *DaprCubeQuerier) ListSettlements(ctx context.Context, branchID string, ids []string) ([]SettlementRow, error) {
-	if len(ids) == 0 {
+	purchase, err := q.querySettlementRowsByIDs(ctx, branchID, "settlement", "settlement.total_goods_yuan", "", ids, false)
+	if err != nil {
+		return nil, err
+	}
+	joint, err := q.querySettlementRowsByIDs(ctx, branchID, "settlement_ly", "settlement_ly.total_sales_yuan", DocumentTypeJoint, ids, false)
+	if err != nil {
+		return nil, err
+	}
+	dx, err := q.querySettlementRowsByIDs(ctx, branchID, "settlement_dx", "settlement_dx.total_settle_yuan", DocumentTypeDelivery, ids, false)
+	if err != nil {
+		return nil, err
+	}
+	return append(append(purchase, joint...), dx...), nil
+}
+
+// querySettlementRowsByIDs 用指定 model 按 id 分批查结算单头。
+//
+// model 是 "settlement"(购销) / "settlement_ly"(联营);
+// measure 是货款口径的 measure 全名;documentTypeDefault 非空时**覆盖**
+// document_type(联营表恒为 LY,不依赖源列 trans_no);
+// normalizeDates=true 时把 datetime 规范成 YYYY-MM-DD(诊断/精确查询用)。
+func (q *DaprCubeQuerier) querySettlementRowsByIDs(ctx context.Context, branchID, model, measure, documentTypeDefault string, ids []string, normalizeDates bool) ([]SettlementRow, error) {
+	const chunk = 200
+	clean := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if v := strings.TrimSpace(id); v != "" {
+			clean = append(clean, v)
+		}
+	}
+	if len(clean) == 0 {
 		return nil, nil
 	}
-	vals := make([]any, 0, len(ids))
-	for _, id := range ids {
-		vals = append(vals, id)
-	}
-	data, err := q.c.LoadCubeQuery(ctxWithBranch(ctx, branchID), "settlement", cubeclient.CubeQuery{
-		Measures: []string{"settlement.total_goods_yuan"},
-		Dimensions: []string{
-			"settlement.id", "settlement.supplier_id", "settlement.document_type",
-			"settlement.approve_status", "settlement.period_start", "settlement.period_end",
-		},
-		Filters: []cubeclient.CubeFilter{
-			{Member: "settlement.id", Operator: "in", Values: vals},
-		},
-		Limit: len(ids) * 4,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("cube settlement query: %w", err)
-	}
-	out := make([]SettlementRow, 0, len(data))
-	for _, r := range data {
-		out = append(out, SettlementRow{
-			ID:             rowStr(r, "settlement.id"),
-			SupplierID:     rowStr(r, "settlement.supplier_id"),
-			DocumentType:   rowStr(r, "settlement.document_type"),
-			ApproveStatus:  rowStr(r, "settlement.approve_status"),
-			PeriodStart:    rowStr(r, "settlement.period_start"),
-			PeriodEnd:      rowStr(r, "settlement.period_end"),
-			TotalGoodsYuan: rowDec(r, "settlement.total_goods_yuan"),
+	out := make([]SettlementRow, 0, len(clean))
+	for start := 0; start < len(clean); start += chunk {
+		end := start + chunk
+		if end > len(clean) {
+			end = len(clean)
+		}
+		vals := make([]any, 0, end-start)
+		for _, id := range clean[start:end] {
+			vals = append(vals, id)
+		}
+		data, err := q.c.LoadCubeQuery(ctxWithBranch(ctx, branchID), model, cubeclient.CubeQuery{
+			Measures: []string{measure},
+			Dimensions: []string{
+				model + ".id", model + ".supplier_id", model + ".document_type",
+				model + ".approve_status", model + ".period_start", model + ".period_end",
+			},
+			Filters: []cubeclient.CubeFilter{
+				{Member: model + ".id", Operator: "in", Values: vals},
+			},
+			Limit: (end - start) * 4,
 		})
+		if err != nil {
+			return nil, fmt.Errorf("cube %s by ids query: %w", model, err)
+		}
+		for _, r := range data {
+			docType := rowStr(r, model+".document_type")
+			if documentTypeDefault != "" {
+				docType = documentTypeDefault
+			}
+			periodStart := rowStr(r, model+".period_start")
+			periodEnd := rowStr(r, model+".period_end")
+			if normalizeDates {
+				periodStart = normalizeCubeDate(periodStart)
+				periodEnd = normalizeCubeDate(periodEnd)
+			}
+			out = append(out, SettlementRow{
+				ID:             rowStr(r, model+".id"),
+				SupplierID:     rowStr(r, model+".supplier_id"),
+				DocumentType:   docType,
+				ApproveStatus:  rowStr(r, model+".approve_status"),
+				PeriodStart:    periodStart,
+				PeriodEnd:      periodEnd,
+				TotalGoodsYuan: rowDec(r, measure),
+			})
+		}
 	}
 	return out, nil
 }
@@ -235,12 +400,20 @@ const cubeSettlementFetchCap = 5000
 // 语义:[from, to),打 `settlement.period_end`(账期结束日)。
 // 空串 = 不限,该端不产生 filter。
 func settlementPeriodFilters(from, to string) []cubeclient.CubeFilter {
+	return settlementPeriodFiltersFor("settlement", from, to)
+}
+
+// settlementPeriodFiltersFor 是 settlementPeriodFilters 的多 model 版本。
+//
+// 联营帐款单(settlement_ly)有一模一样的 period_end 维度 ⇒ 复用同一口径,
+// 只把 model 名前缀换掉(别让"日期筛选静默失效"在联营 tab 上重演)。
+func settlementPeriodFiltersFor(model, from, to string) []cubeclient.CubeFilter {
 	var out []cubeclient.CubeFilter
 	if from != "" {
-		out = append(out, cubeclient.CubeFilter{Member: "settlement.period_end", Operator: "gte", Values: []any{from}})
+		out = append(out, cubeclient.CubeFilter{Member: model + ".period_end", Operator: "gte", Values: []any{from}})
 	}
 	if to != "" {
-		out = append(out, cubeclient.CubeFilter{Member: "settlement.period_end", Operator: "lt", Values: []any{to}})
+		out = append(out, cubeclient.CubeFilter{Member: model + ".period_end", Operator: "lt", Values: []any{to}})
 	}
 	return out
 }
@@ -314,6 +487,223 @@ func (q *DaprCubeQuerier) ListAuditedSettlements(ctx context.Context, branchID, 
 	sortSettlementRowsDesc(out)
 	if len(out) > limit {
 		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ListAuditedJointSettlements H5「联营」tab 数据源:approve_status=1 的联营帐款单。
+//
+// 口径与 ListAuditedSettlements 一致(账期结束日倒序、limit 截断、先拉满再排序),
+// 差别只有两点:
+//
+//  1. model 是 **settlement_ly**(独立表 t_fm_recpay_ly_master,不在 gx_master 里);
+//  2. 货款 measure 是 **total_sales_yuan**(毛销售额)——联营单的"货款"就是销售额,
+//     扣点作为收款项单独冲减(见 service/joint.go)。
+func (q *DaprCubeQuerier) ListAuditedJointSettlements(ctx context.Context, branchID, from, to, supplierID string, limit int) ([]SettlementRow, error) {
+	filters := []cubeclient.CubeFilter{
+		{Member: "settlement_ly.approve_status", Operator: "equals", Values: []any{"1"}},
+	}
+	filters = append(filters, settlementPeriodFiltersFor("settlement_ly", from, to)...)
+	if supplierID != "" {
+		filters = append(filters, cubeclient.CubeFilter{Member: "settlement_ly.supplier_id", Operator: "equals", Values: []any{supplierID}})
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	fetch := limit
+	if fetch < cubeSettlementFetchCap {
+		fetch = cubeSettlementFetchCap
+	}
+	data, err := q.c.LoadCubeQuery(ctxWithBranch(ctx, branchID), "settlement_ly", cubeclient.CubeQuery{
+		Measures: []string{"settlement_ly.total_sales_yuan"},
+		Dimensions: []string{
+			"settlement_ly.id", "settlement_ly.supplier_id", "settlement_ly.document_type",
+			"settlement_ly.approve_status", "settlement_ly.period_start", "settlement_ly.period_end",
+		},
+		Filters: filters,
+		Limit:   fetch,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cube settlement_ly list query: %w", err)
+	}
+	out := make([]SettlementRow, 0, len(data))
+	for _, r := range data {
+		out = append(out, SettlementRow{
+			ID:            rowStr(r, "settlement_ly.id"),
+			SupplierID:    rowStr(r, "settlement_ly.supplier_id"),
+			DocumentType:  DocumentTypeJoint,
+			ApproveStatus: rowStr(r, "settlement_ly.approve_status"),
+			PeriodStart:   normalizeCubeDate(rowStr(r, "settlement_ly.period_start")),
+			PeriodEnd:     normalizeCubeDate(rowStr(r, "settlement_ly.period_end")),
+			// 联营单的"货款"= 毛销售额(sum_amount)。
+			TotalGoodsYuan: rowDec(r, "settlement_ly.total_sales_yuan"),
+		})
+	}
+	sortSettlementRowsDesc(out)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ListJointSettlementFacts 取联营结算单的扣点事实(销售额 / 扣点额)。
+//
+// 查 settlement_ly_line(明细 t_fm_recpay_ly_detail),按 settlement_id 分组汇总:
+//
+//	扣点率 = SUM(sup_ly_amount) / SUM(sale_amount)
+//
+// ⚠️ 不 AVG 逐行 sup_ly_rate(促销/零销售行会让逐行率失真,见 cube 模型注释)。
+func (q *DaprCubeQuerier) ListJointSettlementFacts(ctx context.Context, branchID string, ids []string) ([]JointFact, error) {
+	const chunk = 200
+	clean := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if v := strings.TrimSpace(id); v != "" {
+			clean = append(clean, v)
+		}
+	}
+	if len(clean) == 0 {
+		return nil, nil
+	}
+	out := make([]JointFact, 0, len(clean))
+	for start := 0; start < len(clean); start += chunk {
+		end := start + chunk
+		if end > len(clean) {
+			end = len(clean)
+		}
+		vals := make([]any, 0, end-start)
+		for _, id := range clean[start:end] {
+			vals = append(vals, id)
+		}
+		data, err := q.c.LoadCubeQuery(ctxWithBranch(ctx, branchID), "settlement_ly_line", cubeclient.CubeQuery{
+			Measures: []string{
+				"settlement_ly_line.total_sales_yuan",
+				"settlement_ly_line.total_deduct_yuan",
+			},
+			Dimensions: []string{"settlement_ly_line.settlement_id"},
+			Filters: []cubeclient.CubeFilter{
+				{Member: "settlement_ly_line.settlement_id", Operator: "in", Values: vals},
+			},
+			Limit: (end - start) * 4,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("cube settlement_ly_line query: %w", err)
+		}
+		for _, r := range data {
+			out = append(out, JointFact{
+				SettlementID: rowStr(r, "settlement_ly_line.settlement_id"),
+				SalesYuan:    rowDec(r, "settlement_ly_line.total_sales_yuan"),
+				DeductYuan:   rowDec(r, "settlement_ly_line.total_deduct_yuan"),
+			})
+		}
+	}
+	return out, nil
+}
+
+// ListAuditedDxSettlements H5「代销」tab 数据源:approve_status=1 的代销帐款单。
+//
+// 口径与联营一致(账期结束日倒序、limit 截断、先拉满再排序),差别:
+//
+//  1. model 是 **settlement_dx**(独立表 t_fm_recpay_dx_master);
+//  2. 货款 measure 是 **total_settle_yuan**(结算额 = 应付供应商的钱)。
+//
+// ⚠️ 代销单的「货款」就是结算额 —— 零售额只用于算毛利率,
+//    不能拿来当应付(否则会多付零售与结算之间的差额)。
+func (q *DaprCubeQuerier) ListAuditedDxSettlements(ctx context.Context, branchID, from, to, supplierID string, limit int) ([]SettlementRow, error) {
+	filters := []cubeclient.CubeFilter{
+		{Member: "settlement_dx.approve_status", Operator: "equals", Values: []any{"1"}},
+	}
+	filters = append(filters, settlementPeriodFiltersFor("settlement_dx", from, to)...)
+	if supplierID != "" {
+		filters = append(filters, cubeclient.CubeFilter{Member: "settlement_dx.supplier_id", Operator: "equals", Values: []any{supplierID}})
+	}
+	if limit <= 0 {
+		limit = 200
+	}
+	fetch := limit
+	if fetch < cubeSettlementFetchCap {
+		fetch = cubeSettlementFetchCap
+	}
+	data, err := q.c.LoadCubeQuery(ctxWithBranch(ctx, branchID), "settlement_dx", cubeclient.CubeQuery{
+		Measures: []string{"settlement_dx.total_settle_yuan"},
+		Dimensions: []string{
+			"settlement_dx.id", "settlement_dx.supplier_id", "settlement_dx.document_type",
+			"settlement_dx.approve_status", "settlement_dx.period_start", "settlement_dx.period_end",
+		},
+		Filters: filters,
+		Limit:   fetch,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cube settlement_dx list query: %w", err)
+	}
+	out := make([]SettlementRow, 0, len(data))
+	for _, r := range data {
+		out = append(out, SettlementRow{
+			ID:            rowStr(r, "settlement_dx.id"),
+			SupplierID:    rowStr(r, "settlement_dx.supplier_id"),
+			DocumentType:  DocumentTypeDelivery,
+			ApproveStatus: rowStr(r, "settlement_dx.approve_status"),
+			PeriodStart:   normalizeCubeDate(rowStr(r, "settlement_dx.period_start")),
+			PeriodEnd:     normalizeCubeDate(rowStr(r, "settlement_dx.period_end")),
+			// 代销单的"货款"= 结算额(sum_amount)。
+			TotalGoodsYuan: rowDec(r, "settlement_dx.total_settle_yuan"),
+		})
+	}
+	sortSettlementRowsDesc(out)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ListDxSettlementFacts 取代销结算单的毛利事实(零售额 / 结算额)。
+//
+// 查 settlement_dx_line(明细 t_fm_recpay_dx_detail_v4),按 settlement_id 分组汇总:
+//
+//	毛利率 = (SUM(num1) − SUM(ac_amount)) / SUM(num1)
+//
+// ⚠️ 不 AVG 逐行毛利率(逐行金额只有几元,比值误差会把整体毛利率抬偏)。
+func (q *DaprCubeQuerier) ListDxSettlementFacts(ctx context.Context, branchID string, ids []string) ([]DxFact, error) {
+	const chunk = 200
+	clean := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if v := strings.TrimSpace(id); v != "" {
+			clean = append(clean, v)
+		}
+	}
+	if len(clean) == 0 {
+		return nil, nil
+	}
+	out := make([]DxFact, 0, len(clean))
+	for start := 0; start < len(clean); start += chunk {
+		end := start + chunk
+		if end > len(clean) {
+			end = len(clean)
+		}
+		vals := make([]any, 0, end-start)
+		for _, id := range clean[start:end] {
+			vals = append(vals, id)
+		}
+		data, err := q.c.LoadCubeQuery(ctxWithBranch(ctx, branchID), "settlement_dx_line", cubeclient.CubeQuery{
+			Measures: []string{
+				"settlement_dx_line.total_retail_yuan",
+				"settlement_dx_line.total_settle_yuan",
+			},
+			Dimensions: []string{"settlement_dx_line.settlement_id"},
+			Filters: []cubeclient.CubeFilter{
+				{Member: "settlement_dx_line.settlement_id", Operator: "in", Values: vals},
+			},
+			Limit: (end - start) * 4,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("cube settlement_dx_line query: %w", err)
+		}
+		for _, r := range data {
+			out = append(out, DxFact{
+				SettlementID: rowStr(r, "settlement_dx_line.settlement_id"),
+				RetailYuan:   rowDec(r, "settlement_dx_line.total_retail_yuan"),
+				SettleYuan:   rowDec(r, "settlement_dx_line.total_settle_yuan"),
+			})
+		}
 	}
 	return out, nil
 }
@@ -456,7 +846,7 @@ func (q *DaprCubeQuerier) ListPurchaseSheets(ctx context.Context, branchID strin
 		Dimensions: []string{
 			"purchase_sheet.id", "purchase_sheet.supplier_id",
 			"purchase_sheet.document_type", "purchase_sheet.approve_status",
-			"purchase_sheet.created_at",
+			"purchase_sheet.created_at", "purchase_sheet.remark",
 		},
 		Filters: []cubeclient.CubeFilter{
 			{Member: "purchase_sheet.id", Operator: "in", Values: vals},
@@ -474,6 +864,7 @@ func (q *DaprCubeQuerier) ListPurchaseSheets(ctx context.Context, branchID strin
 			DocumentType:       rowStr(r, "purchase_sheet.document_type"),
 			ApproveStatus:      rowStr(r, "purchase_sheet.approve_status"),
 			CreatedAt:          normalizeCubeDate(rowStr(r, "purchase_sheet.created_at")),
+			Remark:             strings.TrimSpace(rowStr(r, "purchase_sheet.remark")),
 			TotalAmountYuan:    rowDec(r, "purchase_sheet.total_amount_yuan"),
 			TotalNetAmountYuan: rowDec(r, "purchase_sheet.total_net_amount_yuan"),
 		})
@@ -707,6 +1098,89 @@ func (q *DaprCubeQuerier) GetStocks(ctx context.Context, branchID string, produc
 	return out, nil
 }
 
+// ListDailySales 拉商品 [fromDate, toDate) 的**逐日**净销量(备货系数算法用)。
+//
+// ⚠️ 维度带 business_date(sale_day 是 char_date,字符串比较可走索引)——
+// 一次查询拿到整段曲线,而不是每天查一次(源表 120 万行,一次约 1.2s)。
+//
+// ⚠️ limit 要按"商品数 × 天数"给足:截断会静默丢掉一部分日销量,
+// 算出来的日均/变异系数就偏低(宁可多拉,也不要少算)。
+func (q *DaprCubeQuerier) ListDailySales(ctx context.Context, branchID string, productIDs []string, fromDate, toDate string) ([]DailySaleRow, error) {
+	if len(productIDs) == 0 {
+		return nil, nil
+	}
+	vals := make([]any, 0, len(productIDs))
+	for _, id := range productIDs {
+		vals = append(vals, id)
+	}
+	limit := len(productIDs) * 400
+	if limit > 50000 {
+		limit = 50000
+	}
+	data, err := q.c.LoadCubeQuery(ctxWithBranch(ctx, branchID), "sale_day", cubeclient.CubeQuery{
+		Measures:   []string{"sale_day.net_sale_quantity"},
+		Dimensions: []string{"sale_day.product_id", "sale_day.business_date"},
+		Filters: []cubeclient.CubeFilter{
+			{Member: "sale_day.product_id", Operator: "in", Values: vals},
+			{Member: "sale_day.business_date", Operator: "gte", Values: []any{fromDate}},
+			{Member: "sale_day.business_date", Operator: "lt", Values: []any{toDate}},
+		},
+		Limit: limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cube sale_day daily query: %w", err)
+	}
+	out := make([]DailySaleRow, 0, len(data))
+	for _, r := range data {
+		out = append(out, DailySaleRow{
+			ProductID:    strings.TrimSpace(rowStr(r, "sale_day.product_id")),
+			BusinessDate: normalizeCubeDate(rowStr(r, "sale_day.business_date")),
+			Quantity:     rowDec(r, "sale_day.net_sale_quantity"),
+		})
+	}
+	return out, nil
+}
+
+// ListProductPurchaseDates 拉商品 [fromDate, toDate) 的采购单**制单日期**。
+//
+// 走 purchase_sheet_line(商品侧有单列索引 item_no)join purchase_sheet(单据类型/日期),
+// 只要 PI(进货)—— RO 退货不代表补货节奏。
+func (q *DaprCubeQuerier) ListProductPurchaseDates(ctx context.Context, branchID string, productIDs []string, fromDate, toDate string) ([]ProductPurchaseDateRow, error) {
+	if len(productIDs) == 0 {
+		return nil, nil
+	}
+	vals := make([]any, 0, len(productIDs))
+	for _, id := range productIDs {
+		vals = append(vals, id)
+	}
+	limit := len(productIDs) * 200
+	if limit > 50000 {
+		limit = 50000
+	}
+	data, err := q.c.LoadCubeQuery(ctxWithBranch(ctx, branchID), "purchase_sheet_line", cubeclient.CubeQuery{
+		Measures:   []string{"purchase_sheet_line.count"},
+		Dimensions: []string{"purchase_sheet_line.product_id", "purchase_sheet.created_at"},
+		Filters: []cubeclient.CubeFilter{
+			{Member: "purchase_sheet_line.product_id", Operator: "in", Values: vals},
+			{Member: "purchase_sheet.document_type", Operator: "equals", Values: []any{"PI"}},
+			{Member: "purchase_sheet.created_at", Operator: "gte", Values: []any{fromDate}},
+			{Member: "purchase_sheet.created_at", Operator: "lt", Values: []any{toDate}},
+		},
+		Limit: limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cube purchase dates query: %w", err)
+	}
+	out := make([]ProductPurchaseDateRow, 0, len(data))
+	for _, r := range data {
+		out = append(out, ProductPurchaseDateRow{
+			ProductID: strings.TrimSpace(rowStr(r, "purchase_sheet_line.product_id")),
+			SheetDate: normalizeCubeDate(rowStr(r, "purchase_sheet.created_at")),
+		})
+	}
+	return out, nil
+}
+
 // GetSettlementsByIDs 按单号精确查结算单头(**不过滤**审核状态/单据类型)。
 //
 // # 为什么要一个"不过滤"的查询
@@ -718,53 +1192,21 @@ func (q *DaprCubeQuerier) GetStocks(ctx context.Context, branchID string, produc
 // ⚠️ id 列表分批:一个 IN 子句塞几千个值在 MSSQL 上很慢,
 // 而且 cube 的参数绑定也有限制。
 func (q *DaprCubeQuerier) GetSettlementsByIDs(ctx context.Context, branchID string, ids []string) ([]SettlementRow, error) {
-	const chunk = 200
-	clean := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if v := strings.TrimSpace(id); v != "" {
-			clean = append(clean, v)
-		}
+	purchase, err := q.querySettlementRowsByIDs(ctx, branchID, "settlement", "settlement.total_goods_yuan", "", ids, true)
+	if err != nil {
+		return nil, err
 	}
-	if len(clean) == 0 {
-		return nil, nil
+	// 联营单也要查：否则「这张单去哪了」的诊断会对 LY 单号回 not_found。
+	joint, err := q.querySettlementRowsByIDs(ctx, branchID, "settlement_ly", "settlement_ly.total_sales_yuan", DocumentTypeJoint, ids, true)
+	if err != nil {
+		return nil, err
 	}
-	out := make([]SettlementRow, 0, len(clean))
-	for start := 0; start < len(clean); start += chunk {
-		end := start + chunk
-		if end > len(clean) {
-			end = len(clean)
-		}
-		vals := make([]any, 0, end-start)
-		for _, id := range clean[start:end] {
-			vals = append(vals, id)
-		}
-		data, err := q.c.LoadCubeQuery(ctxWithBranch(ctx, branchID), "settlement", cubeclient.CubeQuery{
-			Measures: []string{"settlement.total_goods_yuan"},
-			Dimensions: []string{
-				"settlement.id", "settlement.supplier_id", "settlement.document_type",
-				"settlement.approve_status", "settlement.period_start", "settlement.period_end",
-			},
-			Filters: []cubeclient.CubeFilter{
-				{Member: "settlement.id", Operator: "in", Values: vals},
-			},
-			Limit: end - start,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("cube settlement by ids query: %w", err)
-		}
-		for _, r := range data {
-			out = append(out, SettlementRow{
-				ID:             rowStr(r, "settlement.id"),
-				SupplierID:     rowStr(r, "settlement.supplier_id"),
-				DocumentType:   rowStr(r, "settlement.document_type"),
-				ApproveStatus:  rowStr(r, "settlement.approve_status"),
-				PeriodStart:    normalizeCubeDate(rowStr(r, "settlement.period_start")),
-				PeriodEnd:      normalizeCubeDate(rowStr(r, "settlement.period_end")),
-				TotalGoodsYuan: rowDec(r, "settlement.total_goods_yuan"),
-			})
-		}
+	// 代销单同理（DX 单号同样落在独立表）。
+	dx, err := q.querySettlementRowsByIDs(ctx, branchID, "settlement_dx", "settlement_dx.total_settle_yuan", DocumentTypeDelivery, ids, true)
+	if err != nil {
+		return nil, err
 	}
-	return out, nil
+	return append(append(purchase, joint...), dx...), nil
 }
 
 // CubeSettlementList 是「可勾选结算单」列表 + 两类隐藏统计。
@@ -840,14 +1282,45 @@ type SettlementUnavailable struct {
 // ⇒ query 非空时改成:拉**全量**(cubeSettlementFetchCap)再在 Go 侧做包含匹配,
 //   **先筛后截** ⇒ 任意历史单都能搜到;并把命中的不可选单连同原因一起回传。
 func (s *Service) ListCubeSettlements(ctx context.Context, branchID, from, to, supplierID, query string, limit int, includePaid bool) (*CubeSettlementList, error) {
+	return s.listCubeSettlements(ctx, branchID, from, to, supplierID, query, limit, includePaid, SettlementKindPurchase)
+}
+
+// ListCubeJointSettlements 是「联营」tab 的可勾选列表（2026-10-31 用户口径）。
+//
+// 与购销列表走**同一套**剔除逻辑（已付款 / 待审批中 / 搜索不可选原因），
+// 只有数据源不同（settlement_ly 独立表，见 DocumentTypeJoint）。
+func (s *Service) ListCubeJointSettlements(ctx context.Context, branchID, from, to, supplierID, query string, limit int, includePaid bool) (*CubeSettlementList, error) {
+	return s.listCubeSettlements(ctx, branchID, from, to, supplierID, query, limit, includePaid, SettlementKindJoint)
+}
+
+// ListCubeDeliverySettlements 是「代销」tab 的可勾选列表（2026-11-01 用户口径）。
+//
+// 与联营同构：数据源是 settlement_dx 独立表，其余剔除逻辑（已付款/待审批中/
+// 搜索不可选原因）全部复用。
+func (s *Service) ListCubeDeliverySettlements(ctx context.Context, branchID, from, to, supplierID, query string, limit int, includePaid bool) (*CubeSettlementList, error) {
+	return s.listCubeSettlements(ctx, branchID, from, to, supplierID, query, limit, includePaid, SettlementKindDelivery)
+}
+
+func (s *Service) listCubeSettlements(ctx context.Context, branchID, from, to, supplierID, query string, limit int, includePaid bool, kind string) (*CubeSettlementList, error) {
 	if s.cube == nil {
 		return nil, ErrCubeUnavailable
+	}
+	// 数据源按 tab 选：购销(DP/CP) / 联营(LY) / 代销(DX)。
+	fetchAudited := func(lim int) ([]SettlementRow, error) {
+		switch kind {
+		case SettlementKindJoint:
+			return s.cube.ListAuditedJointSettlements(ctx, branchID, from, to, supplierID, lim)
+		case SettlementKindDelivery:
+			return s.cube.ListAuditedDxSettlements(ctx, branchID, from, to, supplierID, lim)
+		default:
+			return s.cube.ListAuditedSettlements(ctx, branchID, from, to, supplierID, lim)
+		}
 	}
 	query = strings.TrimSpace(query)
 	var rows []SettlementRow
 	if query == "" {
 		var err error
-		rows, err = s.cube.ListAuditedSettlements(ctx, branchID, from, to, supplierID, limit)
+		rows, err = fetchAudited(limit)
 		if err != nil {
 			return nil, err
 		}
@@ -856,7 +1329,7 @@ func (s *Service) ListCubeSettlements(ctx context.Context, branchID, from, to, s
 	} else {
 		// 搜索模式:拉**全量**再在 Go 侧匹配 —— 截断必须发生在**匹配之后**,
 		// 否则老单永远进不来(这正是上面那 4 张单搜不到的原因)。
-		all, err := s.cube.ListAuditedSettlements(ctx, branchID, from, to, supplierID, cubeSettlementFetchCap)
+		all, err := fetchAudited(cubeSettlementFetchCap)
 		if err != nil {
 			return nil, err
 		}
@@ -992,6 +1465,92 @@ func (s *Service) fillSupplierNames(ctx context.Context, branchID string, rows [
 			rows[i].SupplierName = n
 		}
 	}
+}
+
+// fillDxFacts 给代销结算单补毛利事实（2026-11-01 用户口径）。
+//
+// 只查 DocumentType=DX 的那些单；查不到明细(无零售/结算行)时按 0 处理 ——
+// 这样毛利率就是 0%,会触发「毛利率低于最低要求」的 warn(而不是静默跳过)。
+//
+// ⚠️ 查询失败只告警（不阻断审核）：毛利事实是**旁路证据**，
+//   与供应商字典/商品名同一定位；失败时 row.Dx 为 nil，checkDx 会给"毛利未知"。
+func (s *Service) fillDxFacts(ctx context.Context, branchID string, rows []SettlementRow) error {
+	if s.cube == nil {
+		return nil
+	}
+	ids := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if r.DocumentType == DocumentTypeDelivery {
+			ids = append(ids, strings.TrimSpace(r.ID))
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	facts, err := s.cube.ListDxSettlementFacts(ctx, branchID, ids)
+	if err != nil {
+		// 不阻断：调用方会把它降级成一条 warn 信号/日志。
+		return err
+	}
+	byID := make(map[string]DxFact, len(facts))
+	for _, f := range facts {
+		byID[strings.TrimSpace(f.SettlementID)] = f
+	}
+	for i := range rows {
+		if rows[i].DocumentType != DocumentTypeDelivery {
+			continue
+		}
+		f, ok := byID[strings.TrimSpace(rows[i].ID)]
+		if !ok {
+			f = DxFact{SettlementID: rows[i].ID}
+		}
+		cp := f
+		rows[i].Dx = &cp
+	}
+	return nil
+}
+
+// fillJointFacts 给联营结算单补扣点事实（2026-10-31 用户口径）。
+//
+// 只查 DocumentType=LY 的那些单；查不到明细(无扣点行)时按 0 处理 ——
+// 这样扣点率就是 0%，会触发「低于最低扣点率」的提示（而不是静默跳过）。
+//
+// ⚠️ 查询失败只告警（不阻断审核）：扣点事实是**旁路证据**，
+//   与供应商字典/商品名同一定位；失败时 row.Joint 为 nil，扣点校验跳过。
+func (s *Service) fillJointFacts(ctx context.Context, branchID string, rows []SettlementRow) error {
+	if s.cube == nil {
+		return nil
+	}
+	ids := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if r.DocumentType == DocumentTypeJoint {
+			ids = append(ids, strings.TrimSpace(r.ID))
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	facts, err := s.cube.ListJointSettlementFacts(ctx, branchID, ids)
+	if err != nil {
+		// 不阻断：调用方会把它降级成一条 warn 信号/日志。
+		return err
+	}
+	byID := make(map[string]JointFact, len(facts))
+	for _, f := range facts {
+		byID[strings.TrimSpace(f.SettlementID)] = f
+	}
+	for i := range rows {
+		if rows[i].DocumentType != DocumentTypeJoint {
+			continue
+		}
+		f, ok := byID[strings.TrimSpace(rows[i].ID)]
+		if !ok {
+			f = JointFact{SettlementID: rows[i].ID}
+		}
+		cp := f
+		rows[i].Joint = &cp
+	}
+	return nil
 }
 
 // fillApprovalSettlementNames 给审批快照的结算单行补供应商名称(读时 join)。

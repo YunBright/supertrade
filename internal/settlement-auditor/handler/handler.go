@@ -73,6 +73,10 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	// ⚠️ 端点内部**双重守门**(scope settlement:audit + 角色 admin)——
 	// merchant 持有 settlement:audit ⇒ 只守 scope 的话店长能自己放行自己的单。
 	r.POST("/settlement-approvals/:id/admin-approve", requireBranch, h.AdminApprove)
+	// 手动生成「计划盘点单」（2026-11-01 用户口径）：
+	// warn 级盘点类信号不再由流水线自动建单，改由审批详情页由人触发。
+	// scope 与提交/重跑同级（店长可操作），block 信号仍自动建单。
+	r.POST("/settlement-approvals/:id/stocktake-plan", requireBranch, h.GenerateStocktakePlan)
 	// 物理删一次审批及其 5 张从表（数据治理 / 测试清理）。
 	// 流水线在途时会返 409 让调用方稍后重试 —— 详见 service.ErrApprovalInFlight。
 	r.DELETE("/settlement-approvals/:id", requireBranch, h.Delete)
@@ -119,6 +123,15 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/stocktake-notify-group", requireBranch, h.GetStocktakeNotifyGroup)
 	r.PUT("/stocktake-notify-group", requireBranch, h.SetStocktakeNotifyGroup)
 	r.DELETE("/stocktake-notify-group", requireBranch, h.DeleteStocktakeNotifyGroup)
+
+	// ---- 备货系数维护（2026-10-31 用户口径，挂在 Flutter「商品」菜单下）----
+	//
+	// 读走 product:view、写走 product:manage（merchant 两者都没有 ⇒ 店长改不了）。
+	// ⚠️ regenerate 必须注册在 :product_id 之前（静态段先命中）。
+	r.GET("/stocking-coefficients", requireBranch, h.ListStockingCoefficients)
+	r.POST("/stocking-coefficients/regenerate", requireBranch, h.RegenerateStockingCoefficients)
+	r.PUT("/stocking-coefficients/:product_id", requireBranch, h.UpdateStockingCoefficient)
+	r.DELETE("/stocking-coefficients/:product_id", requireBranch, h.DeleteStockingCoefficient)
 }
 
 // stocktakeNotifyGroupResp 是推送群配置的响应体。
@@ -359,6 +372,8 @@ func writeError(c *gin.Context, status int, code, msg string) {
 func mapErr(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, service.ErrApprovalNotFound):
+		writeError(c, http.StatusNotFound, "not_found", err.Error())
+	case errors.Is(err, service.ErrStockingNotFound):
 		writeError(c, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, service.ErrInvalidInput), errors.Is(err, service.ErrInvalidStatus):
 		writeError(c, http.StatusBadRequest, "bad_request", err.Error())
@@ -701,6 +716,31 @@ func (h *Handler) ListCubeSettlements(c *gin.Context) {
 	}
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "200"))
 	includePaid := c.Query("include_paid") == "1" || c.Query("include_paid") == "true"
+	// kind = purchase(购销,默认) | joint(联营) | dx(代销)。三类单在思迅是
+	// **三张不同的源表**(gx_master / t_fm_recpay_ly_master / t_fm_recpay_dx_master),
+	// 无法合并查询 ⇒ H5 用 tab 切换。
+	kind := strings.TrimSpace(c.DefaultQuery("kind", "purchase"))
+	if kind == "joint" || kind == "dx" {
+		query := c.Query("q")
+		fetch := h.svc.ListCubeJointSettlements
+		if kind == "dx" {
+			fetch = h.svc.ListCubeDeliverySettlements
+		}
+		list, err := fetch(c.Request.Context(), branchID,
+			c.Query("from"), c.Query("to"), c.Query("supplier_id"), query, limit, includePaid)
+		if err != nil {
+			mapErr(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"items":                list.Rows,
+			"hidden_paid_count":    list.HiddenPaid,
+			"hidden_pending_count": list.HiddenPending,
+			"match_total":          list.MatchTotal,
+			"unavailable":          list.Unavailable,
+		})
+		return
+	}
 	// q = 关键字搜索（单号 / 供应商编号 / 供应商名称）。
 	//
 	// ⚠️ 有 q 时后端走**全量集合 + Go 侧包含匹配**，不再按 limit 截断 ——

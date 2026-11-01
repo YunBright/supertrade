@@ -262,7 +262,8 @@ func buildSettlementStatus(id string, src SettlementRow, state model.SettlementP
 		item.StateLabel = "思迅里这张单还没审核，审核后才能发起付款审批"
 		return item
 	}
-	if src.DocumentType != "DP" && src.DocumentType != "CP" {
+	if src.DocumentType != "DP" && src.DocumentType != "CP" &&
+		src.DocumentType != DocumentTypeJoint && src.DocumentType != DocumentTypeDelivery {
 		item.State = SettlementStateNotPayable
 		item.StateLabel = "这张单不是采购结款单（单据类型 " + src.DocumentType + "），不能发起付款审批"
 		return item

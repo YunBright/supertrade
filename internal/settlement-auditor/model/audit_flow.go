@@ -70,6 +70,12 @@ type AuditSupplierFlow struct {
 	Mode string `gorm:"size:16" json:"mode"`
 	// LogicKind 是逻辑条件类型（Mode=logic 时有意义）。
 	LogicKind string `gorm:"size:32" json:"logic_kind"`
+	// MinJointDeductRate 是**联营最低扣点率（%）**（2026-10-31 用户口径）。
+	//
+	// 联营帐款单的扣点率 = Σ明细扣点(sup_ly_amount) / Σ明细销售额(sale_amount)。
+	// 低于该值 ⇒ 机器审核给 warn，由 LLM 结合备注研判是否拒绝。
+	// 默认 10（用户口径「默认大于 10%」），可在管理后台「结算-供应商流程管理」里改。
+	MinJointDeductRate float64 `gorm:"not null;default:10" json:"min_joint_deduct_rate"`
 	// Enabled=false 等同「没配置」⇒ 走机器人审核流程。
 	//
 	// 保留这条而不是直接删行，是为了"临时停用某个供应商的定制流程"不用重建。

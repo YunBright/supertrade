@@ -115,6 +115,9 @@ func initApp() error {
 		// 统计「每月有且仅有一单」,不再实时 JOIN 扫全表。
 		&model.ApprovalMonthlyItem{},
 		&model.ApprovalMonthlyBackfill{},
+		// 备货系数（2026-10-31 用户口径）:本域 PG 的经营参数,
+		// 审批时缺失即触发现算并落库;管理后台可维护。
+		&model.StockingCoefficient{},
 	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)
 	}

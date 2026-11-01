@@ -63,6 +63,8 @@ type supplierFlowReq struct {
 	LogicKind    string `json:"logic_kind"`
 	Enabled      bool   `json:"enabled"`
 	Note         string `json:"note"`
+	// MinJointDeductRate 是联营最低扣点率(%)；0 或缺省 ⇒ 默认 10%。
+	MinJointDeductRate float64 `json:"min_joint_deduct_rate"`
 }
 
 type itemFlowReq struct {
@@ -118,12 +120,13 @@ func (h *Handler) CreateSupplierFlow(c *gin.Context) {
 		return
 	}
 	row, err := h.svc.CreateSupplierFlow(c.Request.Context(), branchID, h.operatorID(c), service.SupplierFlowInput{
-		SupplierID:   req.SupplierID,
-		SupplierName: req.SupplierName,
-		Mode:         req.Mode,
-		LogicKind:    req.LogicKind,
-		Enabled:      req.Enabled,
-		Note:         req.Note,
+		SupplierID:         req.SupplierID,
+		SupplierName:       req.SupplierName,
+		Mode:               req.Mode,
+		LogicKind:          req.LogicKind,
+		Enabled:            req.Enabled,
+		Note:               req.Note,
+		MinJointDeductRate: req.MinJointDeductRate,
 	})
 	if err != nil {
 		mapFlowErr(c, err)
@@ -144,12 +147,13 @@ func (h *Handler) UpdateSupplierFlow(c *gin.Context) {
 		return
 	}
 	row, err := h.svc.UpdateSupplierFlow(c.Request.Context(), branchID, c.Param("id"), h.operatorID(c), service.SupplierFlowInput{
-		SupplierID:   req.SupplierID,
-		SupplierName: req.SupplierName,
-		Mode:         req.Mode,
-		LogicKind:    req.LogicKind,
-		Enabled:      req.Enabled,
-		Note:         req.Note,
+		SupplierID:         req.SupplierID,
+		SupplierName:       req.SupplierName,
+		Mode:               req.Mode,
+		LogicKind:          req.LogicKind,
+		Enabled:            req.Enabled,
+		Note:               req.Note,
+		MinJointDeductRate: req.MinJointDeductRate,
 	})
 	if err != nil {
 		mapFlowErr(c, err)

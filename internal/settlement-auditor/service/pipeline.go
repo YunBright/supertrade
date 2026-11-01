@@ -25,7 +25,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
-	"google.golang.org/grpc/metadata"
 	"gorm.io/gorm"
 
 	"github.com/YunBright/supertrade/internal/cubeclient"
@@ -38,7 +37,17 @@ const (
 	StepExpandLines      = "expand_lines"
 	StepCheckSheets      = "check_sheets"
 	StepCheckAmounts     = "check_amounts"
-	StepCheckQuantity    = "check_quantity"
+	// StepCheckJoint 是**联营扣点核对**步骤（2026-10-31 用户口径）。
+	//
+	// 在金额勾稽之后单独记一步：联营单的"扣点是否随单申报 / 扣点率是否达标"
+	// 是两类不同的事实，混在金额日志里看不出结论。
+	StepCheckJoint = "check_joint"
+	// StepCheckDx 是**代销毛利核对**步骤（2026-11-01 用户口径）。
+	//
+	// 与联营扣点同理单独记一步：代销单的"整体实现毛利率是否达标"
+	// 混在金额日志里看不出来。
+	StepCheckDx    = "check_dx"
+	StepCheckQuantity = "check_quantity"
 	StepLLMVerdict       = "llm_verdict"
 	// StepFlowDecision 是**流程定制**的结论步骤（2026-10-28 用户口径）。
 	//
@@ -356,8 +365,14 @@ func (s *Service) runAudit(ctx context.Context, approvalID string) {
 	// step 4: 金额勾稽(比的是**应付金额** = 货款 + 付款项 − 收款项)
 	amountCheck := s.stepCheckAmounts(ctx, ap, settlements, linesBySettlement, &signals, items)
 
-	// step 5: 数量信号(采购量 vs 销售) + 毛利额度信号(补差价)
-	margins, err := s.stepCheckQuantity(ctx, ap, linesBySettlement, sheets, &signals, allowance)
+	// step 4.5: 联营扣点核对(扣点是否随联营帐款单一起申报 / 扣点率是否达标)
+	jointSummary := s.stepCheckJoint(ctx, ap, settlements, &signals, items)
+
+	// step 4.6: 代销毛利核对(整体实现毛利率是否达标,2026-11-01 用户口径)
+	dxSummary := s.stepCheckDx(ctx, ap, settlements, &signals)
+
+	// step 5: 数量信号(采购量 vs 销售) + 毛利额度信号(补差价) + 备货系数事实
+	margins, stockingFacts, err := s.stepCheckQuantity(ctx, ap, linesBySettlement, sheets, &signals, allowance)
 	if err != nil {
 		s.markFailed(ctx, ap, err.Error())
 		return
@@ -384,7 +399,7 @@ func (s *Service) runAudit(ctx context.Context, approvalID string) {
 	}
 
 	// step 6: 出结论 —— 命中流程定制配置 ⇒ 用流程结论；没命中 ⇒ 现有机器人(LLM)研判
-	extras := AuditExtras{Margins: *marginsOrZero(margins), Stocktakes: verified}
+	extras := AuditExtras{Margins: *marginsOrZero(margins), Stocktakes: verified, Stocking: stockingFacts, Joint: jointSummary, Dx: dxSummary}
 	verdict, err := s.decideVerdict(ctx, ap, settlements, linesBySettlement, sheets, signals, &amountCheck, items, allowance, extras)
 	if err != nil {
 		s.markFailed(ctx, ap, err.Error())
@@ -491,6 +506,16 @@ func (s *Service) stepFetchSettlements(ctx context.Context, ap *model.ApprovalIn
 	// ⇒ 只能在 Go 侧 join（与 fillSupplierNames 同一套路）。
 	// 字典取不到时名称留空 ⇒ 提示词里只给编号（同 fillSupplierNames 的降级取舍）。
 	s.fillSupplierNames(ctx, ap.BranchID, rows)
+	// 联营单补扣点事实(销售额/扣点,2026-10-31 用户口径)。查询失败只告警:
+	// 扣点事实是旁路证据,失败时退化为「扣点率 0%」(由 checkJoint 给 warn)。
+	if err := s.fillJointFacts(ctx, ap.BranchID, rows); err != nil {
+		s.logger.Warn("fill joint settlement facts failed", "approval_id", ap.ID, "err", err)
+	}
+	// 代销单补毛利事实(零售额/结算额,2026-11-01 用户口径)。查询失败只告警:
+	// 毛利事实是旁路证据,失败时 row.Dx 为 nil(由 checkDx 给「毛利未知」warn)。
+	if err := s.fillDxFacts(ctx, ap.BranchID, rows); err != nil {
+		s.logger.Warn("fill dx settlement facts failed", "approval_id", ap.ID, "err", err)
+	}
 	*signals = append(*signals, checkSettlements(ids, rows)...)
 	s.logStep(ctx, ap, StepFetchSettlements,
 		fmt.Sprintf("勾选 %d 张: %s", len(ids), strings.Join(ids, ",")),
@@ -633,7 +658,7 @@ func (s *Service) stepCheckAmounts(ctx context.Context, ap *model.ApprovalInstan
 //
 // 信号里写「<商品名称>-<商品货号>」(ProductLabel)⇒ 这里要先把名字查出来。
 // 名字查不到只 warn 不失败:回退成纯货号,不影响主结论。
-func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInstance, linesBySettlement map[string][]SettlementLineRow, sheets []PurchaseSheetRow, signals *[]signalDraft, allowance Allowance) (*MarginSummary, error) {
+func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInstance, linesBySettlement map[string][]SettlementLineRow, sheets []PurchaseSheetRow, signals *[]signalDraft, allowance Allowance) (*MarginSummary, []StockingFact, error) {
 	start := time.Now()
 	// 仅 PI(进货)单做收货量聚合;RO 退货本期不建信号(见 checks.go 注释)。
 	piSheetSet := make(map[string]struct{})
@@ -650,11 +675,11 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 	}
 	if len(piSheets) == 0 {
 		s.logStep(ctx, ap, StepCheckQuantity, "无 PI 进货单", "跳过数量信号", "", time.Since(start).Milliseconds())
-		return nil, nil
+		return nil, nil, nil
 	}
 	lines, err := s.cube.ListSheetLines(ctx, ap.BranchID, piSheets)
 	if err != nil {
-		return nil, fmt.Errorf("fetch sheet lines: %w", err)
+		return nil, nil, fmt.Errorf("fetch sheet lines: %w", err)
 	}
 	received := make(map[string]decimal.Decimal)
 	productSheets := make(map[string][]string) // 商品 → 它出现过的采购单
@@ -675,21 +700,34 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 	}
 	sort.Strings(products)
 
-	// 每张 PI 单的制单日期(同一单多行时取最晚的一条,防御脏数据)。
-	sheetDates := make(map[string]string)
-	for _, sh := range sheets {
-		if sh.DocumentType != "PI" || sh.CreatedAt == "" {
-			continue
-		}
-		if cur, ok := sheetDates[sh.ID]; !ok || sh.CreatedAt > cur {
-			sheetDates[sh.ID] = sh.CreatedAt
-		}
-	}
 	// 窗口终点 = 明天(开区间)⇒ **今天当天的销售也算在内**。
 	// 源表 t_rm_daysum 当天就有数据(实测卖到当天),用今天做上界会把当天的销量漏掉。
 	now := s.now()
 	today := now.Format("2006-01-02")
 	toDate := now.AddDate(0, 0, 1).Format("2006-01-02")
+
+	// 每张 PI 单的**实际收货日期**(同一单多行时取最晚的一条,防御脏数据)。
+	//
+	// ⚠️ 优先用备注里写的实际收货日期(延后录入场景,见 receipt_date.go),
+	//   解析不出来才兜底制单日期 —— 被拒审批 21170868728a4a57a9d3e82d14f42611
+	//   就是"2026-09-18 收货、2026-10-21 才录单",按制单日起算会判成"进货后无销售"。
+	sheetDates := make(map[string]string)
+	extracted := 0
+	for _, sh := range sheets {
+		if sh.DocumentType != "PI" {
+			continue
+		}
+		d := sh.effectiveDate(today)
+		if d == "" {
+			continue
+		}
+		if sh.Remark != "" && d != sh.CreatedAt {
+			extracted++
+		}
+		if cur, ok := sheetDates[sh.ID]; !ok || d > cur {
+			sheetDates[sh.ID] = d
+		}
+	}
 	// 取不到采购日期时的回退窗口(老口径:今天往前 SaleWindowDays 天)。
 	fallbackFrom, _ := s.saleWindowDates()
 
@@ -698,7 +736,7 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 	for _, g := range groups {
 		sales, err := s.cube.SumSalesByProduct(ctx, ap.BranchID, g.Products, g.From, toDate)
 		if err != nil {
-			return nil, fmt.Errorf("fetch sales: %w", err)
+			return nil, nil, fmt.Errorf("fetch sales: %w", err)
 		}
 		for _, r := range sales {
 			salesByProduct[r.ProductID] = r
@@ -755,6 +793,15 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 		names = nil
 	}
 
+	// ---- 备货系数（2026-10-31 用户口径）----
+	//
+	// 把本次涉及的 SKU 的备货系数连同库存数、周期销售数一起交给 LLM
+	// （见 service/stocking.go）。缺失的系数在这里现算并落库。
+	//
+	// ⚠️ 全部失败路径都只告警不阻断：备货系数是**参考事实**，
+	//    不是审批结论的必要条件，不能因为它拿不到就把整单审核搞挂。
+	stocking := s.stockingFactsForAudit(ctx, ap.BranchID, products, received, sheetDates, productSheets, names, now)
+
 	before := len(*signals)
 	*signals = append(*signals, checkQuantity(received, salesByProduct, lossByProduct, s.cfg.QtyDeviationFactor, QuantityContext{
 		Names:      names,
@@ -777,6 +824,10 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 	perSKU := estimateProductMargins(cost, salesByProduct)
 	gmSignals := checkGrossMarginWithAllowance(gm, allowance, perSKU, names)
 	*signals = append(*signals, gmSignals...)
+
+	// 备货过量提示（2026-10-31 用户口径）:按备货系数估算合理备货量，
+	// 进货明显超出（> 2 倍）时给 warn —— 只提示，不阻断。
+	*signals = append(*signals, checkStockingExcess(stocking, names)...)
 
 	// ---- 实现毛利（2026-10-29 用户口径）----
 	//
@@ -804,16 +855,33 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 	for _, rm := range realizedNeg {
 		summary.RealizedNegYuan = summary.RealizedNegYuan.Add(rm.AmountYuan)
 	}
+	// 备货系数核对结论（推理时间线可见，2026-10-31 用户要求）。
+	stockingNote := "备货系数核对:未启用"
+	if len(stocking) > 0 {
+		estimatedCnt := 0
+		excessCnt := 0
+		for _, f := range stocking {
+			if f.Estimated {
+				estimatedCnt++
+			}
+			if f.ReasonableQty.GreaterThan(decimal.Zero) &&
+				f.ReceivedQty.GreaterThan(f.ReasonableQty.Mul(decimal.NewFromInt(2))) {
+				excessCnt++
+			}
+		}
+		stockingNote = fmt.Sprintf("备货系数核对:%d 个商品(其中 %d 个本次现算),进货明显过量 %d 个",
+			len(stocking), estimatedCnt, excessCnt)
+	}
 	s.logStep(ctx, ap, StepCheckQuantity,
-		fmt.Sprintf("PI 单 %d 张,商品 %d 种,窗口 %s~%s(按各商品最后一次采购入库日起算,取不到则回退 %s)",
-			len(piSheets), len(products), groups[0].From, toDate, fallbackFrom),
-		fmt.Sprintf("新增 %d 条数量信号;%s;窗口毛利估算 %s 元(成本口径:库存加权平均成本价 %d 个商品,回退本次进货均价 %d 个),补差价额度 %s 元,毛利为负的商品 %d 个;实现毛利为负的商品 %d 个",
-			len(*signals)-before, lossNote, yuanText(gm.AmountYuan), avgCnt, purchaseCnt,
+		fmt.Sprintf("PI 单 %d 张(其中 %d 张按备注实际收货日起算),商品 %d 种,窗口 %s~%s(按各商品最后一次采购收货日起算,取不到则回退 %s)",
+			len(piSheets), extracted, len(products), groups[0].From, toDate, fallbackFrom),
+		fmt.Sprintf("新增 %d 条数量信号;%s;%s;窗口毛利估算 %s 元(成本口径:库存加权平均成本价 %d 个商品,回退本次进货均价 %d 个),补差价额度 %s 元,毛利为负的商品 %d 个;实现毛利为负的商品 %d 个",
+			len(*signals)-before, lossNote, stockingNote, yuanText(gm.AmountYuan), avgCnt, purchaseCnt,
 			yuanText(allowance.PriceDiffYuan),
 			len(negGross),
 			len(realizedNeg)),
 		"", 0)
-	return summary, nil
+	return summary, stocking, nil
 }
 
 // realizedWindowSales 拉「实现毛利」口径要用的窗口销售汇总。
@@ -1016,6 +1084,9 @@ func (s *Service) stepLLMVerdict(ctx context.Context, ap *model.ApprovalInstance
 		Allowance:   allowance,
 		Margins:     ex.Margins,
 		Stocktakes:  ex.Stocktakes,
+		Stocking:    ex.Stocking,
+		Joint:       ex.Joint,
+		Dx:          ex.Dx,
 	}
 	verdict, err := s.verdictFn(ctx, in)
 	trace := ""
@@ -1166,6 +1237,12 @@ const stocktakeStatusApproved = "approved"
 //
 // 幂等:同一审批已有 approval_stocktake_links 时直接跳过(重跑/RescanStuck
 // 不会重复建单、不会重复推卡片)。
+//
+// ⚠️ 2026-11-01 用户口径:**warn 信号不再自动建计划盘点单**。
+//
+//	只有存在**阻断级(block)信号**时才自动建;仅 warn 信号触发的情形
+//	改由用户在 Flutter「结算-付款审批-审批详情页」手动点「生成计划盘点单」。
+//	无信号本来就不会有盘点建议 ⇒ 维持原样(不建单)。
 func (s *Service) stepStocktake(ctx context.Context, ap *model.ApprovalInstance, verdict *VerdictResult, signals []signalDraft) {
 	start := time.Now()
 	st := verdict.SuggestStocktake
@@ -1185,95 +1262,17 @@ func (s *Service) stepStocktake(ctx context.Context, ap *model.ApprovalInstance,
 			"", time.Since(start).Milliseconds())
 		return
 	}
-	productIDs, derived := stocktakePlanProductIDs(st, signals)
-	// 计划单商品是**必填语义**:没有商品就是一张空计划单,
-	// 盘点人打开只看到"无计划项",等于这次建单完全没意义(2026-10-31 生产事故:
-	// ST20261031501addf7 建出来 0 个计划项)。⇒ 宁可跳过并留痕,也不建空单。
-	if len(productIDs) == 0 {
+	// ⚠️ warn ⇒ 不自动建单(改为审批详情页手动生成)。
+	if !hasBlock(signals) {
 		s.logStep(ctx, ap, StepStocktake, "",
-			fmt.Sprintf("建议盘点(scope=%s)但没有可落地的计划商品,跳过建单", st.Scope),
+			"仅有 warn 级信号,按口径不再自动生成计划盘点单(可在审批详情页手动生成)",
 			"", time.Since(start).Milliseconds())
 		return
 	}
-	settlementIDs := s.settlementIDsOf(ctx, ap.ID)
-	remark := fmt.Sprintf("结算付款审批 %s 机器审核建议盘点(scope=%s;结算单 %s;计划商品 %d 个%s)",
-		ap.ID, st.Scope, strings.Join(settlementIDs, ","), len(productIDs), derived)
-	in := StocktakeCreatePlanInput{
-		BranchID:   ap.BranchID,
-		OperatorID: ap.ApplicantUserID,
-		Remark:     truncate(remark, 500),
-		ProductIDs: productIDs,
-	}
-	// 透传申请人 JWT **和门店** 给 stocktake:
-	//   - Authorization:AddPlanItems 从 cube 现拉商品名/条码时 cube 侧要认这个凭证;
-	//   - X-Branch-ID:cube-router 的 /v1/load 挂着 rbac.RequireScopeWithBranch("cube:read"),
-	//     门店从 header 取 —— 不带就是 400 branch_required。
-	//
-	// ⚠️ 2026-10-22 生产实踩:只传 Authorization、不传门店 ⇒ stocktake 侧
-	// 建单 500(Internal Server Error)⇒ 审批日志里"建盘点计划失败",
-	// 而拒绝理由里还写着"建议针对性盘点" —— 盘点单根本没建出来。
-	if ap.ApplicantBearer != "" {
-		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", ap.ApplicantBearer)
-	}
-	if ap.BranchID != "" {
-		ctx = metadata.AppendToOutgoingContext(ctx, "x-branch-id", ap.BranchID)
-	}
-	header, err := s.stocktake.CreatePlanHeader(ctx, in)
-	if err != nil {
+	if _, err := s.createStocktakePlan(ctx, ap, st, signals, ap.ApplicantUserID,
+		ap.ApplicantBearer, "机器审核建议盘点"); err != nil {
 		s.logger.Warn("create stocktake plan failed", "approval_id", ap.ID, "err", err)
-		s.logStep(ctx, ap, StepStocktake, remark, "建盘点计划失败: "+err.Error(), "", time.Since(start).Milliseconds())
-		return
 	}
-	link := &model.ApprovalStocktakeLink{
-		ID:                uuid.NewString(),
-		ApprovalID:        ap.ID,
-		StocktakeHeaderID: header.ID,
-	}
-	if err := s.db.WithContext(ctx).Create(link).Error; err != nil {
-		s.logger.Warn("insert stocktake link failed", "approval_id", ap.ID, "err", err)
-	}
-	// 盘点计划通知:优先发到**门店指定的群**(Flutter 管理后台「仓库-设置」里配),
-	// 没配群才退回固定的人(env SETTLEMENT_AUDITOR_STOCKTAKE_NOTIFY_USERS)。
-	//
-	// 群消息用 markdown 而不是 taskcard:企微的 taskcard(任务卡片)只支持成员消息,
-	// 群聊(appchat)只吃 text/markdown ⇒ 卡片形态在群里发不出去。
-	planURL := strings.TrimSuffix(s.cfg.WxH5BaseURL, "/") + "/inventory.html?header_id=" + header.ID
-	desc := fmt.Sprintf("结算单 %s 审核发现库存异常,已生成针对性盘点计划,请及时盘点。计划单 %s",
-		strings.Join(settlementIDs, ","), header.ID)
-	group := s.notifyGroupOf(ctx, ap.BranchID)
-	switch {
-	case group != nil:
-		payload := TaskCardPayload{
-			ToChat:      group.ChatID,
-			AppID:       group.AppID,
-			Title:       "结算异常盘点计划",
-			Description: truncate(desc, 200),
-			URL:         planURL,
-			TaskID:      "stocktake-plan-" + header.ID,
-			// 让 wechat-bot 把链接包成企微 OAuth2 授权链接 ⇒
-			// 群卡片点「去盘点」进自建应用「云商AI」的盘点单页,而不是系统浏览器。
-			OpenInApp: true,
-		}
-		if _, err := s.publishCommand(ctx, CmdTaskCard, payload); err != nil {
-			s.logger.Warn("publish stocktake_taskcard(群) failed", "approval_id", ap.ID, "err", err)
-			s.logStep(ctx, ap, StepStocktake, remark, "盘点计划已创建,但推送到群失败: "+err.Error(), "", time.Since(start).Milliseconds())
-			return
-		}
-	case len(s.cfg.StocktakeNotifyUsers) > 0:
-		payload := TaskCardPayload{
-			ToUser:      s.cfg.StocktakeNotifyUsers,
-			Title:       "结算异常盘点计划",
-			Description: truncate(desc, 200),
-			URL:         planURL,
-			TaskID:      "stocktake-plan-" + header.ID,
-		}
-		if _, err := s.publishCommand(ctx, CmdTaskCard, payload); err != nil {
-			s.logger.Warn("publish stocktake_taskcard failed", "approval_id", ap.ID, "err", err)
-		}
-	}
-	s.logStep(ctx, ap, StepStocktake, remark,
-		fmt.Sprintf("盘点计划单 %s 已创建(通知:%s)", header.ID, notifyTargetText(group, s.cfg.StocktakeNotifyUsers)),
-		"", time.Since(start).Milliseconds())
 }
 
 // stocktakePlanProductIDs 把 LLM 的盘点建议折算成**要落进计划单的商品 id**。

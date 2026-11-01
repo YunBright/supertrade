@@ -190,6 +190,8 @@ var (
 	ErrAlreadyExists = errors.New("service: 已存在")
 	// ErrAuditFlowNotFound 是"流程配置不存在（或不属于该门店）"。
 	ErrAuditFlowNotFound = errors.New("service: 流程配置不存在")
+	// ErrStockingNotFound 是"该 SKU 在本门店还没有备货系数"。
+	ErrStockingNotFound = errors.New("service: 备货系数不存在")
 )
 
 // New 构造 Service。cfg 必填项不足时以默认值兜底(见 withDefaults)。

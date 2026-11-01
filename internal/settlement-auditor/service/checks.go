@@ -209,11 +209,18 @@ func checkAmounts(settlements []SettlementRow, linesBySettlement map[string][]Se
 	var out []signalDraft
 	grandTotal := decimal.Zero
 	for _, st := range settlements {
+		grandTotal = grandTotal.Add(st.TotalGoodsYuan)
+		// 联营帐款单(LY)与代销帐款单(DX)都没有 PI/RO 明细行(明细按销售额/
+		// 结算背书,见 joint.go / dx.go),它们的单头金额与明细自洽由 cube 的
+		// settlement_ly / settlement_dx 口径保证 ⇒ 跳过本层校验,
+		// 只计入 grandTotal(否则会凭"明细合计 0"误报 LineAmountMismatch)。
+		if isJointOrDelivery(st.DocumentType) {
+			continue
+		}
 		lineSum := decimal.Zero
 		for _, ln := range linesBySettlement[st.ID] {
 			lineSum = lineSum.Add(ln.TotalGoodsYuan)
 		}
-		grandTotal = grandTotal.Add(st.TotalGoodsYuan)
 		diff := lineSum.Sub(st.TotalGoodsYuan).Abs()
 		if diff.GreaterThan(tolerance) {
 			out = append(out, newSignal(model.SignalBlock, SigLineAmountMismatch, st.ID, "",

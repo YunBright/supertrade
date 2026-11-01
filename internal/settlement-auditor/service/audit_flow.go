@@ -42,6 +42,9 @@ type SupplierFlowInput struct {
 	LogicKind    string
 	Enabled      bool
 	Note         string
+	// MinJointDeductRate 是联营最低扣点率(%)（2026-10-31 用户口径）。
+	// <=0 时按默认 10% 落库。
+	MinJointDeductRate float64
 }
 
 // ItemFlowInput 是付款项流程配置的写入入参。
@@ -168,7 +171,8 @@ func (s *Service) UpdateSupplierFlow(ctx context.Context, branchID, id, operator
 		Updates(map[string]any{
 			"supplier_id": row.SupplierID, "supplier_name": row.SupplierName,
 			"mode": row.Mode, "logic_kind": row.LogicKind,
-			"enabled": row.Enabled, "note": row.Note, "updated_by": operator,
+			"min_joint_deduct_rate": row.MinJointDeductRate,
+			"enabled":               row.Enabled, "note": row.Note, "updated_by": operator,
 		}).Error; err != nil {
 		return nil, fmt.Errorf("update supplier flow: %w", err)
 	}
@@ -205,6 +209,14 @@ func (s *Service) buildSupplierFlow(branchID, operator string, in SupplierFlowIn
 	if err != nil {
 		return nil, err
 	}
+	// 联营最低扣点率:未填(<=0)⇒ 默认 10%;上限 100%(扣点率不可能超过销售额)。
+	minRate := in.MinJointDeductRate
+	if minRate <= 0 {
+		minRate = DefaultMinJointDeductRate
+	}
+	if minRate > 100 {
+		return nil, fmt.Errorf("%w: 最低联营扣点率不能超过 100%%(实际 %.2f)", ErrInvalidInput, minRate)
+	}
 	return &model.AuditSupplierFlow{
 		ID:           uuid.NewString(),
 		BranchID:     branchID,
@@ -212,6 +224,7 @@ func (s *Service) buildSupplierFlow(branchID, operator string, in SupplierFlowIn
 		SupplierName: strings.TrimSpace(in.SupplierName),
 		Mode:         mode,
 		LogicKind:    logicKind,
+		MinJointDeductRate: minRate,
 		Enabled:      in.Enabled,
 		Note:         strings.TrimSpace(in.Note),
 		CreatedBy:    operator,

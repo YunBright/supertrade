@@ -304,7 +304,9 @@ func evaluateDailySingle(sheets []PurchaseSheetRow) (bool, string) {
 	byDate := map[string][]string{}
 	unknown := 0
 	for _, sh := range sheets {
-		d := strings.TrimSpace(sh.CreatedAt)
+		// 分组用**实际收货日期**(备注提取,兜底制单日期)——
+		// 延后录入的单若按制单日分组,"9.18 收货、10.21 录单"会被误判成同日多单。
+		d := strings.TrimSpace(sh.effectiveDate(""))
 		if d == "" {
 			unknown++
 			continue

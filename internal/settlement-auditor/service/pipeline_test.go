@@ -40,6 +40,8 @@ type fakeCube struct {
 	losses         []LossRow         // 盘损分组行(默认空 = 无盘损)
 	lossErr        error             // 非 nil ⇒ 盘损查询失败(测降级)
 	productNames   map[string]string // 货号 → 商品名
+	dailySales     []DailySaleRow    // 备货系数用:逐日销量
+	purchaseDates  []ProductPurchaseDateRow
 }
 
 func (f *fakeCube) ListSupplierNames(_ context.Context, _ string) (map[string]string, error) {
@@ -81,6 +83,72 @@ func (f *fakeCube) ListAuditedSettlements(_ context.Context, _, _, _, _ string, 
 		rows = rows[:limit]
 	}
 	return rows, nil
+}
+
+// ListAuditedJointSettlements 返回预置的联营结算单（DocumentType=LY）。
+func (f *fakeCube) ListAuditedJointSettlements(_ context.Context, _, _, _, _ string, limit int) ([]SettlementRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []SettlementRow
+	for _, r := range f.settlements {
+		if r.DocumentType == DocumentTypeJoint {
+			out = append(out, r)
+		}
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ListJointSettlementFacts 返回预置的联营单事实（取自 SettlementRow.Joint）。
+func (f *fakeCube) ListJointSettlementFacts(_ context.Context, _ string, ids []string) ([]JointFact, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	want := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	var out []JointFact
+	for _, r := range f.settlements {
+		if want[r.ID] && r.Joint != nil {
+			out = append(out, *r.Joint)
+		}
+	}
+	return out, nil
+}
+
+// ListAuditedDxSettlements 返回预置的代销结算单（DocumentType=DX）。
+func (f *fakeCube) ListAuditedDxSettlements(_ context.Context, _, _, _, _ string, limit int) ([]SettlementRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []SettlementRow
+	for _, r := range f.settlements {
+		if r.DocumentType == DocumentTypeDelivery {
+			out = append(out, r)
+		}
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ListDxSettlementFacts 返回预置的代销单毛利事实（取自 SettlementRow.Dx）。
+func (f *fakeCube) ListDxSettlementFacts(_ context.Context, _ string, ids []string) ([]DxFact, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	want := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	var out []DxFact
+	for _, r := range f.settlements {
+		if want[r.ID] && r.Dx != nil {
+			out = append(out, *r.Dx)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeCube) ListPurchaseLines(_ context.Context, _, settlementID string) ([]SettlementLineRow, error) {
@@ -170,6 +238,20 @@ func (l *fakeLoss) SumLossByProduct(ctx context.Context, branchID string, produc
 
 func (f *fakeCube) GetStocks(_ context.Context, _ string, _ []string) ([]StockRow, error) {
 	return nil, nil
+}
+
+// ListDailySales / ListProductPurchaseDates 让 fakeCube 实现 stockingQuerier。
+// 默认返回空 ⇒ 备货系数按「无销量/无进货」算，不产生过量信号。
+func (f *fakeCube) ListDailySales(_ context.Context, _ string, productIDs []string, _, _ string) ([]DailySaleRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.dailySales, nil
+}
+
+func (f *fakeCube) ListProductPurchaseDates(_ context.Context, _ string, productIDs []string, _, _ string) ([]ProductPurchaseDateRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.purchaseDates, nil
 }
 
 // GetSettlementsByIDs 按单号精确查（不过滤审核/单据类型）。
@@ -312,6 +394,7 @@ func newTestService(t *testing.T) (*Service, *gorm.DB, *fakeCube, *fakePublisher
 		&model.ApprovalPayeeAccount{},
 		&model.AuditSupplierFlow{}, &model.AuditPaymentItemFlow{}, &model.AuditRegexPattern{},
 		&model.ApprovalMonthlyItem{}, &model.ApprovalMonthlyBackfill{},
+		&model.StockingCoefficient{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -777,7 +860,7 @@ func TestStepStocktake_PublishesToConfiguredGroup(t *testing.T) {
 	db.Create(&model.ApprovalSettlement{ID: "x1", ApprovalID: ap.ID, SettlementID: "CP1"})
 	svc.stepStocktake(context.Background(), ap, &VerdictResult{
 		SuggestStocktake: &StocktakeSuggestion{Scope: "product", IDs: []string{"02000116"}},
-	}, nil)
+	}, []signalDraft{newSignal(model.SignalBlock, SigQtyDeviation, "", "02000116", "偏离", nil)})
 	if st.calls != 1 {
 		t.Fatalf("建单应调 1 次, got %d", st.calls)
 	}
@@ -861,7 +944,8 @@ func TestStepStocktake_NoProducts_SkipsCreate(t *testing.T) {
 	verdict := &VerdictResult{
 		SuggestStocktake: &StocktakeSuggestion{Scope: "category", IDs: []string{"cat-1"}},
 	}
-	svc.stepStocktake(context.Background(), ap, verdict, nil)
+	svc.stepStocktake(context.Background(), ap, verdict,
+		[]signalDraft{newSignal(model.SignalBlock, SigQtyDeviation, "", "", "偏离", nil)})
 
 	if st.calls != 0 {
 		t.Fatalf("没有计划商品不应建单, got %d 次", st.calls)
@@ -990,7 +1074,10 @@ func TestRunAudit_LLMErrorFallback(t *testing.T) {
 
 // ---- 流水线:建议盘点 ----
 
-func TestRunAudit_SuggestStocktake(t *testing.T) {
+// TestRunAudit_SuggestStocktake_WarnOnly 锁 2026-11-01 用户口径：
+// LLM 建议盘点、但信号只有 warn（这里连 warn 都没有）⇒ **不自动建单**，
+// 只留一条 step 日志说明"改为审批详情页手动生成"。
+func TestRunAudit_SuggestStocktake_WarnOnly(t *testing.T) {
 	svc, db, cube, pub, st := newTestService(t)
 	seedPassData(cube)
 	svc.SetVerdictFn(func(_ context.Context, _ *AuditInput) (*VerdictResult, error) {
@@ -1009,48 +1096,27 @@ func TestRunAudit_SuggestStocktake(t *testing.T) {
 	if ap.Status != model.StatusApproved {
 		t.Fatalf("status = %s, want approved", ap.Status)
 	}
-
-	// stocktake 建单入参
+	// 没有 block ⇒ 不建单、不绑定、不推卡片。
 	st.mu.Lock()
-	got := st.got
+	calls := st.calls
 	st.mu.Unlock()
-	if got == nil {
-		t.Fatal("应调 stocktake 建单")
+	if calls != 0 {
+		t.Errorf("warn 场景不该自动建盘点单, CreatePlanHeader 调用 %d 次", calls)
 	}
-	if got.BranchID != "B1" || got.OperatorID != "u-1" {
-		t.Errorf("建单入参 branch/operator = %s/%s", got.BranchID, got.OperatorID)
+	var linkCount int64
+	db.Model(&model.ApprovalStocktakeLink{}).Where("approval_id = ?", ap.ID).Count(&linkCount)
+	if linkCount != 0 {
+		t.Errorf("warn 场景不该有盘点绑定, got %d", linkCount)
 	}
-	if len(got.ProductIDs) != 1 || got.ProductIDs[0] != "PR1" {
-		t.Errorf("product scope 应透传计划商品, got %v", got.ProductIDs)
+	if cmds := pub.commands(CmdTaskCard); len(cmds) != 0 {
+		t.Errorf("warn 场景不该推盘点卡片, got %d", len(cmds))
 	}
-	// 绑定表
-	var link model.ApprovalStocktakeLink
-	if err := db.First(&link, "approval_id = ?", ap.ID).Error; err != nil {
-		t.Fatalf("缺审批↔盘点绑定: %v", err)
+	var logRow model.AuditLog
+	if err := db.First(&logRow, "approval_id = ? AND step = ?", ap.ID, StepStocktake).Error; err != nil {
+		t.Fatalf("缺 stocktake step 日志: %v", err)
 	}
-	if link.StocktakeHeaderID != "ST-PLAN-1" {
-		t.Errorf("绑定 header = %s, want ST-PLAN-1", link.StocktakeHeaderID)
-	}
-	// taskcard 待办
-	cmds := pub.commands(CmdTaskCard)
-	if len(cmds) != 1 {
-		t.Fatalf("taskcard 命令数 = %d, want 1", len(cmds))
-	}
-	var p TaskCardPayload
-	if err := json.Unmarshal(cmds[0].Payload, &p); err != nil {
-		t.Fatalf("解析 taskcard payload: %v", err)
-	}
-	if p.URL != "https://h5.example.com/inventory.html?header_id=ST-PLAN-1" {
-		t.Errorf("taskcard url = %s", p.URL)
-	}
-	if p.Title != "结算异常盘点计划" {
-		t.Errorf("taskcard title = %s", p.Title)
-	}
-	if len(p.ToUser) != 1 || p.ToUser[0] != "keeper-1" {
-		t.Errorf("to_user = %v", p.ToUser)
-	}
-	if p.TaskID != "stocktake-plan-ST-PLAN-1" {
-		t.Errorf("task_id = %s", p.TaskID)
+	if !strings.Contains(logRow.OutputSummary, "手动生成") {
+		t.Errorf("step 日志应说明改为手动生成, got %q", logRow.OutputSummary)
 	}
 }
 
@@ -1094,9 +1160,11 @@ func TestStepStocktake_Idempotent(t *testing.T) {
 	}
 	db.Create(&model.ApprovalSettlement{ID: "x1", ApprovalID: ap.ID, SettlementID: "CP002610104463"})
 	verdict := &VerdictResult{SuggestStocktake: &StocktakeSuggestion{Scope: "product", IDs: []string{"PR1"}}}
+	// ⚠️ 2026-11-01: 自动建单只认**阻断级**信号 ⇒ 必须带一条 block。
+	signals := []signalDraft{newSignal(model.SignalBlock, SigQtyDeviation, "", "PR1", "偏离", nil)}
 
-	svc.stepStocktake(context.Background(), ap, verdict, nil)
-	svc.stepStocktake(context.Background(), ap, verdict, nil) // 模拟重跑
+	svc.stepStocktake(context.Background(), ap, verdict, signals)
+	svc.stepStocktake(context.Background(), ap, verdict, signals) // 模拟重跑
 
 	if st.calls != 1 {
 		t.Fatalf("CreatePlanHeader 应只调 1 次(幂等), got %d", st.calls)
