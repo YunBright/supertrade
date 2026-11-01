@@ -250,13 +250,8 @@ func (s *Service) SaveStockOpenings(ctx context.Context, branchID string, items 
 			}
 			bizDate = parsed
 		}
-		// 冻结检查:期初生效日落在已结转的期间 ⇒ 不许改。
-		//
-		// ⚠️ **先于数值校验**:审计不可逆是硬规则 ⇒ 冻结期间的任何改动
-		//   都要先说"已冻结"(而不是"你没填单价")—— 前者才是真正的拦路虎。
-		if err := s.assertNotAudited(ctx, branchID, bizDate, "期初结转"); err != nil {
-			return nil, err
-		}
+		// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 冻结机制一并下线
+		//   ⇒ 期初生效日落在已结转期间也不再拦(不再有「已冻结」这回事)。
 		if it.ColdStoreKg.IsNegative() {
 			return nil, fmt.Errorf("%w: openings[%d].cold_store_kg 不能为负", ErrInvalidInput, i)
 		}
@@ -399,8 +394,8 @@ func (s *Service) SaveStockOpenings(ctx context.Context, branchID string, items 
 //
 // ⚠️ 只删**起点之前**的;起点之后的由 recomputeCostSnapshots + 物化任务覆盖。
 //
-// ⚠️ 审计结转后**不许**再改期初(见 SaveStockOpenings 的冻结检查)
-//   ⇒ 冻结期的快照不会被这里删掉。
+// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 冻结机制一并下线
+//   ⇒ 这里按**链起点**判断即可(不再有"冻结期"这个额外保护带)。
 func (s *Service) dropStaleCostSnapshots(ctx context.Context, branchID string) error {
 	openings, err := s.loadOpenings(ctx, branchID)
 	if err != nil {
@@ -448,10 +443,8 @@ func (s *Service) DeleteStockOpening(ctx context.Context, branchID string, cutTy
 		}
 		return nil, fmt.Errorf("query sku_stock_opening: %w", err)
 	}
-	// 冻结检查:生效日落在已结转的期间 ⇒ 不许删。
-	if err := s.assertNotAudited(ctx, branchID, time.Time(rec.BizDate).In(s.bizTZOrUTC()), "期初结转"); err != nil {
-		return nil, err
-	}
+	// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 冻结机制一并下线
+	//   ⇒ 删期初不再被「截止日已冻结」拦截。
 	// ⚠️ **同事务**:删期初 + 撤位置表/队列 + 清链外的旧账(2026-10-30)。
 	//
 	//	删掉一个部位的期初 ⇒ 链的起点可能**后移** ⇒ 新的起点当天及之前

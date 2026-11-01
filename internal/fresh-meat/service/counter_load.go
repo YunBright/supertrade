@@ -184,10 +184,8 @@ func (s *Service) UpdateCounterLoad(ctx context.Context, branchID, id string, in
 		return s.ListStock(ctx, branchID, model.StockScopeCounter)
 	}
 	bizDate := time.Time(cur.BizDate).In(s.bizTZOrUTC())
-	// 冻结检查:已审计结转的期间不能再改。
-	if err := s.assertNotAudited(ctx, branchID, bizDate, "搬台"); err != nil {
-		return nil, err
-	}
+	// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 冻结机制一并下线
+	//   ⇒ 改搬台不再被「截止日已冻结」拦截。
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.WithContext(ctx).Model(&model.CounterLoadRecord{}).
 			Where("branch_id = ? AND id = ?", branchID, id).
@@ -235,10 +233,8 @@ func (s *Service) DeleteCounterLoad(ctx context.Context, branchID, id string) (*
 		return nil, fmt.Errorf("query counter_load %s: %w", id, err)
 	}
 	bizDate := time.Time(cur.BizDate).In(s.bizTZOrUTC())
-	// 冻结检查:已审计结转的期间不能再改。
-	if err := s.assertNotAudited(ctx, branchID, bizDate, "搬台"); err != nil {
-		return nil, err
-	}
+	// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 冻结机制一并下线
+	//   ⇒ 撤搬台不再被「截止日已冻结」拦截。
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.WithContext(ctx).Where("branch_id = ? AND id = ?", branchID, id).
 			Delete(&model.CounterLoadRecord{}).Error; err != nil {

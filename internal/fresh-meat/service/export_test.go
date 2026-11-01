@@ -110,7 +110,8 @@ func ProducedBySkuForTest(ctx context.Context, s *Service, branchID string,
 //	⇒ owner 给的两条边界(各部位合计价值 ≤ 猪总进货金额)会被静默破坏。
 //
 // ⚠️ 封顶标志(capped)**故意不导出**:现有用例锁的是"单价 + 来源"这一对契约,
-//   封顶行为由 [SuggestedCutUnitPricesCappedForTest] 单独锁。
+//
+//	封顶行为由 [SuggestedCutUnitPricesCappedForTest] 单独锁。
 func SuggestedCutUnitPricesForTest(ctx context.Context, s *Service, branchID string,
 	pigs []model.WholePig, splitPerPig map[string]map[string]decimal.Decimal, bizDate time.Time) (
 	unit map[string]decimal.Decimal, source map[string]string, err error,
@@ -122,7 +123,8 @@ func SuggestedCutUnitPricesForTest(ctx context.Context, s *Service, branchID str
 // SuggestedCutUnitPricesCappedForTest 暴露"本次是否触发封顶"。
 //
 // ⚠️ 为什么单独导出:封顶是**静默**的(单价被按比例砍下去,数值上看不出来)
-//   ⇒ 少了这个标志,owner 给的边界②被破坏时没有任何信号。
+//
+//	⇒ 少了这个标志,owner 给的边界②被破坏时没有任何信号。
 func SuggestedCutUnitPricesCappedForTest(ctx context.Context, s *Service, branchID string,
 	pigs []model.WholePig, splitPerPig map[string]map[string]decimal.Decimal, bizDate time.Time) (
 	capped bool, err error,
@@ -150,14 +152,84 @@ func CollectCutPriceSamplesForTest(ctx context.Context, s *Service, branchID str
 	return s.CollectCutPriceSamples(ctx, branchID, day, rows)
 }
 
+// ReferenceDayTotalsForTest 造一个 [ReferenceDayTotals](参考口径的当日输入)。
+//
+// ⚠️ 为什么值得单独暴露:参考口径的**总采 / 期末剩余 / 采购均价**
+//
+//	  是外部测试包造不出来的(要真的建猪、真的做盘点)⇒ 单独给个构造器。
+//
+//		典型用法:
+//
+//		ref := service.ReferenceDayTotalsForTest("227.1", "3315.66", "27.65", true)
+//		rows, total := service.RollUpPerCutCutsForTest(cutRows, nil, ref)
+//
+// ⚠️ purchaseAvg 是**采购金额 ÷ 采购重量**算出来的 ⇒ 这里按同样的口径给。
+func ReferenceDayTotalsForTest(purchasedKg, purchasedYuan, remainKg string, hasRemain bool) ReferenceDayTotals {
+	out := ReferenceDayTotals{HasRemain: hasRemain}
+	if v, err := decimal.NewFromString(purchasedKg); err == nil {
+		out.PurchasedKg = v
+	}
+	if v, err := decimal.NewFromString(purchasedYuan); err == nil {
+		out.PurchasedYuan = v
+	}
+	if v, err := decimal.NewFromString(remainKg); err == nil {
+		out.RemainKg = v
+	}
+	if out.PurchasedKg.IsPositive() {
+		out.PurchaseAvgYuan = out.PurchasedYuan.Div(out.PurchasedKg)
+	}
+	return out
+}
+
 // RollUpPerCutCutsForTest 暴露 [rollUpPerCutCuts](部位行装配)。
 //
-// ⚠️ 为什么值得单独暴露:「日终剩余 / 售罄率 / 建议毛利」三项
+// ⚠️ 为什么值得单独暴露:「日终剩余 / 售罄率 / **参考口径毛利**」几项
 //
 //	**全部**在这个函数里算出来(它们要跨部位才算得出)
 //	⇒ 不导出就没法从外部测试包锁它们的口径。
-func RollUpPerCutCutsForTest(rows []CutDailyCost, promoAlloc *PromoAllocation) (
+func RollUpPerCutCutsForTest(rows []CutDailyCost, promoAlloc *PromoAllocation, ref ReferenceDayTotals) (
 	[]PerCutGrossMargin, TotalGrossMargin,
 ) {
-	return rollUpPerCutCuts(rows, promoAlloc)
+	return rollUpPerCutCuts(rows, promoAlloc, ref)
+}
+
+// BuildLongTermMarginReportForTest 暴露 [buildLongTermMarginReport](长期毛利的纯汇总)。
+//
+// ⚠️ 为什么值得单独暴露:长期毛利页的**期间公式**
+//
+//	期间毛利 = 期间营收 − 期间采购 + (期末冷库 − 期初冷库) × 期间采购均价
+//
+//	**只在这个函数里**算 ⇒ 不导出就没法从外部测试包锁它。
+//	(IO 部分——逐日事实与冷库链——留给端到端场景。)
+func BuildLongTermMarginReportForTest(branchID, from, to string, rows []LongTermMarginDay,
+	openingCold, closingCold decimal.Decimal) *LongTermMarginReport {
+	return buildLongTermMarginReport(branchID, from, to, rows, openingCold, closingCold)
+}
+
+// FocusCutsForPigForTest 暴露 [focusCutsForPig](LLM 只补**缺销售数据**的部位)。
+//
+// ⚠️ 为什么值得单独暴露:「哪些部位缺销售数据」这条判定
+//
+//	(本店在售部位 − 该体重段基线已覆盖部位)
+//
+//	**只在这个函数里**发生 ⇒ 不导出就没法从外部测试包锁它
+//	⇒ owner 2026-11-01 D8「LLM 只补缺销售数据的部位」会被静默破坏
+//	⇒ 而破坏的表征是"LLM 又开始问整副猪了"(没人看得出来,只是慢一点、贵一点)。
+func FocusCutsForPigForTest(ctx context.Context, s *Service, branchID, band, mode string) (
+	[]model.CutType, error,
+) {
+	return s.focusCutsForPig(ctx, branchID, band, mode)
+}
+
+// BuildSystemPromptForTest 暴露 [buildSystemPrompt](提示词只列焦点部位)。
+//
+// ⚠️ 为什么值得单独暴露:owner D8 的**可观测面**就是提示词本身 ——
+//	「不再产整猪切割方案」= 提示词里**不再出现全集**。
+func BuildSystemPromptForTest(focus []model.CutType) string {
+	return buildSystemPrompt(focus)
+}
+
+// BuildUserPromptForTest 暴露 [buildUserPrompt](user 侧点名要补的部位)。
+func BuildUserPromptForTest(pig *model.WholePig, history []model.WholePig, focus []model.CutType) string {
+	return buildUserPrompt(pig, history, focus)
 }

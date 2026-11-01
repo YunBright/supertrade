@@ -87,11 +87,22 @@ func (s *Service) generateAdvice(ctx context.Context, pigID, branchID string) {
 	// 查近 30 天 ±10% 重量段历史(LLM 的输入 + history_avg 的兜底依据)。
 	history := s.findHistoryPigs(ctx, branchID, pig.GrossWeightKg, pig.ArrivedAt)
 
-	result, predictErr := s.predictFn(ctx, &pig, history)
+	// ⚠️ 2026-11-01 owner D8:「LLM 只补**缺销售数据**的部位(不再产整猪切割方案)」。
+	//   ⇒ 先算出**焦点部位**(本店在售 − 该体重段基线已覆盖)⇒ 提示词只问这几个。
+	//   ⇒ 判定不出缺口时 focus = nil ⇒ 保持旧行为(问全集),见 llm_focus.go。
+	focus, err := s.focusCutsForPig(ctx, branchID,
+		WeightBandOf(pig.GrossWeightKg), adviceModeOf(pig))
+	if err != nil {
+		// ⚠️ 算焦点失败**不该**让整条建议失败 ⇒ 退回"不限"。
+		s.pubLogger.Warn("generateAdvice: 算焦点部位失败,退回问全集", "pig_id", pigID, "err", err)
+		focus = nil
+	}
+
+	result, predictErr := s.predictFn(ctx, &pig, history, focus)
 	if predictErr != nil {
 		s.pubLogger.Warn("generateAdvice: predictFn failed, fallback to history_avg",
 			"pig_id", pigID, "err", predictErr)
-		result, predictErr = defaultPredictFn(ctx, &pig, history)
+		result, predictErr = defaultPredictFn(ctx, &pig, history, focus)
 		if predictErr != nil {
 			s.pubLogger.Error("generateAdvice: history_avg fallback also failed",
 				"pig_id", pigID, "err", predictErr)
@@ -156,8 +167,10 @@ func (s *Service) markAdviceFailed(ctx context.Context, pigID string) {
 //
 // 权限:freshmeat:write。
 //
-// ⚠️ 建议会参与"LLM 兜底产出"(computeProducedBySku)⇒ 会改成本链
-//   ⇒ **已审计结转的期间冻结**(与补录同口径)。
+// ⚠️ 建议会参与"LLM 兜底产出"(computeProducedBySku)⇒ 会改成本链。
+//
+// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 冻结机制一并下线
+//   ⇒ 不再有「已审计结转的期间不许改」这回事(重新生成建议随时可做)。
 func (s *Service) RegeneratePigAdvice(ctx context.Context, branchID, pigID string) (*model.WholePig, error) {
 	if branchID == "" {
 		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
@@ -176,9 +189,8 @@ func (s *Service) RegeneratePigAdvice(ctx context.Context, branchID, pigID strin
 	if pig.BranchID != branchID {
 		return nil, ErrBranchMismatch
 	}
-	if err := s.assertNotAudited(ctx, branchID, pig.ArrivedAt, "重新生成分割建议"); err != nil {
-		return nil, err
-	}
+	// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 冻结机制一并下线
+	//   ⇒ 重新生成分割建议不再被「截止日已冻结」拦截。
 	// ⚠️ 「只用基线」的猪**不生成 AI 建议**(2026-10-31 owner)
 	//   ⇒ 这里必须**明确拒绝**,不能让门店点一下就白花一次 LLM 调用,
 	//   更不能让 ai_advice_json 里有数、成本链却不用(看着像"建议已生成",

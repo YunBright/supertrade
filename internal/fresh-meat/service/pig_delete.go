@@ -11,8 +11,10 @@ package service
 // # 什么时候能删
 //
 //	① 没有**分割补录**（pig_cuts）—— 有的话删了会留下孤儿分割行；
-//	② 没有**销售归属**（line_sales_by_pigs）—— 有的话收入会归到不存在的猪；
-//	③ 归属日**不在已审计结转的期间**里（冻结不可逆，见 assertNotAudited）。
+//	② 没有**销售归属**（line_sales_by_pigs）—— 有的话收入会归到不存在的猪。
+//
+// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 原第③条「归属日不在已审计结转的期间里」随之失效
+//   （账面链改为实时可改，不再有冻结期）⇒ 删除条件由 ③ 条收敛为 ①② 两条。
 //
 // # 删了之后
 //
@@ -48,10 +50,8 @@ func (s *Service) DeleteWholePig(ctx context.Context, branchID, pigID string) er
 	if err != nil {
 		return fmt.Errorf("query whole_pig: %w", err)
 	}
-	// 冻结检查：已审计结转的期间不能改（含删）。
-	if err := s.assertNotAudited(ctx, branchID, pig.ArrivedAt, "进猪"); err != nil {
-		return err
-	}
+	// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 冻结机制一并下线
+	//   ⇒ 删猪不再被「截止日已冻结」拦截。
 	// ① 有分割补录 ⇒ 不许删（会留下孤儿分割行）。
 	var cuts int64
 	if err := s.db.WithContext(ctx).Model(&model.PigCut{}).

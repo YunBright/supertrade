@@ -186,7 +186,14 @@ func TestCollectSamples_SourcedBranch_IgnoresLocalSaleEvents(t *testing.T) {
 //	⇒ 有源门店"零售走 cube + 统收走本地"⇒ 完整性校验也必须两边都认。
 func TestCollectSamples_BulkSettlementCountsAsSales(t *testing.T) {
 	svc, ctx, sku := fmGenSetupSourced(t, nil) // cube 当天 0 行零售
-	fmGenSeedDayExceptSales(t, svc, ctx, sku)
+	pigID := fmGenSeedDayExceptSales(t, svc, ctx, sku)
+
+	// ⚠️ 补录一条分割实录 ⇒ 那一天**有样本**。
+	//
+	//	否则两个样本池都空 ⇒ 会报「缺:分割样本」——
+	//	那是**另一个**缺口(那天确实没卖出任何部位),与本用例要锁的
+	//	「统收算销售 ⇒ 不报缺销售」无关。
+	estPigCut(t, svc, ctx, "S001", pigID, sku, "B-BULK-1", "30")
 
 	// 本地插一张当天统收单。
 	mustNoErr(t, testDBSingleton.Create(&model.BulkSettlement{

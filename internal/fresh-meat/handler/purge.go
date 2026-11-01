@@ -62,8 +62,15 @@ func PurgeRegistry() *purge.Registry {
 		purge.Model{Table: "counter_loads", Model: &model.CounterLoadRecord{}},
 		purge.Model{Table: "cut_stock_daily", Model: &model.CutStockDaily{}},
 		purge.Model{Table: "sku_stock_openings", Model: &model.SkuStockOpening{}},
+		// ⚠️ 2026-11-01 owner：审计结转端点(`/stock/audit`)已下线 ⇒ 这张表不再有新行写入，
+		//   但**保留 purge 登记** —— 它还存着老店的"最后一次审计截止日"，
+		//   那是余额链基线锚点 + 期初结转清理的水位线(只读，见 service/audit_history.go)。
+		//   ⇒ 必须能清得掉，否则契约测试/单测写进去的行永远留在生产库。
 		purge.Model{Table: "biz_audits", Model: &model.BizAudit{}},
-		// 预期毛利(预售)结转 + 按猪分摊(单列代理主键 ⇒ 可登记)。
+		// ⚠️ 2026-11-01 owner：预期毛利(预售结转)端点(`/stock/presale`)已下线
+		//   ⇒ 这三张表同样只剩历史存量(结转写路径已退役)，
+		//   但账面期末重估仍要读 `cut_presale_settlements.expected_unit_yuan`
+		//   ⇒ 保留登记，等下一张卡随账面链一起彻底移除。
 		purge.Model{Table: "cut_presale_settlements", Model: &model.CutPresale{}},
 		purge.Model{Table: "pig_presale_margins", Model: &model.PigPresaleMargin{}},
 		purge.Model{Table: "cut_presale_edits", Model: &model.CutPresaleEdit{}},

@@ -206,9 +206,8 @@ func (s *Service) ApplyBaselineToPig(ctx context.Context, branchID, pigID, mode 
 	if pig.BranchID != branchID {
 		return nil, ErrBranchMismatch
 	}
-	if err := s.assertNotAudited(ctx, branchID, pig.ArrivedAt, "按基线重算分割建议"); err != nil {
-		return nil, err
-	}
+	// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 冻结机制一并下线
+	//   ⇒ 按基线重算分割建议不再被「截止日已冻结」拦截。
 	// ---- ① 改口径 ----
 	//
 	// ⚠️ **切回「自动」时必须先校验该体重段有可用基线**:

@@ -1558,6 +1558,15 @@ func (SkuStockOpening) TableName() string { return "sku_stock_openings" }
 
 // ---- 表19:biz_audits(审计结转)----
 //
+// ⚠️ **2026-11-01 owner：审计结转端点已下线**（`/stock/audit` 及其 precheck）。
+//
+//	模型与表**保留**，但语义收缩为**历史只读**：
+//	① 余额链基线(`daily_balance.go` 的 chainBase / closingForDay)以最后一次审计截止日
+//	   作为链的起点锚点；② 期初结转清理(`stock_openings.go`)用同一截止日当水位线。
+//	⇒ 不会再有新行写入，冻结语义已随端点一起消失(写操作不再被"已冻结"拦截)。
+//	⇒ 保留 AutoMigrate + purge 登记，是为了**别删掉老店的历史锚点**，
+//	  同时让 purge 能把远古数据清干净。
+//
 // BizAudit 一次**审计结转**:把截止日期(含)及之前的营业日**冻结**成快照。
 //
 // # 门店口径(2026-10-24)
@@ -1594,6 +1603,14 @@ type BizAudit struct {
 func (BizAudit) TableName() string { return "biz_audits" }
 
 // ---- 表20:cut_presale_settlements(预期毛利 / 预售结转)----
+//
+// ⚠️ **2026-11-01 owner：预期毛利(预售结转)端点已下线**（`/stock/presale`）。
+//
+//	模型与表**保留**，但语义收缩为**历史只读**：
+//	账面期末重估(`cut_cost.go`)仍要读本表的 `expected_unit_yuan`
+//	(把结余按预期售价重估，否则期末会退回成本口径、账面毛利失真)。
+//	⇒ 不会再有新行写入(结转写路径 `settlePresale` / `writePigAllocations` 已随端点退役)；
+//	  AutoMigrate + purge 登记保留，老店历史预售价继续参与重估。
 //
 // CutPresale 审计结转时某个 **SKU** 的「预期毛利(预售)」结转行。
 //
@@ -1711,6 +1728,11 @@ type PigPresaleMargin struct {
 func (PigPresaleMargin) TableName() string { return "pig_presale_margins" }
 
 // ---- 表22:cut_presale_edits(预售价的人工修改痕迹)----
+//
+// ⚠️ **2026-11-01 owner：预期毛利(预售结转)端点已下线**（`/stock/presale` 的 PUT）。
+//
+//	模型与表**保留**，但语义收缩为**历史只读**：改价写路径(`UpdatePresale`)已随端点退役，
+//	不会再有新行写入；AutoMigrate + purge 登记保留，老店的改价留痕不被抹掉。
 //
 // CutPresaleEdit 门店审计人**改预售价**的留痕（append-only 审计轨迹）。
 //

@@ -837,10 +837,16 @@ type fakePredictFn struct {
 	calls int
 	// fn 允许返回 (result, err);若 err != nil,service 内部走 defaultPredictFn(history_avg)。
 	fn func(ctx context.Context, pig *model.WholePig, history []model.WholePig) (*service.LLMResult, error)
+	// focus 记录**最后一次**调用传进来的焦点部位(缺销售数据、要 LLM 补的部位)。
+	//
+	// ⚠️ nil = 不限(问全集);非 nil = 只问这几个(2026-11-01 owner D8)。
+	focus []model.CutType
 }
 
-func (f *fakePredictFn) Predict(ctx context.Context, pig *model.WholePig, history []model.WholePig) (*service.LLMResult, error) {
+func (f *fakePredictFn) Predict(ctx context.Context, pig *model.WholePig, history []model.WholePig,
+	focus []model.CutType) (*service.LLMResult, error) {
 	f.calls++
+	f.focus = focus
 	if f.fn == nil {
 		return defaultLLMResult(), nil
 	}

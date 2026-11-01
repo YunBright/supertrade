@@ -313,8 +313,21 @@ func TestBulk_SettlementLandsOnProducingPig(t *testing.T) {
 
 // ---- ③ 长期毛利 ----
 
-// TestPeriodMargin_MatchesDailySnapshot 锁"长期毛利 = 日快照累加"。
-func TestPeriodMargin_MatchesDailySnapshot(t *testing.T) {
+// TestLongTermMargin_MatchesDailySnapshot 锁「期间 = 每日快照累加」。
+//
+// ⚠️ 2026-11-01 owner：账面期间毛利端点(`/gross-margin/period`)已下线
+//
+//	⇒ 原用例(用 `ComputePeriodMargin` 锁"期间毛利 = 每日快照累加")改由**长期毛利**
+//	  (`ComputeLongTermMargin`,全店口径)承接。
+//
+// # 仍然锁住的不变量
+//
+//	① **跨路径营收一致**:长期毛利的期间营收 == 每日毛利看板的当天营收
+//	   (两条路径读的是同一份销售流水 ⇒ 不许一个有数一个没数);
+//	② **每日之和自洽**:`Total.DailySumGrossMarginYuan` == 各日行 `GrossMarginYuan` 之和;
+//	③ **不许静默返回空**:营收与采购都不能是 0
+//	   (查错表 ⇒ 返回 0 ⇒ 接口看起来"正常"但没数据)。
+func TestLongTermMargin_MatchesDailySnapshot(t *testing.T) {
 	svc, _ := setupTestService(t)
 	ctx := context.Background()
 	bizLoc := time.FixedZone("Asia/Shanghai", 8*3600)
@@ -350,37 +363,38 @@ func TestPeriodMargin_MatchesDailySnapshot(t *testing.T) {
 	}, "u-1")
 	mustNoErr(t, err, "RecordPorkCutsStocktake")
 
-	// 单日
+	// 单日(每日毛利看板)
 	daily, err := svc.ComputeGrossMargin(ctx, "S001", day)
 	mustNoErr(t, err, "ComputeGrossMargin")
-	// 期间(同一天)
-	period, err := svc.ComputePeriodMargin(ctx, "S001", "2026-10-01", "2026-10-01", "day")
-	mustNoErr(t, err, "ComputePeriodMargin")
+	// 期间(同一天,长期毛利口径)
+	period, err := svc.ComputeLongTermMargin(ctx, "S001", "2026-10-01", "2026-10-01")
+	mustNoErr(t, err, "ComputeLongTermMargin")
 	// ⚠️ 允许 1 分钱误差:日快照列是 decimal(16,2)(入库即四舍五入到分),
 	// 而单日路径是内存里的全精度值 ⇒ 两者天然有 ≤0.01 的差。
 	const tol = "0.01"
+	// ① 跨路径营收一致。
 	if !period.Total.RevenueYuan.Sub(daily.Total.RevenueYuan).Abs().LessThanOrEqual(d(tol)) {
-		t.Errorf("期间收入 %s ≠ 单日收入 %s", period.Total.RevenueYuan, daily.Total.RevenueYuan)
-	}
-	if !period.Total.SalesCostYuan.Sub(daily.Total.SalesCostYuan).Abs().LessThanOrEqual(d(tol)) {
-		t.Errorf("期间成本 %s ≠ 单日成本 %s", period.Total.SalesCostYuan, daily.Total.SalesCostYuan)
-	}
-	if !period.Total.GrossMarginYuan.Sub(daily.Total.GrossMarginYuan).Abs().LessThanOrEqual(d(tol)) {
-		t.Errorf("期间毛利 %s ≠ 单日毛利 %s", period.Total.GrossMarginYuan, daily.Total.GrossMarginYuan)
+		t.Errorf("期间营收 %s ≠ 单日营收 %s", period.Total.RevenueYuan, daily.Total.RevenueYuan)
 	}
 	if len(period.Rows) != 1 {
-		t.Errorf("按天聚合应 1 行, got %d", len(period.Rows))
+		t.Fatalf("按天聚合应 1 行, got %d", len(period.Rows))
 	}
-	// ⚠️ 2026-10-27(成本链改部位级):期间毛利改查 `cut_cost_daily`。
-	// ⇒ 加一条"不许静默返回空"的守卫:**营收与成本都不能是 0**
-	//   (旧表 sku_cost_daily 停写后,查错表 ⇒ 返回 0 ⇒ 接口看起来"正常"但没数据)。
+	// ② 每日之和自洽:汇总里的"每日之和"必须等于各日行之和。
+	rowSum := d("0")
+	for _, r := range period.Rows {
+		if r.HasStocktake && r.HasPurchase {
+			rowSum = rowSum.Add(r.GrossMarginYuan)
+		}
+	}
+	if !period.Total.DailySumGrossMarginYuan.Sub(rowSum).Abs().LessThanOrEqual(d(tol)) {
+		t.Errorf("★ 每日之和 %s ≠ 各日行之和 %s", period.Total.DailySumGrossMarginYuan, rowSum)
+	}
+	// ③ 不许静默返回空。
 	if period.Total.RevenueYuan.IsZero() {
-		t.Errorf("★ 期间营收应是 340(查部位级快照 cut_cost_daily),got %s —— "+
-			"返回 0 = 查错了表(旧表已停写)", period.Total.RevenueYuan)
+		t.Errorf("★ 期间营收应是 340,got %s —— 返回 0 = 没读到销售流水", period.Total.RevenueYuan)
 	}
-	if period.Total.SalesCostYuan.IsZero() {
-		t.Errorf("★ 期间销售成本不该是 0(查部位级快照 cut_cost_daily),got %s —— "+
-			"返回 0 = 查错了表(旧表已停写)", period.Total.SalesCostYuan)
+	if period.Total.PurchasedKg.IsZero() {
+		t.Errorf("★ 期间采购重量不该是 0,got %s —— 返回 0 = 没读到进猪", period.Total.PurchasedKg)
 	}
 }
 

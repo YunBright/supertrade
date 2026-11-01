@@ -54,9 +54,14 @@ type PredictedCut struct {
 
 // PredictFn 是 service.Service.predictFn 的签名(便于单测注入 fake)。
 //
-// 输入:pig 上下文 + 近 30 天同重量段历史猪(可能为空)。
-// 返回:LLMResult 或 error(error 由 caller 降级为 history_avg)。
-type PredictFn func(ctx context.Context, pig *model.WholePig, history []model.WholePig) (*LLMResult, error)
+// 输入:pig 上下文 + 近 30 天同重量段历史猪(可能为空)
+//	+ **焦点部位**(focus:缺销售数据、需要 LLM 补的部位;nil = 不限)。
+//
+// ⚠️ focus 的语义(2026-11-01 owner D8「LLM 只补缺销售数据的部位」):
+//   非 nil ⇒ 提示词**只问这几个部位**⇒ LLM 不再产整猪切割方案。
+//   nil     ⇒ 不限(问全集)—— 只在"判定不出缺口"时用(见 llm_focus.go)。
+type PredictFn func(ctx context.Context, pig *model.WholePig, history []model.WholePig,
+	focus []model.CutType) (*LLMResult, error)
 
 // ---- 默认 PredictFn:history_avg 降级路径 ----
 
@@ -64,7 +69,8 @@ type PredictFn func(ctx context.Context, pig *model.WholePig, history []model.Wh
 //
 // 默认不走 LLM,直接走 history_avg 兜底;真实接入 Dapr Conversation API 时
 // 由 main.go 调 SetPredictFn 覆盖。
-func defaultPredictFn(_ context.Context, pig *model.WholePig, history []model.WholePig) (*LLMResult, error) {
+func defaultPredictFn(_ context.Context, pig *model.WholePig, history []model.WholePig,
+	_ []model.CutType) (*LLMResult, error) {
 	cuts, raw, err := fallbackToHistoryAvg(pig, history)
 	if err != nil {
 		return nil, err
@@ -122,12 +128,13 @@ func DaprConversationPredictFn(daprCli dapr.Client, convName string, timeout tim
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
-	return func(ctx context.Context, pig *model.WholePig, history []model.WholePig) (*LLMResult, error) {
+	return func(ctx context.Context, pig *model.WholePig, history []model.WholePig,
+		focus []model.CutType) (*LLMResult, error) {
 		if daprCli == nil {
 			return nil, errors.New("dapr client not injected")
 		}
-		system := buildSystemPrompt()
-		user := buildUserPrompt(pig, history)
+		system := buildSystemPrompt(focus)
+		user := buildUserPrompt(pig, history, focus)
 		req := dapr.NewConversationRequest(convName, []dapr.ConversationInput{
 			{Role: ptrStr("system"), Content: system},
 			{Role: ptrStr("user"), Content: user},
@@ -166,8 +173,25 @@ func ptrStr(s string) *string { return &s }
 // 部位清单**由 model.CarcassCutTypes 生成**(不是手写常量)⇒ 枚举一改,prompt 自动跟着改。
 // ⚠️ 用 CarcassCutTypes 而不是 AllCutTypes:local_pork(隔山肉)是品种级商品,
 // 一头普通猪分割不出它,让 LLM 去预测它的 kg 只会产生幻觉。
-func buildSystemPrompt() string {
+//
+// # focus = **焦点部位**(2026-11-01 owner D8)
+//
+//	非 nil ⇒ **只列这几个部位** ⇒ LLM 不再产整猪切割方案。
+//	nil     ⇒ 列全集(判定不出缺口时的退化行为,见 llm_focus.go)。
+func buildSystemPrompt(focus []model.CutType) string {
 	var sb strings.Builder
+	if len(focus) > 0 {
+		sb.WriteString("你是猪分割顾问。只需要补下面这几个**缺销售数据**的部位的产出估计。\n")
+		sb.WriteString("不要给整猪的分割方案,不要给清单以外的部位。\n")
+		sb.WriteString("输出 JSON 数组 cuts,每个元素含 cut_type、expected_kg(预期部位产出 kg)\n")
+		sb.WriteString("与 unit_price_yuan(该部位的进货单价,元/kg)。\n")
+		sb.WriteString("cut_type 只能取下面这些值(英文 wire + 中文名),不要自造:\n")
+		for _, c := range focus {
+			fmt.Fprintf(&sb, "  - %s (%s)\n", c, model.CutLabel(c))
+		}
+		sb.WriteString("只输出 JSON,不要 markdown。")
+		return sb.String()
+	}
 	sb.WriteString("你是猪分割顾问。根据用户给定的整猪毛重、历史同段重量的猪拆分记录,\n")
 	sb.WriteString("输出 JSON 数组 cuts,每个元素含 cut_type、expected_kg(预期部位产出 kg)\n")
 	sb.WriteString("与 unit_price_yuan(该部位的进货单价,元/kg)。\n")
@@ -179,11 +203,14 @@ func buildSystemPrompt() string {
 	return sb.String()
 }
 
-// buildUserPrompt 拼 user prompt(pig metadata + 历史样本)。
-func buildUserPrompt(pig *model.WholePig, history []model.WholePig) string {
+// buildUserPrompt 拼 user prompt(pig metadata + 历史样本 [+ 焦点部位])。
+func buildUserPrompt(pig *model.WholePig, history []model.WholePig, focus []model.CutType) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "本次整猪:pig_id=%s, ear_tag=%s, gross_kg=%s, unit_price_yuan=%s, supplier_id=%s\n",
 		pig.ID, pig.EarTag, pig.GrossWeightKg.String(), pig.PurchaseUnitPriceYuan.String(), pig.SupplierID)
+	if len(focus) > 0 {
+		fmt.Fprintf(&sb, "只需要补这些部位:%s\n", focusCutsLabel(focus))
+	}
 	if len(history) > 0 {
 		fmt.Fprintf(&sb, "近 30 天 ±10%% 重量段历史 %d 头:\n", len(history))
 		// 按 arrived_at 倒序,只取 5 头

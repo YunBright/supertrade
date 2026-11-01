@@ -45,7 +45,29 @@ import (
 )
 
 // EstimateSourceStocktakeDerived 估计样本的来源:由日终倒推值摊出来的。
+//
+// ⚠️ **已停用**(2026-11-01 owner D8:「基线只从销售数据采集样本来计算」)。
+// 保留常量是为了让**存量行**仍能被识别(它们还在库里)。
 const EstimateSourceStocktakeDerived = "stocktake_derived"
+
+// EstimateSourceSalesDerived 估计样本的来源:由**当日逐部位销量**摊出来的。
+//
+// # 为什么换掉倒推值(2026-11-01 owner D8)
+//
+//	旧口径的样本 = 日终倒推值 = 台面实盘 + 销量 + 统收 + 报损 + 搭赠 − 搬上台
+//	⇒ **依赖盘点单与搬台登记** ⇒ 事后改搬台 / 改盘点 ⇒ 样本会变
+//	⇒ 与 owner 的「**采集即固化**」直接冲突。
+//
+//	新口径的样本 = 当日逐部位**销量**(cube 的销售流水)
+//	⇒ 销量是**事实** ⇒ 改搬台 / 改盘点 / 改猪重都不影响它
+//	⇒ 配合「已存在的样本不覆盖」⇒ **采集即固化**成立。
+//
+// ⚠️ **代价(必须写明,别让它悄悄变成惊喜)**:
+// 销量 ≠ 切分产出 —— 柜台上没卖掉的货不在销量里。
+// 生产实测(店 00 三天):销量比「卖出 + 柜台剩余」合计少 47.5kg(约占真实产出 7.3%);
+// 慢销部位单日可差 40%(leg_rear 10-29:15.88kg vs 27.03kg)
+// ⇒ 用销量做样本 ⇒ **基线系统性偏低**(且偏低量随当天剩货量波动)。
+const EstimateSourceSalesDerived = "sales_derived"
 
 // SampleSourceRecorded 基线采用的样本池:**实录**(pig_cuts)。
 const SampleSourceRecorded = "recorded"
@@ -67,6 +89,11 @@ type forecastRebuildStats struct {
 	// ⚠️ 墓碑行**不复活**：门店明确删掉的样本，重建时必须原样保留"已删除"状态
 	//   （否则"删除"这个动作会被引擎悄悄撤销 ⇒ 用户以为删了，其实没删）。
 	SkippedExcluded int
+	// SkippedExisting 是**因"已存在"而跳过**的条数（固化模式）。
+	//
+	// ⚠️ 这是 owner「采集即固化」的实现点：**已存在的样本一律不动**
+	//   ⇒ 事后改搬台 / 改猪重 ⇒ 重物化 ⇒ 样本库原样不动。
+	SkippedExisting int
 	// PigCount 是当天进场的猪数。
 	PigCount int
 }
@@ -78,14 +105,20 @@ type forecastRebuildStats struct {
 //	`persistCutCostDaily` 刚跑完引擎(rows 里已有 opening/实盘/冷库/搬台/实际分割)
 //	⇒ 复用它 ⇒ **不多跑一次销售读取**（引擎一次要读 cube 的销售,很贵）。
 //
-// # 幂等
+// # overwrite = **固化 vs 重采**（2026-11-01 owner D8「采集即固化」）
 //
-//	同一天重复调用 ⇒ 同 (店, 猪, 部位) 覆盖 ⇒ 结果不变。
-//	⚠️ 还要**删掉不再产出的旧行**（例如某部位今天补了实录 ⇒ 不再是 derived ⇒ 它的估计样本要消失）。
+//	| 模式 | 调用方 | 已有样本 | 墓碑行 | 不再产出的旧行 |
+//	|---|---|---|---|---|
+//	| overwrite=false | 引擎自动路径(盘点提交 / 重物化) | **不动** | 不复活 | **不删** |
+//	| overwrite=true  | 门店显式「按一天加入样本」/「重采」 | 覆盖 | **也不复活**(要先「恢复」) | 删掉 |
+//
+//	⇒ owner 的原话：「就算修改那天的搬台，猪重都不会影响他的样本库吧，
+//	  如果不影响，那就对了。如果样本不对，我们手动删就行。」
+//	⇒ 两条都要满足：**自动路径不覆盖** + **样本源不依赖搬台/盘点**（见 [EstimateSourceSalesDerived]）。
 //
 // # ⚠️ 墓碑行既不复活、也不被删掉（2026-10-30 owner:删除 = 打墓碑）
 func (s *Service) rebuildEstimatedSplitSamples(ctx context.Context, branchID string, day time.Time,
-	rows []CutDailyCost) (forecastRebuildStats, error) {
+	rows []CutDailyCost, overwrite bool) (forecastRebuildStats, error) {
 	stats := forecastRebuildStats{}
 	if branchID == "" {
 		return stats, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
@@ -101,40 +134,85 @@ func (s *Service) rebuildEstimatedSplitSamples(ctx context.Context, branchID str
 	}
 	stats.PigCount = len(pigs)
 
-	// ② 从成本行里挑出"可信的倒推值"。
+	// ② 样本值 = 当日**逐部位销量**(owner 2026-11-01 D8)。
 	//
-	// ⚠️ 两个条件缺一不可:
-	//   - DataSource == actual ⇒ 当天有**完整**日终盘点（否则倒推只是近似）;
-	//   - ActualSplitSource == derived ⇒ 该部位是**倒推**的（有实录的部位不用估）。
-	derived := map[model.CutType]decimal.Decimal{}
+	// ⚠️ 为什么不再用"日终倒推值":
+	//   倒推值 = 台面实盘 + 销量 + 统收 + 报损 + 搭赠 − 搬上台
+	//   ⇒ **依赖盘点单与搬台登记** ⇒ 事后改搬台 / 改盘点 ⇒ 样本会变
+	//   ⇒ 与 owner 的「采集即固化」直接冲突。
+	//   销量来自 cube 的销售流水 ⇒ 是**事实** ⇒ 改搬台 / 改盘点都不影响它。
+	//
+	// ⚠️ 代价见 [EstimateSourceSalesDerived] 的注释(基线会系统性偏低约 7%)。
+	//
+	// ⚠️ 零售销量 + 统收销量(两者都是"卖掉了")。
+	//
+	// ②b **有 pig_cuts 实录的部位不产生估计样本**(2026-10-30 硬规矩②:实录更准,
+	// 两个池子互补、不打架)。
+	//
+	// ⚠️ 这里**直接查 pig_cuts**而不是读引擎的 ActualSplitSource
+	//   ⇒ 不依赖盘点/倒推 ⇒ 样本的产出口径里没有"盘点"这一环。
+	recordedCuts := map[model.CutType]bool{}
+	if len(pigs) > 0 {
+		pigIDs := make([]string, 0, len(pigs))
+		for _, p := range pigs {
+			pigIDs = append(pigIDs, p.ID)
+		}
+		var cuts []model.PigCut
+		if err := s.db.WithContext(ctx).
+			Where("branch_id = ? AND pig_id IN ?", branchID, pigIDs).
+			Find(&cuts).Error; err != nil {
+			return stats, fmt.Errorf("query pig_cuts(estimates): %w", err)
+		}
+		for _, c := range cuts {
+			recordedCuts[c.CutType] = true
+		}
+	}
+	sold := map[model.CutType]decimal.Decimal{}
 	for _, r := range rows {
-		// ⚠️ **只信有完整日终盘点的倒推**(硬规矩①):
-		//   没有完整盘点单时,倒推走的是"台面流量近似"(搬上台是老货 ⇒ 只能扣掉估计)
-		//   ⇒ 噪声太大 ⇒ 不当样本(会把基线教歪)。
-		if r.DataSource != dataSourceActual {
+		if recordedCuts[r.CutType] {
+			continue // 有实录 ⇒ 不估
+		}
+		kg := r.SoldKg.Add(r.BulkSoldKg)
+		if !kg.IsPositive() {
 			continue
 		}
-		if r.ActualSplitSource != ActualSplitSourceDerived {
-			continue
-		}
-		if r.ActualSplitKg == nil || !r.ActualSplitKg.IsPositive() {
-			continue
-		}
-		derived[r.CutType] = *r.ActualSplitKg
+		sold[r.CutType] = sold[r.CutType].Add(kg)
 	}
 
-	// ②' 已删除（墓碑）的样本 ⇒ 重建时**跳过**（不复活）。
+	// ②' 已删除（墓碑）的样本 ⇒ 固化模式下**跳过**（不复活）。
 	excluded, err := s.excludedForecastSampleKeys(ctx, branchID, day)
 	if err != nil {
 		return stats, err
 	}
 
+	// ②'' **已存在**的样本 ID（固化模式要跳过它们）。
+	existingIDs := map[string]bool{}
+	if !overwrite {
+		candidateIDs := make([]string, 0, len(pigs)*len(sold))
+		for _, cut := range sortedCutTypes(sold) {
+			for _, p := range pigs {
+				candidateIDs = append(candidateIDs, PigCutEstimateID(branchID, p.ID, cut))
+			}
+		}
+		if len(candidateIDs) > 0 {
+			var existing []model.PigCutEstimate
+			if err := s.db.WithContext(ctx).
+				Where("branch_id = ? AND id IN ?", branchID, candidateIDs).
+				Find(&existing).Error; err != nil {
+				return stats, fmt.Errorf("query pig_cut_estimates(existing): %w", err)
+			}
+			for _, r := range existing {
+				existingIDs[r.ID] = true
+			}
+		}
+	}
+
 	// ③ 写样本 + 清掉不再产出的旧行。
 	keepIDs := map[string]bool{}
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if len(pigs) > 0 && len(derived) > 0 {
-			for _, cut := range sortedCutTypes(derived) {
-				shares := allocateByGrossWeight(derived[cut], pigs)
+		if len(pigs) > 0 && len(sold) > 0 {
+			for _, cut := range sortedCutTypes(sold) {
+				shares := allocateByGrossWeight(sold[cut], pigs)
 				for i, p := range pigs {
 					if !shares[i].IsPositive() {
 						continue
@@ -147,12 +225,23 @@ func (s *Service) rebuildEstimatedSplitSamples(ctx context.Context, branchID str
 						WeightKg:   shares[i],
 						WeightBand: WeightBandOf(p.GrossWeightKg),
 						BizDate:    datatypesDate(day.In(s.bizTZOrUTC())),
-						Source:     EstimateSourceStocktakeDerived,
+						Source:     EstimateSourceSalesDerived,
 						CreatedAt:  s.now(),
 						UpdatedAt:  s.now(),
 					}
-					// ⚠️ **墓碑行不复活**：门店删掉的样本，重建时原样保留"已删除"。
-					if excluded[forecastSampleKey{PigID: p.ID, Cut: cut}] {
+					key := forecastSampleKey{PigID: p.ID, Cut: cut}
+					// ⚠️ **固化**(owner D8「采集即固化」):
+					//   引擎自动路径(overwrite=false)⇒ **已存在的样本一律不动**。
+					//   ⇒ 事后改搬台 / 改猪重 ⇒ 重物化 ⇒ 样本库**原样不动**。
+					if !overwrite && existingIDs[rec.ID] {
+						stats.SkippedExisting++
+						continue
+					}
+					// ⚠️ 墓碑行**一律不复活**(2026-10-30 owner:删除 = 打墓碑;
+					//   对门店的承诺是「没有自动恢复,点『恢复』可找回」)
+					//   ⇒ **显式「加入样本」也不复活** ⇒ 要找回必须先「恢复」
+					//   (owner 2026-11-01:「不对就手动删掉重采」⇒ 删除 + 恢复 + 重采)。
+					if excluded[key] {
 						stats.SkippedExcluded++
 						keepIDs[rec.ID] = true // 墓碑行**不能被 stale 清理删掉**
 						continue
@@ -173,6 +262,10 @@ func (s *Service) rebuildEstimatedSplitSamples(ctx context.Context, branchID str
 					stats.Written++
 				}
 			}
+		}
+		// ⚠️ **固化模式不删任何旧行**:样本是冻结的 ⇒ 删了就等于"改历史 ⇒ 样本库变了"。
+		if !overwrite {
+			return nil
 		}
 		// ⚠️ 幂等的关键:那天的旧行(不再产出的部位 / 猪)要**清掉**。
 		//   不清 ⇒ 补了实录的部位会同时留着一份旧估计 ⇒ 两个池子重复计样本。
@@ -232,8 +325,10 @@ func (s *Service) deleteStaleEstimates(ctx context.Context, tx *gorm.DB, branchI
 // RebuildEstimatedSplitSamples 重建某店某营业日的估计样本（自己跑引擎）。
 //
 // ⚠️ 代价:跑一次引擎要读 cube 的销售 ⇒ 不便宜 ⇒ 只在**重算基线**时按需调用。
+//
+// ⚠️ 这是**显式重采** ⇒ overwrite=true（覆盖已有样本 + 复活墓碑行）。
 func (s *Service) RebuildEstimatedSplitSamples(ctx context.Context, branchID string, day time.Time) (int, error) {
-	stats, err := s.rebuildForecastDaySamples(ctx, branchID, day)
+	stats, err := s.rebuildForecastDaySamples(ctx, branchID, day, true)
 	if err != nil {
 		return 0, err
 	}
@@ -246,13 +341,15 @@ func (s *Service) RebuildEstimatedSplitSamples(ctx context.Context, branchID str
 //
 //	「按一天加入样本」需要知道**写了几条 / 跳过了几条（墓碑）**，
 //	而 [RebuildEstimatedSplitSamples] 只回一个条数 ⇒ 这里多跑一层拿明细。
+//
+// # overwrite 的含义见 [rebuildEstimatedSplitSamples]。
 func (s *Service) rebuildForecastDaySamples(ctx context.Context, branchID string,
-	day time.Time) (forecastRebuildStats, error) {
+	day time.Time, overwrite bool) (forecastRebuildStats, error) {
 	rows, _, _, _, err := s.computeCutDailyCosts(ctx, branchID, day)
 	if err != nil {
 		return forecastRebuildStats{}, err
 	}
-	return s.rebuildEstimatedSplitSamples(ctx, branchID, day, rows)
+	return s.rebuildEstimatedSplitSamples(ctx, branchID, day, rows, overwrite)
 }
 
 // loadEstimatedSplitSamples 读某店的**估计样本**（按 pig + 部位汇总）。

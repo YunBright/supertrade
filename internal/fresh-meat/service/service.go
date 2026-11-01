@@ -99,7 +99,12 @@ type Service struct {
 // SearchSuppliers 用于 supplier_id 校验。
 //
 // BatchCurrentPrices 用于「预期毛利(预售)结转」取**当前售价**
-// (零售价 + 促销价;有促销价按促销价)—— 见 service/presale.go。
+// (零售价 + 促销价;有促销价按促销价)。
+//
+// ⚠️ 2026-11-01 owner：预期毛利(预售结转)端点已下线 ⇒ 这个方法**当前没有调用方**
+//   (唯一调用方在已删除的 service/presale.go 里)。
+//   ⇒ 先保留在接口上:① 现有实现(cubeclientfake / DaprCubeClient)不用改;
+//     ② 下一张卡随账面链一起清理时,连同实现一起删,不会漏。
 type CubeClient interface {
 	SearchSuppliers(ctx context.Context, query string, limit int) ([]cubeclient.SupplierDTO, error)
 	// BatchCurrentPrices 批量查当前售价;**没维护售价**的商品不在返回里。
@@ -403,10 +408,8 @@ func (s *Service) RecordWholePig(ctx context.Context, branchID string, in model.
 	if err := s.assertPrevBizDayStocktaken(ctx, branchID, in.ArrivedAt); err != nil {
 		return nil, err
 	}
-	// ---- 冻结检查:已审计结转的期间不能再改(含补录)----
-	if err := s.assertNotAudited(ctx, branchID, in.ArrivedAt, "进猪"); err != nil {
-		return nil, err
-	}
+	// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 冻结机制一并下线
+	//   ⇒ 进猪(含补录)不再被「截止日已冻结」拦截。
 
 	// supplier_id 校验(需注入 cube client):调 cube.SearchSuppliers 拿前 1 个 supplier,
 	// 若 ID 不匹配 → ErrInvalidInput。
@@ -558,10 +561,8 @@ func (s *Service) RecordPigCut(ctx context.Context, branchID string, in model.Re
 	if pig.BranchID != branchID {
 		return nil, fmt.Errorf("%w: pig 不属于该 branch", ErrBranchMismatch)
 	}
-	// 冻结检查:已审计结转的期间不能再改(含补录)—— 分割补录属于那头猪的营业日。
-	if err := s.assertNotAudited(ctx, branchID, pig.ArrivedAt, "分割补录"); err != nil {
-		return nil, err
-	}
+	// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 冻结机制一并下线
+	//   ⇒ 分割补录不再被「截止日已冻结」拦截。
 
 	// (branch, cut_type) 必须在 branch_cut_mapping 配置中
 	var mapping model.BranchCutMapping
@@ -674,10 +675,8 @@ func (s *Service) RecordPorkCutsStocktake(ctx context.Context, branchID string, 
 	if err != nil {
 		return nil, err
 	}
-	// ---- 冻结检查:已审计结转的期间不能再改(含补录)----
-	if err := s.assertNotAudited(ctx, branchID, takenDate, "盘点"); err != nil {
-		return nil, err
-	}
+	// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 冻结机制一并下线
+	//   ⇒ 日终盘点(含补录)不再被「截止日已冻结」拦截。
 	takenAt := takenDate
 	if isToday {
 		takenAt = now
@@ -1128,10 +1127,8 @@ func (s *Service) RecordWasteLog(ctx context.Context, branchID string, in model.
 	if !in.RecordedAt.IsZero() {
 		recordedAt = in.RecordedAt
 	}
-	// 冻结检查:已审计结转的期间不能再改(含补录)。
-	if err := s.assertNotAudited(ctx, branchID, recordedAt, "报损"); err != nil {
-		return nil, err
-	}
+	// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 冻结机制一并下线
+	//   ⇒ 报损不再被「截止日已冻结」拦截。
 
 	sku := strings.TrimSpace(in.CubeProductID)
 	cutType := in.CutType

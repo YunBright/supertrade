@@ -94,12 +94,17 @@ type cutRollupMid struct {
 //     且**不再单列 promo 桶**(否则同一笔收入被算两次);
 //   - **分摊失败** ⇒ promo 桶原样保留(金额重量仍然可见,只是没分到部位)。
 //
-// # 三步(2026-10-31 owner 口径)
+// # 三步(2026-11-01 owner 终稿)
 //
-//	① 部位行 + 全店合计(账:移动加权链出来的实际毛利)
+//	① 部位行 + 全店合计(账:移动加权链出来的实际毛利 —— P1 会退休)
 //	② 日终剩余(kg/金额) + 售罄率(用**猪肉台日终盘点**,不用进货量)
-//	③ 建议毛利 / 建议毛利率(用**建议成本单价**重算一遍成本)
-func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation) ([]PerCutGrossMargin, TotalGrossMargin) {
+//	③ **参考口径**:总毛利率 m + 部位成本单价 + 部位参考毛利 + 全店参考毛利
+//	   (owner:「header不需要与部位同口径」⇒ ③ 的头**不是**部位的加总)
+//
+// # ref 是**参考口径的当日输入**(总采 + 期末猪肉台剩余),由 referenceDayTotalsOf 采集。
+func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation, ref ReferenceDayTotals) (
+	[]PerCutGrossMargin, TotalGrossMargin,
+) {
 	mids := buildCutRollupMids(cutRows, promoAlloc)
 
 	var tot TotalGrossMargin
@@ -119,9 +124,16 @@ func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation) ([]Pe
 		tot.GrossMarginPct = f
 	}
 
-	// ② 日终剩余 + 售罄率;③ 建议毛利。两步都要**跨部位**算 ⇒ 放循环之后。
-	applyDayEndRemain(mids, &tot)
-	applySuggestedMargin(mids, &tot)
+	// ② 日终剩余 + 售罄率;③ 参考口径。两步都要**跨部位**算 ⇒ 放循环之后。
+	applyDayEndRemain(mids, &tot, ref.PurchaseAvgYuan)
+	marginRate, marginOK := referenceMarginRate(ref, tot.RevenueYuan)
+	applyReferenceMargin(mids, &tot, marginRate, ref, marginOK)
+
+	// ---- 出成率(owner 2026-11-01:>100% ⇒ 有问题,要去查)----
+	if rate, ok := referenceYieldRate(cutRows, ref.PurchasedKg); ok {
+		f, _ := rate.Float64()
+		tot.YieldRate = &f
+	}
 
 	// ---- 短卖(2026-10-30):全店合计 ----
 	var shortSellKg decimal.Decimal

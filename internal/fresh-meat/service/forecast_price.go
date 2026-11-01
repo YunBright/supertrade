@@ -129,13 +129,21 @@ func (s *Service) CollectCutPriceSamples(ctx context.Context, branchID string, d
 	loc := s.bizTZOrUTC()
 	dayKey := day.In(loc).Format("2006-01-02")
 
-	// ---- ① 当日整体毛利率 ----
-	margin, ok := priceMarginRateOfRows(rows)
+	// ---- ① 当日整体毛利率(**参考口径**)----
+	//
+	// ⚠️ 2026-11-01 owner 终稿:这里**不再用账面毛利率**。
+	//   账面的销售成本走移动加权链 ⇒ 依赖分割重量 ⇒ 切割误差会被带进单价基线
+	//   ⇒ 正是 owner 要断的那条污染链。
+	//   参考口径 = (营收 − 采购 + 期末猪肉台剩余成本) / 营收 ⇒ **零分割假设**。
+	margin, ok, err := s.referenceMarginRateOfDay(ctx, branchID, day, rows)
+	if err != nil {
+		return res, err
+	}
 	res.MarginRate = margin
 	if !ok {
 		res.Message = fmt.Sprintf(
 			"%s 这一天没有产出单价样本:整体毛利率 %s 不在可用区间(%s ~ %s)—— "+
-				"多半是当天成本算不出来(没有期初也没有进货)", dayKey, margin.String(),
+				"多半是当天缺日终盘点(剩余算不出来)或当天没有进货", dayKey, margin.String(),
 			priceMarginValidLow, priceMarginValidHigh)
 		return res, nil
 	}
@@ -177,18 +185,18 @@ func (s *Service) CollectCutPriceSamples(ctx context.Context, branchID string, d
 		id := cutPriceSampleID(branchID, dayKey, string(r.CutType))
 		keepIDs[id] = true
 		samples = append(samples, model.PigCutPriceSample{
-			ID:             id,
-			BranchID:       branchID,
-			BizDate:        dayKey,
-			CutType:        r.CutType,
-			SoldKg:         soldKg,
-			RevenueYuan:    r.RevenueYuan,
+			ID:              id,
+			BranchID:        branchID,
+			BizDate:         dayKey,
+			CutType:         r.CutType,
+			SoldKg:          soldKg,
+			RevenueYuan:     r.RevenueYuan,
 			RetailPriceYuan: retail,
-			MarginRate:     margin,
-			CostPriceYuan:  costPrice,
-			PigPriceYuan:   pigPrice,
-			CreatedAt:      now,
-			UpdatedAt:      now,
+			MarginRate:      margin,
+			CostPriceYuan:   costPrice,
+			PigPriceYuan:    pigPrice,
+			CreatedAt:       now,
+			UpdatedAt:       now,
 		})
 	}
 	// 墓碑行:不复活,但**不能被 stale 清理删掉**(删了 ⇒ 下次重建会写回来 ⇒ 复活)。
@@ -282,11 +290,16 @@ func cutPriceBaselineID(branchID string, cut model.CutType) string {
 	return surrogateID("PCB", branchID, string(cut))
 }
 
-// priceMarginRateOfRows 从部位级成本行汇总出当日**整体毛利率**。
+// priceMarginRateOfRows 从部位级成本行汇总出当日**整体毛利率**(**账面口径**)。
 //
 // 口径 = (营收 − 销售成本 − 统收成本 − 报损成本 − 搭赠成本) ÷ 营收
 //
 // ⚠️ **不含**预期毛利(预售结转):那是"预期",不是当天真实赚到的。
+//
+// ⚠️ 2026-11-01:这个**账面**口径已经**不再喂单价样本**了
+//   (账面销售成本依赖分割重量 ⇒ 会把切割误差带进单价基线)。
+//   单价样本现在走 **参考口径**(见 referenceMarginRateOfDay)。
+//   本函数保留:它是"账面口径"的对照口径,测试要能对比两者。
 // 返回 (毛利率, 是否可用于倒推)。
 func priceMarginRateOfRows(rows []CutDailyCost) (decimal.Decimal, bool) {
 	var revenue, salesCost, bulkCost, wasteCost, giftCost decimal.Decimal
@@ -301,12 +314,18 @@ func priceMarginRateOfRows(rows []CutDailyCost) (decimal.Decimal, bool) {
 		return decimal.Zero, false
 	}
 	margin := revenue.Sub(salesCost).Sub(bulkCost).Sub(wasteCost).Sub(giftCost).Div(revenue)
+	return margin, priceMarginUsable(margin)
+}
+
+// priceMarginUsable 判断毛利率能不能用来倒推单价。
+//
+// ⚠️ 越界 ⇒ **整天不产样本**(宁缺毋滥),而不是产一条垃圾样本。
+//   ≤ 0  : 亏本/口径错 ⇒ 倒推出的进货单价是负数或离谱值 ⇒ 会把基线教歪。
+//   ≥ 0.95: 成本几乎为 0 ⇒ 多半是"成本算不出来"⇒ 倒推出的单价接近零售价 ⇒ 同样教歪。
+func priceMarginUsable(margin decimal.Decimal) bool {
 	low, _ := decimal.NewFromString(priceMarginValidLow)
 	high, _ := decimal.NewFromString(priceMarginValidHigh)
-	if !margin.GreaterThan(low) || margin.GreaterThanOrEqual(high) {
-		return margin, false
-	}
-	return margin, true
+	return margin.GreaterThan(low) && margin.LessThan(high)
 }
 
 // dayPigPrice 当日猪的**加权平均进价**(元/kg)= Σ猪成本 ÷ Σ猪毛重。
@@ -434,11 +453,11 @@ func (s *Service) RecomputeCutPriceBaselines(ctx context.Context, branchID strin
 		sort.Slice(cuts, func(i, j int) bool { return cuts[i] < cuts[j] })
 		for _, c := range cuts {
 			rec := model.PigCutPriceBaseline{
-				ID:              cutPriceBaselineID(branchID, c),
-				BranchID:        branchID,
-				CutType:         c,
-				SourceBranchID:  branchID,
-				ComputedAt:      now,
+				ID:             cutPriceBaselineID(branchID, c),
+				BranchID:       branchID,
+				CutType:        c,
+				SourceBranchID: branchID,
+				ComputedAt:     now,
 			}
 			if v, ok := values[c]; ok {
 				rec.UnitCostYuan = v.UnitCostYuan
@@ -588,12 +607,12 @@ func (s *Service) DeleteCutPriceSample(ctx context.Context, branchID, dateKey st
 func (s *Service) upsertCutPriceBaseline(ctx context.Context, tx *gorm.DB, row model.PigCutPriceBaseline,
 	existing map[model.CutType]model.PigCutPriceBaseline) error {
 	fields := map[string]any{
-		"unit_cost_yuan":    row.UnitCostYuan,
+		"unit_cost_yuan":     row.UnitCostYuan,
 		"ref_pig_price_yuan": row.RefPigPriceYuan,
-		"sample_count":      row.SampleCount,
-		"source_branch_id":  row.SourceBranchID,
-		"borrowed":          row.Borrowed,
-		"computed_at":       row.ComputedAt,
+		"sample_count":       row.SampleCount,
+		"source_branch_id":   row.SourceBranchID,
+		"borrowed":           row.Borrowed,
+		"computed_at":        row.ComputedAt,
 	}
 	if prev, ok := existing[row.CutType]; ok && prev.ID != "" {
 		if err := tx.WithContext(ctx).Model(&model.PigCutPriceBaseline{}).
@@ -1081,7 +1100,9 @@ func (s *Service) RefreshCutUnitPriceFromLLM(ctx context.Context, branchID strin
 	if err != nil {
 		return decimal.Zero, err
 	}
-	result, err := s.predictFn(ctx, pig, nil)
+	// ⚠️ 焦点部位 = **只要这一个部位**的价(owner D8:LLM 只补缺的部分)。
+	//   这里问全集也只会取一个 cut 的价 ⇒ 但提示词问全集 = 产整猪方案 ⇒ 浪费。
+	result, err := s.predictFn(ctx, pig, nil, []model.CutType{cut})
 	if err != nil {
 		return decimal.Zero, fmt.Errorf("LLM 重新给价失败: %w", err)
 	}

@@ -347,9 +347,14 @@ func TestCutChain_UncomputableCut_DoesNotPoisonNextDay(t *testing.T) {
 //
 // # 期望
 //
-//	① 期间毛利报告里 days_without_cost_baseline ≥ 1。
-//	② 那一行的 cost_incomplete = true。
-//	③ Note 里说清楚"成本算不出来"⇒ **不能**让门店看到"毛利 100%"却没人提示。
+//	① 每日毛利报告 cost_incomplete = true。
+//	② 有一句人话说明"成本算不出来"⇒ **不能**让门店看到"毛利 100%"却没人提示。
+//	③ 长期毛利(期间)也必须标 cost_incomplete ⇒ 期间数同样不完整。
+//
+// ⚠️ 2026-11-01 owner：账面期间毛利端点(`/gross-margin/period`)已下线
+//
+//	⇒ 原用例(用 `ComputePeriodMargin` 的 days_without_cost_baseline 与行级 cost_incomplete)
+//	  改由**每日毛利报告**(`ComputeGrossMargin`)+ **长期毛利**(`ComputeLongTermMargin`)承接。
 func TestCutChain_NoBaseline_CostMarkedUncomputable(t *testing.T) {
 	day2 := fmDay1.Add(24 * time.Hour) // 2026-10-02
 	svc, ctx := fmChainSetup(t, map[string][]map[string]any{
@@ -357,36 +362,53 @@ func TestCutChain_NoBaseline_CostMarkedUncomputable(t *testing.T) {
 	})
 	svc.SetClock(fmClock(day2))
 
-	rep, err := svc.ComputePeriodMargin(ctx, "S001", "2026-10-02", "2026-10-02", "day")
-	mustNoErr(t, err, "ComputePeriodMargin")
-
-	if rep.DaysWithoutCostBaseline < 1 {
-		t.Errorf("★ 没有基线的那天必须被标出来(days_without_cost_baseline ≥ 1), got %d",
-			rep.DaysWithoutCostBaseline)
-	}
+	// ① 每日毛利报告必须标"成本算不出来"。
+	rep, err := svc.ComputeGrossMargin(ctx, "S001", day2)
+	mustNoErr(t, err, "ComputeGrossMargin")
 	if !rep.CostIncomplete {
-		t.Errorf("★ 区间里有成本算不出来 ⇒ 必须标 cost_incomplete=true, got false —— "+
+		t.Errorf("★ 没有基线的那天必须标 cost_incomplete=true, got false —— " +
 			"店长会把「毛利 100%%」当真")
 	}
-	if len(rep.Rows) == 0 {
-		t.Fatalf("期间毛利应至少有一行: %+v", rep)
+	// ② 人话说明必须非空(前端要原样显示)。
+	if rep.CostIncompleteNote == "" {
+		t.Error("★ CostIncompleteNote 必须说明\"成本算不出来\",否则门店会以为毛利 100% 是真的")
 	}
-	if !rep.Rows[0].CostIncomplete {
-		t.Errorf("★ 没有基线的那行必须 cost_incomplete=true(成本算不出来 ≠ 成本为 0), got %+v",
-			rep.Rows[0])
+	if len(rep.PerCut) == 0 {
+		t.Fatalf("每日毛利应至少有一行: %+v", rep)
 	}
-	if rep.Note == "" {
-		t.Error("★ Note 必须说明\"成本算不出来\",否则门店会以为毛利 100% 是真的")
+	// ③ 长期毛利(期间)同样不完整 ⇒ 必须标出来。
+	period, err := svc.ComputeLongTermMargin(ctx, "S001", "2026-10-02", "2026-10-02")
+	mustNoErr(t, err, "ComputeLongTermMargin")
+	if !period.Total.CostIncomplete {
+		t.Errorf("★ 长期毛利也必须标 cost_incomplete=true(没有完整盘点 ⇒ 剩余算不出来), got false")
+	}
+	if period.Total.CostIncompleteNote == "" {
+		t.Error("★ 长期毛利必须带一句人话说明")
+	}
+	if len(period.Rows) == 0 {
+		t.Fatalf("长期毛利应至少有一行: %+v", period)
 	}
 }
 
-// TestCutChain_PeriodMarginEqualsSumOfDaily 锁 ③。
+// TestCutChain_LongTermMarginRevenueEqualsSumOfDaily 锁 ③。
 //
-// **长期毛利 = 每日毛利之和**(链式路径下也要成立)。
+// ⚠️ 2026-11-01 owner：账面期间毛利端点(`/gross-margin/period`)已下线
 //
-// ⚠️ 这条是"每日毛利"与"长期毛利"两套代码的唯一交叉校验:
-//   两者若各自算各自的,门店会看到"这个月加起来 ≠ 每天加起来"。
-func TestCutChain_PeriodMarginEqualsSumOfDaily(t *testing.T) {
+//	⇒ 原用例(锁"期间毛利 == 每日毛利之和")改由**长期毛利**(`/long-term-margin`)承接。
+//
+// # 口径变化(为什么断言从"毛利相等"变成"营收相等")
+//
+//	旧:账面期间毛利(移动加权链口径) == 每日毛利之和 —— 两数**同口径**,可直接相等。
+//	新:长期毛利是**全店口径**(含冷库)⇒ **期间毛利 ≠ 每日之和** —— 这是**设计**,不是 bug
+//	    (每日行故意不含冷库 ⇒ 跨期才平,见 long_term_margin.go)。
+//	⇒ 仍然成立、且必须锁的交叉校验是 **营收**:
+//	   期间营收 == 每日营收之和(两条路径读同一份销售流水 ⇒ 不许一个有数一个没数)。
+//	⇒ 另外锁:报告自带的"每日之和" == 各日行之和(口径自洽)。
+//
+// # 判别力
+//
+//	若有人把长期毛利改成从另一张表读销售 ⇒ 营收对不上 ⇒ 立刻红。
+func TestCutChain_LongTermMarginRevenueEqualsSumOfDaily(t *testing.T) {
 	day2 := fmDay1.Add(24 * time.Hour)
 	day3 := fmDay1.Add(48 * time.Hour)
 	day4 := fmDay1.Add(72 * time.Hour)
@@ -412,24 +434,42 @@ func TestCutChain_PeriodMarginEqualsSumOfDaily(t *testing.T) {
 		sumDaily = sumDaily.Add(rep.Total.GrossMarginYuan)
 		sumDailyRev = sumDailyRev.Add(rep.Total.RevenueYuan)
 	}
+	_ = sumDaily // 每日毛利与期间毛利**口径不同**(含冷库)⇒ 不可直接比;保留求和仅为留痕。
 
-	// 长期毛利。
+	// 长期毛利(期间)。
 	svc.SetClock(fmClock(day4))
-	period, err := svc.ComputePeriodMargin(ctx, "S001", "2026-10-02", "2026-10-04", "day")
-	mustNoErr(t, err, "ComputePeriodMargin")
+	period, err := svc.ComputeLongTermMargin(ctx, "S001", "2026-10-02", "2026-10-04")
+	mustNoErr(t, err, "ComputeLongTermMargin")
 
+	// ① 跨路径营收一致(两条路径读同一份销售流水)。
 	if !period.Total.RevenueYuan.Equal(sumDailyRev) {
 		t.Errorf("★ 期间营收应是每日营收之和: 期间 %s vs 每日之和 %s",
 			period.Total.RevenueYuan, sumDailyRev)
 	}
-	// 金额有 1e-16 级尾数(移动加权单价是除法结果)⇒ 用容差比。
-	if period.Total.GrossMarginYuan.Sub(sumDaily).Abs().GreaterThan(d("0.000001")) {
-		t.Errorf("★ 长期毛利应是每日毛利之和: 期间 %s vs 每日之和 %s",
-			period.Total.GrossMarginYuan, sumDaily)
+	// ② 报告自洽:"每日之和"必须等于各日行之和。
+	var rowSum decimal.Decimal
+	for _, r := range period.Rows {
+		if r.HasStocktake && r.HasPurchase {
+			rowSum = rowSum.Add(r.GrossMarginYuan)
+		}
+	}
+	// 金额有 1e-16 级尾数(采购均价是除法结果)⇒ 用容差比。
+	if period.Total.DailySumGrossMarginYuan.Sub(rowSum).Abs().GreaterThan(d("0.000001")) {
+		t.Errorf("★ 期间报告里的每日之和 %s ≠ 各日行之和 %s",
+			period.Total.DailySumGrossMarginYuan, rowSum)
+	}
+	// ③ 期间毛利**必然不等于**每日之和(全店口径含冷库)⇒ 差得有理由,不是 bug。
+	if period.Total.GrossMarginYuan.Equal(sumDaily) {
+		t.Logf("本期恰好相等(可能没有冷库变动): %s", period.Total.GrossMarginYuan)
 	}
 }
 
-// TestPeriodMargin_PartialCostIncomplete_ReportLevelFlag 锁 ④。
+// TestPartialCostIncomplete_ReportLevelFlag 锁 ④。
+//
+// ⚠️ 2026-11-01 owner：账面期间毛利端点(`/gross-margin/period`)已下线
+//
+//	⇒ 原用例(用 `ComputePeriodMargin` 的报告级 cost_incomplete / days_without_cost_baseline)
+//	  改由**每日毛利报告**(`ComputeGrossMargin`)承接。
 //
 // # 场景(生产真实形态:店 00 的 10-01)
 //
@@ -439,18 +479,17 @@ func TestCutChain_PeriodMarginEqualsSumOfDaily(t *testing.T) {
 //
 // # 期望
 //
-//	① 报告级 cost_incomplete = true（宽口径 ⇒ 必须报）
-//	② days_without_cost_baseline = 0（严口径 ⇒ 那天不是"整天缺基线"）
-//	③ cost_incomplete_note 非空，且**不能**出现"0 天"这种自相矛盾的说法
-//	④ note 同样不能出现"0 天"
+//	① 报告级 cost_incomplete = true(宽口径 ⇒ 必须报)
+//	② cost_incomplete_note 非空,且**只点名算不出来的那几个部位**
+//	  (belly 算得出来 ⇒ 不该出现在名单里)
+//	③ cost_incomplete_note 不能出现"0 天"这种自相矛盾的说法
 //
 // # 为什么锁这条
 //
-//	前端若用 `days_without_cost_baseline > 0` 驱动区间级提示 ⇒
-//	店 00 的 10 月区间(days=0)会**一条提示都不显示** ⇒
-//	店长只看得到"毛利 13.47%",完全不知道 10-01 那天的成本是被低估的。
-//	⇒ 区间级提示必须由**报告级** cost_incomplete 驱动。
-func TestPeriodMargin_PartialCostIncomplete_ReportLevelFlag(t *testing.T) {
+//	前端若只看"整天算不出来" ⇒ 店 00 的 10 月区间会**一条提示都不显示**
+//	⇒ 店长只看得到"毛利 13.47%",完全不知道 10-01 那天的成本是被低估的。
+//	⇒ 提示必须由**报告级** cost_incomplete 驱动,且要**点名部位**。
+func TestPartialCostIncomplete_ReportLevelFlag(t *testing.T) {
 	day2 := fmDay1.Add(24 * time.Hour) // 2026-10-02
 	svc, ctx := fmChainSetup(t, map[string][]map[string]any{
 		"2026-10-02": {
@@ -472,28 +511,28 @@ func TestPeriodMargin_PartialCostIncomplete_ReportLevelFlag(t *testing.T) {
 	}
 	svc.SetClock(fmClock(day2))
 
-	rep, err := svc.ComputePeriodMargin(ctx, "S001", "2026-10-02", "2026-10-02", "day")
-	mustNoErr(t, err, "ComputePeriodMargin")
+	rep, err := svc.ComputeGrossMargin(ctx, "S001", day2)
+	mustNoErr(t, err, "ComputeGrossMargin")
 
 	// ① 报告级标志(宽口径)。
 	if !rep.CostIncomplete {
-		t.Errorf("★ 区间里有部位成本算不出来 ⇒ 报告级 cost_incomplete 必须为 true, got false —— "+
+		t.Errorf("★ 区间里有部位成本算不出来 ⇒ 报告级 cost_incomplete 必须为 true, got false —— " +
 			"前端会用它决定要不要给店长提示(缺了 ⇒ 门店看不到毛利被高估)")
 	}
-	// ② 严口径的天数:那天不是"整天缺基线"(belly 算得出来)。
-	if rep.DaysWithoutCostBaseline != 0 {
-		t.Errorf("★ 部分算不出来 ≠ 整天算不出来 ⇒ days_without_cost_baseline 应为 0, got %d",
-			rep.DaysWithoutCostBaseline)
-	}
-	// ③ 人话说明:非空 + 不出现"0 天"。
+	// ② 人话说明:非空 + 只点名算不出来的那几个部位。
 	if rep.CostIncompleteNote == "" {
 		t.Error("★ cost_incomplete_note 必须非空 —— 前端要原样显示它(口径是后端的职责)")
 	}
+	if !strings.Contains(rep.CostIncompleteNote, string(model.CutTrotter)) {
+		t.Errorf("★ cost_incomplete_note 必须点名算不出来的那几个部位(%s): %q",
+			model.CutTrotter, rep.CostIncompleteNote)
+	}
+	if strings.Contains(rep.CostIncompleteNote, string(model.CutBelly)) {
+		t.Errorf("★ belly 有期初结转 ⇒ 成本算得出来 ⇒ 不该出现在名单里: %q",
+			rep.CostIncompleteNote)
+	}
+	// ③ 不能出现"0 天"(自相矛盾)。
 	if strings.Contains(rep.CostIncompleteNote, "0 天") {
 		t.Errorf("★ cost_incomplete_note 不能出现「0 天」(自相矛盾): %q", rep.CostIncompleteNote)
-	}
-	// ④ note 同样不能出现"0 天"(旧写法会拼出「其中 0 天成本算不出来」)。
-	if strings.Contains(rep.Note, "0 天") {
-		t.Errorf("★ note 不能出现「0 天」(自相矛盾): %q", rep.Note)
 	}
 }

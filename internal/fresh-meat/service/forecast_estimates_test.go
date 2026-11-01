@@ -45,6 +45,21 @@ func estPigCut(t *testing.T, svc *service.Service, ctx context.Context, branchID
 	mustNoErr(t, err, "RecordPigCut "+barcode)
 }
 
+// estSell 记一笔零售销售(本地事件表)—— 估计样本的**来源**。
+//
+// ⚠️ 2026-11-01 owner D8:样本源改成**当日销量** ⇒ 这些用例必须有销售才有样本。
+func estSell(t *testing.T, svc *service.Service, branchID, sku, lineID, qty, amount string, at time.Time) {
+	t.Helper()
+	_, err := svc.OnSaleCompleted(context.Background(), service.SaleCompletedPayload{
+		SaleID: "SO-" + lineID, BranchID: branchID, CompletedAt: at,
+		Lines: []service.SaleLine{{
+			LineID: lineID, SKUID: sku, FreshType: "meat",
+			Qty: d(qty), AmountYuan: d(amount), PigID: "PIG-1", CutType: model.CutBelly,
+		}},
+	})
+	mustNoErr(t, err, "OnSaleCompleted "+lineID)
+}
+
 // estStocktake 提交一张**完整**日终盘点(归属日 = takenDate;空 = 时钟那天)。
 func estStocktake(t *testing.T, svc *service.Service, ctx context.Context, branchID, sku, remainKg, takenDate string) {
 	t.Helper()
@@ -116,12 +131,15 @@ func estBaseline(t *testing.T, branchID, band string, cut model.CutType) (model.
 	return row, true
 }
 
-// ---- ① 倒推值按毛重比例摊到每头猪 ----
+// ---- ① 当日销量按毛重比例摊到每头猪 ----
 
 // TestForecastEstimates_SplitByGrossWeight 锁「按毛重比例摊 + Σ 守恒」。
 //
 // 两头猪:200kg / 100kg(同一营业日)⇒ 估计值之比应是 2:1。
-// ⚠️ 并且 Σ 各头猪的估计值 **恰好等于** 当天该部位的倒推实际分割(尾差补给最大的那头)。
+// ⚠️ 并且 Σ 各头猪的估计值 **恰好等于** 当天该部位的**销量**(尾差补给最大的那头)。
+//
+// ⚠️ 2026-11-01 owner D8:样本源 = **当日销量**(不再是"日终倒推值")
+// ⇒ 这个用例同时锁住了"样本来自销售"这件事。
 func TestForecastEstimates_SplitByGrossWeight(t *testing.T) {
 	svc, ctx, sku := splitSetup(t)
 	estBaselineSeed(t, "S001", model.CutBelly, "200-249", "20")
@@ -129,6 +147,8 @@ func TestForecastEstimates_SplitByGrossWeight(t *testing.T) {
 	pigBig := estPig(t, svc, ctx, "S001", "EB-BIG", "200", splitDay)
 	pigSmall := estPig(t, svc, ctx, "S001", "EB-SMALL", "100", splitDay)
 	estStocktake(t, svc, ctx, "S001", sku, "5", "")
+	// 当天卖出 30kg belly ⇒ 样本源。
+	estSell(t, svc, "S001", sku, "L-EST-1", "30", "600", splitDay.Add(time.Hour))
 
 	// 这一天算完了 ⇒ 落成本快照 ⇒ 顺带重建估计样本。
 	_, err := svc.PersistCutCostDaily(ctx, "S001", splitDay)
@@ -155,88 +175,87 @@ func TestForecastEstimates_SplitByGrossWeight(t *testing.T) {
 		t.Errorf("★ 估计值之比应是毛重比例 2:1, got %s", ratio)
 	}
 
-	// ⚠️ Σ 恰好等于当天的倒推实际分割(报表上那个数)。
-	rep, err := svc.ComputeGrossMargin(ctx, "S001", splitDay)
-	mustNoErr(t, err, "ComputeGrossMargin")
-	belly := findPerCut(t, rep.PerCut, model.CutBelly)
-	if belly.ActualSplitKg == nil {
-		t.Fatalf("★ 有完整日终盘点 ⇒ 实际分割必须有值")
-	}
-	// ⚠️ Σ 应**等于**倒推实际分割。
+	// ⚠️ Σ 恰好等于**当天该部位的销量**(owner D8:样本来自销售数据)。
 	//
 	//	误差判据 = 0.01kg(= 列精度 decimal(10,3) 的 1 个最小单位):
 	//	样本按列精度落库 ⇒ Σ 只能"约等于";PG 上会被舍入到 3 位小数,
 	//	SQLite 上 decimal 列更是按 float64 存 ⇒ 会有 1e-16 级微差。
-	//	(基线是**统计拟合**(p50)⇒ 这个量级的舍入对样本没有影响。)
 	total := big.Add(small)
-	if diff := total.Sub(*belly.ActualSplitKg).Abs(); diff.GreaterThan(d("0.01")) {
-		t.Errorf("★ Σ 估计样本应约等于倒推实际分割 %s(容差 0.01), got %s", *belly.ActualSplitKg, total)
+	if diff := total.Sub(d("30")).Abs(); diff.GreaterThan(d("0.01")) {
+		t.Errorf("★ Σ 估计样本应约等于当日销量 30kg(容差 0.01), got %s", total)
+	}
+	// ⚠️ 样本来源必须标成 sales_derived(前端/审计要能看出来源)。
+	for _, r := range estRows(t, "S001") {
+		if r.Source != service.EstimateSourceSalesDerived {
+			t.Errorf("★ 样本来源应是 %q, got %q", service.EstimateSourceSalesDerived, r.Source)
+		}
 	}
 }
 
-// ---- ② 只信"有完整日终盘点"的倒推 ----
+// ---- ② 样本源 = 当日销量 ⇒ **不再依赖盘点** ----
 
-// TestForecastEstimates_NoCompleteStocktake_NoSamples 锁「没完整盘点 ⇒ 不产样本」。
+// TestForecastEstimates_SalesSource ⭐ 锁「样本来自**销售**，与盘点无关」。
 //
-// ⚠️ 没有完整盘点时,倒推走的是"台面流量近似"(搬上台是老货 ⇒ 只能扣掉估计)
-// ⇒ 噪声太大 ⇒ **不能**喂基线(会把基线教歪)。
+// # 2026-11-01 owner D8 的核心性质
 //
-// # ⚠️ 这个用例必须真的**造得出倒推值**,否则是假绿
+//	owner：「分割基线是不是采集某天数据后，就算修改那天的搬台，猪重都不会影响他的样本库」
+//	⇒ 要成立,样本的**产出口径里就不能有"盘点/搬台"**。
 //
-//	无实盘口径:A_c = 销售 + 统收 + 报损 − 期初 − 搬上台
-//	⇒ 造不出 A_c > 0 ⇒ **就算撤掉**过滤条件,也不会有样本 ⇒ 用例测不出任何东西。
+// # 两个方向都要锁
 //
-//	⇒ 这里造:卖 10kg belly(⇒ A_belly = 10 > 0)且**不给**统计基线
-//	  (建议分割 S_belly = 0 ⇒ 不会被显示规则隐藏成 nil)。
+//	① **有销售、没盘点** ⇒ **照样产样本**（盘点不再是前提)
+//	② **有盘点、没销售** ⇒ **不产样本**（销售才是前提)
 //
-//	⇒ 两个分支都验:完全没有盘点单(口径 estimated)、只有半盘(口径 partial)。
-func TestForecastEstimates_NoCompleteStocktake_NoSamples(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		partialTake bool
-	}{
-		{name: "完全没有盘点单", partialTake: false},
-		{name: "只有半盘(不是完整盘点)", partialTake: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			svc, ctx, sku := splitSetup(t)
-			// 1 头猪(当天进场)⇒ "按毛重摊到每头猪"才有对象。
-			estPig(t, svc, ctx, "S001", "EB-1", "200", splitDay)
-			// ⚠️ **不**给统计基线 ⇒ 建议分割 S_belly = 0(单测里 LLM 兜底不出数)。
-			// 卖 10kg belly ⇒ 台面近似倒推出 A_belly = 10kg > 0。
-			splitSell(t, svc, sku, "L-1", "10", "200")
-			if tc.partialTake {
-				estPartialStocktake(t, svc, ctx, "S001", sku, "5")
-			}
-			_, err := svc.PersistCutCostDaily(ctx, "S001", splitDay)
-			mustNoErr(t, err, "PersistCutCostDaily")
+// ⚠️ ② 若没有,用例会变白测:撤掉"按销量取样本"后 ① 也会红不了。
+func TestForecastEstimates_SalesSource(t *testing.T) {
+	t.Run("有销售没盘点 ⇒ 照样产样本", func(t *testing.T) {
+		svc, ctx, sku := splitSetup(t)
+		estPig(t, svc, ctx, "S001", "EB-1", "200", splitDay)
+		// ⚠️ **不**录任何盘点单。
+		estSell(t, svc, "S001", sku, "L-SRC-1", "10", "200", splitDay.Add(time.Hour))
 
-			// ---- 前提:报表上**确实有** derived 的实际分割 ----
-			// (否则就算撤掉过滤条件也测不出东西 ⇒ 假绿)
-			rep, err := svc.ComputeGrossMargin(ctx, "S001", splitDay)
-			mustNoErr(t, err, "ComputeGrossMargin")
-			belly := findPerCut(t, rep.PerCut, model.CutBelly)
-			if belly.ActualSplitKg == nil || !belly.ActualSplitKg.IsPositive() {
-				t.Fatalf("★ 前提:没有完整盘点时也应倒推出实际分割(台面近似), got %v", belly.ActualSplitKg)
-			}
+		_, err := svc.PersistCutCostDaily(ctx, "S001", splitDay)
+		mustNoErr(t, err, "PersistCutCostDaily")
 
-			if rows := estRows(t, "S001"); len(rows) != 0 {
-				t.Errorf("★ 没有完整日终盘点 ⇒ 不该产生估计样本, got %d 行: %+v", len(rows), rows)
-			}
-		})
-	}
+		rows := estRows(t, "S001")
+		if len(rows) != 1 {
+			t.Fatalf("★ 样本源是**销售** ⇒ 没有盘点也该有 1 条样本, got %d 行: %+v", len(rows), rows)
+		}
+		if !rows[0].WeightKg.Equal(d("10")) {
+			t.Errorf("★ 样本值应是当日销量 10kg, got %s", rows[0].WeightKg.String())
+		}
+	})
+
+	t.Run("有盘点没销售 ⇒ 不产样本", func(t *testing.T) {
+		svc, ctx, sku := splitSetup(t)
+		estPig(t, svc, ctx, "S001", "EB-2", "200", splitDay)
+		estStocktake(t, svc, ctx, "S001", sku, "5", "")
+		// ⚠️ **不**卖任何东西。
+
+		_, err := svc.PersistCutCostDaily(ctx, "S001", splitDay)
+		mustNoErr(t, err, "PersistCutCostDaily")
+
+		if rows := estRows(t, "S001"); len(rows) != 0 {
+			t.Errorf("★ 没有销售就没有可采的样本, got %d 行: %+v", len(rows), rows)
+		}
+	})
 }
 
 // ---- ③ 只喂 derived 部位(有实录的部位不估) ----
 
 // TestForecastEstimates_RecordedCutNotEstimated 锁「有实录的部位不产生估计样本」。
+//
+// ⚠️ 必须**先有销售**才有判别力:有销售时该部位照样会被"按销量"命中
+// ⇒ 是"有实录"这条规则把它挡掉的 ⇒ 撤掉规则 ⇒ 本用例立刻红。
 func TestForecastEstimates_RecordedCutNotEstimated(t *testing.T) {
 	svc, ctx, sku := splitSetup(t)
 	estBaselineSeed(t, "S001", model.CutBelly, "200-249", "20")
 	pigID := estPig(t, svc, ctx, "S001", "EB-1", "200", splitDay)
-	// 门店手工补录了 belly 的分割 ⇒ 该部位来源是 recorded ⇒ 不该被倒推覆盖。
+	// 门店手工补录了 belly 的分割 ⇒ 该部位来源是 recorded ⇒ 不该被估计样本覆盖。
 	estPigCut(t, svc, ctx, "S001", pigID, sku, "B-1", "30")
 	estStocktake(t, svc, ctx, "S001", sku, "5", "")
+	// ⚠️ 有销售(否则本用例是白测:没销售本来就没有样本)。
+	estSell(t, svc, "S001", sku, "L-REC-1", "10", "200", splitDay.Add(time.Hour))
 
 	_, err := svc.PersistCutCostDaily(ctx, "S001", splitDay)
 	mustNoErr(t, err, "PersistCutCostDaily")
@@ -258,6 +277,7 @@ func TestForecastEstimates_DoesNotTouchPigCuts(t *testing.T) {
 	estBaselineSeed(t, "S001", model.CutBelly, "200-249", "20")
 	estPig(t, svc, ctx, "S001", "EB-1", "200", splitDay)
 	estStocktake(t, svc, ctx, "S001", sku, "5", "")
+	estSell(t, svc, "S001", sku, "L-NTC-1", "10", "200", splitDay.Add(time.Hour))
 
 	_, err := svc.PersistCutCostDaily(ctx, "S001", splitDay)
 	mustNoErr(t, err, "PersistCutCostDaily")
@@ -303,11 +323,12 @@ func TestForecastBaselines_MergedSources(t *testing.T) {
 	// 前一天也要有盘点单(跨日顺序校验:不补录昨天,今天录不了猪)。
 	estStocktake(t, svc, ctx, "S001", sku, "5", prevDay.Format("2006-01-02"))
 
-	// 当天:5 头猪(**不**补录)⇒ 倒推值摊到它们身上 ⇒ 估计池 5 个样本。
+	// 当天:5 头猪(**不**补录)⇒ 当日销量按毛重摊到它们身上 ⇒ 估计池 5 个样本。
 	for i := 0; i < 5; i++ {
 		estPig(t, svc, ctx, "S001", "EB-T"+string(rune('A'+i)), "200", splitDay)
 	}
 	estStocktake(t, svc, ctx, "S001", sku, "5", "")
+	estSell(t, svc, "S001", sku, "L-MIX-1", "50", "1000", splitDay.Add(time.Hour))
 	_, err := svc.PersistCutCostDaily(ctx, "S001", splitDay)
 	mustNoErr(t, err, "PersistCutCostDaily")
 
@@ -348,11 +369,12 @@ func TestForecastBaselines_MergedSources(t *testing.T) {
 // 实录 0 条 + 估计 5 条(5 头猪)⇒ 基线必须取**估计**的 p50,且 sample_source=estimated。
 func TestForecastBaselines_EstimatedFallback(t *testing.T) {
 	svc, ctx, sku := splitSetup(t)
-	// 5 头猪(都没有补录分割)⇒ 倒推值按毛重摊到 5 头猪 ⇒ 估计池 5 个样本。
+	// 5 头猪(都没有补录分割)⇒ 当日销量按毛重摊到 5 头猪 ⇒ 估计池 5 个样本。
 	for i := 0; i < 5; i++ {
 		estPig(t, svc, ctx, "S001", "EB-"+string(rune('A'+i)), "200", splitDay)
 	}
 	estStocktake(t, svc, ctx, "S001", sku, "5", "")
+	estSell(t, svc, "S001", sku, "L-EFB-1", "50", "1000", splitDay.Add(time.Hour))
 	_, err := svc.PersistCutCostDaily(ctx, "S001", splitDay)
 	mustNoErr(t, err, "PersistCutCostDaily")
 
@@ -399,6 +421,7 @@ func TestForecastBaselines_StoreIsolation(t *testing.T) {
 		estPig(t, svc, ctx, "S001", "EB-"+string(rune('A'+i)), "200", splitDay)
 	}
 	estStocktake(t, svc, ctx, "S001", sku, "5", "")
+	estSell(t, svc, "S001", sku, "L-ISO-1", "50", "1000", splitDay.Add(time.Hour))
 	_, err := svc.PersistCutCostDaily(ctx, "S001", splitDay)
 	mustNoErr(t, err, "PersistCutCostDaily")
 	_, err = svc.RecomputeForecastBaselines(ctx, "S001")
@@ -411,6 +434,7 @@ func TestForecastBaselines_StoreIsolation(t *testing.T) {
 	estBaselineSeed(t, "S002", model.CutBelly, "200-249", "20")
 	estPig(t, svc, ctx, "S002", "EB-B1", "200", splitDay)
 	estStocktake(t, svc, ctx, "S002", sku, "5", "")
+	estSell(t, svc, "S002", sku, "L-ISO-2", "10", "200", splitDay.Add(time.Hour))
 	_, err = svc.PersistCutCostDaily(ctx, "S002", splitDay)
 	mustNoErr(t, err, "PersistCutCostDaily")
 	_, err = svc.RecomputeForecastBaselines(ctx, "S002")
@@ -443,10 +467,14 @@ func TestForecastEstimates_Idempotent(t *testing.T) {
 	estPig(t, svc, ctx, "S001", "EB-1", "200", splitDay)
 	estPig(t, svc, ctx, "S001", "EB-2", "240", splitDay)
 	estStocktake(t, svc, ctx, "S001", sku, "5", "")
+	estSell(t, svc, "S001", sku, "L-IDEM-1", "34", "680", splitDay.Add(time.Hour))
 
 	_, err := svc.PersistCutCostDaily(ctx, "S001", splitDay)
 	mustNoErr(t, err, "PersistCutCostDaily")
 	first := estKgByPig(t, "S001", model.CutBelly)
+	if len(first) == 0 {
+		t.Fatalf("★ 前提:有销售 ⇒ 应该有估计样本")
+	}
 
 	_, err = svc.PersistCutCostDaily(ctx, "S001", splitDay)
 	mustNoErr(t, err, "PersistCutCostDaily")
@@ -466,6 +494,70 @@ func TestForecastEstimates_Idempotent(t *testing.T) {
 	}
 }
 
+// ---- ⑨ 采集即固化(2026-11-01 owner D8 的核心诉求) ----
+
+// TestForecastEstimates_FrozenAfterCollection ⭐ 锁「采集即固化」。
+//
+// # owner 的原话
+//
+//	「分割基线是不是采集某天数据后，就算修改那天的搬台，猪重都不会影响他的样本库吧，
+//	  如果不影响，那就对了。如果样本不对，我们手动删就行。」
+//
+// ⇒ 本用例直接验这句话：**采集之后**再改搬台 / 改猪重 ⇒ **样本库纹丝不动**。
+//
+// # 判别力自检
+//
+//	把"引擎自动路径不覆盖已有样本"这条去掉(overwrite=true)⇒ 本用例立刻红
+//	(改猪重 200→150 ⇒ 按毛重摊的份额变了 ⇒ 样本值会变)。
+//
+//	把"样本源从倒推改成当日销量"这条去掉 ⇒ 改搬台会改写倒推值 ⇒ 样本也会变 ⇒ 同样红。
+func TestForecastEstimates_FrozenAfterCollection(t *testing.T) {
+	svc, ctx, sku := splitSetup(t)
+	pigID := estPig(t, svc, ctx, "S001", "EB-FRZ", "200", splitDay)
+	estStocktake(t, svc, ctx, "S001", sku, "5", "")
+	estSell(t, svc, "S001", sku, "L-FRZ-1", "30", "600", splitDay.Add(time.Hour))
+
+	// 第一次采集(引擎自动路径)。
+	_, err := svc.PersistCutCostDaily(ctx, "S001", splitDay)
+	mustNoErr(t, err, "PersistCutCostDaily")
+	before := estKgByPig(t, "S001", model.CutBelly)
+	if len(before) != 1 {
+		t.Fatalf("★ 前提:采集后应有 1 条样本, got %d: %+v", len(before), before)
+	}
+
+	// ---- 事后改历史:① 改猪重 ② 补搬台 ----
+	mustNoErr(t, testDBSingleton.Model(&model.WholePig{}).
+		Where("id = ?", pigID).Update("gross_weight_kg", d("150")).Error, "改猪重")
+	_, err = svc.CounterLoad(ctx, "S001", service.CounterLoadInput{
+		Lines: []service.CounterLoadLine{{CubeProductID: sku, QtyKg: d("12")}},
+	}, "u-1")
+	mustNoErr(t, err, "补搬台")
+
+	// 重物化那一天 ⇒ 样本**必须原样不动**。
+	_, err = svc.PersistCutCostDaily(ctx, "S001", splitDay)
+	mustNoErr(t, err, "PersistCutCostDaily(重物化)")
+
+	after := estKgByPig(t, "S001", model.CutBelly)
+	if len(after) != len(before) {
+		t.Fatalf("★ 重物化后样本行数不该变: %d → %d", len(before), len(after))
+	}
+	for pig, kg := range before {
+		got, ok := after[pig]
+		if !ok {
+			t.Fatalf("★ 重物化后 %s 的样本不见了", pig)
+		}
+		if !got.Equal(kg) {
+			t.Errorf("★ 采集即固化:改了搬台/猪重后 %s 的样本不该变: %s → %s", pig, kg, got)
+		}
+	}
+	// 体重段也不该变(它是**采集时**定下的)。
+	for _, r := range estRows(t, "S001") {
+		if r.WeightBand != "200-249" {
+			t.Errorf("★ 采集即固化:体重段不该被事后改的猪重带走, got %q", r.WeightBand)
+		}
+	}
+}
+
 // ---- ⑧ 读取侧:基线列表按 branch_id 过滤 ----
 
 // TestForecastBaselines_ListIsStoreScoped 锁「列基线只列本店的」。
@@ -476,6 +568,7 @@ func TestForecastBaselines_ListIsStoreScoped(t *testing.T) {
 		estPig(t, svc, ctx, "S001", "EB-"+string(rune('A'+i)), "200", splitDay)
 	}
 	estStocktake(t, svc, ctx, "S001", sku, "5", "")
+	estSell(t, svc, "S001", sku, "L-LST-1", "50", "1000", splitDay.Add(time.Hour))
 	_, err := svc.PersistCutCostDaily(ctx, "S001", splitDay)
 	mustNoErr(t, err, "PersistCutCostDaily")
 	_, err = svc.RecomputeForecastBaselines(ctx, "S001")

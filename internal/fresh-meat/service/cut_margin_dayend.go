@@ -1,12 +1,20 @@
-// Package service / cut_margin_dayend.go —— 日终剩余、售罄率、建议毛利(2026-10-31)。
+// Package service / cut_margin_dayend.go —— 日终剩余、售罄率、**参考口径毛利**(2026-11-01 owner 终稿)。
 //
-// # 这三个数分别是什么
+// # 这几个数分别是什么
 //
 //	日终剩余(kg) = **猪肉台日终盘点**的剩余量(柜台实盘,**不含冷库**)
-//	日终剩余(元) = 日终剩余(kg) × 折算进货单价
-//	               折算进货单价 = **零售均价 ÷ (1 + 今日毛利率)**(owner 亲定)
+//	日终剩余(元) = 日终剩余(kg) × **采购均价**
 //	售罄率       = 销售 ÷ (销售 + 日终剩余)
-//	建议毛利     = 营收 − 建议成本单价×零售销量 − 统收成本 − 报损成本 − 搭赠成本 + 预期毛利
+//	参考毛利率 m = (营收 − 采购 + 期末剩余成本) / 营收
+//	参考毛利_c   = 营收_c − 成本单价_c×销量_c − 搭赠成本_c − 报损成本_c
+//	              成本单价_c = 零售均价_c ÷ (1 + m)
+//
+// # 为什么日终剩余的金额改用**采购均价**(2026-11-01 owner)
+//
+//	旧口径是「零售均价 ÷ (1 + 今日毛利率)」倒推 ⇒ 那个价里**含 m**
+//	⇒ 拿它去估值期末库存 ⇒ m 的输入里又出现了 m ⇒ **成环**。
+//	而采购均价**不含 m** ⇒ 天然无环。
+//	⚠️ 也正因为它无环,它才能当 m 的输入(owner:「可以用采购均价计算」)。
 //
 // # 为什么售罄率不再用 sold/purchased
 //
@@ -19,72 +27,16 @@
 //
 //	⇒ **绝不回落成 100%**(那等于告诉门店"全卖完了",而其实不知道)。
 //
-// # 为什么"折算进货单价"和单价基线用同一条公式
+// # ⚠️「建议毛利 / 建议毛利率」已删除(2026-11-01 owner)
 //
-// 单价日样本的倒推(见 forecast_price.go)也是「零售均价 ÷ (1 + 毛利率)」
-// ⇒ 同一套口径 ⇒ 「日终剩余估值」与「单价基线」不会各算各的。
+//	它的定义就是「用建议成本单价再倒推一遍毛利」——而单价列已经给了,
+//	且数学上 m 进去、m′ 出来 ⇒ **永远对不上 header** ⇒ 纯属重复且误导。
+//	⇒ 现在只有**参考毛利**一个口径(见 applyReferenceMargin)。
 package service
 
 import (
 	"github.com/shopspring/decimal"
 )
-
-// foldDownCostPrice 按 owner 口径倒推**进货单价**(元/kg)= 零售均价 ÷ (1 + 毛利率)。
-//
-// ⚠️ 毛利率 ≤ −95%(亏到毛利率比 −1 还狠)⇒ 1+毛利率 ≤ 0.05
-//
-//	⇒ 倒推出来的单价会翻十几倍 ⇒ **不用这个价**(宁可退回全店兜底价)。
-//
-// ⚠️ 均价必须 > 0 ⇒ 没卖过的部位没有自己的均价 ⇒ 由调用方走兜底。
-func foldDownCostPrice(avgPrice, marginRate decimal.Decimal) (decimal.Decimal, bool) {
-	if !avgPrice.IsPositive() {
-		return decimal.Zero, false
-	}
-	divisor := decimal.NewFromInt(1).Add(marginRate)
-	if divisor.LessThanOrEqual(decimal.NewFromFloat(0.05)) {
-		return decimal.Zero, false
-	}
-	return avgPrice.Div(divisor), true
-}
-
-// storeFoldPrice 全店折算进货单价(兜底价)。
-//
-// ⚠️ 全店没有销量(整天没卖)⇒ 算不出来 ⇒ ok=false。
-func storeFoldPrice(mids []cutRollupMid) (decimal.Decimal, bool) {
-	var revenue, soldKg, gm, gmBase decimal.Decimal
-	for _, m := range mids {
-		revenue = revenue.Add(m.revenue)
-		soldKg = soldKg.Add(m.soldKg).Add(m.bulkKg)
-		gm = gm.Add(m.gm)
-		gmBase = gmBase.Add(m.gmBase)
-	}
-	if !soldKg.IsPositive() || gmBase.IsZero() {
-		return decimal.Zero, false
-	}
-	return foldDownCostPrice(revenue.Div(soldKg), gm.Div(gmBase))
-}
-
-// cutFoldPrice 该部位的折算进货单价(元/kg)。
-//
-// 口径:① 该部位自己的「零售均价 ÷ (1 + 该部位毛利率)」
-//
-//	② 兜底:全店折算进货单价
-//
-// ⚠️ **该部位没卖过** ⇒ 没有自己的均价 ⇒ 直接用全店兜底价。
-func cutFoldPrice(m cutRollupMid, storePrice decimal.Decimal, storeOK bool) (decimal.Decimal, bool) {
-	soldKg := m.soldKg.Add(m.bulkKg)
-	if soldKg.IsPositive() && !m.gmBase.IsZero() {
-		avg := m.revenue.Div(soldKg)
-		margin := m.gm.Div(m.gmBase)
-		if price, ok := foldDownCostPrice(avg, margin); ok {
-			return price, true
-		}
-	}
-	if storeOK {
-		return storePrice, true
-	}
-	return decimal.Zero, false
-}
 
 // applyDayEndRemain 回填**日终剩余**(kg/金额)与**售罄率**。
 //
@@ -92,9 +44,10 @@ func cutFoldPrice(m cutRollupMid, storePrice decimal.Decimal, storeOK bool) (dec
 //
 //	⇒ 没有 ⇒ nil(前端显示「—」),**不是 0**。
 //
-// ⚠️ 金额 = 剩余 kg × 折算进货单价;取不到折算价 ⇒ 只给 kg,不给金额。
-func applyDayEndRemain(mids []cutRollupMid, tot *TotalGrossMargin) {
-	storePrice, storeOK := storeFoldPrice(mids)
+// ⚠️ 金额 = 剩余 kg × **采购均价**(不含 m ⇒ 无环;见包注释)。
+//
+//	取不到采购均价(当天没进猪)⇒ 只给 kg,不给金额。
+func applyDayEndRemain(mids []cutRollupMid, tot *TotalGrossMargin, purchaseAvg decimal.Decimal) {
 	var totalRemainKg, totalRemainYuan, totalSoldKg decimal.Decimal
 	hasStocktake := false
 	for i := range mids {
@@ -108,8 +61,8 @@ func applyDayEndRemain(mids []cutRollupMid, tot *TotalGrossMargin) {
 		remainKg := m.src.CounterActualKg
 		m.row.DayEndRemainKg = &remainKg
 		totalRemainKg = totalRemainKg.Add(remainKg)
-		if price, ok := cutFoldPrice(*m, storePrice, storeOK); ok {
-			remainYuan := remainKg.Mul(price)
+		if purchaseAvg.IsPositive() {
+			remainYuan := remainKg.Mul(purchaseAvg)
 			m.row.DayEndRemainYuan = &remainYuan
 			totalRemainYuan = totalRemainYuan.Add(remainYuan)
 		}
@@ -137,55 +90,80 @@ func applyDayEndRemain(mids []cutRollupMid, tot *TotalGrossMargin) {
 	}
 }
 
-// applySuggestedMargin 回填**建议毛利 / 建议毛利率**。
+// applyReferenceMargin 回填**参考口径**的成本单价与毛利(部位 + 全店)。
 //
-// ⚠️ 建议毛利与实际毛利**逐项平行**,只差「零售货的成本口径」:
+// # 全店(头)的参考毛利 —— **不是**各部位之和
 //
-//	建议毛利 = 营收 − 建议成本单价×零售销量 − 统收成本 − 报损成本 − 搭赠成本 + 预期毛利
+//	毛利 = 营收 − 当日采购总额 + 期末猪肉台剩余成本
 //
-// ⚠️ 取不到建议成本单价 ⇒ 该部位的建议毛利**算不出来** ⇒ nil(前端显示「—」)
+// ⚠️ owner 2026-11-01:「header不需要与部位同口径」
 //
-//	⇒ **不用实际销售成本冒充**(那会让「建议」和「实际」长得一样 ⇒ 这一列白做)。
+//	⇒ 部位是"参考值"(产出靠基线估算),头是"总量口径"(总采/总售/总剩余)
+//	⇒ **两者不相等是正常的**,不要为了对得上而把头的口径改成部位之和。
 //
-// ⚠️ **没卖过**的部位不需要单价(零售成本恒 0)⇒ 照样算得出来。
-func applySuggestedMargin(mids []cutRollupMid, tot *TotalGrossMargin) {
-	var sum decimal.Decimal
-	counted := 0
-	partial := false
-	for i := range mids {
-		m := &mids[i]
-		var suggestedSalesCost decimal.Decimal
-		switch {
-		case m.src.SuggestedCostUnitPriceYuan != nil:
-			suggestedSalesCost = m.src.SuggestedCostUnitPriceYuan.Mul(m.soldKg)
-		case m.soldKg.IsZero():
-			suggestedSalesCost = decimal.Zero
-		default:
-			// 卖过、但这个部位**取不到价** ⇒ 建议毛利算不出来。
-			partial = true
-			continue
+// # 部位
+//
+//	成本单价_c = 零售均价_c ÷ (1 + m)      (owner 亲定)
+//	参考毛利_c = 营收_c − 成本单价_c×销量_c − 搭赠成本_c − 报损成本_c
+//
+// ⚠️ m 算不出来(没有完整日终盘点 / 当天没营收)⇒ 全部给 nil(前端「—」),
+//
+//	**绝不回落成 0**(0 会被门店误读成"当天不赚钱")。
+func applyReferenceMargin(mids []cutRollupMid, tot *TotalGrossMargin, m decimal.Decimal,
+	ref ReferenceDayTotals, marginOK bool) {
+	// ---- 全店 ----
+	tot.ReferenceMarginRate = nil
+	tot.ReferenceGrossMarginYuan = nil
+	tot.ReferenceGrossMarginPct = nil
+	tot.ReferenceCostPartial = false
+	tot.PurchasedKg = ref.PurchasedKg
+	tot.PurchasedYuan = ref.PurchasedYuan
+	tot.PurchaseAvgYuan = ref.PurchaseAvgYuan
+	tot.ReferenceRemainKg = ref.RemainKg
+	tot.ReferenceRemainYuan = ref.RemainKg.Mul(ref.PurchaseAvgYuan)
+
+	if !marginOK {
+		// ⚠️ m 算不出来 ⇒ 部位也给不出(成本单价依赖 m)。
+		for i := range mids {
+			mids[i].row.ReferenceCostUnitPriceYuan = nil
+			mids[i].row.ReferenceCostPriceSource = referencePriceSourceNone
+			mids[i].row.ReferenceGrossMarginYuan = nil
+			mids[i].row.ReferenceGrossMarginPct = nil
 		}
-		gm := m.revenue.Sub(suggestedSalesCost).Sub(m.bulkCost).Sub(m.wasteCost).
-			Sub(m.giftCost).Add(m.presaleMargin)
-		m.row.SuggestedGrossMarginYuan = &gm
-		if !m.gmBase.IsZero() {
-			f, _ := gm.Mul(decimal.NewFromInt(100)).Div(m.gmBase).Float64()
-			m.row.SuggestedGrossMarginPct = &f
-		}
-		sum = sum.Add(gm)
-		counted++
-	}
-	// ⚠️ **先**记 partial:一个部位都算不出来时也要让前端知道"缺价",
-	//   否则前端会以为"没有建议毛利"就是"这天毛利是 0"。
-	tot.SuggestedCostPartial = partial
-	if counted == 0 {
-		// 一个部位都算不出来 ⇒ 全店也给不出 ⇒ 前端显示「—」。
 		return
 	}
-	tot.SuggestedGrossMarginYuan = &sum
-	base := sumMid(mids, func(m cutRollupMid) decimal.Decimal { return m.gmBase })
-	if !base.IsZero() {
-		f, _ := sum.Mul(decimal.NewFromInt(100)).Div(base).Float64()
-		tot.SuggestedGrossMarginPct = &f
+
+	rate := m
+	tot.ReferenceMarginRate = &rate
+	// 全店毛利 = 营收 − 采购 + 期末剩余成本。
+	gm := tot.RevenueYuan.Sub(ref.PurchasedYuan).Add(tot.ReferenceRemainYuan)
+	amount := gm
+	pct, _ := gm.Mul(decimal.NewFromInt(100)).Div(tot.RevenueYuan).Float64()
+	tot.ReferenceGrossMarginYuan = &amount
+	tot.ReferenceGrossMarginPct = &pct
+
+	// ---- 部位 ----
+	partial := false
+	for i := range mids {
+		mid := &mids[i]
+		soldAll := mid.soldKg.Add(mid.bulkKg)
+		rc := referencePartCostOf(m, ref.PurchaseAvgYuan, mid.revenue, soldAll,
+			mid.src.GiftKg, mid.src.WasteKg)
+		if !rc.Priceable {
+			partial = true
+			mid.row.ReferenceCostUnitPriceYuan = nil
+			mid.row.ReferenceCostPriceSource = referencePriceSourceNone
+			mid.row.ReferenceGrossMarginYuan = nil
+			mid.row.ReferenceGrossMarginPct = nil
+			continue
+		}
+		unit := rc.UnitPriceYuan
+		gmC := rc.GrossMarginYuan
+		pctC := rc.GrossMarginPct
+		mid.row.ReferenceCostUnitPriceYuan = &unit
+		mid.row.ReferenceCostPriceSource = rc.UnitPriceSource
+		mid.row.ReferenceGrossMarginYuan = &gmC
+		mid.row.ReferenceGrossMarginPct = &pctC
 	}
+	tot.ReferenceCostPartial = partial
 }

@@ -18,7 +18,9 @@ package service_test
 //	R3 当日**总量**短卖才算数(short_sell_kg);
 //	R4 真短卖才结转(累计短卖),且**绝不回写成负库存**;
 //	R5 短卖的那部分货**必须计成本**(不许成本算不出来 ⇒ 不许毛利虚高);
-//	R6 描红(报表出参)+ 阻断审计结转(POST /stock/audit 拒绝、precheck 列出那天)。
+//	R6 描红(报表出参)。
+//	   ⚠️ 2026-11-01 owner：审计端点下线 ⇒ 原 R6 的「阻断审计结转」那半条随之退休
+//	   (锁它的两个用例已删,原因见本文件 TestShortSell_AuditRejected 原来的位置)。
 //
 // # 为什么这些用例必须走**公开 API + 真实 SQLite**
 //
@@ -27,8 +29,6 @@ package service_test
 
 import (
 	"context"
-	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -356,109 +356,14 @@ func TestShortSell_TotalShortSell_Carried(t *testing.T) {
 	ssAssertNoNegativeOpening(t, rep3, "2026-10-31")
 }
 
-// TestShortSell_AuditRejected 锁 **R6②③**(审计结转被拒 + 预检点名)。
+// ⚠️ 2026-11-01 owner：审计结转端点(`/stock/audit` 及其 precheck)已下线
+//   ⇒ 原 R6 的「阻断审计结转」那半条(① `TestShortSell_AuditRejected`：
+//      审计结转被拒 + 预检点名短卖那天；② `TestShortSell_PrecheckReportsMissingStocktakeAndShortSellTogether`：
+//      预检一次报全"缺盘点 + 短卖")**随端点一起退休** —— 它们锁的是端点行为，
+//   不是短卖口径本身。
+//   ⇒ R6 剩余部分(报表描红)仍由本文件其它用例锁定，未受影响。
 //
-// # 场景
-//
-//	10-29:进猪切 belly 20kg、盘点 20kg;
-//	10-30:搬上台 50kg、卖 50kg、盘点 0kg ⇒ 账面只有 20kg ⇒ **短卖 30kg**。
-//
-// # 期望
-//
-//	① **审计结转被拒**(400)且消息点名是哪几天
-//	(⚠️ 两天都有完整日终盘点 ⇒ 拒审的**唯一**理由就是短卖);
-//	② 预检(short_sell_days)列出那天,且 Ready=false。
-//
-// # 判别力
-//
-//	去掉 R6 的审计拦截 ⇒ ① 立刻红(审计会通过)。
-func TestShortSell_AuditRejected(t *testing.T) {
-	svc, ctx := ssSetup(t)
-	svc.SetClock(fmClock(ssDay1))
-	pigID := ssSeedPig(t, svc, ssDay1, "EB-1", map[model.CutType]string{model.CutBelly: "20"})
-	ssStocktake(t, svc, ssDay1, map[model.CutType]string{model.CutBelly: "20"})
-
-	svc.SetClock(fmClock(ssDay2))
-	ssCounterLoad(t, svc, ssDay2, model.CutBelly, "50")
-	ssSell(t, svc, ssDay2, pigID, model.CutBelly, "50", "1500")
-	ssStocktake(t, svc, ssDay2, map[model.CutType]string{model.CutBelly: "0"})
-
-	svc.SetClock(fmClock(ssDay3))
-	// ① 审计结转被拒(400),消息点名哪天。
-	_, err := svc.AuditBusinessDays(ctx, "S001",
-		service.BizAuditInput{CutoffDate: "2026-10-30"}, "u-1")
-	if err == nil {
-		t.Fatalf("★ 有短卖(10-30)的日子不该允许审计结转")
-	}
-	if !errors.Is(err, service.ErrInvalidInput) {
-		t.Errorf("★ 应是输入校验错(⇒ 400), got %v", err)
-	}
-	if !strings.Contains(err.Error(), "2026-10-30") {
-		t.Errorf("★ 报错要点名短卖的是哪几天, got %q", err.Error())
-	}
-	// ② 预检列出短卖的那几天。
-	pre, err := svc.PrecheckBizAudit(ctx, "S001", "2026-10-30")
-	mustNoErr(t, err, "PrecheckBizAudit")
-	if len(pre.ShortSellDays) != 1 || pre.ShortSellDays[0] != "2026-10-30" {
-		t.Errorf("★ 预检应列出短卖的日子 [2026-10-30], got %v", pre.ShortSellDays)
-	}
-	if pre.Ready {
-		t.Errorf("★ 有短卖时预检不该说可以审计结转")
-	}
-}
-
-// TestShortSell_PrecheckReportsMissingStocktakeAndShortSellTogether 锁「两个坑一次报全」。
-//
-// # 场景(生产实测后改的)
-//
-//	10-29:进猪切 belly 20kg、盘点 20kg;
-//	10-30:搬上台 50kg、卖 50kg、**不录盘点单**
-//	⇒ 那天**既缺完整盘点**,**又**有短卖(账面只有 20kg 却卖了 50kg)。
-//
-// # 期望
-//
-//	预检**同时**给出:
-//	① `missing_stocktake_days` 含 2026-10-30;
-//	② `short_sell_days` 含 2026-10-30;
-//	③ error 里**两样都提到**(缺盘点 + 短卖)。
-//
-// # 为什么必须"一次报全"
-//
-//	门店经常同时踩两个坑 ⇒ 只报一个 ⇒ 门店补完盘点再点一次 ⇒ 又冒出短卖
-//	⇒ 来回好几轮才改得完 ⇒ 门店体验极差。
-//
-// # 判别力
-//
-//	把「短卖检查」挪到「缺盘点」的 early return **之后** ⇒ ② 立刻红(短卖日根本没算出来)。
-func TestShortSell_PrecheckReportsMissingStocktakeAndShortSellTogether(t *testing.T) {
-	svc, ctx := ssSetup(t)
-	svc.SetClock(fmClock(ssDay1))
-	pigID := ssSeedPig(t, svc, ssDay1, "EB-1", map[model.CutType]string{model.CutBelly: "20"})
-	ssStocktake(t, svc, ssDay1, map[model.CutType]string{model.CutBelly: "20"})
-
-	// 10-30:搬上台 50kg、卖 50kg,**故意不录盘点单**。
-	svc.SetClock(fmClock(ssDay2))
-	ssCounterLoad(t, svc, ssDay2, model.CutBelly, "50")
-	ssSell(t, svc, ssDay2, pigID, model.CutBelly, "50", "1500")
-
-	svc.SetClock(fmClock(ssDay3))
-	pre, err := svc.PrecheckBizAudit(ctx, "S001", "2026-10-30")
-	mustNoErr(t, err, "PrecheckBizAudit")
-
-	if len(pre.MissingStocktakeDays) == 0 {
-		t.Errorf("★ 10-30 没录盘点单 ⇒ 缺盘点清单里必须有它: %+v", pre)
-	}
-	if len(pre.ShortSellDays) == 0 {
-		t.Errorf("★ 10-30 卖了 50kg 而账面只有 20kg ⇒ 短卖清单里必须有它"+
-			"(缺盘点的 early return 把它吞掉了 ⇒ 门店得来回好几轮才改得完): %+v", pre)
-	}
-	if !strings.Contains(pre.Error, "短卖") {
-		t.Errorf("★ 提示里要点名短卖: %q", pre.Error)
-	}
-	if pre.Ready {
-		t.Errorf("★ 两个坑都在 ⇒ 不该说可以审计")
-	}
-}
+// (原 R6 全文) R6 描红(报表出参)+ 阻断审计结转(POST /stock/audit 拒绝、precheck 列出那天)。
 
 // TestShortSell_ClampNonNegative 锁「读到负的期末 ⇒ 裁成 0(kg 与金额一起)」。
 //

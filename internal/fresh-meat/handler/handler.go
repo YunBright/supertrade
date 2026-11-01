@@ -125,19 +125,9 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/stock/openings", requireBranch, h.ListStockOpenings)
 	r.PUT("/stock/openings", requireBranch, h.SaveStockOpenings)
 	r.DELETE("/stock/openings", requireBranch, h.DeleteStockOpening)
-	// POST /stock/audit —— **审计结转**(指定截止日期):
-	//   截止日期及之前的每日日终盘点必须齐全 ⇒ 通过则落快照并**冻结**(不能再补录)。
-	//   审计同时做**预期毛利(预售)结转** + **重放截止日之后的动作** + 校准当前余额。
-	r.POST("/stock/audit", requireBranch, h.AuditBusinessDays)
-	// GET /stock/audit —— 审计状态(最近一次截止日 + 历次审计)。
-	r.GET("/stock/audit", requireBranch, h.GetBizAuditStatus)
-	// GET /stock/audit/precheck —— **审计前**的预检(条件 / 结余 / 预期毛利测算 / 提示文案)。
-	r.GET("/stock/audit/precheck", requireBranch, h.PrecheckBizAudit)
-	// GET /stock/presale —— **预期毛利(预售结转)**明细(按部位 / 按 SKU / 按猪)。
-	r.GET("/stock/presale", requireBranch, h.ListPresale)
-	// PUT /stock/presale —— 改**已审计**那一天的预售单价(门店审计人的人工修改;
-	// 每次改都留痕,并自动重算毛利 / 按猪分摊 / 重放截止日之后的天)。
-	r.PUT("/stock/presale", requireBranch, h.UpdatePresale)
+	// ⚠️ 2026-11-01 owner：审计结转(`/stock/audit` ×3)、预期毛利(`/stock/presale` ×2)端点已下线。
+	//   账面链改为「实时可改」：不再有快照冻结，不再有预售结转写入口。
+	//   历史 `biz_audits` / `cut_presale_settlements` 行仍保留，仅供余额链基线与期末重估只读。
 	// GET /stock/bags —— 袋子(标签号)清单:冷库里有哪些袋、标签号是什么。
 	r.GET("/stock/bags", requireBranch, h.ListStockBags)
 	r.GET("/stock", requireBranch, h.ListStock)
@@ -166,8 +156,9 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.POST("/bulk-settlements", requireBranch, h.CreateBulkSettlement)
 	r.GET("/bulk-balances", requireBranch, h.ListBulkBalances)
 
-	// 长期毛利(周/月/季)
-	r.GET("/gross-margin/period", requireBranch, h.ComputePeriodMargin)
+	// **长期毛利页(全店口径)**(2026-11-01 owner 拍板:专门建一个)
+	// —— 期间口径含**冷库量**;每日毛利看板故意不含冷库 ⇒ 跨期才平。
+	r.GET("/long-term-margin", requireBranch, h.ComputeLongTermMargin)
 
 	// 分割重量统计基线(替掉 LLM 做数值回归)
 	r.GET("/forecast-baselines", requireBranch, h.ListForecastBaselines)
@@ -940,121 +931,10 @@ func (h *Handler) DeleteStockOpening(c *gin.Context) {
 	c.JSON(http.StatusOK, out)
 }
 
-// AuditBusinessDays POST /stock/audit
-//
-// **审计结转**:指定截止日期 ⇒ 该日期及之前的每日日终盘点必须齐全,
-// 通过则落快照(=结转)并**冻结**(截止日期及之前不能再改,含补录)。
-func (h *Handler) AuditBusinessDays(c *gin.Context) {
-	branchID := middleware.SingleBranchFromCtx(c)
-	if !h.requireScope(c, branchID, "freshmeat:write") {
-		return
-	}
-	var in service.BizAuditInput
-	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
-		return
-	}
-	cl, _ := claims.FromContext(c.Request.Context())
-	out, err := h.svc.AuditBusinessDays(c.Request.Context(), branchID, in, actorIDFromClaims(cl))
-	if err != nil {
-		mapErr(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, out)
-}
-
-// GetBizAuditStatus GET /stock/audit
-//
-// 审计状态:最近一次截止日(该日及之前已冻结)+ 历次审计。
-func (h *Handler) GetBizAuditStatus(c *gin.Context) {
-	branchID := middleware.SingleBranchFromCtx(c)
-	if !h.requireScope(c, branchID, "freshmeat:view") {
-		return
-	}
-	out, err := h.svc.GetBizAuditStatus(c.Request.Context(), branchID)
-	if err != nil {
-		mapErr(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, out)
-}
-
-// PrecheckBizAudit GET /stock/audit/precheck?cutoff_date=YYYY-MM-DD
-//
-// 审计**前**的预检:条件是否满足(缺哪几天的日终盘点)、本次会不会产生结余、
-// 预期毛利(预售结转)的测算、审计提示文案。
-//
-// ⚠️ 审计是**不可逆**的一刀 ⇒ 门店应当在按下确认之前看到这些。
-func (h *Handler) PrecheckBizAudit(c *gin.Context) {
-	branchID := middleware.SingleBranchFromCtx(c)
-	if !h.requireScope(c, branchID, "freshmeat:view") {
-		return
-	}
-	cutoff := strings.TrimSpace(c.Query("cutoff_date"))
-	if cutoff == "" {
-		writeError(c, http.StatusBadRequest, "bad_request", "cutoff_date 必填(YYYY-MM-DD)")
-		return
-	}
-	out, err := h.svc.PrecheckBizAudit(c.Request.Context(), branchID, cutoff)
-	if err != nil {
-		mapErr(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, out)
-}
-
-// ListPresale GET /stock/presale?date=YYYY-MM-DD
-//
-// 某个营业日的**预期毛利(预售结转)**明细:按部位 / 按 SKU / 按猪。
-func (h *Handler) ListPresale(c *gin.Context) {
-	branchID := middleware.SingleBranchFromCtx(c)
-	if !h.requireScope(c, branchID, "freshmeat:view") {
-		return
-	}
-	day, err := h.parseDay(c.Query("date"))
-	if err != nil {
-		writeError(c, http.StatusBadRequest, "bad_date", err.Error())
-		return
-	}
-	out, err := h.svc.ListPresale(c.Request.Context(), branchID, day)
-	if err != nil {
-		mapErr(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, out)
-}
-
-// UpdatePresale PUT /stock/presale
-//
-// **改已审计那一天的预售单价**(门店审计人的人工修改)。
-//
-// ⚠️ 冻结的是**源数据**与**成本口径快照**;预售价是「审计结转」这个**产物**的
-// 一项(审计人拍板"这批货按什么价卖掉")⇒ 改它是**修正审计结论**。
-// 每次改都留痕(cut_presale_edits)⇒ 改完自动重算毛利 / 按猪分摊 /
-// 重放截止日之后的天 / 校准当前余额。
-func (h *Handler) UpdatePresale(c *gin.Context) {
-	branchID := middleware.SingleBranchFromCtx(c)
-	if !h.requireScope(c, branchID, "freshmeat:write") {
-		return
-	}
-	var in service.UpdatePresaleInput
-	if err := c.ShouldBindJSON(&in); err != nil {
-		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
-		return
-	}
-	cl, _ := claims.FromContext(c.Request.Context())
-	out, err := h.svc.UpdatePresale(
-		c.Request.Context(),
-		branchID,
-		in,
-		actorIDFromClaims(cl),
-	)
-	if err != nil {
-		mapErr(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, out)
-}
+// ⚠️ 2026-11-01 owner：审计结转（AuditBusinessDays / GetBizAuditStatus / PrecheckBizAudit）
+//   与预期毛利（ListPresale / UpdatePresale）五组 handler 已随端点一并下线。
+//   账面链改为「实时可改」：无快照冻结、无预售结转写入口。
+//   替代口径：长期毛利用 GET /long-term-margin（ComputeLongTermMargin，已上线，勿动）。
 
 // ListStockBags GET /stock/bags?location=&label=
 //
@@ -1291,8 +1171,17 @@ func (h *Handler) ListBulkBalances(c *gin.Context) {
 
 // ---- 长期毛利 ----
 
-// ComputePeriodMargin GET /gross-margin/period?from=&to=&group_by=day|cut|sku
-func (h *Handler) ComputePeriodMargin(c *gin.Context) {
+// ⚠️ 2026-11-01 owner：账面期间毛利端点 GET /gross-margin/period 已下线。
+//   原因：它走**账面口径**(移动加权链)⇒ 依赖分割重量，随账面链一起退休。
+//   替代口径：GET /long-term-margin（全店口径，零分割假设，长期有效）。
+
+// ComputeLongTermMargin GET /long-term-margin?from=YYYY-MM-DD&to=YYYY-MM-DD
+//
+// # 口径说明
+//
+//	全店口径(营收/采购/冷库)⇒ 零分割假设 ⇒ 长期有效
+//	且**含冷库量**(owner:「冷库量只在长期毛利页单独展示」)
+func (h *Handler) ComputeLongTermMargin(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "freshmeat:view") {
 		return
@@ -1312,7 +1201,7 @@ func (h *Handler) ComputePeriodMargin(c *gin.Context) {
 		}
 		from = fromT.AddDate(0, 0, -29).Format("2006-01-02")
 	}
-	out, err := h.svc.ComputePeriodMargin(c.Request.Context(), branchID, from, to, c.Query("group_by"))
+	out, err := h.svc.ComputeLongTermMargin(c.Request.Context(), branchID, from, to)
 	if err != nil {
 		mapErr(c, err)
 		return
@@ -1510,7 +1399,8 @@ func (h *Handler) DeleteForecastPriceSample(c *gin.Context) {
 // 入参 {"cut_type":"liver"}
 //
 // ⚠️ 这一步要调 LLM(10~30s)⇒ 只在**门店主动触发**时跑,
-//   绝不放进报表路径(会把毛利看板拖到超时)。
+//
+//	绝不放进报表路径(会把毛利看板拖到超时)。
 func (h *Handler) RefreshCutUnitPrice(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "freshmeat:write") {
@@ -1529,7 +1419,7 @@ func (h *Handler) RefreshCutUnitPrice(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"cut_type":       string(in.CutType),
+		"cut_type":        string(in.CutType),
 		"unit_price_yuan": price,
 	})
 }

@@ -83,9 +83,10 @@ func (s *Service) dropChainExternalRecords(ctx context.Context, tx *gorm.DB, bra
 	loc := s.bizTZOrUTC()
 	start, end := s.businessDayBounds(mustParseDateInLoc(chainStartKey, loc))
 
-	// ⚠️ **冻结期不许碰**:已审计结转的期间是不可逆的(见 assertNotAudited)
-	//   ⇒ 哪怕它落在链起点之前,也不能删。
-	//   (链起点 = 最早的期初生效日 ⇒ 可能早于冻结期 ⇒ 那种情况下只清"没冻结"的部分。)
+	// ⚠️ **历史审计期不许碰**:即便它落在链起点之前,也不能删。
+	//   (链起点 = 最早的期初生效日 ⇒ 可能早于最后一次审计的截止日 ⇒ 那种情况下只清"没审计过"的部分。)
+	//   ⚠️ 2026-11-01 owner：审计端点已下线 ⇒ 这里读的是**历史** `biz_audits` 行
+	//     (只读锚点，见 audit_history.go)，不再是"可写入的冻结期"。
 	frozen := frozenKey
 
 	// ---- ① 搬台(biz_date <= 链起点)----

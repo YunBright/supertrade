@@ -87,17 +87,26 @@ func priceSetup(t *testing.T) (*service.Service, string) {
 // ⚠️ 这是 owner 2026-10-31 亲口定的口径(统计栏「日终剩余」那一格:
 // 「用零售均价/(1+今日毛利率)」)⇒ 单价样本的倒推**必须**跟它一致。
 //
-// 数据:营收 100、销量 10kg ⇒ 零售单价 10;销售成本 70 ⇒ 整体毛利率 30%
-// ⇒ 倒推的进货单价 = 10 ÷ 1.3 = **7.6923… 元/kg**。
+// # ⚠️ 2026-11-01:整体毛利率改用**参考口径**
+//
+//	m = (营收 − 当日采购 + 期末猪肉台剩余×采购均价) / 营收
+//
+//	⇒ 这里:买 146kg @ 10 元 = 1460 元(均价 10);营收 1000;台面剩 76kg
+//	⇒ m = (1000 − 1460 + 760) / 1000 = **0.30**
+//	⇒ 零售均价 = 1000 ÷ 100 = 10 ⇒ 倒推进货单价 = 10 ÷ 1.3 = **7.6923… 元/kg**。
+//
+// ⚠️ 判别力:把剩余成本那一项去掉 ⇒ m = −0.46 ⇒ 整天不产样本 ⇒ 本用例必红。
 func TestPrice_SampleDerivesCostPrice(t *testing.T) {
 	svc, branch := priceSetup(t)
-	pricePig(t, "PIG-1", "100", "14.6", priceDay)
+	pricePig(t, "PIG-1", "146", "10", priceDay)
 
 	rows := []service.CutDailyCost{{
-		CutType:       model.CutBelly,
-		SoldKg:        d("10"),
-		RevenueYuan:   d("100"),
-		SalesCostYuan: d("70"),
+		CutType:         model.CutBelly,
+		SoldKg:          d("100"),
+		RevenueYuan:     d("1000"),
+		SalesCostYuan:   d("700"),
+		DataSource:      "actual",
+		CounterActualKg: d("76"),
 	}}
 	res, err := service.CollectCutPriceSamplesForTest(t.Context(), svc, branch, priceDay, rows)
 	mustNoErr(t, err, "CollectCutPriceSamples")
@@ -114,7 +123,7 @@ func TestPrice_SampleDerivesCostPrice(t *testing.T) {
 		t.Errorf("★ 零售单价应是 10,got %s", got.RetailPriceYuan)
 	}
 	if !got.MarginRate.Equal(d("0.3")) {
-		t.Errorf("★ 整体毛利率应是 0.3,got %s", got.MarginRate)
+		t.Errorf("★ 整体毛利率应是 0.3(参考口径),got %s", got.MarginRate)
 	}
 	if !priceEq(got.CostPriceYuan, d("10").Div(d("1.3"))) {
 		t.Errorf("★ 倒推进货单价应是 10 ÷ 1.3(owner 口径),got %s", got.CostPriceYuan)
@@ -145,10 +154,13 @@ func priceEq(got, want decimal.Decimal) bool {
 // ⇒ 也就没有基线 ⇒ 应用时走退取链。
 func TestPrice_NoSaleCutHasNoSample(t *testing.T) {
 	svc, branch := priceSetup(t)
-	pricePig(t, "PIG-1", "100", "14.6", priceDay)
+	pricePig(t, "PIG-1", "146", "10", priceDay)
 
 	rows := []service.CutDailyCost{
-		{CutType: model.CutBelly, SoldKg: d("10"), RevenueYuan: d("100"), SalesCostYuan: d("70")},
+		{
+			CutType: model.CutBelly, SoldKg: d("100"), RevenueYuan: d("1000"),
+			SalesCostYuan: d("700"), DataSource: "actual", CounterActualKg: d("76"),
+		},
 		// 猪肝:只搭赠、没卖出 ⇒ 销量 0 ⇒ 不该有样本。
 		{CutType: model.CutLiver, SoldKg: d("0"), RevenueYuan: d("0"), SalesCostYuan: d("0")},
 	}
@@ -173,21 +185,29 @@ func TestPrice_NoSaleCutHasNoSample(t *testing.T) {
 
 // TestPrice_InvalidMarginProducesNoSample 锁「整体毛利率不可用 ⇒ 整天不产样本」。
 //
-// 成本算不出来的那天(销售成本 ≈ 0)会让毛利率接近 100% ⇒ 倒推出的单价接近零售价
-// ⇒ 这样的样本会把基线教歪 ⇒ **宁缺毋滥**。
+// ⚠️ 2026-11-01:整体毛利率改用**参考口径** m = (营收 − 采购 + 剩余×采购均价) / 营收。
+//
+//	⇒ 越界也按新口径构造(买 146kg @ 10 = 1460 元,均价 10):
+//	- m ≤ 0:台面剩 0kg ⇒ m = (1000 − 1460) / 1000 = **−0.46**;
+//	- m ≥ 0.95:台面剩 150kg ⇒ m = (1000 − 1460 + 1500) / 1000 = **1.04**;
+//	- 没有营收 ⇒ m 算不出来。
+//
+// 越界 ⇒ 倒推出的单价会把基线教歪 ⇒ **宁缺毋滥**。
 func TestPrice_InvalidMarginProducesNoSample(t *testing.T) {
 	svc, branch := priceSetup(t)
-	pricePig(t, "PIG-1", "100", "14.6", priceDay)
+	pricePig(t, "PIG-1", "146", "10", priceDay)
 
 	for _, tc := range []struct {
 		name string
 		rows []service.CutDailyCost
 	}{
-		{"毛利率为 0(成本算错)", []service.CutDailyCost{{
-			CutType: model.CutBelly, SoldKg: d("10"), RevenueYuan: d("100"), SalesCostYuan: d("100"),
+		{"毛利率为负(采购远大于营收)", []service.CutDailyCost{{
+			CutType: model.CutBelly, SoldKg: d("100"), RevenueYuan: d("1000"),
+			DataSource: "actual", CounterActualKg: d("0"),
 		}}},
-		{"毛利率 95%(成本几乎为 0)", []service.CutDailyCost{{
-			CutType: model.CutBelly, SoldKg: d("10"), RevenueYuan: d("100"), SalesCostYuan: d("5"),
+		{"毛利率超过 95%(剩余算不回来)", []service.CutDailyCost{{
+			CutType: model.CutBelly, SoldKg: d("100"), RevenueYuan: d("1000"),
+			DataSource: "actual", CounterActualKg: d("150"),
 		}}},
 		{"当天没有营收", []service.CutDailyCost{{
 			CutType: model.CutBelly, SoldKg: d("0"), RevenueYuan: d("0"),

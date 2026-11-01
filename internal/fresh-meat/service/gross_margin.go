@@ -131,30 +131,12 @@ type GrossMarginReport struct {
 	// Alerts 是**红字告警**(门店口径:「修改值造成负库存时,需要在每日毛利的 alert 上
 	// 红字显示」)⇒ 前端直接标红,不要吞掉。
 	Alerts []MarginAlert `json:"alerts,omitempty"`
-	// Presale 是**预期毛利(预售结转)**明细(审计日才有;其余日子不返)。
-	//
-	// ⚠️ 它的金额**已经含在** PerCut / Total 的毛利里(期末结余按预期售价重估)
-	//   ⇒ 这一节是"把预期毛利单独列出来给门店看",不是再加一次。
-	Presale *PresaleView `json:"presale,omitempty"`
-	// PresaleHint 是**悬浮提示**用的数据(前端直接显示,不用自己拼)。
-	//
-	// 门店口径:「显示全部毛利(含预期毛利),鼠标悬浮时显示含多少预期毛利」
-	// ⇒ 页面上的毛利 = Total.GrossMarginYuan(**已含**预期毛利);
-	//   悬浮提示 = 本 Hint 里的 Text(含金额)。
-	PresaleHint *PresaleHint `json:"presale_hint,omitempty"`
-	GeneratedAt time.Time    `json:"generated_at"`
-}
-
-// PresaleHint 毛利里的**预期毛利**占比(悬浮提示用)。
-type PresaleHint struct {
-	// GrossMarginYuan 是本期毛利(**已含**预期毛利)。
-	GrossMarginYuan decimal.Decimal `json:"gross_margin_yuan"`
-	// PresaleMarginYuan 是其中**预期毛利**的金额(负数 = 预估亏本)。
-	PresaleMarginYuan decimal.Decimal `json:"presale_margin_yuan"`
-	// ExpectedRevenueYuan 是预售的**预期收入**(不是现金收入)。
-	ExpectedRevenueYuan decimal.Decimal `json:"expected_revenue_yuan"`
-	// Text 是可直接显示的一句话。
-	Text string `json:"text"`
+	// ⚠️ 2026-11-01 owner：预期毛利(预售结转)端点下线 ⇒ `presale` 明细与 `presale_hint`
+	//   悬浮提示两节随之删除(它们的数据源是已退役的预售结转视图)。
+	//   部位行 / 汇总行上的 `presale_margin_yuan`、`presale_expected_revenue_yuan`、
+	//   `presale_expected_unit_yuan` **仍然保留** —— 那是账面字段(期末结余按预期售价重估的结果)，
+	//   不是预售结转视图；下一张卡才随账面链一起清理。
+	GeneratedAt time.Time `json:"generated_at"`
 }
 
 // MarginAlert 每日毛利的**红字告警**。
@@ -322,16 +304,36 @@ type PerCutGrossMargin struct {
 	//
 	// ⚠️ nil = 当天没有完整日终盘点(分母算不出来) ⇒ 前端显示「—」。
 	SellThroughRate *float64 `json:"sell_through_rate,omitempty"`
-	// SuggestedGrossMarginYuan 是该部位的**建议毛利**(元)——
-	// 「如果今天的货按**建议成本单价**算,这刀货能赚多少」。
+	// ---- 参考口径（2026-11-01 owner 终稿）----
 	//
-	// ⚠️ 与实际毛利**逐项平行**,只差「零售货的成本口径」:
-	//	建议毛利 = 营收 − 建议成本单价×零售销量 − 统收成本 − 报损成本 − 搭赠成本 + 预期毛利
-	// ⚠️ nil = 这个部位**取不到建议成本单价**且当天**卖过** ⇒ 算不出来 ⇒ 前端显示「—」。
-	SuggestedGrossMarginYuan *decimal.Decimal `json:"suggested_gross_margin_yuan,omitempty"`
-	// SuggestedGrossMarginPct 是**建议毛利率**(%)—— 分母与实际毛利率一致
-	// (营收 + 预售预期收入)⇒ 两行可以横向比。
-	SuggestedGrossMarginPct *float64        `json:"suggested_gross_margin_pct,omitempty"`
+	// ⚠️ **owner 2026-11-01 明确要求删掉「建议毛利 / 建议毛利率」**:
+	//	它们的定义就是「用建议成本单价再倒推一遍毛利」——而单价列已经给了,
+	//	且数学上 m 进去、m′ 出来 ⇒ **永远对不上 header** ⇒ 纯属重复且误导。
+	//	⇒ 部位毛利改成**参考口径**(下面三个字段)。
+	//
+	// ReferenceCostUnitPriceYuan 是该部位的**参考成本单价**(元/kg)
+	// = **零售均价 ÷ (1 + 当日总毛利率)**(owner 亲定)。
+	//
+	// ⚠️ **完全不需要分割重量假设** ⇒ 切割不准也不会污染它
+	//	(账面口径的移动加权单价依赖期初快照 ⇒ 一次历史漏记会被放大成假短卖)。
+	//
+	// ⚠️ nil = 取不到价(既没卖过、全店也没有采购均价)⇒ 前端显示「—」。
+	ReferenceCostUnitPriceYuan *decimal.Decimal `json:"reference_cost_unit_price_yuan,omitempty"`
+	// ReferenceCostPriceSource 是参考成本单价的来源:
+	// retail_backout(零售均价÷(1+m))| purchase_avg(全店采购均价兜底)| none(没有)。
+	//
+	// ⚠️ 门店要看得见这个价**怎么来的** ⇒ 前端写在悬浮提示里。
+	ReferenceCostPriceSource string `json:"reference_cost_price_source,omitempty"`
+	// ReferenceGrossMarginYuan 是该部位的**参考毛利**(元):
+	//	营收 − 成本单价×销量 − 搭赠成本 − 报损成本。
+	//
+	// ⚠️ **与全店 header 的毛利不必相等**(owner:「header不需要与部位同口径」):
+	//	部位的**产出是基线估算的**,而 header 是总采/总售/总剩余算出来的
+	//	⇒ 两者本就不该有恒等关系。
+	// ⚠️ nil = 这个部位取不到成本单价 ⇒ 算不出来 ⇒ 前端显示「—」。
+	ReferenceGrossMarginYuan *decimal.Decimal `json:"reference_gross_margin_yuan,omitempty"`
+	// ReferenceGrossMarginPct 是**参考毛利率**(%)—— 分母 = 营收。
+	ReferenceGrossMarginPct *float64        `json:"reference_gross_margin_pct,omitempty"`
 	RevenueYuan             decimal.Decimal `json:"revenue_yuan"`
 	// ⚠️ 改名(2026-10-23):旧字段 `purchase_cost_yuan` 是"按消耗比例摊销的猪采购成本";
 	// 新字段是**本期销售成本**(移动加权结转)—— 两者语义不同,不是同一个数。
@@ -424,16 +426,47 @@ type TotalGrossMargin struct {
 	//
 	// ⚠️ nil = 当天没有完整日终盘点 ⇒ 前端显示「—」(不是 100%)。
 	SellThroughRate *float64 `json:"sell_through_rate,omitempty"`
-	// SuggestedGrossMarginYuan 是全店**建议毛利**(元)—— 各部位之和。
+	// ---- 参考口径（2026-11-01 owner 终稿）----
 	//
-	// ⚠️ **部分**部位取不到建议成本单价时,这里只累加**算得出来**的部分
-	//   ⇒ 必须同时看 [SuggestedCostPartial] ⇒ 前端要提示"部分部位未计入"。
-	SuggestedGrossMarginYuan *decimal.Decimal `json:"suggested_gross_margin_yuan,omitempty"`
-	// SuggestedGrossMarginPct 是全店**建议毛利率**(%)。
-	SuggestedGrossMarginPct *float64 `json:"suggested_gross_margin_pct,omitempty"`
-	// SuggestedCostPartial = true ⇒ **有部位取不到建议成本单价** ⇒
-	// [SuggestedGrossMarginYuan] 是**不完整**的(部分成本没算进去)。
-	SuggestedCostPartial bool `json:"suggested_cost_partial,omitempty"`
+	// ⚠️ **owner 2026-11-01 明确要求删掉「建议毛利 / 建议毛利率」** ⇒ 见下面这一组。
+	//
+	// ReferenceGrossMarginYuan 是**全店参考毛利**(元):
+	//
+	//	营收 − 当日采购总额 + 期末猪肉台剩余成本
+	//
+	// ⚠️ **期初剩余 = 0**:夜里柜台清空、货回冷库 ⇒ **冷库才是跨日结转的位置**
+	//   ⇒ 冷库归「长期毛利」(owner:「冷库余额链…在长期毛利里」),单日口径不含它。
+	// ⚠️ **剩余 → 0 时 m = (营收 − 采购)/营收 ⇒ 精确**(owner 的收敛判据)。
+	// ⚠️ **与各部位参考毛利之和不相等**(owner:「header不需要与部位同口径」)⇒ 正常。
+	// ⚠️ nil = 当天没有完整日终盘点(剩余算不出来)⇒ 前端显示「—」(不是 0)。
+	ReferenceGrossMarginYuan *decimal.Decimal `json:"reference_gross_margin_yuan,omitempty"`
+	// ReferenceGrossMarginPct 是**全店参考毛利率**(%)。
+	ReferenceGrossMarginPct *float64 `json:"reference_gross_margin_pct,omitempty"`
+	// ReferenceMarginRate 是**当日总毛利率** m(小数,0.22 = 22%)——
+	// 倒推部位成本单价的那个输入。nil = 算不出来(同上)。
+	ReferenceMarginRate *decimal.Decimal `json:"reference_margin_rate,omitempty"`
+	// ReferenceCostPartial = true ⇒ **有部位取不到参考成本单价**
+	// ⇒ 各部位参考毛利是**不完整**的(前端要提示"部分部位未计入")。
+	ReferenceCostPartial bool `json:"reference_cost_partial,omitempty"`
+	// ---- 参考口径的输入(让门店能自己验算)----
+	//
+	// PurchasedKg / PurchasedYuan 是当日进店的猪的合计(总采)。
+	PurchasedKg   decimal.Decimal `json:"purchased_kg"`
+	PurchasedYuan decimal.Decimal `json:"purchased_yuan"`
+	// PurchaseAvgYuan 是**采购均价**(元/kg)= 采购金额 ÷ 采购重量
+	// ⇒ 它是**期末剩余成本**的估值价(owner:「可以用采购均价计算」)。
+	PurchaseAvgYuan decimal.Decimal `json:"purchase_avg_yuan"`
+	// ReferenceRemainKg / ReferenceRemainYuan 是**期末猪肉台剩余**(kg/元)
+	// —— **不含冷库**(owner:「总剩余不含冷库」)。
+	ReferenceRemainKg   decimal.Decimal `json:"reference_remain_kg"`
+	ReferenceRemainYuan decimal.Decimal `json:"reference_remain_yuan"`
+	// YieldRate 是**出成率** = 真实切分产出 ÷ 当日进货毛重。
+	//
+	// ⚠️ **> 100% ⇒ 有问题,要去查**(owner 2026-11-01):
+	//	真实产出是**台面恒等式**解出来的(纯事实:台面实盘 + 销售 + 搭赠 + 统收 + 报损 − 搬上台)
+	//	⇒ >100% 说明**搬台没登记**或**盘点漏了部位**(生产实测 店 00 10-30 = 106.4%)。
+	// ⚠️ nil = 算不出来(没有完整日终盘点 / 当天没进猪)⇒ 前端显示「—」。
+	YieldRate *float64 `json:"yield_rate,omitempty"`
 }
 
 // ComputeGrossMargin 按 (branchID, day) 算毛利。
@@ -458,7 +491,18 @@ func (s *Service) ComputeGrossMargin(ctx context.Context, branchID string, day t
 	recon, losses := cd.recon, cd.losses
 	promoAlloc := allocatePromo(promoRowsOf(cutRows))
 
-	perCut, total := rollUpPerCutCuts(cutRows, promoAlloc)
+	// ---- 参考口径的当日输入(总采 + 期末猪肉台剩余)----
+	//
+	// ⚠️ 这两项**都来自分割之外的来源**(猪 / 盘点单)⇒ 切割不准也不影响参考毛利。
+	// ⚠️ 采集失败**不阻断**报表(账面口径那一套还能出数)⇒ 只降级成"参考口径不可算"。
+	refTotals, refErr := s.referenceDayTotalsOf(ctx, branchID, day, cutRows)
+	if refErr != nil {
+		s.pubLogger.Warn("ComputeGrossMargin: 采集参考口径输入失败(参考毛利显示「—」)",
+			"branch_id", branchID, "biz_date", day.In(s.bizTZOrUTC()).Format("2006-01-02"), "err", refErr)
+		refTotals = ReferenceDayTotals{}
+	}
+
+	perCut, total := rollUpPerCutCuts(cutRows, promoAlloc, refTotals)
 
 	dataSource := dataSourceEstimated
 	isComplete := false
@@ -473,22 +517,9 @@ func (s *Service) ComputeGrossMargin(ctx context.Context, branchID string, day t
 		}
 	}
 
-	// 预期毛利(预售结转):只有做过结转的营业日才有 ⇒ 没有就不挂这一节。
-	var presale *PresaleView
-	if pv, err := s.ListPresale(ctx, branchID, day); err == nil && len(pv.Rows) > 0 {
-		presale = pv
-	}
-	// 悬浮提示:毛利里的预期毛利占比。
-	var hint *PresaleHint
-	if presale != nil && !total.PresaleMarginYuan.IsZero() {
-		hint = &PresaleHint{
-			GrossMarginYuan:     total.GrossMarginYuan,
-			PresaleMarginYuan:   total.PresaleMarginYuan,
-			ExpectedRevenueYuan: total.PresaleExpectedRevenueYuan,
-			Text: fmt.Sprintf("毛利 %s 元中含预期毛利 %s 元(结余按当前售价结转;实际售价与预期售价的差额落在下一期)",
-				total.GrossMarginYuan.String(), total.PresaleMarginYuan.String()),
-		}
-	}
+	// ⚠️ 2026-11-01 owner：预期毛利(预售结转)端点下线 ⇒ 这里不再挂「预售明细」与
+	//   「悬浮提示」两节(它们的唯一数据源 `ListPresale` 已随端点退役)。
+	//   账面口径不变：部位行/汇总行上的 `presale_*` 字段仍按预期售价重估填充。
 
 	// 销售来源(2026-10-26):让门店看得见"收入是从哪读出来的"。
 	salesSource, salesSourceNote, err := s.salesSourceOf(ctx, branchID)
@@ -547,8 +578,6 @@ func (s *Service) ComputeGrossMargin(ctx context.Context, branchID string, day t
 		Losses:             *losses,
 		PromoAllocation:    promoAlloc,
 		Alerts:             s.buildCutMarginAlerts(ctx, branchID, day, cutRows),
-		Presale:            presale,
-		PresaleHint:        hint,
 		GeneratedAt:        s.now(),
 	}, nil
 }

@@ -9,7 +9,7 @@ package service_test
 //	① 余额链逐日自洽：冷库 = 上期 + 结转 − 搬上台 − 大宗出库 + 大宗进冷库；
 //	② 袋子水位不超卖：零售 + 大宗**共用** consumed_kg ⇒ 同一批货不被卖两遍；
 //	③ 队列剩余与冷库余额是**同一本账**（差额 = 0）—— 差了就说明"记了两本账"；
-//	④ 审计把**实时算**的结论固化成快照（数字不因审计而变）+ 冻结生效；
+//	④ 审计结转已下线 ⇒ **不再有冻结期**（历史营业日仍可改；账面链实时可算）；
 //	⑤ 跨日**顺序校验**：前一天没盘点 ⇒ 今天不能录猪/搬台（且错误点名要补哪天）。
 //
 // # 跑在哪
@@ -25,7 +25,10 @@ package service_test
 //	  ③ 搬台：把**前一天的袋子整袋搬上猪肉台**（门店口径：整袋搬）
 //	  ④ 零售：卖五花 10kg（POS 事件 ⇒ 毛利按 FIFO 归摊到猪）
 //	  ⑤ 日终盘点：五花剩 10kg（贴标签）+ 板油 10kg（不装袋）⇒ 夜里进冷库
-//	10-07：统收结算把攒着的板油结掉 30kg（6 元/kg）→ 审计结转（截止 10-07）
+//	10-07：统收结算把攒着的板油结掉 30kg（6 元/kg）
+//
+// ⚠️ 2026-11-01 owner：审计结转端点(`/stock/audit`)与预期毛利端点(`/stock/presale`)已下线
+//   ⇒ 本文件原来「先审计拿快照再核对余额链」「审计后一切改动被拒」两段已随之改写。
 
 import (
 	"context"
@@ -168,31 +171,29 @@ func simBags(t *testing.T) []model.StockBag {
 	return bags
 }
 
-// simSnapshot 读审计落下的**按营业日结余快照**（按部位）。
-func simSnapshot(t *testing.T) map[string]map[string]float64 {
+// simSnapshot 读每个营业日的**按部位日终冷库量**(kg)。
+//
+// ⚠️ 2026-11-01 owner：审计结转端点下线 ⇒ `cut_stock_daily`(审计的产物)不再被写入
+//
+//	⇒ 这里改用 `ClosingByCutForTest`(内部走 `closingForDay` → `deriveColdChain`)
+//	—— **同一条余额链**,只是不再有审计快照可读。
+//
+// ⚠️ 时钟要停在**最后一天**:余额链的日终结算是从链起点一路推到"今天"的,
+//
+//	时钟停早了 ⇒ 后面的天还没算出来。
+func simSnapshot(t *testing.T, svc *service.Service, ctx context.Context) map[string]map[string]float64 {
 	t.Helper()
-	type row struct {
-		BizDate     string
-		CutType     string
-		ColdStoreKg float64
-	}
-	var rows []row
-	if err := testDBSingleton.Table("cut_stock_daily").
-		Select("biz_date, cut_type, cold_store_kg").
-		Where("branch_id = ?", simBranch).
-		Order("biz_date ASC").Scan(&rows).Error; err != nil {
-		t.Fatalf("query cut_stock_daily: %v", err)
-	}
 	out := map[string]map[string]float64{}
-	for _, r := range rows {
-		day := r.BizDate
-		if len(day) > 10 {
-			day = day[:10] // datatypes.Date 落库带时分秒 ⇒ 只取日期部分
+	svc.SetClock(fmClock(simDay(simDays - 1)))
+	for n := 0; n < simDays; n++ {
+		day := simKey(n)
+		_, cold, err := service.ClosingByCutForTest(ctx, svc, simBranch, simDay(n))
+		mustNoErr(t, err, "ClosingByCutForTest("+day+")")
+		perCut := map[string]float64{}
+		for cut, kg := range cold {
+			perCut[cut] = kg.InexactFloat64()
 		}
-		if out[day] == nil {
-			out[day] = map[string]float64{}
-		}
-		out[day][r.CutType] = r.ColdStoreKg
+		out[day] = perCut
 	}
 	return out
 }
@@ -237,24 +238,16 @@ func TestMultiDaySim_OneWeekBusiness(t *testing.T) {
 		t.Errorf("结算总额应 = 30×6 = 180, got %s", settle.TotalAmountYuan)
 	}
 
-	// ---- ① 余额链逐日自洽（用审计快照核对）----
+	// ---- ① 余额链逐日自洽（用每日毛利报告的部位冷库量核对）----
 	//
 	// 五花：期初 100 + 结转 10×7 − 搬台 10×6 = 110
 	// 板油：期初 40 + 结转 10×7 − 大宗出库 30 = 80
+	//
+	// ⚠️ 2026-11-01 owner：审计结转端点下线 ⇒ 这里**不再**先跑
+	//   PrecheckBizAudit / AuditBusinessDays 去固化快照(那两个端点已退役),
+	//   改为直接用**每日毛利报告**的部位冷库量核对同一条余额链。
 	svc.SetClock(fmClock(simDay(simDays - 1)))
-	pre, err := svc.PrecheckBizAudit(ctx, simBranch, simKey(simDays-1))
-	mustNoErr(t, err, "PrecheckBizAudit")
-	if !pre.Ready {
-		t.Fatalf("审计预检应就绪: %+v", pre)
-	}
-	status, err := svc.AuditBusinessDays(ctx, simBranch,
-		service.BizAuditInput{CutoffDate: simKey(simDays - 1)}, "u-1")
-	mustNoErr(t, err, "AuditBusinessDays")
-	if !status.Audited {
-		t.Fatalf("审计后应有审计记录: %+v", status)
-	}
-
-	snap := simSnapshot(t)
+	snap := simSnapshot(t, svc, ctx)
 	for n := 0; n < simDays; n++ {
 		day := simKey(n)
 		got, ok := snap[day]
@@ -302,42 +295,49 @@ func TestMultiDaySim_OneWeekBusiness(t *testing.T) {
 		}
 	}
 
-	// ---- ④ 审计后：截止日及之前**冻结**（补录/搬台/结算/改期初 全被拒）----
-	frozen := []struct {
+	// ---- ④ 审计下线 ⇒ **不再有冻结期**：历史营业日仍可改 ----
+	//
+	// ⚠️ 2026-11-01 owner：审计结转端点下线 ⇒ 冻结机制一并下线
+	//   ⇒ 原用例锁的「审计之后 截止日及之前的一切改动都必须被拒」**语义反转**：
+	//   现在这些改动**必须被接受**(账面链改为实时可改,补录会让后续日期的数跟着变)。
+	//
+	//   保留同一个测试槽位,是为了锁住**新语义**:
+	//   若哪天有人把「截止日已冻结」的闸门又接回去 ⇒ 下面这四条会红。
+	historical := []struct {
 		what string
 		do   func() error
 	}{
-		{"补录截止日之前的盘点", func() error {
+		{"补录历史营业日的盘点", func() error {
 			_, err := svc.RecordPorkCutsStocktake(ctx, simBranch, model.RecordPorkCutsStocktakeInput{
 				IsComplete: true, TakenDate: simKey(2),
 				Cuts: []model.CutInput{{CutType: model.CutBelly, CubeProductID: simBellySKU, ActualRemainKg: d("1")}},
 			}, "u-1")
 			return err
 		}},
-		{"改截止日之前的搬台", func() error {
+		{"改历史营业日的搬台", func() error {
 			_, err := svc.CounterLoad(ctx, simBranch, service.CounterLoadInput{
 				TakenDate: simKey(2),
 				Lines:     []service.CounterLoadLine{{CubeProductID: simBellySKU, QtyKg: d("1")}},
 			}, "u-1")
 			return err
 		}},
-		{"改截止日之前的大宗结算", func() error {
+		{"改历史营业日的大宗结算", func() error {
 			_, err := svc.CreateBulkSettlement(ctx, simBranch, service.BulkSettlementInput{
 				SettleDate: simKey(2), Mode: service.BulkModeDelivery,
 				Items: []service.BulkSettlementItemInput{{ProductCode: "fat", QtyKg: d("1"), UnitPriceYuan: d("6")}},
 			}, "u-1")
 			return err
 		}},
-		{"改截止日之前的期初结转", func() error {
+		{"改历史营业日的期初结转", func() error {
 			_, err := svc.SaveStockOpenings(ctx, simBranch, []service.StockOpeningInput{
 				{CutType: model.CutBelly, BizDate: simKey(0), ColdStoreKg: d("999"), UnitPriceYuan: d("18")},
 			})
 			return err
 		}},
 	}
-	for _, f := range frozen {
-		if err := f.do(); err == nil {
-			t.Errorf("★ 审计之后 %s 必须被拒(冻结不可逆)", f.what)
+	for _, f := range historical {
+		if err := f.do(); err != nil {
+			t.Errorf("审计下线后 %s 不该再被拒(账面链实时可改), got %v", f.what, err)
 		}
 	}
 
@@ -345,9 +345,8 @@ func TestMultiDaySim_OneWeekBusiness(t *testing.T) {
 	//
 	// 「取不到也按 0 生成」是**生产**口径（价格客户端在位）。
 	// 单测环境没有价格源 ⇒ 预售结转被跳过（"不猜价"）⇒ 断言不了。
-	// ⇒ 预期毛利与人工改价由**生产契约**验：
-	//    deployer/tests/contract/fresh_meat_bizday_test.go
-	//    （TestFreshMeatBizDay_AuditLifecycle 覆盖 审计→冻结→预期毛利改价）。
+	// ⚠️ 2026-11-01 owner：预期毛利(预售结转)端点(`/stock/presale`)已整体下线
+	//   ⇒ 预售结转**不再有写入口** ⇒ 这段从"端点未验"变成"端点已不存在"。
 }
 
 // TestMultiDaySim_MissingStocktakeBlocksNextDay 锁⑤：跨日**顺序校验**。

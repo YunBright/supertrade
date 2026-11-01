@@ -172,10 +172,8 @@ func (s *Service) RecordBulkProduction(ctx context.Context, branchID string, in 
 		}
 		bizDate = datatypesDate(parsed)
 	}
-	// 冻结检查:已审计结转的期间不能再改(含补录)。
-	if err := s.assertNotAudited(ctx, branchID, time.Time(bizDate), "大宗产出"); err != nil {
-		return nil, err
-	}
+	// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 冻结机制一并下线
+	//   ⇒ 大宗产出不再被「截止日已冻结」拦截(账面链改为实时可改)。
 	// 大宗库存记在**大宗品项自己绑的货号**上(没绑定才回退到部位主 SKU)。
 	//
 	// ⚠️ 全链路(进冷库 / 出冷库 / 结存)必须记在**同一个 SKU** 上,
@@ -468,10 +466,8 @@ func (s *Service) CreateBulkSettlement(ctx context.Context, branchID string, in 
 		}
 		settleDate = datatypesDate(parsed)
 	}
-	// 冻结检查:已审计结转的期间不能再改(含补录)。
-	if err := s.assertNotAudited(ctx, branchID, time.Time(settleDate), "大宗结算"); err != nil {
-		return nil, err
-	}
+	// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 冻结机制一并下线
+	//   ⇒ 大宗结算不再被「截止日已冻结」拦截。
 	// 明细预校验(失败要在开事务前就报,免得白开一次)
 	for i, it := range in.Items {
 		if !it.QtyKg.IsPositive() {

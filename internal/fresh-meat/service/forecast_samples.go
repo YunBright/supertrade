@@ -409,7 +409,10 @@ func (s *Service) CollectForecastSamples(ctx context.Context, branchID string,
 	}
 
 	// ---- ② 跑引擎 ⇒ 落估计样本 ----
-	stats, err := s.rebuildForecastDaySamples(ctx, source, day)
+	//
+	// ⚠️ overwrite=true：这是门店**显式**「按一天加入样本」/「重采」
+	//   ⇒ 覆盖该日的旧样本 + 复活墓碑行（owner:「不对就手动删掉重采」）。
+	stats, err := s.rebuildForecastDaySamples(ctx, source, day, true)
 	if err != nil {
 		// ⚠️ 引擎跑不了(例如 cube 读失败)⇒ **上抛**,别回落成"那天没样本"
 		//   (回落 = 把一次链路故障说成"数据不完整",门店会去补一堆不存在的数据)。

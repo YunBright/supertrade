@@ -202,10 +202,8 @@ func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLo
 			return nil, err
 		}
 	}
-	// ---- 冻结检查:已审计结转的期间不能再改(含补录)----
-	if err := s.assertNotAudited(ctx, branchID, takenDate, "搬台"); err != nil {
-		return nil, err
-	}
+	// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 冻结机制一并下线
+	//   ⇒ 搬台(含补录)不再被「截止日已冻结」拦截。
 
 	// ---- 解析每一行(整袋搬的 SKU 与重量取自袋子)----
 	//
@@ -768,12 +766,17 @@ func (s *Service) persistCutCostDaily(ctx context.Context, branchID string, day 
 	}
 	// ---- 估计样本(2026-10-30 owner 选的 A 方案)----
 	//
-	// 这一天算完了 ⇒ 倒推值定了 ⇒ 把"倒推值按毛重比例摊到每头猪"的**估计样本**落库
+	// 这一天算完了 ⇒ 当日逐部位销量定了 ⇒ 把"销量按毛重比例摊到每头猪"的**估计样本**落库
 	// ⇒ 之后「重算基线」就能用它 ⇒ 建议分割开始反映**本店真实出肉率**(而不是 LLM 通用先验)。
 	//
 	// ⚠️ **失败不阻断**:成本快照已经落好了 ⇒ 估计样本只是"喂基线"的材料
 	//   ⇒ 挂了就挂了(下次重算/物化时再补)⇒ 不能让盘点提交整个失败。
-	if _, estErr := s.rebuildEstimatedSplitSamples(ctx, branchID, day, rows); estErr != nil {
+	//
+	// ⚠️⚠️ **overwrite=false**(2026-11-01 owner D8「采集即固化」):
+	//   这是**引擎自动路径** ⇒ **已存在的样本一律不动**
+	//   ⇒ 事后改搬台 / 改猪重 ⇒ 再物化 ⇒ 样本库**原样不动**。
+	//   ⇒ 想让样本跟上最新数据 ⇒ 门店显式「按一天加入样本」/「重采」。
+	if _, estErr := s.rebuildEstimatedSplitSamples(ctx, branchID, day, rows, false); estErr != nil {
 		s.pubLogger.Warn("persistCutCostDaily: 估计样本重建失败(不影响成本快照)",
 			"branch_id", branchID, "biz_date", bizKey, "err", estErr)
 	}
