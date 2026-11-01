@@ -52,9 +52,17 @@ type ForecastSampleCut struct {
 // ForecastSamplePig 样本库里的一头猪（= 一组样本）。
 type ForecastSamplePig struct {
 	PigID string `json:"pig_id"`
-	// EarTag 是猪的耳标（猪被删了则为空串）。
+	// EarTag 是猪的耳标。
+	//
+	// ⚠️ **耳标空有两种原因**(2026-11-02 owner 截图指出,前端曾因此把活猪说成"猪已删"):
+	//
+	//	① **猪被删了** ⇒ 耳标空 **且 [GrossWeightKg] = 0**(读不到 whole_pigs 这行);
+	//	② **猪还在、但门店没录耳标号** ⇒ 耳标**也空**,可毛重**有值**
+	//	  (后端明确允许:"有些猪没有耳标/不扫码"⇒ ear_tag 只是普通索引)。
+	//
+	// ⇒ **判"猪被删"要看毛重,不能看耳标**。
 	EarTag string `json:"ear_tag"`
-	// GrossWeightKg 是这头猪的毛重（猪被删了则 0）。
+	// GrossWeightKg 是这头猪的毛重（**猪被删了则 0** ⇒ 这是"猪还在不在"的可靠信号）。
 	GrossWeightKg decimal.Decimal `json:"gross_weight_kg"`
 	WeightBand    string          `json:"weight_band"`
 	// Date 是这头猪的营业日（样本归属的那一天）。
