@@ -158,7 +158,11 @@ func (s *Service) loadCubeSales(ctx context.Context, branchID, operDate string, 
 		// ⚠️ **必须限量**:没有 limit 的查询会拉回整张日汇总表
 		// (实测店 00 单日 840 行 / 全店 1854 天)。
 		// 鲜肉域关心的货号只有几十个 ⇒ 200 足够,且能兜住"映射表被改乱"的极端情况。
-		Limit: 200,
+		//
+		// ⚠️ 这个上限**必须与区间预取用的那个是同一个常量**(cubeSalesDailyRowLimit):
+		//	逐日查询会被它截断、而区间查询不会 ⇒ 两边行集可能不同 ⇒ 数值会不一样
+		//	⇒ 区间预取里任何一天超过这个行数,就整份丢掉(见 cube_sales_range.go)。
+		Limit: cubeSalesDailyRowLimit,
 		Total: true,
 	})
 	if err != nil {

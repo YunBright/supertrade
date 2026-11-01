@@ -69,10 +69,11 @@ func fmGenSetupSourced(t *testing.T, cubeRows []map[string]any) (*service.Servic
 		}
 		// ⚠️ **必须按 oper_date 过滤**:成本链逐日回溯时每一天都会问一次 cube,
 		//   假身若对任何日期都返回同一批销售 ⇒ 销售被重复计入。
-		if d := fmCubeOperDate(q); d != "" && d != fmGenDate {
-			return nil, 0, nil
-		}
-		return cubeRows, len(cubeRows), nil
+		//
+		// ⚠️ 2026-11-01:链现在先问一次**区间查询**(gte/lte)⇒ 假身也得认区间
+		//   ⇒ 统一走 fmCubeRowsForRange(逐日 / 区间两种形态都认)。
+		rows, n := fmCubeRowsForRange(map[string][]map[string]any{fmGenDate: cubeRows}, q)
+		return rows, n, nil
 	}
 	svc.SetCubeReader(cube)
 	// 有源 + 启用 ⇒ 走 cube(与生产店 00 的形态一致)。

@@ -27,24 +27,6 @@ import (
 // fmDay2Key 是测试里的"营业日"字符串(销售只在这一天发生)。
 const fmDay2Key = "2026-10-02"
 
-// fmCubeOperDate 从 cube 查询里取出"要哪天"的 oper_date 过滤值。
-//
-// ⚠️ 成本链**逐日回溯**时,每一天都会带自己的 oper_date 来问 cube
-//   ⇒ 假身必须按这个值过滤,否则同一批销售会被算进每一天。
-func fmCubeOperDate(q cubeclient.CubeQuery) string {
-	for _, f := range q.Filters {
-		if f.Member != "sales_report.oper_date" {
-			continue
-		}
-		for _, v := range f.Values {
-			if s, ok := v.(string); ok {
-				return s
-			}
-		}
-	}
-	return ""
-}
-
 // fmMultiSkuSetup 起一个"有源门店"的毛利环境:**belly 一个部位挂多个货号**。
 //
 // ⚠️ 销售走 cube 替身(有源门店的销售在 cube 里,见 cube_sales_test.go);
@@ -68,10 +50,11 @@ func fmMultiSkuSetup(t *testing.T, cubeRows []map[string]any, skus ...string) (*
 		//   成本链现在**逐日回溯**(基线日 → 今天),每一天都会问一次 cube。
 		//   假身若对任何日期都返回同一批销售 ⇒ 销售会被**重复计入每一天**
 		//   ⇒ 链的期初被算成"卖了两遍"的残值 ⇒ 账面应有/成本全错。
-		if d := fmCubeOperDate(q); d != "" && d != fmDay2Key {
-			return nil, 0, nil
-		}
-		return cubeRows, len(cubeRows), nil
+		//
+		// ⚠️ 2026-11-01:链现在先问一次**区间查询**(gte/lte)⇒ 假身也得认区间
+		//   ⇒ 统一走 fmCubeRowsForRange(逐日 / 区间两种形态都认)。
+		rows, n := fmCubeRowsForRange(map[string][]map[string]any{fmDay2Key: cubeRows}, q)
+		return rows, n, nil
 	}
 	svc.SetCubeReader(cube)
 	svc.SetSourceResolver(fmFakeResolver{src: cubesource.Source{

@@ -433,6 +433,20 @@ func (s *Service) computeCutChainDays(ctx context.Context, branchID string,
 		}
 	}
 	out := make([]cutChainDay, 0, 8)
+	// ⚠️ **先预取整条链的销售**(2026-11-01 性能优化):
+	//   下面的日循环每一天都会问一次 cube「这天卖了什么」⇒ N 次远程往返
+	//   ⇒ 这里一次查回 [start..to] 的销售,日循环直接按天取 ⇒ 1 次远程往返。
+	//
+	//   语义与现在**逐字一致**:
+	//     - 走不走 cube 由 salesReadPath 判定(问不到 / 被停用 ⇒ 原样上抛);
+	//     - 预取失败(非权限类)⇒ Warn + 不挂预取 ⇒ 日循环照旧逐日查(错误照旧产生);
+	//     - 预取的数据**不可信**(被 limit 截断 / 有行归不到某一天)
+	//       ⇒ **整份丢弃** ⇒ 日循环照旧逐日查。
+	//       (⚠️ 绝不"只丢那一行" —— 那会把「这天没卖」当成事实 ⇒ 毛利虚高。)
+	ctx, err = s.prefetchCubeSalesRange(ctx, branchID, start, to)
+	if err != nil {
+		return nil, err
+	}
 	for d := start; !d.After(to); d = d.AddDate(0, 0, 1) {
 		row, err := runner.day(ctx, d)
 		if err != nil {
@@ -472,6 +486,12 @@ func (s *Service) computeCutChainDaysFull(ctx context.Context, branchID string,
 	}
 	runner := newCutChainRunner(s, branchID)
 	out := make([]cutChainDay, 0, 8)
+	// ⚠️ **先预取整条链的销售**(2026-11-01 性能优化)—— 同 computeCutChainDays。
+	//   审计要逐日重算(每一天都要问一次 cube)⇒ 同样吃"天数 × 330ms"的亏。
+	ctx, err = s.prefetchCubeSalesRange(ctx, branchID, start, to)
+	if err != nil {
+		return nil, err
+	}
 	for d := start; !d.After(to); d = d.AddDate(0, 0, 1) {
 		row, err := runner.day(ctx, d)
 		if err != nil {

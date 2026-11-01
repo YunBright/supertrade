@@ -49,8 +49,10 @@ func fmChainSetup(t *testing.T, rowsByDate map[string][]map[string]any) (*servic
 		if m != "sales_report" {
 			return nil, 0, nil
 		}
-		rows := rowsByDate[fmCubeOperDate(q)]
-		return rows, len(rows), nil
+		// ⚠️ 2026-11-01:链现在先问一次**区间查询**(gte/lte)⇒ 假身也得认区间
+		//   ⇒ 统一走 fmCubeRowsForRange(逐日 / 区间两种形态都认)。
+		rows, n := fmCubeRowsForRange(rowsByDate, q)
+		return rows, n, nil
 	}
 	svc.SetCubeReader(cube)
 	svc.SetSourceResolver(fmFakeResolver{src: cubesource.Source{

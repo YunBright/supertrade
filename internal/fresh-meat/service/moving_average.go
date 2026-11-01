@@ -569,7 +569,14 @@ func (s *Service) loadCubeSalesInto(
 		return nil
 	}
 	operDate := day.In(s.bizTZOrUTC()).Format("2006-01-02")
-	rows, err := s.loadCubeSales(ctx, branchID, operDate, skus)
+	// ⚠️ **优先用 ctx 里的预取**(2026-11-01 性能优化)。
+	//
+	//	成本链逐日推进时,整条链的销售已经被**一次**远程查询取回 ⇒ 这里直接按天取
+	//	⇒ N 次远程往返变 1 次(生产实测 店 00:11-05 ≈3.3s ⇒ 约 0.4s)。
+	//
+	//	⚠️ **没预取就照旧逐日查**:单日调用 / 预取失败 / 数据被截断
+	//	⇒ 行为与现在**完全一样**(见 cube_sales_range.go 的 cubeSalesRowsForDay)。
+	rows, err := s.cubeSalesRowsForDay(ctx, branchID, operDate, skus)
 	if err != nil {
 		return err
 	}

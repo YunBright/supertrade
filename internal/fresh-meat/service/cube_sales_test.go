@@ -48,6 +48,81 @@ func fmCubeSalesRow(sku, qty, amount string) map[string]any {
 	}
 }
 
+// fmCubeSalesRowOn 造一行**带营业日**的 cube sales_report 返回。
+//
+// ⚠️ 为什么需要带日期的版本(2026-11-01 区间预取):
+//
+//	成本链现在会先问一次**区间查询**(dimensions = [oper_date, item_no])
+//	⇒ cube 会把 oper_date 作为维度返回 ⇒ 收方靠它把行归到某一天。
+//	⇒ 假身不返回它 ⇒ 收方**无法把行归到某一天** ⇒ 只能整份作废 ⇒ 回落逐日。
+//
+// ⚠️ 逐日查询(dimensions = [item_no])时 cube **不会**返回 oper_date
+//	⇒ 那条路径本来就不需要它。
+func fmCubeSalesRowOn(date, sku, qty, amount string) map[string]any {
+	r := fmCubeSalesRow(sku, qty, amount)
+	r["sales_report.oper_date"] = date
+	return r
+}
+
+// fmCubeDateRange 从 cube 查询里解析出日期区间。
+//
+// ⚠️ **必须同时认两种形态**(2026-11-01 区间预取):
+//
+//	逐日查询:oper_date equals D          ⇒ from = to = D
+//	区间查询:oper_date gte from + lte to  ⇒ 闭区间 [from, to]
+//
+//	⇒ 假身只认其中一种,另一种就会"查不出来"
+//	⇒ 而"查不出来"和"这天真没卖"在报表上长得**一模一样** ⇒ 极难查。
+func fmCubeDateRange(q cubeclient.CubeQuery) (from, to string) {
+	for _, f := range q.Filters {
+		if f.Member != "sales_report.oper_date" || len(f.Values) == 0 {
+			continue
+		}
+		s, _ := f.Values[0].(string)
+		switch f.Operator {
+		case cubeclient.OperatorEquals:
+			return s, s
+		case "gte":
+			from = s
+		case "lte":
+			to = s
+		}
+	}
+	return from, to
+}
+
+// fmCubeRowsForRange 按查询里的日期区间,从"按日期分组的行"里挑出该返回的行。
+//
+// ⚠️ **必须按日期过滤**(2026-10-27 链式接续后暴露):
+//
+//	成本链逐日回溯(基线日 → 今天),每一天都会问一次 cube。
+//	假身若对任何日期都返回同一批销售 ⇒ 销售被重复计入每一天
+//	⇒ 期初被算成"卖了两遍"的残值 ⇒ 账面应有/成本全错。
+//
+// ⚠️ 返回的行**带上 oper_date**(区间查询时 cube 会返回它)⇒ 收方才能把行归到某一天。
+//	⚠️ **复制**一份再补键:不能就地改调用方那批行(它们会被多次查询复用)。
+func fmCubeRowsForRange(rowsByDate map[string][]map[string]any, q cubeclient.CubeQuery) ([]map[string]any, int) {
+	from, to := fmCubeDateRange(q)
+	if from == "" || to == "" {
+		return nil, 0
+	}
+	var out []map[string]any
+	for date, rows := range rowsByDate {
+		if date < from || date > to {
+			continue
+		}
+		for _, r := range rows {
+			cp := make(map[string]any, len(r)+1)
+			for k, v := range r {
+				cp[k] = v
+			}
+			cp["sales_report.oper_date"] = date
+			out = append(out, cp)
+		}
+	}
+	return out, len(out)
+}
+
 // fmSetupSales 造一个"有源门店"的毛利环境。
 //
 // 返回:svc / cube 替身 / 上下文。
@@ -73,10 +148,11 @@ func fmSetupSales(t *testing.T, cubeRows []map[string]any) (*service.Service, *c
 		//   成本链现在逐日回溯(基线日 → 今天),每一天都会问一次 cube。
 		//   假身若对任何日期都返回同一批销售 ⇒ 销售被重复计入每一天
 		//   ⇒ 期初被算成"卖了两遍"的残值 ⇒ 账面应有/成本全错。
-		if d := fmCubeOperDate(q); d != "" && d != fmDay2Key {
-			return nil, 0, nil
-		}
-		return cubeRows, len(cubeRows), nil
+		//
+		// ⚠️ 2026-11-01:链现在先问一次**区间查询**(gte/lte)⇒ 假身也得认区间
+		//   ⇒ 统一走 fmCubeRowsForRange(逐日 / 区间两种形态都认)。
+		rows, n := fmCubeRowsForRange(map[string][]map[string]any{fmDay2Key: cubeRows}, q)
+		return rows, n, nil
 	}
 	svc.SetCubeReader(cube)
 	// 有源 + 启用 ⇒ 走 cube。
