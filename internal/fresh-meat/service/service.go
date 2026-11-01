@@ -458,6 +458,21 @@ func (s *Service) RecordWholePig(ctx context.Context, branchID string, in model.
 			"branch_id", branchID, "pig_id", pig.ID, "err", err)
 	}
 
+	// ---- 成本链重算(2026-11-01 补)----
+	//
+	// ⚠️ **进猪这条路径以前没挂物化** ⇒ 成本日快照会一直停在"上一次有别的写动作"那天
+	//	(生产实测 店 00:11-01 录了猪,但快照最后写入停在 10-31 23:40
+	//	⇒ 11-01 整天没有快照 ⇒ 依赖快照的读路径(长期毛利)读不到当天)。
+	//
+	// ⇒ 其它写路径(盘点/搬台/大宗/删猪/期初结转)都挂了,这里补上 ⇒ 口径统一。
+	//
+	// ⚠️ 失败**不阻断录猪**:录猪是"事实录入",成功就成功;
+	//	派生数据没跟上只影响"看数字",下次任何写动作都会自愈。
+	if err := s.recomputeCostSnapshots(ctx, branchID, in.ArrivedAt); err != nil {
+		s.pubLogger.Error("RecordWholePig: 成本链重算失败(派生数据会旧,下次写动作会自愈)",
+			"branch_id", branchID, "pig_id", pig.ID, "err", err)
+	}
+
 	// ---- 分割建议:**异步**生成(2026-10-26)----
 	//
 	// ⚠️ 这里**不再同步等 LLM**:同步等 ⇒ 客户端 dio receiveTimeout(30s)与服务端
