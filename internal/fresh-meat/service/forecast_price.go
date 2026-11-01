@@ -28,6 +28,12 @@
 //	⚠️ 物化表(pig_cut_price_baselines)是给门店**看**的;算建议成本单价时
 //	  **不读它**,而是现算 as-of 版本 ⇒ 物化表的刷新时机不会影响正确性。
 //
+//	⇒ 2026-11-02 owner 拍板:采集/删除样本后**自动重算**这张物化表
+//	  (不用再让门店手动点「重算」)⇒ 门店看到的样本数/单价与样本库同步。
+//
+//	⚠️ 自动重算**不改变任何计算数字**(取价走 as-of 现算)
+//	  ⇒ 只动"给门店看的那张表"。
+//
 // # 边界(owner 给定的两条硬边界)
 //
 //	① 重量:建议分割之和不得超过猪重(已由 cut_split_algo.go 的 scaleSplitToPigWeight 保证)。
@@ -75,6 +81,22 @@ const (
 	priceMarginValidHigh = "0.95"
 )
 
+// 单价基线物化表的**重算时机**开关(2026-11-02 owner 拍板「采集完自动重算」)。
+//
+// ⚠️ 为什么要有开关:
+//
+//	**批量**路径(全量物化成本链)会逐日跑引擎 ⇒ 逐日采集单价样本
+//	⇒ 若每天都重算一次基线物化表,就是 N 次"读全店样本 + 写一遍物化表"的重复劳动
+//	⇒ 批量路径逐日用 priceRecomputeOff,**最后统一重算一次**。
+//
+//	**单日**写事实路径(录猪/盘点/搬台/大宗/删猪)必须用 priceRecomputeOn
+//	⇒ 否则门店看到的基线样本数永远停在旧值
+//	⇒ (2026-11-02 实测:分割基线样本数已是 5,单价基线样本数还是 1 —— 就是漏了这一步。)
+const (
+	priceRecomputeOn  = true
+	priceRecomputeOff = false
+)
+
 // CutPriceSampleResult 采集单价日样本的结果(给门店看的一句话在 Message 里)。
 type CutPriceSampleResult struct {
 	Date string `json:"date"`
@@ -88,6 +110,23 @@ type CutPriceSampleResult struct {
 	MarginRate decimal.Decimal `json:"margin_rate"`
 	// PigPriceYuan 是当日猪的加权平均进价(元/kg)—— 单价缩放的上下文。
 	PigPriceYuan decimal.Decimal `json:"pig_price_yuan"`
+	// Baselines 是**自动重算**后物化表里写出的基线条数(0 = 没重算或重算失败)。
+	//
+	// ⚠️ 这是"自动重算跑过了"的可见证据 ⇒ 门店不用再猜"到底生效没有"。
+	Baselines int `json:"baselines"`
+	// BaselineError 是自动重算的失败原因(成功时为空串)。
+	//
+	// ⚠️ 采集成功但重算失败 ⇒ 必须**看得见**:否则门店界面永远停在旧样本数,
+	//   而他以为"已经更新了"。
+	//
+	// ⚠️ **不带 omitempty**:字段恒在 ⇒ 契约/前端能稳定断言"它存在"
+	//   (成功时是空串,不是"没这个键")。
+	BaselineError string `json:"baseline_error"`
+	// staleDeleted 是这轮清掉的旧样本条数(服务层内部用)。
+	//
+	// ⚠️ 它的意义:**基线要不要重算**不能只看"写了多少条"(Written),
+	//   还要看"清掉了多少条"(某个部位不再产样本 ⇒ 它的基线必须消失)。
+	staleDeleted int `json:"-"`
 	// Message 是给门店看的一句话。
 	Message string `json:"message"`
 }
@@ -101,7 +140,7 @@ type priceBaselineValue struct {
 
 // ---- 采集:日样本 ----
 
-// CollectCutPriceSamples 采集某营业日的**单价日样本**。
+// CollectCutPriceSamples 采集某营业日的**单价日样本**,并**自动重算**单价基线物化表。
 //
 // # 入参 rows = 那天的**部位级成本行**(引擎已经算好的)
 //
@@ -120,7 +159,79 @@ type priceBaselineValue struct {
 //
 //	同一 (店, 日, 部位) 只有一行 ⇒ 重复采集 = 覆盖。
 //	⚠️ **墓碑行不复活**(与重量样本同口径):门店删掉的样本,重跑时原样保留"已删除"。
+//
+// # 自动重算(2026-11-02 owner 拍板)
+//
+//	采集完**自动重算**物化表(pig_cut_price_baselines)⇒ 门店界面上看到的
+//	"样本数 / 单价"当场就跟样本库同步,不用再手动点「重算」。
+//
+//	⚠️ 重算**失败不阻断采集**(样本是事实、基线是派生结果)⇒ 但失败要**看得见**
+//	  (写进 result.BaselineError + 记日志)⇒ 否则门店永远停在旧数字却以为更新了。
 func (s *Service) CollectCutPriceSamples(ctx context.Context, branchID string, day time.Time,
+	rows []CutDailyCost) (*CutPriceSampleResult, error) {
+	res, err := s.collectCutPriceSamples(ctx, branchID, day, rows)
+	if err != nil {
+		return res, err
+	}
+	s.applyPriceBaselineRecompute(ctx, branchID, res)
+	return res, nil
+}
+
+// applyPriceBaselineRecompute 采集/删除样本后**自动重算**单价基线物化表。
+//
+// # 为什么要有它(2026-11-02 owner 拍板)
+//
+//	物化表(pig_cut_price_baselines)是门店界面上**唯一**看得见的东西
+//	(样本数、单价都读它)⇒ 它不刷新,门店看到的永远是旧数字。
+//
+//	⚠️ 2026-11-02 实测:录完 11-01 的猪、分割基线样本数已经是 5,
+//	  而"部位进货单价基线"的样本数还是 1
+//	  ⇒ **采集跑了、重算没跑** ⇒ 差异不是显示问题,是物化表压根没被刷新。
+//
+// # 失败怎么办
+//
+//	⚠️ **失败不阻断**(样本是事实、基线是派生结果)
+//	  ⇒ 但必须**看得见**:写进 result.BaselineError + 记日志
+//	  ⇒ 否则门店以为已经更新,其实界面还停在旧数字。
+//
+// # 什么时候**不**重算
+//
+//	⚠️ 样本一条没写、也没清掉任何旧行 ⇒ 样本库没变 ⇒ 基线也不该变
+//	  ⇒ 跳过重算(省掉一次"读全店样本 + 写一遍物化表")。
+func (s *Service) applyPriceBaselineRecompute(ctx context.Context, branchID string,
+	res *CutPriceSampleResult) {
+	if res == nil {
+		return
+	}
+	if res.Written == 0 && res.staleDeleted == 0 {
+		return
+	}
+	n, err := s.RecomputeCutPriceBaselines(ctx, branchID)
+	if err != nil {
+		res.BaselineError = err.Error()
+		s.pubLogger.Warn("单价基线自动重算失败(样本已写入,基线待下次重算)",
+			"branch_id", branchID, "err", err)
+		res.Message += "，但单价基线自动重算失败，请手动点「重算」"
+		return
+	}
+	res.Baselines = n
+	s.pubLogger.Info("单价基线已自动重算",
+		"branch_id", branchID, "samples", res.Written, "stale_deleted", res.staleDeleted,
+		"baselines", n)
+	res.Message += fmt.Sprintf("，单价基线已自动重算（%d 个部位）", n)
+}
+
+// collectCutPriceSamples 只**采集**样本(**不重算基线**)。
+//
+// ⚠️ 为什么单独拆一个"不重算"的版本:
+//
+//	**批量**路径(全量物化成本链)会逐日调引擎 ⇒ 逐日采集 ⇒ 若每天都重算一次基线,
+//	就是 N 次重复劳动(每次都要读全店样本 + 写一遍物化表)。
+//	⇒ 批量路径用这个版本逐日采集,**最后统一重算一次**即可。
+//
+//	⚠️ 单日写事实路径(录猪/盘点/搬台/大宗/删猪)必须走**带重算**的公开入口
+//	⇒ 否则 owner 看到的"样本数还是 1"就会重现(2026-11-02 实测)。
+func (s *Service) collectCutPriceSamples(ctx context.Context, branchID string, day time.Time,
 	rows []CutDailyCost) (*CutPriceSampleResult, error) {
 	res := &CutPriceSampleResult{Date: day.In(s.bizTZOrUTC()).Format("2006-01-02")}
 	if branchID == "" {
@@ -237,13 +348,17 @@ func (s *Service) CollectCutPriceSamples(ctx context.Context, branchID string, d
 		}
 	}
 	// ---- ④ 清掉那天**不再产出**的旧样本(幂等的关键) ----
-	if err := s.deleteStaleCutPriceSamples(ctx, branchID, dayKey, keepIDs); err != nil {
+	stale, err := s.deleteStaleCutPriceSamples(ctx, branchID, dayKey, keepIDs)
+	if err != nil {
 		return res, err
 	}
+	res.staleDeleted = stale
 
 	switch {
 	case res.Written > 0:
-		res.Message = fmt.Sprintf("已采集 %d 条单价样本（整体毛利率 %s%%），点「重算」后生效",
+		// ⚠️ 这里**只写前半句**:重算在包装器里做(见 CollectCutPriceSamples)
+		//   ⇒ 后半句("基线已自动重算")要等重算**真的跑过**才能写 ⇒ 否则是说谎。
+		res.Message = fmt.Sprintf("已采集 %d 条单价样本（整体毛利率 %s%%）",
 			res.Written, margin.Mul(decimal.NewFromInt(100)).StringFixed(2))
 	case res.NoSaleCutCount > 0:
 		res.Message = "这一天没有产出单价样本：当天没有卖出过的部位不产生单价（搭赠等无销售记录的部位保持无基线）"
@@ -253,11 +368,13 @@ func (s *Service) CollectCutPriceSamples(ctx context.Context, branchID string, d
 	return res, nil
 }
 
-// CollectCutPriceSamplesForDay 按一天采集单价样本(**自己跑引擎**)。
+// CollectCutPriceSamplesForDay 按一天采集单价样本(**自己跑引擎**),并自动重算基线。
 //
 // ⚠️ 跑一次引擎要读 cube 的销售 ⇒ 不便宜 ⇒ 只在**明确按天采集**时调。
 //
-// ⚠️ **不自动重算基线** —— 重算是另一个明确动作(与重量样本同口径)。
+// ⚠️ 2026-11-02:采集完**自动重算**单价基线物化表
+//   ⇒ 门店不用再手动点「重算」(owner 原话:「我录完 11-1 的数据后…
+//   部位进货单价基线的样本还是 1」——那就是物化表没跟着刷新)。
 func (s *Service) CollectCutPriceSamplesForDay(ctx context.Context, branchID, dayKey string) (
 	*CutPriceSampleResult, error) {
 	if branchID == "" {
@@ -367,12 +484,17 @@ func (s *Service) excludedCutPriceSampleKeys(ctx context.Context, branchID, dayK
 	return out, nil
 }
 
-// deleteStaleCutPriceSamples 删掉那天**不在 keepIDs 里**的样本行。
+// deleteStaleCutPriceSamples 删掉那天**不在 keepIDs 里**的样本行,返回删掉的条数。
 //
 // ⚠️ **墓碑行不删**:墓碑是"已删除"的留痕 ⇒ 删掉墓碑 ⇒ 下次采集会把它写回来(复活)
 //   ⇒ 门店的"删除"被引擎悄悄撤销。
+//
+// ⚠️ 返回条数是为了让调用方判断"基线要不要重算":
+//
+//	某个部位不再产样本 ⇒ 它的样本被清掉 ⇒ 它的单价基线也必须随之消失
+//	⇒ 这时候"写了 0 条样本"**不等于**"样本库没变"。
 func (s *Service) deleteStaleCutPriceSamples(ctx context.Context, branchID, dayKey string,
-	keepIDs map[string]bool) error {
+	keepIDs map[string]bool) (int, error) {
 	q := s.db.WithContext(ctx).
 		Where("branch_id = ? AND biz_date = ? AND excluded_at IS NULL", branchID, dayKey)
 	if len(keepIDs) > 0 {
@@ -382,10 +504,11 @@ func (s *Service) deleteStaleCutPriceSamples(ctx context.Context, branchID, dayK
 		}
 		q = q.Where("id NOT IN ?", ids)
 	}
-	if err := q.Delete(&model.PigCutPriceSample{}).Error; err != nil {
-		return fmt.Errorf("delete stale pig_cut_price_samples: %w", err)
+	res := q.Delete(&model.PigCutPriceSample{})
+	if res.Error != nil {
+		return 0, fmt.Errorf("delete stale pig_cut_price_samples: %w", res.Error)
 	}
-	return nil
+	return int(res.RowsAffected), nil
 }
 
 // ---- 基线:从日样本聚合 ----
@@ -579,6 +702,10 @@ func (s *Service) ListForecastPriceSamples(ctx context.Context, branchID, dateKe
 // DeleteCutPriceSample 给某店某天某部位的单价样本**打墓碑**(不物理删)。
 //
 // ⚠️ 物理删会被引擎重跑复活 ⇒ 删除必须是墓碑(与重量样本同口径)。
+//
+// ⚠️ 2026-11-02:墓碑之后**自动重算**基线物化表
+//   ⇒ 门店删掉一条不准确的样本,那个部位的样本数/单价**当场**就跟着变
+//   ⇒ 不用再手动点「重算」(否则界面会一直显示删之前的数 ⇒ 门店以为删除没生效)。
 func (s *Service) DeleteCutPriceSample(ctx context.Context, branchID, dateKey string,
 	cut model.CutType) (int, error) {
 	if branchID == "" {
@@ -600,7 +727,16 @@ func (s *Service) DeleteCutPriceSample(ctx context.Context, branchID, dateKey st
 	if res.Error != nil {
 		return 0, fmt.Errorf("exclude pig_cut_price_samples: %w", res.Error)
 	}
-	return int(res.RowsAffected), nil
+	affected := int(res.RowsAffected)
+	if affected > 0 {
+		// ⚠️ **失败不阻断删除**(墓碑已经是事实)⇒ 但要记日志:
+		//   否则基线会停在"含这条样本"的旧值 ⇒ 门店看到的数字对不上样本库。
+		if _, err := s.RecomputeCutPriceBaselines(ctx, branchID); err != nil {
+			s.pubLogger.Warn("删除单价样本后自动重算基线失败(基线待下次重算)",
+				"branch_id", branchID, "biz_date", day, "cut_type", string(cut), "err", err)
+		}
+	}
+	return affected, nil
 }
 
 // upsertCutPriceBaseline 写一行单价基线(先读后写,见 forecast.go 的同款说明)。

@@ -191,7 +191,7 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.POST("/forecast-price-baselines/recompute", requireBranch, h.RecomputeForecastPriceBaselines)
 	// GET —— 列单价日样本(店 × 日 × 部位)。
 	r.GET("/forecast-price-samples", requireBranch, h.ListForecastPriceSamples)
-	// POST —— **按一天采集**单价样本(跑那天的引擎落样本;不自动重算)。
+	// POST —— **按一天采集**单价样本(跑那天的引擎落样本;采集完自动重算基线物化表)。
 	r.POST("/forecast-price-samples/collect", requireBranch, h.CollectForecastPriceSamples)
 	// DELETE —— 删除单价样本(打墓碑,不物理删):?date=&cut_type=
 	r.DELETE("/forecast-price-samples", requireBranch, h.DeleteForecastPriceSample)
@@ -1343,7 +1343,7 @@ func (h *Handler) ListForecastPriceSamples(c *gin.Context) {
 //
 // 「按一天采集单价样本」:入参 {"date":"2026-10-29"}
 //
-// ⚠️ **不自动重算** —— 重算是另一个明确动作(与重量样本同口径)。
+// ⚠️ 2026-11-02:采集完**自动重算**单价基线物化表 ⇒ 不用再手动点「重算」。
 func (h *Handler) CollectForecastPriceSamples(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "freshmeat:write") {

@@ -630,7 +630,10 @@ func (s *Service) recomputeCostSnapshots(ctx context.Context, branchID string, f
 		if !hasTake[d] {
 			continue
 		}
-		if _, err := s.persistCutCostDaily(ctx, branchID, mustParseDateInLoc(d, s.bizTZOrUTC()), false); err != nil {
+		// ⚠️ 这里**逐日重算**单价基线(priceRecomputeOn)⇒ 门店界面的基线当场跟上
+		//   (通常只有一天有盘点单 ⇒ 重算次数 = 1,可接受)。
+		if _, err := s.persistCutCostDaily(ctx, branchID, mustParseDateInLoc(d, s.bizTZOrUTC()), false,
+			priceRecomputeOn); err != nil {
 			s.pubLogger.Error("recomputeCostSnapshots: 成本日快照重算失败",
 				"branch_id", branchID, "biz_date", d, "err", err)
 		}

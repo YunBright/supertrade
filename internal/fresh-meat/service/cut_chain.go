@@ -542,11 +542,23 @@ func (s *Service) materializeCostChain(ctx context.Context, branchID string, fro
 	//   (引擎的 loadCutOpening ① 读前一日快照 ⇒ 逐日落库时链自动接续 ✓)
 	total := 0
 	for d := start; !d.After(today); d = d.AddDate(0, 0, 1) {
-		n, err := s.persistCutCostDaily(ctx, branchID, d, false)
+		// ⚠️ 逐日**不**重算单价基线(priceRecomputeOff)⇒ 循环结束后统一重算一次
+		//   (逐日重算 = N 次"读全店样本 + 写物化表";而这里只需要最后一次)。
+		n, err := s.persistCutCostDaily(ctx, branchID, d, false, priceRecomputeOff)
 		if err != nil {
 			return total, fmt.Errorf("物化 %s 的成本日快照: %w", d.Format("2006-01-02"), err)
 		}
 		total += n
+	}
+	// ---- 单价基线物化表:逐日采集完 ⇒ **统一重算一次** ----
+	//
+	// ⚠️ 必须在这里做:逐日采集已经把样本写进样本库了
+	//   ⇒ 不重算 ⇒ 门店界面上"基线样本数/单价"停在旧值(2026-11-02 owner 报的正是这个)。
+	//
+	// ⚠️ **失败不阻断物化**(成本快照才是主产物)⇒ 只记日志,下次写事实会自愈。
+	if _, err := s.RecomputeCutPriceBaselines(ctx, branchID); err != nil {
+		s.pubLogger.Warn("物化成本链后重算单价基线失败(基线待下次重算)",
+			"branch_id", branchID, "err", err)
 	}
 	return total, nil
 }

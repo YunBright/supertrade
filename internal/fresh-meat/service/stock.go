@@ -537,7 +537,7 @@ func (s *Service) applyOvernightMove(ctx context.Context, branchID string, count
 //
 //	旧的 `sku_cost_daily` / `sku_cost_states` **停止写入**(历史保留只读)。
 func (s *Service) PersistCutCostDaily(ctx context.Context, branchID string, day time.Time) (int, error) {
-	return s.persistCutCostDaily(ctx, branchID, day, true)
+	return s.persistCutCostDaily(ctx, branchID, day, true, priceRecomputeOn)
 }
 
 // persistCutCostDaily 落某营业日的**部位级**成本快照(幂等 upsert)。
@@ -573,7 +573,19 @@ func (s *Service) PersistCutCostDaily(ctx context.Context, branchID string, day 
 // (根因在 cut_cost.go 的定价优先级:它没有比较状态的 last_biz_date;
 //
 //	这边用"刷新时机"规避,不改引擎。)
-func (s *Service) persistCutCostDaily(ctx context.Context, branchID string, day time.Time, updateState bool) (int, error) {
+//
+// # recomputePrice 的含义(2026-11-02)
+//
+//	true  —— 采集完单价样本后**顺手重算**单价基线物化表
+//	         ⇒ 单日写事实路径(录猪/盘点/搬台/大宗/删猪)走这条
+//	         ⇒ 门店界面上"基线样本数/单价"当场就跟上,不用手动点「重算」。
+//	false —— 只采集样本,**不**重算 ⇒ **批量**路径(全量物化成本链)走这条,
+//	         逐日采集、**循环结束后统一重算一次**。
+//
+//	⚠️ 挂在**这里**而不是各写入口 ⇒ 因为所有"写事实"的路都会走到这一层
+//	  ⇒ 不用逐个入口去记得触发(2026-11-02 的教训:触发点漏接 ⇒ 界面一直停在旧数字)。
+func (s *Service) persistCutCostDaily(ctx context.Context, branchID string, day time.Time,
+	updateState bool, recomputePrice bool) (int, error) {
 	rows, _, _, _, err := s.computeCutDailyCosts(ctx, branchID, day)
 	if err != nil {
 		return 0, err
@@ -783,13 +795,21 @@ func (s *Service) persistCutCostDaily(ctx context.Context, branchID string, day 
 	// ---- 单价日样本(2026-10-31 owner:「分割基线加入单价」)----
 	//
 	// 这一天算完了 ⇒ 当日的**整体毛利率**与各部位的**零售单价**都定了
-	// ⇒ 倒推出的**部位进货单价**落库 ⇒ 之后「重算单价基线」就能用它。
+	// ⇒ 倒推出的**部位进货单价**落库 ⇒ 之后基线就能用它。
 	//
 	// ⚠️ **失败不阻断**:单价样本只是"喂基线"的材料
 	//   ⇒ 挂了就挂了(下次重算/物化时再补)⇒ 不能让盘点提交整个失败。
-	if _, priceErr := s.CollectCutPriceSamples(ctx, branchID, day, rows); priceErr != nil {
+	//
+	// ⚠️ 这里用**不自动重算**的内部版 ⇒ 重算由 recomputePrice 开关决定
+	//   (批量路径要攒到最后统一重算一次;见 persistCutCostDaily 的说明)。
+	priceRes, priceErr := s.collectCutPriceSamples(ctx, branchID, day, rows)
+	if priceErr != nil {
 		s.pubLogger.Warn("persistCutCostDaily: 单价样本采集失败(不影响成本快照)",
 			"branch_id", branchID, "biz_date", bizKey, "err", priceErr)
+	} else if recomputePrice {
+		// ⚠️ **自动重算单价基线物化表**(2026-11-02 owner 拍板)
+		//   ⇒ 失败不阻断(样本已经是事实)⇒ 但会记日志 + 写进 result。
+		s.applyPriceBaselineRecompute(ctx, branchID, priceRes)
 	}
 	return len(rows), nil
 }
