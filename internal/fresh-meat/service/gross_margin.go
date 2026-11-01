@@ -288,12 +288,13 @@ type PerCutGrossMargin struct {
 	DayEndRemainKg *decimal.Decimal `json:"day_end_remain_kg,omitempty"`
 	// DayEndRemainYuan 是该部位**日终剩余的金额**(元)—— 「猪肉台日终盘点总值」。
 	//
-	// ⚠️ 折算口径(owner 亲定):**零售均价 ÷ (1 + 今日毛利率)** ⇒ 倒推出进货单价,
-	//   再 × 日终剩余 kg ⇒ 柜台上还压着多少钱。
-	// ⚠️ 与单价日样本的倒推公式**同一条**(见 forecast_price.go)
-	//   ⇒ 「日终剩余估值」与「单价基线」不会各算各的。
+	// ⚠️ 折算口径(2026-11-01 owner 拍板):**采购均价** × 日终剩余 kg
+	//   ⇒ 柜台上还压着多少钱。
+	// ⚠️ **为什么不用「零售均价 ÷ (1 + 今日毛利率)」**:那个价里**含 m**
+	//   ⇒ 拿它估值期末库存 ⇒ m 的输入里又出现 m ⇒ **成环**。
+	//   采购均价**不含 m** ⇒ 天然无环。
 	//
-	// ⚠️ nil = 取不到折算价(没卖过 + 全店也算不出来) ⇒ 前端显示「—」。
+	// ⚠️ nil = 取不到折算价(当天没进猪 ⇒ 没有采购均价) ⇒ 前端显示「—」。
 	DayEndRemainYuan *decimal.Decimal `json:"day_end_remain_yuan,omitempty"`
 	// SellThroughRate 是该部位的**售罄率**(0~1)。
 	//
@@ -307,17 +308,21 @@ type PerCutGrossMargin struct {
 	// ---- 参考口径（2026-11-01 owner 终稿）----
 	//
 	// ⚠️ **owner 2026-11-01 明确要求删掉「建议毛利 / 建议毛利率」**:
-	//	它们的定义就是「用建议成本单价再倒推一遍毛利」——而单价列已经给了,
-	//	且数学上 m 进去、m′ 出来 ⇒ **永远对不上 header** ⇒ 纯属重复且误导。
-	//	⇒ 部位毛利改成**参考口径**(下面三个字段)。
+	//	它们的定义就是「用建议成本单价再倒推一遍毛利」——而单价列已经给了。
+	//	⚠️ 口径切 B 之后,「建议毛利」与「参考毛利」**其实是同一个数**
+	//	(参考毛利用的就是建议成本单价)⇒ 加上去就是**同一列显示两遍**。
+	//	⇒ 部位毛利用**参考口径**(下面三个字段)。
 	//
 	// ReferenceCostUnitPriceYuan 是该部位的**参考成本单价**(元/kg)
-	// = **零售均价 ÷ (1 + 当日总毛利率)**(owner 亲定)。
+	// = **建议成本单价**(分割基线的部位单价 × 今天这头猪的进价折算)(B 口径,owner 2026-11-01 拍板)。
+	//
+	// ⚠️ **不需要日终实盘** ⇒ 门店当天没做日终盘点也有数
+	//	(旧口径「零售均价 ÷ (1 + 当日总毛利率)」要 m ⇒ m 要日终盘点 ⇒ 连锁算不出来)。
 	//
 	// ⚠️ **完全不需要分割重量假设** ⇒ 切割不准也不会污染它
 	//	(账面口径的移动加权单价依赖期初快照 ⇒ 一次历史漏记会被放大成假短卖)。
 	//
-	// ⚠️ nil = 取不到价(既没卖过、全店也没有采购均价)⇒ 前端显示「—」。
+	// ⚠️ nil = 取不到价(这个部位没有基线价、全店也没有采购均价)⇒ 前端显示「—」。
 	ReferenceCostUnitPriceYuan *decimal.Decimal `json:"reference_cost_unit_price_yuan,omitempty"`
 	// ReferenceCostPriceSource 是参考成本单价的来源:
 	// baseline(建议成本单价 = 分割基线 × 今天进价折算)| purchase_avg(全店采购均价兜底)| none(没有)。
@@ -343,7 +348,7 @@ type PerCutGrossMargin struct {
 	// ⚠️ 分母是**产出加权**的平均 ⇒ 详见 value_coefficient.go 里的恒等式说明
 	//   (owner 原话里的「加权价值产出」按字面算恒等于产出总重 ⇒ 已改成产出估值)。
 	ValueCoefficient *decimal.Decimal `json:"value_coefficient,omitempty"`
-	RevenueYuan      decimal.Decimal `json:"revenue_yuan"`
+	RevenueYuan      decimal.Decimal  `json:"revenue_yuan"`
 	// ⚠️ 改名(2026-10-23):旧字段 `purchase_cost_yuan` 是"按消耗比例摊销的猪采购成本";
 	// 新字段是**本期销售成本**(移动加权结转)—— 两者语义不同,不是同一个数。
 	// 旧的"摊销采购成本"在"今天没进猪的部位今天在卖"时会算成 0 ⇒ 毛利虚高。
@@ -431,8 +436,8 @@ type TotalGrossMargin struct {
 	DayEndRemainKg *decimal.Decimal `json:"day_end_remain_kg,omitempty"`
 	// DayEndRemainYuan 是**日终剩余总值**(元)—— 各部位金额之和。
 	//
-	// ⚠️ 折算口径(owner 亲定):**零售均价 ÷ (1 + 今日毛利率)** ⇒ 倒推进货单价 × kg。
-	// ⚠️ nil = 没有完整盘点(或取不到折算价)⇒ 前端显示「—」。
+	// ⚠️ 折算口径(2026-11-01 owner 拍板):**采购均价** × kg(无环;见 applyDayEndRemain)。
+	// ⚠️ nil = 没有完整盘点(或取不到采购均价)⇒ 前端显示「—」。
 	DayEndRemainYuan *decimal.Decimal `json:"day_end_remain_yuan,omitempty"`
 	// SellThroughRate 是全店**售罄率**(0~1)= 销售 ÷ (销售 + 日终剩余)。
 	//

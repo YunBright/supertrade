@@ -214,6 +214,14 @@ func (s *Service) ComputeLongTermMargin(ctx context.Context, branchID, from, to 
 		}
 		// ⚠️ 没有完整盘点 **或** 没有进货 ⇒ 当天毛利**算不出来**(不给 0)。
 		//   详见 cost_reference.go 的 referenceMarginRate 的同款说明。
+		//
+		// ⚠️⚠️ **这里的每日毛利仍是旧口径(A)** —— 刻意保留,2026-11-01 owner 知悉:
+		//
+		//	毛利看板的参考毛利已切 **B 口径**(部位单价 = 建议成本单价,头 = Σ部位),
+		//	而这一页的每日行是**期间口径**(营收 − 采购 + 期末剩余×采购均价)
+		//	⇒ **两页的每日数不再相等**(不是 bug,是两套口径)。
+		//	⇒ 这一页自己**自洽**(期间毛利 = 每日之和 + 冷库变动),门店能自己核。
+		//	⇒ 要不要把每日行也切 B(需要给快照加"建议成本单价"列),是另一个决定。
 		if ref.HasRemain && ref.PurchasedKg.IsPositive() {
 			// 每日参考毛利(猪肉台口径)= 营收 − 采购 + 期末台面剩余×采购均价。
 			gm := revenue.Sub(ref.PurchasedYuan).Add(ref.RemainKg.Mul(ref.PurchaseAvgYuan))

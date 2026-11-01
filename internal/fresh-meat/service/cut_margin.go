@@ -105,7 +105,8 @@ type cutRollupMid struct {
 // # ref 是**参考口径的当日输入**(总采 + 期末猪肉台剩余),由 referenceDayTotalsOf 采集。
 //
 // ⚠️ ② 仍然依赖日终实盘(售罄率的分母是期末实盘)⇒ 没盘点时售罄率仍是「—」。
-//   ③ 不再依赖它。
+//
+//	③ 不再依赖它。
 func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation, ref ReferenceDayTotals) (
 	[]PerCutGrossMargin, TotalGrossMargin,
 ) {
