@@ -92,25 +92,20 @@ func applyDayEndRemain(mids []cutRollupMid, tot *TotalGrossMargin, purchaseAvg d
 
 // applyReferenceMargin 回填**参考口径**的成本单价与毛利(部位 + 全店)。
 //
-// # 全店(头)的参考毛利 —— **不是**各部位之和
+// # 口径(B 口径,owner 2026-11-01 拍板)
 //
-//	毛利 = 营收 − 当日采购总额 + 期末猪肉台剩余成本
+//	成本单价_c = **建议成本单价**(分割基线 × 今天这头猪的进价折算)
+//	参考毛利_c = 营收_c − 成本单价_c×(销量_c + 搭赠_c + 报损_c)
+//	全店参考毛利 = **Σ 部位参考毛利** ⇒ 头与部位同源。
 //
-// ⚠️ owner 2026-11-01:「header不需要与部位同口径」
+// ⚠️ **不再需要日终实盘**(旧口径要它)⇒ 门店没做日终盘点也有数。
 //
-//	⇒ 部位是"参考值"(产出靠基线估算),头是"总量口径"(总采/总售/总剩余)
-//	⇒ **两者不相等是正常的**,不要为了对得上而把头的口径改成部位之和。
+// ⚠️ 兜底:某部位没有基线价 ⇒ 用**全店采购均价**;
+//	连采购均价都没有(当天没进货)⇒ 该部位算不出来(「—」),
+//	此时全店也给不出来(Σ 里缺一块 ⇒ 会把毛利算高)⇒ 全店给 nil。
 //
-// # 部位
-//
-//	成本单价_c = 零售均价_c ÷ (1 + m)      (owner 亲定)
-//	参考毛利_c = 营收_c − 成本单价_c×销量_c − 搭赠成本_c − 报损成本_c
-//
-// ⚠️ m 算不出来(没有完整日终盘点 / 当天没营收)⇒ 全部给 nil(前端「—」),
-//
-//	**绝不回落成 0**(0 会被门店误读成"当天不赚钱")。
-func applyReferenceMargin(mids []cutRollupMid, tot *TotalGrossMargin, m decimal.Decimal,
-	ref ReferenceDayTotals, marginOK bool) {
+// ⚠️ **绝不回落成 0**(0 会被门店误读成"当天不赚钱")。
+func applyReferenceMargin(mids []cutRollupMid, tot *TotalGrossMargin, ref ReferenceDayTotals) {
 	// ---- 全店 ----
 	tot.ReferenceMarginRate = nil
 	tot.ReferenceGrossMarginYuan = nil
@@ -122,34 +117,14 @@ func applyReferenceMargin(mids []cutRollupMid, tot *TotalGrossMargin, m decimal.
 	tot.ReferenceRemainKg = ref.RemainKg
 	tot.ReferenceRemainYuan = ref.RemainKg.Mul(ref.PurchaseAvgYuan)
 
-	if !marginOK {
-		// ⚠️ m 算不出来 ⇒ 部位也给不出(成本单价依赖 m)。
-		for i := range mids {
-			mids[i].row.ReferenceCostUnitPriceYuan = nil
-			mids[i].row.ReferenceCostPriceSource = referencePriceSourceNone
-			mids[i].row.ReferenceGrossMarginYuan = nil
-			mids[i].row.ReferenceGrossMarginPct = nil
-		}
-		return
-	}
-
-	rate := m
-	tot.ReferenceMarginRate = &rate
-	// 全店毛利 = 营收 − 采购 + 期末剩余成本。
-	gm := tot.RevenueYuan.Sub(ref.PurchasedYuan).Add(tot.ReferenceRemainYuan)
-	amount := gm
-	pct, _ := gm.Mul(decimal.NewFromInt(100)).Div(tot.RevenueYuan).Float64()
-	tot.ReferenceGrossMarginYuan = &amount
-	tot.ReferenceGrossMarginPct = &pct
-
 	// ---- 部位 ----
 	partial := false
+	var sumMargin decimal.Decimal
 	for i := range mids {
 		mid := &mids[i]
 		soldAll := mid.soldKg.Add(mid.bulkKg)
-		rc := referencePartCostOf(m, ref.PurchaseAvgYuan, mid.revenue, soldAll,
-			mid.src.GiftKg, mid.src.WasteKg)
-		if !rc.Priceable {
+		unit, source := referenceCutUnitPriceFromBaseline(mid.src.SuggestedCostUnitPriceYuan, ref.PurchaseAvgYuan)
+		if source == referencePriceSourceNone {
 			partial = true
 			mid.row.ReferenceCostUnitPriceYuan = nil
 			mid.row.ReferenceCostPriceSource = referencePriceSourceNone
@@ -157,13 +132,30 @@ func applyReferenceMargin(mids []cutRollupMid, tot *TotalGrossMargin, m decimal.
 			mid.row.ReferenceGrossMarginPct = nil
 			continue
 		}
-		unit := rc.UnitPriceYuan
+		rc := referencePartCostOf(unit, source, mid.revenue, soldAll,
+			mid.src.GiftKg, mid.src.WasteKg)
+		price := rc.UnitPriceYuan
 		gmC := rc.GrossMarginYuan
 		pctC := rc.GrossMarginPct
-		mid.row.ReferenceCostUnitPriceYuan = &unit
+		mid.row.ReferenceCostUnitPriceYuan = &price
 		mid.row.ReferenceCostPriceSource = rc.UnitPriceSource
 		mid.row.ReferenceGrossMarginYuan = &gmC
 		mid.row.ReferenceGrossMarginPct = &pctC
+		sumMargin = sumMargin.Add(gmC)
 	}
 	tot.ReferenceCostPartial = partial
+
+	// ---- 全店 = 部位之和 ----
+	//
+	// ⚠️ **有部位算不出来 ⇒ 全店也给不出来**:
+	//	Σ 缺了那块成本 ⇒ 毛利会偏高 ⇒ 与其给一个偏高的数,不如给「—」。
+	if partial || !tot.RevenueYuan.IsPositive() {
+		return
+	}
+	amount := sumMargin
+	pct, _ := sumMargin.Mul(decimal.NewFromInt(100)).Div(tot.RevenueYuan).Float64()
+	rate := sumMargin.Div(tot.RevenueYuan)
+	tot.ReferenceGrossMarginYuan = &amount
+	tot.ReferenceGrossMarginPct = &pct
+	tot.ReferenceMarginRate = &rate
 }

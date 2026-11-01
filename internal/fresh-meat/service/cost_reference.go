@@ -1,33 +1,39 @@
-// Package service / cost_reference.go —— 参考口径的成本与毛利(2026-11-01 owner 终稿)。
+// Package service / cost_reference.go —— 参考口径的成本与毛利(2026-11-01 owner 口径切换)。
 //
-// # 口径(owner 亲定)
+// # 口径(B 口径,owner 2026-11-01 拍板)
 //
-//	总采   = 当日进店的猪(whole_pigs):重量 + 采购金额
-//	总售   = 当日零售 + 统收(cube):重量 + 金额
-//	总剩余 = **猪肉台日终实盘**(owner:「总剩余不含冷库」)
-//	剩余成本 ≈ 剩余kg × 采购均价(owner:「可以用采购均价计算」)
-//	m = (营收 − 采购 + 期末剩余成本 − 期初剩余成本) / 营收
+//	部位成本单价_c = **建议成本单价**(分割基线的部位单价 × 今天这头猪的进价折算)
+//	参考毛利_c     = 营收_c − 成本单价_c×(销量_c + 搭赠_c + 报损_c)
+//	全店参考毛利   = **Σ 部位参考毛利**(头与部位同源)
+//	全店参考毛利率 = 全店参考毛利 ÷ 营收
 //
-// # ⚠️ 期初剩余 = 0(夜里柜台清空、货回冷库)
+// # 为什么换口径(owner 原话)
 //
-//	次日台面从零开始 ⇒ **冷库才是跨日结转的位置**。
-//	⇒ 冷库归**长期毛利**(owner:「冷库余额链…在长期毛利里」),单日口径故意不含它。
-//	⇒ 代价:单日毛利会偏高(今天卖昨天结转的货,那笔成本昨天已扣)⇒ 跨期才平。
-//	  owner 知情选定:「十分准确的销售成本基本算不出来」。
+//	「在录入猪的时候不是应用了 auto 基线计算吗？不是会有 7.3 元/斤猪价的成本单价？
+//	  然后根据分割基线，销售重量×建议成本单价不就有了销售成本，
+//	  销售重量×销售单价−销售成本，不就有当前毛利吗？」
 //
-// # ⚠️ 剩余 → 0 时,m = (营收 − 采购)/营收 ⇒ 精确(owner 的收敛判据)。
+// ⇒ 旧口径(A)的部位成本单价 = 零售均价 ÷ (1 + m),而 m = (营收 − 采购 + 期末台面剩余×采购均价) ÷ 营收
+//   **依赖日终实盘** ⇒ 门店当天没做日终盘点 ⇒ m / 成本单价 / 参考毛利 / 毛利率 / 售罄率
+//   **连锁算不出来** ⇒ 界面一片「—」⇒ 明明有猪价、有分割基线,却拿不到当天的毛利。
+// ⇒ 新口径的成本单价用**录猪时就算好的建议成本单价** ⇒ **不需要盘点**。
 //
-// # 部位成本单价 = 零售均价 ÷ (1 + m)
+// # ⚠️ B 口径的取舍(owner 知情选定)
 //
-//	**完全不需要任何分割重量假设** ⇒ 切割不准也不会污染成本单价。
+//	① **依赖统计基线**:建议成本单价是「分割基线 × 今天进价」折算出来的统计量,
+//	   不是这批货的实际成本(今天卖掉的货可能还是前几天进的猪)。
+//	② **偏差方向与旧口径相反**:旧口径把"今天进货但没卖掉"算进今天(单日毛利偏高);
+//	   新口径只给"今天卖掉的货"计成本(猪价涨了当天毛利偏低)⇒ **两者只能选一个**。
+//	③ **当天没进货 ⇒ 算不出来**:建议成本单价要靠当天的猪做缩放 ⇒ 「—」(不回落成 0)。
 //
-// # 为什么不再用账面链
+// # ⚠️ 单价基线(样本采集)仍走**旧口径**
 //
-//	账面的销售成本走移动加权链,期初继承历史快照 ⇒ 一次历史漏记会被放大成假短卖
-//	(生产实测 店 00 2026-10-30:短卖 41.66kg / ¥618.81 ⇒ 某部位毛利被压到 −12.08%)。
-//	⇒ 参考口径**不追求精确**,只求**自洽、可解释、依赖的都是事实**。
+//	单价基线 = 历史样本倒推(进价 = 零售均价 ÷ (1+m))⇒ 这里的 m 用的是**旧口径**
+//	(依赖日终实盘,见下面的 referenceMarginRateOfDay)。
+//	⇒ 这是**有意保留**:基线是历史统计量,换口径不会改写历史。
+//	⇒ 要不要连"样本采集 + 基线"一起换口径,需要连同"重算样本 + 重算基线"另案决定。
 //
-// ⚠️ 参照口径 ≠ 「账面口径」:本文件算的是**参考**值,
+// # ⚠️ 参照口径 ≠ 「账面口径」:本文件算的是**参考**值,
 // 账面值(移动加权链)仍留在 cut_cost.go,只服务对账/审计,并在 P1 退休。
 package service
 
@@ -62,7 +68,14 @@ type ReferenceDayTotals struct {
 	HasRemain bool
 }
 
-// referenceMarginRate 算当日**总毛利率** m。
+// referenceMarginRate 算当日**总毛利率** m(**旧口径 A**)。
+//
+// ⚠️ **只给「单价样本采集」用**(见 referenceMarginRateOfDay)——
+//
+//	看板上的参考毛利已改成 B 口径(成本单价 = 建议成本单价),不再用 m。
+//	⇒ 这里保留 A 口径,是因为**单价基线**是历史统计量:
+//	  它的样本是用「进价 = 零售均价 ÷ (1+m)」倒推的,m 用旧口径 ⇒ 基线不动。
+//	⇒ 要不要连基线一起换口径,是另一个决定(要连同重算样本 + 重算基线)。
 //
 // # 口径
 //
@@ -148,30 +161,29 @@ func (s *Service) referenceDayTotalsOf(ctx context.Context, branchID string, day
 	return out, nil
 }
 
-// referenceCutUnitPrice 算某个部位当天的**成本单价**(元/kg)。
+// referenceCutUnitPriceFromBaseline 取某个部位当天的**参考成本单价**(元/kg)。
 //
-// # 口径(owner 亲定)
+// # 口径(B 口径,owner 2026-11-01 拍板)
 //
-//	成本单价_c = 零售均价_c ÷ (1 + m)
+//	成本单价_c = **建议成本单价**(基线单价 × 今天这头猪的进价折算)
 //
-// # 兜底
+// ⇒ **不需要日终实盘** ⇒ 没做盘点的日子照样有毛利。
 //
-//	当天**没卖过**的部位(零售均价取不到)⇒ 用**全店采购均价**。
+// # 兜底链
 //
-// ⚠️ 为什么必须有兜底:搭赠/报损这类"有量、无销售"的部位
+//	建议成本单价 → 全店采购均价 → 取不到(= none)
 //
-//	(生产实测 店 00 10-30 的猪肝 3.03kg)也要计成本 ⇒ 成本单价不能是空。
+// ⚠️ 为什么要有兜底:某个部位可能**没有自己的基线价**
 //
-// ⚠️ 返回 source 让调用方能说清"这个单价是倒推的还是兜底的"。
-func referenceCutUnitPrice(m, purchaseAvg, retailAvg decimal.Decimal, soldTotalKg decimal.Decimal) (
+//	(部位单价基线覆盖不到、或退取链只走到了整店均价)⇒ 它也要计成本
+//	(搭赠/报损这类"有量、无销售"的部位也要计成本)⇒ 单价不能是空。
+//
+// ⚠️ 返回 source 让调用方能说清"这个单价是基线折算的还是兜底的"。
+func referenceCutUnitPriceFromBaseline(suggested *decimal.Decimal, purchaseAvg decimal.Decimal) (
 	decimal.Decimal, string,
 ) {
-	if soldTotalKg.IsPositive() && retailAvg.IsPositive() && m.IsPositive() {
-		// ⚠️ m ≤ −1 ⇒ (1+m) ≤ 0 ⇒ 倒推不出正数 ⇒ 落兜底。
-		den := decimal.NewFromInt(1).Add(m)
-		if den.IsPositive() {
-			return retailAvg.Div(den), referencePriceSourceRetailBackout
-		}
+	if suggested != nil && suggested.IsPositive() {
+		return *suggested, referencePriceSourceBaseline
 	}
 	if purchaseAvg.IsPositive() {
 		return purchaseAvg, referencePriceSourcePurchaseAvg
@@ -181,15 +193,21 @@ func referenceCutUnitPrice(m, purchaseAvg, retailAvg decimal.Decimal, soldTotalK
 
 // 参考成本单价的**来源**标记(前端要能说清"这个数是怎么来的")。
 const (
-	// referencePriceSourceRetailBackout = 零售均价 ÷ (1+m) —— 正统倒推。
-	referencePriceSourceRetailBackout = "retail_backout"
-	// referencePriceSourcePurchaseAvg = 全店采购均价兜底(当天没卖过这个部位)。
+	// referencePriceSourceBaseline = **建议成本单价**(分割基线 × 今天进价折算)—— B 口径的正统来源。
+	referencePriceSourceBaseline = "baseline"
+	// referencePriceSourcePurchaseAvg = 全店采购均价兜底(这个部位没有基线价)。
 	referencePriceSourcePurchaseAvg = "purchase_avg"
-	// referencePriceSourceNone = 取不到(既没卖出、也没采购)。
+	// referencePriceSourceNone = 取不到(既没有基线价、当天也没进货)。
 	referencePriceSourceNone = "none"
 )
 
-// referenceMarginRateOfDay 算当日**参考口径**的总毛利率 m —— 给**单价样本采集**用。
+// referenceMarginRateOfDay 算当日**总毛利率** m —— 给**单价样本采集**用(**旧口径 A**)。
+//
+// ⚠️ 看板的参考毛利已改成 B 口径(不用 m,也不用日终实盘);
+//
+//	**这里刻意保留旧口径**:单价基线是**历史统计量**,
+//	它的样本按「进价 = 零售均价 ÷ (1+m)」倒推 ⇒ m 用旧口径 ⇒ 基线不动。
+//	⇒ 换口径不会改写历史;要不要连基线一起换,是另一个决定。
 //
 // # 为什么单价样本要用参考口径(2026-11-01 owner)
 //
@@ -293,23 +311,25 @@ type referencePartCost struct {
 //
 // # 输入
 //
-//	m             当日总毛利率(由 referenceMarginRate 给)
-//	purchaseAvg   全店采购均价(兜底价)
-//	revenue       当日该部位营收(零售 + 统收 + 分摊进来的特价)
-//	soldKg        当日该部位销量(零售 + 统收)
-//	giftKg        搭赠量
-//	wasteKg       报损量
+//	unit       该部位的**参考成本单价**(元/kg,由 referenceCutUnitPriceFromBaseline 给)
+//	source     单价来源(见 referencePriceSource*)
+//	revenue    当日该部位营收(零售 + 统收 + 分摊进来的特价)
+//	soldKg     当日该部位销量(零售 + 统收)
+//	giftKg     搭赠量
+//	wasteKg    报损量
+//
+// # 输出
+//
+//	参考销售成本 = 成本单价 × 销量
+//	参考毛利     = 营收 − 参考销售成本 − 搭赠成本 − 报损成本
 //
 // ⚠️ **没有"建议毛利"这一层**:建议成本单价 → 建议毛利 是把同一个信息换个形式说一遍,
 //
 //	而 m 进去、m′ 出来 ⇒ 数学上永远对不上 header ⇒ owner 2026-11-01 明确要求删掉。
-func referencePartCostOf(m, purchaseAvg, revenue, soldKg, giftKg, wasteKg decimal.Decimal) referencePartCost {
+func referencePartCostOf(unit decimal.Decimal, source string,
+	revenue, soldKg, giftKg, wasteKg decimal.Decimal,
+) referencePartCost {
 	out := referencePartCost{}
-	retailAvg := decimal.Zero
-	if soldKg.IsPositive() {
-		retailAvg = revenue.Div(soldKg)
-	}
-	unit, source := referenceCutUnitPrice(m, purchaseAvg, retailAvg, soldKg)
 	out.UnitPriceYuan = unit
 	out.UnitPriceSource = source
 	if source == referencePriceSourceNone {

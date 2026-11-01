@@ -1,26 +1,30 @@
 package service_test
 
-// 回归锁:**参考口径**(2026-11-01 owner 终稿)。
+// 回归锁:**参考口径**(2026-11-01 owner 口径切换 = B 口径)。
 //
-// # 口径(owner 亲定)
+// # 口径(B)
 //
-//	m       = (营收 − 当日采购 + 期末猪肉台剩余×采购均价) / 营收
-//	成本单价_c = 零售均价_c ÷ (1 + m)
+//	成本单价_c = **建议成本单价**(基线单价 × 今天这头猪的进价折算)
 //	参考毛利_c = 营收_c − 成本单价_c×销量_c − 搭赠成本_c − 报损成本_c
+//	全店参考毛利 = **Σ 部位参考毛利**(头与部位同源)
 //
-// # 三条不能违反的性质(每条都有判别力用例)
+// # 四条不能违反的性质(每条都有判别力用例)
 //
-//	① **header ≠ 各部位参考毛利之和**(owner:「header不需要与部位同口径」)
-//	   ⇒ 用例:TestReferenceHeaderNotEqualSumOfParts
-//	② **没有完整日终盘点 ⇒ 参考毛利给不出(nil)**,绝不回落成 0
-//	   ⇒ 用例:TestReferenceMarginNeedsStocktake
-//	③ **出成率 > 100% ⇒ 有问题**(owner:「它大于100%,就知道有问题,就需要查」)
+//	① **没有日终盘点 ⇒ 参考毛利照样有值**(owner 2026-11-01 拍板换口径的原因)
+//	   ⇒ 用例:TestReferenceMarginWithoutStocktakeStillHasValue
+//	② **header = 各部位参考毛利之和**(B 口径同源)
+//	   ⇒ 用例:TestReferenceHeaderEqualsSumOfParts
+//	③ **当天没进货 ⇒ 参考毛利给不出(nil)**,绝不回落成 0/100%
+//	   ⇒ 用例:TestReferenceMarginNeedsPurchase
+//	④ **出成率 > 100% ⇒ 有问题**(owner:「它大于100%,就知道有问题,就需要查」)
 //	   ⇒ 用例:TestYieldRateOver100MeansProblem
 //
 // # 为什么日终剩余的金额用**采购均价**
 //
 //	旧口径「零售均价 ÷ (1 + 毛利率)」里含 m ⇒ 拿它估值期末库存 ⇒ **成环**。
 //	采购均价不含 m ⇒ 天然无环 ⇒ 才能当 m 的输入。
+//
+// ⚠️ 日终剩余/售罄率**仍然依赖日终实盘**(它们的分母是期末实盘)⇒ 没盘点时仍是「—」。
 
 import (
 	"testing"
@@ -47,6 +51,19 @@ func fmDayEndRow(cut model.CutType, soldKg, revenue, salesCost, remainKg float64
 		SalesCostYuan:   fmDayDec(salesCost),
 		CounterActualKg: fmDayDec(remainKg),
 	}
+}
+
+// fmDayEndRowWithSuggested 造一条**带建议成本单价**的部位行(B 口径的正统输入)。
+//
+// ⚠️ B 口径下,部位成本单价 = 建议成本单价(基线 × 今天进价折算)⇒ 没有它就落兜底。
+func fmDayEndRowWithSuggested(cut model.CutType, soldKg, revenue, salesCost, remainKg float64,
+	dataSource string, suggestedUnit string,
+) service.CutDailyCost {
+	row := fmDayEndRow(cut, soldKg, revenue, salesCost, remainKg, dataSource)
+	v := decimal.RequireFromString(suggestedUnit)
+	row.SuggestedCostUnitPriceYuan = &v
+	row.SuggestedCostPriceSource = "baseline"
+	return row
 }
 
 // fmDayEndFind 按部位找行。
@@ -134,18 +151,20 @@ func TestDayEndNoStocktakeGivesNoSellThrough(t *testing.T) {
 	}
 }
 
-// 参考毛利率 m = (营收 − 采购 + 期末剩余×采购均价) / 营收。
+// 全店参考毛利 = Σ 部位参考毛利(B 口径);总采/采购均价照样给出来(门店要能自己验算)。
 //
-// ⚠️ 判别力:把「+期末剩余成本」这一项去掉 ⇒ m 会从 30% 变成 12.5% ⇒ 断言变红。
+// ⚠️ 这条行**没有建议成本单价** ⇒ 成本单价落**全店采购均价兜底**(14 元/kg)
+// ⇒ 成本 = 14 × 80 = 1120 ⇒ 毛利 = 1600 − 1120 = 480 ⇒ 毛利率 30%。
+//
+// ⚠️ 判别力:把兜底价换成"零售均价÷(1+m)倒推"(旧口径)⇒ 单价变成 15.3846 ⇒ 断言变红。
 func TestReferenceMarginRate(t *testing.T) {
 	_, total := service.RollUpPerCutCutsForTest([]service.CutDailyCost{
 		fmDayEndRow(model.CutLegRear, 80, 1600, 1200, 20, "actual"),
 	}, nil, fmRefTotals())
 
 	if total.ReferenceMarginRate == nil {
-		t.Fatal("有完整盘点 ⇒ 参考毛利率必须有值")
+		t.Fatal("有进货 ⇒ 参考毛利率必须有值")
 	}
-	// m = (1600 − 1400 + 20×14) / 1600 = 480 / 1600 = 0.30
 	gotRate, _ := total.ReferenceMarginRate.Float64()
 	if gotRate < 0.2999 || gotRate > 0.3001 {
 		t.Fatalf("参考毛利率 = %v,期望 0.30", gotRate)
@@ -173,41 +192,42 @@ func TestReferenceMarginRate(t *testing.T) {
 	}
 }
 
-// 部位成本单价 = 零售均价 ÷ (1 + m);参考毛利 = 营收 − 单价×销量。
+// 部位成本单价 = **建议成本单价**;参考毛利 = 营收 − 单价×销量。
+//
+// ⚠️ 判别力:把单价换回"零售均价÷(1+m)倒推"(旧口径)⇒ 单价变 15.3846 ⇒ 断言变红。
 func TestReferenceCutUnitPriceAndMargin(t *testing.T) {
 	rows, _ := service.RollUpPerCutCutsForTest([]service.CutDailyCost{
-		fmDayEndRow(model.CutLegRear, 80, 1600, 1200, 20, "actual"),
+		fmDayEndRowWithSuggested(model.CutLegRear, 80, 1600, 1200, 20, "actual", "12"),
 	}, nil, fmRefTotals())
 
 	row := fmDayEndFind(t, rows, model.CutLegRear)
 	if row.ReferenceCostUnitPriceYuan == nil {
-		t.Fatal("有 m ⇒ 部位成本单价必须有值")
+		t.Fatal("有建议成本单价 ⇒ 部位成本单价必须有值")
 	}
-	// 单价 = (1600 ÷ 80) ÷ (1 + 0.30) = 20 ÷ 1.3 = 15.3846…
-	want := fmDayDec(20).Div(fmDayDec(1.3))
+	want := fmDayDec(12)
 	if !row.ReferenceCostUnitPriceYuan.Equal(want) {
 		t.Fatalf("部位成本单价 = %s,期望 %s", row.ReferenceCostUnitPriceYuan.String(), want.String())
 	}
-	if row.ReferenceCostPriceSource != "retail_backout" {
-		t.Fatalf("成本单价来源 = %q,期望 retail_backout", row.ReferenceCostPriceSource)
+	if row.ReferenceCostPriceSource != "baseline" {
+		t.Fatalf("成本单价来源 = %q,期望 baseline", row.ReferenceCostPriceSource)
 	}
 	if row.ReferenceGrossMarginYuan == nil {
 		t.Fatal("有成本单价 ⇒ 参考毛利必须有值")
 	}
-	// 参考毛利 = 1600 − (20/1.3) × 80 = 1600 − 1230.769… = 369.2307…
-	wantGm := fmDayDec(1600).Sub(fmDayDec(20).Div(fmDayDec(1.3)).Mul(fmDayDec(80)))
+	// 参考毛利 = 1600 − 12 × 80 = 640
+	wantGm := fmDayDec(1600).Sub(fmDayDec(12).Mul(fmDayDec(80)))
 	if !row.ReferenceGrossMarginYuan.Equal(wantGm) {
 		t.Fatalf("部位参考毛利 = %s,期望 %s", row.ReferenceGrossMarginYuan.String(), wantGm.String())
 	}
 }
 
-// **header ≠ 各部位参考毛利之和**(owner:「header不需要与部位同口径」)。
+// **header = 各部位参考毛利之和**(B 口径:头与部位同源 ⇒ 门店能自己核)。
 //
-// ⚠️ 判别力:把 header 改成"部位加总"⇒ 本用例必红(611.11 ≠ 880)。
-func TestReferenceHeaderNotEqualSumOfParts(t *testing.T) {
+// ⚠️ 判别力:把 header 改回旧口径的「营收 − 采购 + 期末剩余成本」⇒ 本用例必红。
+func TestReferenceHeaderEqualsSumOfParts(t *testing.T) {
 	rows, total := service.RollUpPerCutCutsForTest([]service.CutDailyCost{
-		fmDayEndRow(model.CutLegRear, 80, 1600, 1200, 0, "actual"),
-		fmDayEndRow(model.CutBelly, 20, 400, 300, 0, "actual"),
+		fmDayEndRowWithSuggested(model.CutLegRear, 80, 1600, 1200, 0, "actual", "12"),
+		fmDayEndRowWithSuggested(model.CutBelly, 20, 400, 300, 0, "actual", "10"),
 	}, nil, fmRefTotals())
 
 	var sum decimal.Decimal
@@ -217,37 +237,72 @@ func TestReferenceHeaderNotEqualSumOfParts(t *testing.T) {
 		}
 	}
 	if total.ReferenceGrossMarginYuan == nil {
-		t.Fatal("有完整盘点 ⇒ 全店参考毛利必须有值")
+		t.Fatal("有进货 ⇒ 全店参考毛利必须有值")
 	}
-	if sum.Equal(*total.ReferenceGrossMarginYuan) {
-		t.Fatalf("★ header 必须**不等于**部位之和(两者口径不同)—— 两者都是 %s,"+
-			"说明有人把 header 改成了部位加总", sum.String())
+	if !sum.Equal(*total.ReferenceGrossMarginYuan) {
+		t.Fatalf("★ header 必须等于部位之和(同源):部位 %s / 头 %s",
+			sum.String(), total.ReferenceGrossMarginYuan.String())
 	}
-	// 全店口径:营收 2000 − 采购 1400 + 剩余 280 = 880
-	if !total.ReferenceGrossMarginYuan.Equal(fmDayDec(880)) {
-		t.Fatalf("全店参考毛利 = %s,期望 880", total.ReferenceGrossMarginYuan.String())
+	// 后腿:1600 − 12×80 = 640;五花:400 − 10×20 = 200 ⇒ 合计 840
+	if !total.ReferenceGrossMarginYuan.Equal(fmDayDec(840)) {
+		t.Fatalf("全店参考毛利 = %s,期望 840", total.ReferenceGrossMarginYuan.String())
 	}
 }
 
-// 没有完整日终盘点 ⇒ 参考毛利**给不出**(nil),**绝不回落成 0**。
-func TestReferenceMarginNeedsStocktake(t *testing.T) {
+// **没有日终盘点 ⇒ 参考毛利照样有值**(owner 2026-11-01 换口径的原因)。
+//
+// ⚠️ 旧口径在这里给的是 nil(整条链算不出来)⇒ 门店看到的是一片「—」。
+//
+// ⚠️ 判别力:把成本单价换回"依赖 m 的倒推"⇒ 没有 m ⇒ 参考毛利变 nil ⇒ 本用例必红。
+func TestReferenceMarginWithoutStocktakeStillHasValue(t *testing.T) {
 	rows, total := service.RollUpPerCutCutsForTest([]service.CutDailyCost{
-		fmDayEndRow(model.CutLegRear, 80, 1600, 1200, 0, "estimated"),
+		fmDayEndRowWithSuggested(model.CutLegRear, 80, 1600, 1200, 0, "estimated", "12"),
 	}, nil, service.ReferenceDayTotalsForTest("100", "1400", "0", false))
 
 	row := fmDayEndFind(t, rows, model.CutLegRear)
-	if row.ReferenceGrossMarginYuan != nil {
-		t.Fatalf("没有盘点 ⇒ 部位参考毛利必须是 nil,实际 %s", row.ReferenceGrossMarginYuan.String())
+	if row.ReferenceGrossMarginYuan == nil {
+		t.Fatal("★ 没有盘点 ⇒ 参考毛利也必须有值(B 口径不需要日终实盘)")
 	}
-	if row.ReferenceCostUnitPriceYuan != nil {
-		t.Fatalf("没有盘点 ⇒ 部位成本单价必须是 nil")
+	if row.ReferenceCostUnitPriceYuan == nil {
+		t.Fatal("★ 没有盘点 ⇒ 部位成本单价也必须有值")
 	}
-	if total.ReferenceGrossMarginYuan != nil {
-		t.Fatalf("没有盘点 ⇒ 全店参考毛利必须是 nil(不是 0!),实际 %s",
-			total.ReferenceGrossMarginYuan.String())
+	if total.ReferenceGrossMarginYuan == nil {
+		t.Fatalf("★ 没有盘点 ⇒ 全店参考毛利必须有值,实际 nil")
 	}
-	if total.ReferenceMarginRate != nil {
-		t.Fatalf("没有盘点 ⇒ 参考毛利率必须是 nil")
+	if !total.ReferenceGrossMarginYuan.Equal(fmDayDec(640)) {
+		t.Fatalf("全店参考毛利 = %s,期望 640", total.ReferenceGrossMarginYuan.String())
+	}
+	// ⚠️ 但**售罄率**仍然需要日终实盘(分母是期末实盘)⇒ 仍是 nil。
+	if total.SellThroughRate != nil {
+		t.Fatalf("没有盘点 ⇒ 售罄率仍应是 nil,实际 %v", *total.SellThroughRate)
+	}
+}
+
+// 参考成本单价必须**优先用建议成本单价**,而不是全店采购均价兜底。
+//
+// ⚠️ 这是本次口径切换的**核心断言**:owner 的原话是
+//
+//	「销售重量×建议成本单价不就有了销售成本」
+//
+// ⇒ 单价取错(拿采购均价顶替)⇒ 毛利会系统性偏 ⇒ 门店看到的是另一个数。
+//
+// ⚠️ 判别力:把优先级反了(先兜底后建议)⇒ 单价变 14 ⇒ 毛利 640 → 480 ⇒ 断言变红。
+func TestReferenceMarginPrefersSuggestedPriceOverPurchaseAvg(t *testing.T) {
+	rows, _ := service.RollUpPerCutCutsForTest([]service.CutDailyCost{
+		fmDayEndRowWithSuggested(model.CutLegRear, 80, 1600, 1200, 20, "actual", "12"),
+	}, nil, fmRefTotals())
+
+	row := fmDayEndFind(t, rows, model.CutLegRear)
+	if row.ReferenceCostUnitPriceYuan == nil ||
+		!row.ReferenceCostUnitPriceYuan.Equal(fmDayDec(12)) {
+		t.Fatalf("★ 成本单价必须用建议成本单价 12,实际 %v", row.ReferenceCostUnitPriceYuan)
+	}
+	if row.ReferenceCostPriceSource != "baseline" {
+		t.Fatalf("★ 来源必须是 baseline(不是 purchase_avg),实际 %q", row.ReferenceCostPriceSource)
+	}
+	// 采购均价是 14 ⇒ 若错用它,毛利会是 480 而不是 640。
+	if !row.ReferenceGrossMarginYuan.Equal(fmDayDec(640)) {
+		t.Fatalf("★ 参考毛利 = %s,期望 640(用建议成本单价 12)", row.ReferenceGrossMarginYuan.String())
 	}
 }
 
@@ -255,13 +310,14 @@ func TestReferenceMarginNeedsStocktake(t *testing.T) {
 //
 // # 为什么这条必须锁(2026-11-01)
 //
-//	没有进货 ⇒ 没有采购均价 ⇒ 期末剩余的成本估不出来;
-//	而公式会退化成 m = (营收 − 0 + 剩余×0) / 营收 = **100%**
-//	⇒ 门店看到「参考毛利 = 营收、毛利率 100%」会以为赚疯了。
-//	⇒ 而那种日子通常只是**还没录猪** ⇒ 正确表现是「—」(算不出来)。
+//	没有进货 ⇒ ① 建议成本单价取不到(它要靠当天的猪做进价缩放)
+//	② 兜底的全店采购均价也没有(分母是进货重量)⇒ **任何部位都取不到价**
+//	⇒ 参考毛利算不出来 ⇒ 只能显示「—」。
 //
-// ⚠️ 判别力:去掉 referenceMarginRate 里的 PurchasedKg 判据
-//   ⇒ 本用例必红(总额会变成 100%)。
+//	⚠️ 更不能回落成"营收 − 0" = 100% 毛利 ⇒ 门店会以为赚疯了。
+//	⇒ 而那种日子通常只是**还没录猪** ⇒ 看板本来就有「今天还没录猪」提示。
+//
+// ⚠️ 判别力:把"没有价 ⇒ 不给数"改成"给 0 成本"⇒ 本用例必红(总额会变成 1600 = 100%)。
 func TestReferenceMarginNeedsPurchase(t *testing.T) {
 	rows, total := service.RollUpPerCutCutsForTest([]service.CutDailyCost{
 		fmDayEndRow(model.CutLegRear, 80, 1600, 1200, 20, "actual"),

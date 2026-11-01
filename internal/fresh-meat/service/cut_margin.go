@@ -98,10 +98,14 @@ type cutRollupMid struct {
 //
 //	① 部位行 + 全店合计(账:移动加权链出来的实际毛利 —— P1 会退休)
 //	② 日终剩余(kg/金额) + 售罄率(用**猪肉台日终盘点**,不用进货量)
-//	③ **参考口径**:总毛利率 m + 部位成本单价 + 部位参考毛利 + 全店参考毛利
-//	   (owner:「header不需要与部位同口径」⇒ ③ 的头**不是**部位的加总)
+//	③ **参考口径**(B 口径):部位成本单价 = **建议成本单价**(基线 × 今天进价折算)
+//	   + 部位参考毛利 + 全店参考毛利(= 部位之和)
+//	   ⇒ **不需要日终实盘** ⇒ 没做盘点的日子也有数。
 //
 // # ref 是**参考口径的当日输入**(总采 + 期末猪肉台剩余),由 referenceDayTotalsOf 采集。
+//
+// ⚠️ ② 仍然依赖日终实盘(售罄率的分母是期末实盘)⇒ 没盘点时售罄率仍是「—」。
+//   ③ 不再依赖它。
 func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation, ref ReferenceDayTotals) (
 	[]PerCutGrossMargin, TotalGrossMargin,
 ) {
@@ -126,8 +130,10 @@ func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation, ref R
 
 	// ② 日终剩余 + 售罄率;③ 参考口径。两步都要**跨部位**算 ⇒ 放循环之后。
 	applyDayEndRemain(mids, &tot, ref.PurchaseAvgYuan)
-	marginRate, marginOK := referenceMarginRate(ref, tot.RevenueYuan)
-	applyReferenceMargin(mids, &tot, marginRate, ref, marginOK)
+	// ⚠️ 2026-11-01 owner 口径切换(B):参考毛利改用**建议成本单价**,
+	//	⇒ 不再依赖日终实盘 ⇒ 没做日终盘点的日子也有数。
+	//	⇒ 旧的 m(零售均价÷(1+m)倒推)只留给「单价样本采集」用,见 cost_reference.go。
+	applyReferenceMargin(mids, &tot, ref)
 
 	// ---- 出成率(owner 2026-11-01:>100% ⇒ 有问题,要去查)----
 	if rate, ok := referenceYieldRate(cutRows, ref.PurchasedKg); ok {

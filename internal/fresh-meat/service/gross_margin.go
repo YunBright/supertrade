@@ -320,16 +320,14 @@ type PerCutGrossMargin struct {
 	// ⚠️ nil = 取不到价(既没卖过、全店也没有采购均价)⇒ 前端显示「—」。
 	ReferenceCostUnitPriceYuan *decimal.Decimal `json:"reference_cost_unit_price_yuan,omitempty"`
 	// ReferenceCostPriceSource 是参考成本单价的来源:
-	// retail_backout(零售均价÷(1+m))| purchase_avg(全店采购均价兜底)| none(没有)。
+	// baseline(建议成本单价 = 分割基线 × 今天进价折算)| purchase_avg(全店采购均价兜底)| none(没有)。
 	//
 	// ⚠️ 门店要看得见这个价**怎么来的** ⇒ 前端写在悬浮提示里。
 	ReferenceCostPriceSource string `json:"reference_cost_price_source,omitempty"`
 	// ReferenceGrossMarginYuan 是该部位的**参考毛利**(元):
 	//	营收 − 成本单价×销量 − 搭赠成本 − 报损成本。
 	//
-	// ⚠️ **与全店 header 的毛利不必相等**(owner:「header不需要与部位同口径」):
-	//	部位的**产出是基线估算的**,而 header 是总采/总售/总剩余算出来的
-	//	⇒ 两者本就不该有恒等关系。
+	// ⚠️ **与全店 header 的参考毛利相等**(B 口径:头 = Σ部位 ⇒ 同源)。
 	// ⚠️ nil = 这个部位取不到成本单价 ⇒ 算不出来 ⇒ 前端显示「—」。
 	ReferenceGrossMarginYuan *decimal.Decimal `json:"reference_gross_margin_yuan,omitempty"`
 	// ReferenceGrossMarginPct 是**参考毛利率**(%)—— 分母 = 营收。
@@ -444,20 +442,18 @@ type TotalGrossMargin struct {
 	//
 	// ⚠️ **owner 2026-11-01 明确要求删掉「建议毛利 / 建议毛利率」** ⇒ 见下面这一组。
 	//
-	// ReferenceGrossMarginYuan 是**全店参考毛利**(元):
+	// ReferenceGrossMarginYuan 是**全店参考毛利**(元)= **各部位参考毛利之和**。
 	//
-	//	营收 − 当日采购总额 + 期末猪肉台剩余成本
-	//
-	// ⚠️ **期初剩余 = 0**:夜里柜台清空、货回冷库 ⇒ **冷库才是跨日结转的位置**
-	//   ⇒ 冷库归「长期毛利」(owner:「冷库余额链…在长期毛利里」),单日口径不含它。
-	// ⚠️ **剩余 → 0 时 m = (营收 − 采购)/营收 ⇒ 精确**(owner 的收敛判据)。
-	// ⚠️ **与各部位参考毛利之和不相等**(owner:「header不需要与部位同口径」)⇒ 正常。
-	// ⚠️ nil = 当天没有完整日终盘点(剩余算不出来)⇒ 前端显示「—」(不是 0)。
+	// ⚠️ 口径(B,2026-11-01 owner 拍板):部位成本单价 = **建议成本单价**
+	//	(分割基线的部位单价 × 今天这头猪的进价折算)
+	//	⇒ 只给"今天卖掉的货"计成本 ⇒ **不需要日终实盘** ⇒ 没做盘点的日子也有数。
+	// ⚠️ **与各部位参考毛利之和相等**(头与部位同源 ⇒ 门店能自己核)。
+	// ⚠️ nil = 有部位取不到成本单价(当天没进货)⇒ 前端显示「—」(不是 0)。
 	ReferenceGrossMarginYuan *decimal.Decimal `json:"reference_gross_margin_yuan,omitempty"`
 	// ReferenceGrossMarginPct 是**全店参考毛利率**(%)。
 	ReferenceGrossMarginPct *float64 `json:"reference_gross_margin_pct,omitempty"`
 	// ReferenceMarginRate 是**当日总毛利率** m(小数,0.22 = 22%)——
-	// 倒推部位成本单价的那个输入。nil = 算不出来(同上)。
+	// B 口径下 = Σ部位参考毛利 ÷ 营收(与 ReferenceGrossMarginPct 同源)。
 	ReferenceMarginRate *decimal.Decimal `json:"reference_margin_rate,omitempty"`
 	// ReferenceCostPartial = true ⇒ **有部位取不到参考成本单价**
 	// ⇒ 各部位参考毛利是**不完整**的(前端要提示"部分部位未计入")。
