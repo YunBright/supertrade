@@ -298,6 +298,58 @@ func TestCheckQuantity(t *testing.T) {
 	}
 }
 
+// TestCheckQuantity_StockingBasis 锁 2026-11-01 用户口径:
+// 有备货系数的 SKU 以「合理备货量」为基准判进货过量,
+// **不再**用「自最后一次采购入库以来的销量」当分母。
+//
+// 生产实踩(审批 6b8ddfe89a7146f2bc16f8a886769a97):乌鸡蛋-00330 进货 13.5,
+// 收货仅 1 天 ⇒ 窗口销量 1.0134 ⇒ 老口径判 13.3 倍 block 拒单;
+// 按备货系数合理备货量 9.25 ⇒ 实际只有 1.46 倍,属正常备货,不应出信号。
+func TestCheckQuantity_StockingBasis(t *testing.T) {
+	received := map[string]decimal.Decimal{"PR1": dec("13.5")}
+	// 老口径的窗口销量很小(只收了 1 天的货)。
+	sales := map[string]SaleRow{"PR1": {ProductID: "PR1", NetSaleQuantity: dec("1.0134")}}
+	stocking := map[string]StockingFact{"PR1": {
+		ProductID:      "PR1",
+		PeriodDays:     7,
+		Multiplier:     dec("1.30"),
+		PeriodSalesQty: dec("7.09"),
+		ReasonableQty:  dec("9.25"),
+		ReceivedQty:    dec("13.5"),
+	}}
+
+	sigs := checkQuantity(received, sales, nil, 3, QuantityContext{Stocking: stocking})
+	if len(sigs) != 0 {
+		t.Fatalf("进货 13.5 = 1.46 倍合理备货量 ⇒ 不应出信号, got %v", sigs)
+	}
+
+	// 超过 3 倍合理备货量(9.25×3=27.75)⇒ block,且消息必须带备货系数口径。
+	received["PR1"] = dec("30")
+	sigs = checkQuantity(received, sales, nil, 3, QuantityContext{Stocking: stocking})
+	if len(sigs) != 1 {
+		t.Fatalf("进货 30 > 3 倍合理备货量 ⇒ 应 block, got %d", len(sigs))
+	}
+	if sigs[0].Level != model.SignalBlock || sigs[0].SignalType != SigQtyDeviation {
+		t.Errorf("level=%s type=%s, want block/qty_deviation", sigs[0].Level, sigs[0].SignalType)
+	}
+	for _, want := range []string{"周期销售数 7.09", "合理备货量 9.25"} {
+		if !strings.Contains(sigs[0].Message, want) {
+			t.Errorf("block 消息应含 %q: %s", want, sigs[0].Message)
+		}
+	}
+}
+
+// TestCheckQuantity_StockingBasis_ZeroReasonableFallsBack 合理备货量为 0
+// (采样窗口内完全没销量)⇒ 没有依据,回退老口径(无销售 + 进货 ⇒ block)。
+func TestCheckQuantity_StockingBasis_ZeroReasonableFallsBack(t *testing.T) {
+	received := map[string]decimal.Decimal{"PR1": dec("5")}
+	stocking := map[string]StockingFact{"PR1": {ProductID: "PR1", ReasonableQty: decimal.Zero}}
+	sigs := checkQuantity(received, map[string]SaleRow{}, nil, 3, QuantityContext{Stocking: stocking})
+	if len(sigs) != 1 || sigs[0].Level != model.SignalBlock || sigs[0].SignalType != SigPurchaseWithoutSales {
+		t.Fatalf("无合理备货量且无销量 ⇒ 应回退为 purchase_without_sales block, got %v", sigs)
+	}
+}
+
 func TestCheckQuantity_ZeroReceivedSkip(t *testing.T) {
 	received := map[string]decimal.Decimal{"PR1": dec("0")}
 	if sigs := checkQuantity(received, nil, nil, 3, QuantityContext{}); len(sigs) != 0 {

@@ -75,7 +75,7 @@ func (n ApprovalFlowNode) NodeType() int {
 // 「付款审批」模板的实际配置:
 //
 //	岑溪市富百家超市(个体工商户)
-//	  ├ 审批人  申请人自选 不限范围 依次审批
+//	  ├ 审批人  申请人自选 不限范围 多选 **或签**
 //	  ├ 办理人  申请人自选 不限范围 单选
 //	  └ 抄送人  申请人自选
 //
@@ -83,12 +83,17 @@ func (n ApprovalFlowNode) NodeType() int {
 // 而不是模板里写死。所以提交必须走 mode=0(app 自带 process.node_list),
 // 且 app 必须把**每一个**节点的成员都填上,包括 type=3 的办理人。
 //
+// ⚠️ **多人审批方式也必须跟着后台改**:走 mode=0 时企微按 app 给的
+// node_list 走 ⇒ `apv_rel` 由这里决定,**后台模板里改「或签」不会生效**。
+// 2026-11-01 用户口径:审批人节点在管理后台已从「依次审批」改成「或签」
+// (一名成员同意即可) ⇒ 这里必须同步成 [ApvRelAny]。
+//
 // ⇒ 早先"写死 mode=0 + 只给审批人/抄送人两个节点"的做法,会让模板里
 // 新加的办理人节点**静默消失** —— 企微按 app 给的 node_list 走,模板流程
 // 里多出来的节点根本没有对应的人。
 func DefaultApprovalFlow() []ApprovalFlowNode {
 	return []ApprovalFlowNode{
-		{Type: FlowNodeApprover, Label: "审批人", Select: FlowSelectMulti, ApvRel: ApvRelSerial, Required: true},
+		{Type: FlowNodeApprover, Label: "审批人", Select: FlowSelectMulti, ApvRel: ApvRelAny, Required: true},
 		{Type: FlowNodeHandler, Label: "办理人", Select: FlowSelectSingle, ApvRel: ApvRelAny, Required: true},
 		{Type: FlowNodeCC, Label: "抄送人", Select: FlowSelectMulti, ApvRel: 0, Required: false},
 	}
@@ -100,7 +105,7 @@ func DefaultApprovalFlow() []ApprovalFlowNode {
 //
 // 格式:
 //
-//	[{"type":"approver","label":"审批人","select":"multi","apv_rel":3,"required":true},
+//	[{"type":"approver","label":"审批人","select":"multi","apv_rel":2,"required":true},
 //	 {"type":"handler","label":"办理人","select":"single","apv_rel":2,"required":true},
 //	 {"type":"cc","label":"抄送人","select":"multi","required":false}]
 func ParseApprovalFlow(raw string) ([]ApprovalFlowNode, error) {

@@ -17,9 +17,9 @@ import (
 // 本文件把这三件事都钉住 —— 判别力：任何一个跑偏，企微里的审批单就会
 // **少一个节点**(办理人就是这样丢的)或**顺序/办理方式不对**,而页面看起来一切正常。
 //
-// 模板实际配置(2026-10-23 企微后台截图):
+// 模板实际配置(2026-11-01 企微后台截图):
 //
-//	审批人  申请人自选 不限范围 依次审批
+//	审批人  申请人自选 不限范围 多选 或签
 //	办理人  申请人自选 不限范围 单选
 //	抄送人  申请人自选
 
@@ -39,7 +39,7 @@ func TestDefaultApprovalFlow_MatchesTemplate(t *testing.T) {
 		apvRel   int
 		required bool
 	}{
-		{FlowNodeApprover, "审批人", FlowSelectMulti, ApvRelSerial, true},
+		{FlowNodeApprover, "审批人", FlowSelectMulti, ApvRelAny, true},
 		{FlowNodeHandler, "办理人", FlowSelectSingle, ApvRelAny, true},
 		{FlowNodeCC, "抄送人", FlowSelectMulti, 0, false},
 	}
@@ -154,8 +154,8 @@ func TestBuildProcess_NodeOrderAndTypes(t *testing.T) {
 	}
 	// 顺序必须与模板流程图一致:申请人 → 审批人 → 办理人 → 抄送人。
 	n0 := process.NodeList[0]
-	if n0.Type != 1 || n0.ApvRel != ApvRelSerial || len(n0.UserID) != 2 {
-		t.Errorf("第 1 个节点 = %+v, want type=1 apv_rel=3 [boss boss2]", n0)
+	if n0.Type != 1 || n0.ApvRel != ApvRelAny || len(n0.UserID) != 2 {
+		t.Errorf("第 1 个节点 = %+v, want type=1 apv_rel=2 [boss boss2]", n0)
 	}
 	n1 := process.NodeList[1]
 	if n1.Type != 3 || n1.ApvRel != ApvRelAny || len(n1.UserID) != 1 || n1.UserID[0] != "cashier" {

@@ -33,6 +33,16 @@ const (
 	SigManualAmountMismatch  = "manual_amount_mismatch"  // 结算总额 vs 手工累加金额不符
 	SigPurchaseWithoutSales  = "purchase_without_sales"  // 窗口内无销售却有进货
 	SigQtyDeviation          = "qty_deviation"           // 采购量/销售量偏离超阈值
+	// SigRecentReceiptNoSales 是「刚收货、还没卖」的提示（warn，不阻断）。
+	SigRecentReceiptNoSales = "recent_receipt_no_sales"
+	// SigNewProductNoSales 是「新品首单、还没有销售」的提示（warn，不阻断）。
+	SigNewProductNoSales = "new_product_no_sales"
+	// SigUnitUnconvertible 是「采购单位与商品档案单位不一致、无法换算」的提示（warn）。
+	SigUnitUnconvertible = "unit_unconvertible"
+	// SigPurchasePriceAboveHistory 是「本单进价比近 180 天均价高」的提示（warn）。
+	SigPurchasePriceAboveHistory = "purchase_price_above_history"
+	// SigStockLedgerGap 是「进货 − 销售 − 库存」对不上账的提示（warn）。
+	SigStockLedgerGap = "stock_ledger_gap"
 )
 
 // signalDraft 是落库前的信号草稿。
@@ -202,7 +212,8 @@ func yuanText(d decimal.Decimal) string {
 // 会把源数据自身的不自洽也一并放过。
 //
 // ⚠️ b) 比的是**应付金额**而不是货款合计:收款项冲减付款金额
-//   (用户口径 2026-10-25),填了净额的人不该被判成"与货款合计不符"。
+//
+//	(用户口径 2026-10-25),填了净额的人不该被判成"与货款合计不符"。
 //
 // 返回信号 + 金额结论摘要(给 LLM 用,见 AmountCheck)。
 func checkAmounts(settlements []SettlementRow, linesBySettlement map[string][]SettlementLineRow, manualAmount, tolerance, paymentTolerance, paymentTotal, receiptTotal decimal.Decimal) ([]signalDraft, AmountCheck) {
@@ -299,10 +310,34 @@ type QuantityContext struct {
 	Names map[string]string
 	// WindowFrom 是货号 → 销量窗口起点(该商品最后一次采购入库日,YYYY-MM-DD)。
 	WindowFrom map[string]string
+	// Stocking 是货号 → 备货系数事实(可空)。
+	//
+	// ⚠️ 2026-11-01 用户口径:有备货系数的 SKU **以「合理备货量」为准**判进货是否过量,
+	// 不再用「自最后一次采购入库以来的销量」当分母 —— 刚收货一两天销量天然≈0,
+	// 分母塌成 0 会把正常备货判成 ×13 的严重偏离(生产实踩:乌鸡蛋-00330 进货 13.5、
+	// 合理备货量 9.25 ⇒ 实际只有 1.46 倍,却被 block 拒单)。
+	Stocking map[string]StockingFact
+	// Purchase 是货号 → 本次采购口径(净进货量 / 退货 / 有效收货日跨度)。
+	//
+	// ⚠️ 2026-11-01 用户口径:10 天合并付款的进货量是**多日累加值**,不能直接比
+	// 单次的合理备货量 ⇒ 传进 checkQuantity 的 purchaseByProduct 已经是
+	// 多日 SKU 的**日均采购量**(见 purchase_basis.go)。这里只负责把口径写进消息。
+	Purchase map[string]purchaseBasis
+	// Groups 是**组级**备货事实（2026-11-01 新口径，见 stocking_group.go）。
+	//
+	// 有组事实的商品不再走下面 checkQuantity 的单 SKU 老口径
+	// （Skip 里的货号会被跳过）—— 组口径已经把它们归并到一起判过一次。
+	Groups []StockingGroupFact
+	// Skip 是**已由组口径处理**的货号集合（checkQuantity 跳过它们）。
+	Skip map[string]struct{}
 }
 
 // checkQuantity 对每个进货商品比较窗口采购量与窗口**消耗量**:
 //
+//   - 有备货系数(见 QuantityContext.Stocking)的商品:**以「合理备货量」为准**
+//     —— 进货 > factor 倍合理备货量才 block;2~factor 倍由 checkStockingExcess 给 warn;
+//     其余不出信号(刚收货一两天「自入库以来销量≈0」是正常现象,不再据此 block);
+//   - 无系数(算不出备货系数)才沿用老口径:
 //   - 消耗量 = 窗口销量 + 窗口盘损(报损/库存调整减少,见 aggregateLoss);
 //   - 消耗量 == 0 且进货 > 0 → block(purchase_without_sales);
 //   - 进货 > 消耗量 × factor×2 → block(qty_deviation);
@@ -322,29 +357,73 @@ type QuantityContext struct {
 //
 // received 只统计 PI(进货);RO(退货)按负量冲减由 caller 聚合时处理
 // (退货量大是另一类信号,本期不做)。
-func checkQuantity(receivedByProduct map[string]decimal.Decimal, salesByProduct map[string]SaleRow, lossByProduct map[string]decimal.Decimal, factor float64, qc QuantityContext) []signalDraft {
+//
+// ⚠️ purchaseByProduct 是**用于比较的**采购量:多日合并付款的 SKU 传进来的是
+// 日均采购量(见 purchase_basis.go 与 QuantityContext.Purchase),单日 SKU 是
+// 净进货量。别在这里再除一次天数。
+func checkQuantity(purchaseByProduct map[string]decimal.Decimal, salesByProduct map[string]SaleRow, lossByProduct map[string]decimal.Decimal, factor float64, qc QuantityContext) []signalDraft {
 	var out []signalDraft
 	f := decimal.NewFromFloat(factor)
 	f2 := decimal.NewFromFloat(factor * 2)
-	for pid, recv := range receivedByProduct {
+	for pid, recv := range purchaseByProduct {
 		if !recv.GreaterThan(decimal.Zero) {
+			continue
+		}
+		if _, skip := qc.Skip[pid]; skip {
+			// 已由组级口径判过（组销量/组库存已含该货号）。
 			continue
 		}
 		label := ProductLabel(qc.Names, pid)
 		from := qc.WindowFrom[pid]
+		basis := qc.Purchase[pid]
+
+		// ---- 备货系数口径（2026-11-01 用户口径）----
+		//
+		// 有系数 ⇒ 只按「合理备货量」判:超过 factor 倍才 block(严重过量),
+		// 2~factor 倍由 checkStockingExcess 给 warn ⇒ 这里不再出信号。
+		// 没有系数(算不出)才回退到「自最后一次采购入库以来销量」的老口径。
+		if fact, ok := qc.Stocking[pid]; ok && fact.ReasonableQty.GreaterThan(decimal.Zero) {
+			ratio := recv.Div(fact.ReasonableQty)
+			if ratio.GreaterThan(f) {
+				params := map[string]any{
+					"product_id":       pid,
+					"received":         recv.String(),
+					"basis":            "stocking",
+					"period_days":      fact.PeriodDays,
+					"multiplier":       fact.Multiplier.String(),
+					"period_sales_qty": fact.PeriodSalesQty.String(),
+					"reasonable_qty":   fact.ReasonableQty.String(),
+					"ratio":            ratio.String(),
+					"sample_days":      fact.SampleDays,
+					"in_stock_days":    fact.InStockDays,
+					"stock_qty":        fact.StockQty.String(),
+					"coverage_days":    fact.CoverageDays.String(),
+					"window_from":      from,
+				}
+				mergeBasisParams(params, basis)
+				out = append(out, newSignal(model.SignalBlock, SigQtyDeviation, "", pid,
+					fmt.Sprintf("商品 %s %s,按备货系数(周期 %d 天、倍数 %s)周期销售数 %s、合理备货量 %s,%s约为其 %s 倍",
+						label, purchaseText(basis, recv), fact.PeriodDays, fact.Multiplier.StringFixed(2),
+						fact.PeriodSalesQty.String(), fact.ReasonableQty.String(),
+						ratioLabel(basis), ratio.StringFixed(1)),
+					params))
+			}
+			continue
+		}
+
 		sale := salesByProduct[pid]
 		sold := sale.NetSaleQuantity
 		loss := lossByProduct[pid]
 		covered := sold.Add(loss)
 
 		if !covered.GreaterThan(decimal.Zero) {
-			msg := fmt.Sprintf("商品 %s 自最后一次采购入库日至今无销售记录,本次进货 %s", label, recv.String())
+			msg := fmt.Sprintf("商品 %s 自最后一次采购入库日至今无销售记录,%s", label, purchaseText(basis, recv))
 			if from != "" {
-				msg = fmt.Sprintf("商品 %s 自 %s 采购入库后无销售记录,本次进货 %s", label, from, recv.String())
+				msg = fmt.Sprintf("商品 %s 自 %s 采购入库后无销售记录,%s", label, from, purchaseText(basis, recv))
 			}
-			out = append(out, newSignal(model.SignalBlock, SigPurchaseWithoutSales, "", pid,
-				msg,
-				map[string]any{"product_id": pid, "received": recv.String(), "sold": "0", "window_from": from}))
+			params := map[string]any{"product_id": pid, "received": recv.String(), "sold": "0", "window_from": from}
+			mergeBasisParams(params, basis)
+			out = append(out, newSignal(model.SignalBlock, SigPurchaseWithoutSales, "", pid, msg, params))
 			continue
 		}
 
@@ -354,26 +433,306 @@ func checkQuantity(receivedByProduct map[string]decimal.Decimal, salesByProduct 
 			"loss": loss.String(), "covered": covered.String(), "ratio": ratio.String(),
 			"window_from": from,
 		}
+		mergeBasisParams(params, basis)
 		switch {
 		case recv.GreaterThan(covered.Mul(f2)):
 			out = append(out, newSignal(model.SignalBlock, SigQtyDeviation, "", pid,
-				fmt.Sprintf("商品 %s 本次进货 %s,%s,约为其 %s 倍", label, recv.String(),
+				fmt.Sprintf("商品 %s %s,%s,约为其 %s 倍", label, purchaseText(basis, recv),
 					consumptionText(from, sold, loss), ratio.StringFixed(1)),
 				params))
 		case recv.GreaterThan(covered.Mul(f)):
 			out = append(out, newSignal(model.SignalWarn, SigQtyDeviation, "", pid,
-				fmt.Sprintf("商品 %s 本次进货 %s,%s,约为其 %s 倍", label, recv.String(),
+				fmt.Sprintf("商品 %s %s,%s,约为其 %s 倍", label, purchaseText(basis, recv),
 					consumptionText(from, sold, loss), ratio.StringFixed(1)),
 				params))
 		case loss.GreaterThan(decimal.Zero) && rawQuantityBlock(recv, sold, f2):
 			// 盘损把原本的 block 消掉了 ⇒ 降级为 warn(不阻断,但留痕)。
 			out = append(out, newSignal(model.SignalWarn, SigQtyDeviation, "", pid,
-				fmt.Sprintf("商品 %s 本次进货 %s,%s,约为其 %s 倍;已核对盘损单,偏离降至可接受范围",
-					label, recv.String(), consumptionText(from, sold, loss), ratio.StringFixed(1)),
+				fmt.Sprintf("商品 %s %s,%s,约为其 %s 倍;已核对盘损单,偏离降至可接受范围",
+					label, purchaseText(basis, recv), consumptionText(from, sold, loss), ratio.StringFixed(1)),
 				params))
 		}
 	}
 	return out
+}
+
+// checkGroupQuantity 按**组级**备货事实出数量信号（2026-11-01 用户口径）。
+//
+// 判定顺序（见 stocking_group.go 的口径说明）：
+//
+//  1. 单位不可换算 ⇒ 只发 warn（无法比较不等于超量），不做数量阻断；
+//  2. 组内近 180 天无销量 ⇒ 按"刚收货 / 首单 / 长期无销售 / 账实缺口"分类，
+//     只有**长期无销售**（有库存且最后一次收货超过 30 天）才 block，且注明需盘点；
+//  3. 本次进货 ≤ 下限 ⇒ 不是压货（最小包装进货），不出信号；
+//  4. 补货后可售天数 ≤ 可售上限 ⇒ 通过；
+//  5. 超过「可售上限 × factor」**或**超量金额 > 300 元 ⇒ block；
+//     其余超过上限的情况 ⇒ warn（只提示，不阻断）；
+//  6. 价格高于历史均价 10% / 账面进货−销售−库存对不上 ⇒ 独立 warn 事实。
+//
+// ⚠️ 消息只陈述事实，不做动机推断（措辞纪律见 llm.go 的 prompt 约束）。
+func checkGroupQuantity(groups []StockingGroupFact, factor float64, today string) []signalDraft {
+	var out []signalDraft
+	f := decimal.NewFromFloat(factor)
+	for _, g := range groups {
+		evidence := groupEvidence(g)
+		// 价格与账面结存是与数量判定**无关**的独立事实，先出。
+		if g.PriceRisePct.GreaterThan(decimal.NewFromFloat(stockingPriceRiseRatio * 100)) {
+			out = append(out, newSignal(model.SignalWarn, SigPurchasePriceAboveHistory, "", g.ProductID,
+				fmt.Sprintf("商品组 %s 本次进货均价 %s 元/%s,近 %d 天加权均价 %s 元/%s,高 %s%%",
+					g.Label, factorText(g.PriceThis), g.BaseUnit, g.SampleDays,
+					factorText(g.PriceHistory), g.BaseUnit, g.PriceRisePct.StringFixed(1)),
+				evidence))
+		}
+		if g.ZeroSalesCase == "" {
+			out = append(out, checkGroupLedger(g, evidence)...)
+		}
+
+		if g.Unconvertible {
+			note := g.UnitNote
+			if note == "" {
+				note = "采购行单位与商品档案单位不一致"
+			}
+			out = append(out, newSignal(model.SignalWarn, SigUnitUnconvertible, "", g.ProductID,
+				fmt.Sprintf("商品组 %s %s;单位说明:%s,该组本次未做数量比较",
+					g.Label, groupPurchaseText(g), note),
+				evidence))
+			continue
+		}
+
+		switch g.ZeroSalesCase {
+		case "recent_receipt":
+			days := daysSince(g.LastDate, today)
+			out = append(out, newSignal(model.SignalWarn, SigRecentReceiptNoSales, "", g.ProductID,
+				fmt.Sprintf("商品组 %s %s;本次到货 %s(距今 %d 天),组内近 %d 天无销售记录,按口径刚收货不判定",
+					g.Label, groupPurchaseText(g), g.LastDate, days, g.SampleDays),
+				evidence))
+			continue
+		case "new_product":
+			out = append(out, newSignal(model.SignalWarn, SigNewProductNoSales, "", g.ProductID,
+				fmt.Sprintf("商品组 %s %s;近 %d 天没有进货记录,也没有销售记录,按口径首单不判定",
+					g.Label, groupPurchaseText(g), g.SampleDays),
+				evidence))
+			continue
+		case "long_stock":
+			out = append(out, newSignal(model.SignalBlock, SigPurchaseWithoutSales, "", g.ProductID,
+				fmt.Sprintf("商品组 %s %s;组内库存 %s,最后一次进货 %s(距今 %d 天),近 %d 天无销售记录%s;阻断条件:需盘点核对库存",
+					g.Label, groupPurchaseText(g), qtyUnitText(g.StockQty, g.BaseUnit),
+					g.LastReceipt, daysSince(g.LastReceipt, today), g.SampleDays, groupLossText(g)),
+				evidence))
+			continue
+		case "ledger_gap":
+			out = append(out, newSignal(model.SignalWarn, SigStockLedgerGap, "", g.ProductID,
+				fmt.Sprintf("商品组 %s %s;组内库存 %s,近 %d 天与近 %d 天均无销售记录%s",
+					g.Label, groupPurchaseText(g), qtyUnitText(g.StockQty, g.BaseUnit),
+					g.SampleDays, stockingRecentSaleDays, groupLossText(g)),
+				evidence))
+			continue
+		}
+
+		// 本次进货不超过「通常一次进多少」⇒ 不是压货。
+		if g.ReceivedQty.LessThanOrEqual(g.FloorQty) {
+			continue
+		}
+		if !g.CoverageDays.GreaterThan(decimal.Zero) {
+			continue
+		}
+		if g.CoverageDays.LessThanOrEqual(decimal.NewFromInt(int64(g.CapDays))) {
+			continue
+		}
+		// 超过可售上限：看"超了多少倍"与"超了多少钱"两个硬阈值。
+		over := g.CoverageDays.Div(decimal.NewFromInt(int64(g.CapDays))).Round(1)
+		severe := g.CoverageDays.GreaterThan(
+			decimal.NewFromInt(int64(g.CapDays)).Mul(f))
+		amount := g.ExcessYuan.GreaterThan(decimal.NewFromInt(stockingExcessAmountYuan))
+		msg := fmt.Sprintf("商品组 %s %s;%s,补货后可售 %s 天,超过可售上限 %d 天的 %s 倍",
+			g.Label, groupPurchaseText(g), groupStockText(g),
+			g.CoverageDays.StringFixed(1), g.CapDays, over.StringFixed(1))
+		if g.ExcessYuan.GreaterThan(decimal.Zero) {
+			msg += fmt.Sprintf(",超出约 %s", yuanText(g.ExcessYuan))
+		}
+		if severe || amount {
+			out = append(out, newSignal(model.SignalBlock, SigQtyDeviation, "", g.ProductID, msg, evidence))
+			continue
+		}
+		out = append(out, newSignal(model.SignalWarn, SigStockingExcess, "", g.ProductID, msg, evidence))
+	}
+	return out
+}
+
+// checkGroupLedger 出「进货 − 销售 − 盘损 − 库存」对不上账的提示（只 warn）。
+//
+// 阈值 = max(3 个基准单位, 180 天进货量的 20%)：小数量商品的绝对差没意义，
+// 大数量商品的相对差才说明账实有缺口。方向不分正负（多了少了都要核对）。
+func checkGroupLedger(g StockingGroupFact, evidence map[string]any) []signalDraft {
+	if g.Unconvertible {
+		return nil
+	}
+	purchases := g.LedgerGap.Add(g.SalesQty).Add(g.LossQty).Add(g.StockQty)
+	floor := purchases.Mul(decimal.NewFromFloat(stockingLedgerGapRatio))
+	if min := decimal.NewFromInt(stockingLedgerGapMinQty); floor.LessThan(min) {
+		floor = min
+	}
+	if !g.LedgerGap.Abs().GreaterThan(floor) {
+		return nil
+	}
+	lossText := ""
+	if g.LossQty.GreaterThan(decimal.Zero) {
+		lossText = "、盘损 " + qtyUnitText(g.LossQty, g.BaseUnit)
+	}
+	return []signalDraft{newSignal(model.SignalWarn, SigStockLedgerGap, "", g.ProductID,
+		fmt.Sprintf("商品组 %s 近 %d 天进货 %s、销售 %s%s、当前库存 %s,进货−销售−盘损−库存 = %s",
+			g.Label, g.SampleDays, qtyUnitText(purchases, g.BaseUnit),
+			qtyUnitText(g.SalesQty, g.BaseUnit), lossText, qtyUnitText(g.StockQty, g.BaseUnit),
+			qtyUnitText(g.LedgerGap, g.BaseUnit)),
+		evidence)}
+}
+
+// groupLossText 渲染「期间盘损 X」片段（无盘损 ⇒ 空串）。
+//
+// 零销量分支也带上它：报损/盘亏是货的真实去向，写清楚才不会让审批人
+// 把"没有销售"读成"货一直压在仓里"。
+func groupLossText(g StockingGroupFact) string {
+	if !g.LossQty.GreaterThan(decimal.Zero) {
+		return ""
+	}
+	return fmt.Sprintf(",期间盘损 %s", qtyUnitText(g.LossQty, g.BaseUnit))
+}
+
+// groupPurchaseText 渲染组消息里的「本次进货」片段（多日写成累计+天数）。
+func groupPurchaseText(g StockingGroupFact) string {
+	s := "本次进货 " + qtyUnitText(g.ReceivedQty, g.BaseUnit)
+	if g.PurchaseDays > 1 {
+		if g.FirstDate != "" && g.LastDate != "" {
+			s = fmt.Sprintf("本次进货累计 %s(%s~%s 共 %d 天)",
+				qtyUnitText(g.ReceivedQty, g.BaseUnit), g.FirstDate, g.LastDate, g.PurchaseDays)
+		} else {
+			s = fmt.Sprintf("本次进货累计 %s(共 %d 天)",
+				qtyUnitText(g.ReceivedQty, g.BaseUnit), g.PurchaseDays)
+		}
+	}
+	if g.ReturnedQty.GreaterThan(decimal.Zero) {
+		s += "(已扣退货 " + qtyUnitText(g.ReturnedQty, g.BaseUnit) + ")"
+	}
+	return s
+}
+
+// groupStockText 渲染组消息里的「库存 + 销量 + 上限」片段。
+func groupStockText(g StockingGroupFact) string {
+	s := fmt.Sprintf("组内库存 %s,补货后合计 %s,近 %d 天组销量 %s",
+		qtyUnitText(g.StockQty, g.BaseUnit), qtyUnitText(g.AfterQty, g.BaseUnit),
+		g.SampleDays, qtyUnitText(g.SalesQty, g.BaseUnit))
+	// 盘损也是货的去向：写出来，审批人和机器才看得懂日均是怎么来的。
+	if g.LossQty.GreaterThan(decimal.Zero) {
+		s += "、组盘损 " + qtyUnitText(g.LossQty, g.BaseUnit)
+	}
+	s += fmt.Sprintf("(有货 %d 天,日均消耗 %s),可售上限 %d 天(%s)",
+		g.InStockDays, qtyUnitText(g.AvgDailySales, g.BaseUnit), g.CapDays,
+		qtyUnitText(g.CapQty, g.BaseUnit))
+	if g.AllowanceBoost {
+		s += ";本次含陈列费/堆头费,可售上限按 ×1.5 计"
+	}
+	// 进货量级事实：本单是历史常见单次进货量的几倍。
+	if g.SingleMedian.GreaterThan(decimal.Zero) && g.ReceivedQty.GreaterThan(decimal.Zero) {
+		ratio := g.ReceivedQty.Div(g.SingleMedian).Round(1)
+		s += fmt.Sprintf(";近 %d 天单次进货中位数 %s,本单约为其 %s 倍",
+			g.SampleDays, qtyUnitText(g.SingleMedian, g.BaseUnit), ratio.StringFixed(1))
+	}
+	return s
+}
+
+// groupEvidence 组装组级信号的证据参数（审批详情页 / LLM 核对用）。
+func groupEvidence(g StockingGroupFact) map[string]any {
+	return map[string]any{
+		"group_key":        g.GroupKey,
+		"product_id":       g.ProductID,
+		"members":          g.MemberIDs,
+		"base_unit":        g.BaseUnit,
+		"received":         g.ReceivedQty.String(),
+		"received_gross":   g.ReceivedGross.String(),
+		"returned":         g.ReturnedQty.String(),
+		"received_amount":  g.ReceivedAmountYuan.String(),
+		"purchase_days":    g.PurchaseDays,
+		"first_date":       g.FirstDate,
+		"last_date":        g.LastDate,
+		"stock_qty":        g.StockQty.String(),
+		"after_qty":        g.AfterQty.String(),
+		"sales_qty":        g.SalesQty.String(),
+		"loss_qty":         g.LossQty.String(),
+		"recent_sales_qty": g.RecentSalesQty.String(),
+		"in_stock_days":    g.InStockDays,
+		"avg_daily_sales":  g.AvgDailySales.String(),
+		"cap_days":         g.CapDays,
+		"cap_qty":          g.CapQty.String(),
+		"coverage_days":    g.CoverageDays.String(),
+		"excess_qty":       g.ExcessQty.String(),
+		"excess_yuan":      g.ExcessYuan.String(),
+		"floor_qty":        g.FloorQty.String(),
+		"single_median":    g.SingleMedian.String(),
+		"price_this":       g.PriceThis.String(),
+		"price_history":    g.PriceHistory.String(),
+		"price_rise_pct":   g.PriceRisePct.String(),
+		"ledger_gap":       g.LedgerGap.String(),
+		"zero_sales_case":  g.ZeroSalesCase,
+		"unconvertible":    g.Unconvertible,
+		"unit_note":        g.UnitNote,
+		"allowance_boost":  g.AllowanceBoost,
+	}
+}
+
+// qtyUnitText 渲染「数量 + 单位」（去掉无意义的尾零）。
+func qtyUnitText(d decimal.Decimal, unit string) string {
+	if strings.TrimSpace(unit) == "" {
+		unit = "单位"
+	}
+	return factorText(d) + " " + unit
+}
+
+// purchaseText 渲染消息里的「本次进货」片段。
+//
+//	单日:      "本次进货 100"
+//	多日:      "本次进货累计 220(2026-09-18~2026-09-27 共 10 天,日均 22)"
+//	有退货:    末尾补 "(已扣退货 30)"
+//
+// ⚠️ 多日必须把「累计 / 天数 / 日均」写全 —— 审批人看到"进货 220"会以为
+// 是一次进了 220,实际是十天合并付款(2026-11-01 用户口径)。
+//
+// fallback 是**比较用的量**(多日时是日均),basis 缺失(老调用方/单测)时用它。
+func purchaseText(b purchaseBasis, fallback decimal.Decimal) string {
+	if b.Days <= 0 && b.NetQty.IsZero() && b.ReturnedQty.IsZero() {
+		return "本次进货 " + fallback.String()
+	}
+	var s string
+	if b.Days > 1 {
+		s = fmt.Sprintf("本次进货累计 %s(%s~%s 共 %d 天,日均 %s)",
+			b.NetQty.String(), b.FirstDate, b.LastDate, b.Days, b.CompareQty().String())
+	} else {
+		s = "本次进货 " + b.NetQty.String()
+	}
+	if b.ReturnedQty.GreaterThan(decimal.Zero) {
+		s = fmt.Sprintf("%s(已扣退货 %s)", s, b.ReturnedQty.String())
+	}
+	return s
+}
+
+// ratioLabel 渲染倍数的口径词:多日比的是日均,单日比的是进货量本身。
+func ratioLabel(b purchaseBasis) string {
+	if b.Days > 1 {
+		return "日均进货"
+	}
+	return "进货"
+}
+
+// mergeBasisParams 把采购口径写进信号参数(审批详情页/LLM 核对要用)。
+//
+// 单日且无退货 ⇒ 不写(与历史信号保持一致,不制造噪音)。
+func mergeBasisParams(params map[string]any, b purchaseBasis) {
+	if b.Days <= 1 && b.ReturnedQty.IsZero() {
+		return
+	}
+	params["received_total"] = b.NetQty.String()
+	params["returned"] = b.ReturnedQty.String()
+	params["purchase_days"] = b.Days
+	params["daily_avg"] = b.CompareQty().String()
 }
 
 // consumptionText 把"窗口消耗量"渲染成一句话里的片段(带盘损时写出合计)。
@@ -437,7 +796,8 @@ const maxSaleWindowGroups = 8
 //     （2026-10-29 用户口径）。
 //
 // ⚠️ 起点不同 ⇒ 销量不同 ⇒ 毛利结论可能相反，这是**两个问题的两个答案**，
-//    不是同一个信号的两种写法。
+//
+//	不是同一个信号的两种写法。
 type windowStartPick int
 
 const (
@@ -482,7 +842,7 @@ func buildSaleWindowGroups(sheetDates map[string]string, productSheets map[strin
 // ⚠️ 合并超限分组时的方向：**取更早的起点**（放宽方向）。
 //   - 对窗口毛利（最晚起点）⇒ 放宽 = 窗口更长 = 统计到更多销量；
 //   - 对实现毛利（最早起点）⇒ 放宽 = 窗口更长 = 销售均价更平滑。
-//   两种口径下"放宽"都只会让结论更接近"整体水平",不会凭空造出亏损。
+//     两种口径下"放宽"都只会让结论更接近"整体水平",不会凭空造出亏损。
 func buildSaleWindowGroupsByDate(sheetDates map[string]string, productSheets map[string][]string, today, fallback string, maxGroups int, pick windowStartPick) []saleWindowGroup {
 	if maxGroups <= 0 {
 		maxGroups = maxSaleWindowGroups

@@ -169,6 +169,16 @@ type SettlementRow struct {
 	// ⚠️ 代销单的「货款」是**结算额**（应付供应商的钱），零售额与毛利
 	//   只在明细里（见 service/dx.go 的口径说明）。
 	Dx *DxFact
+	// PaidStatus / SetMethod 是**付款台账里的事实**(settlement_pay_states)。
+	//
+	// ⚠️ 只在 listCubeSettlements(includePaid=true) 时补上 —— 那一档会把
+	// 已付款的单一起回给初始化页,前端靠这两个字段区分「未付款/已付款」
+	// 并置灰。没有它们,列表里每一行看起来都是未付款(2026-11-01 用户口径:
+	// 点「未付款」后通过审批付掉的单还留在下面)。
+	//
+	// 空串 = 台账里没有这张单的记录(= 未付款)。
+	PaidStatus string // paid / unpaid
+	SetMethod  string // init(初始化补录) / approval(审批流程)
 }
 
 // SettlementLineRow cube settlement_line 行(仅 PI/RO)。
@@ -212,6 +222,15 @@ type SheetLineRow struct {
 	TotalAmountYuan  decimal.Decimal
 	ReceivedQuantity decimal.Decimal
 	OrderQuantity    decimal.Decimal
+	// UnitNo 是这一行录入时用的**采购单位**(件/提/盒/罐/kg)。
+	//
+	// ⚠️ 数量列是采购单位口径，销量是销售单位口径 ⇒ 单位不一致时
+	//    两者不可直接相除（见 service/units.go 的组口径）。
+	UnitNo string
+	// UnitFactor 是采购单位 → 商品基本单位的换算数（源列 Unit_factor）。
+	//
+	// 实测本店恒为 1（进货按销售单位录入）；≤ 0 表示该行口径不可换算。
+	UnitFactor decimal.Decimal
 }
 
 // SaleRow 商品销售窗口汇总。
@@ -256,6 +275,25 @@ type DailySaleRow struct {
 type ProductPurchaseDateRow struct {
 	ProductID string
 	SheetDate string // YYYY-MM-DD
+}
+
+// PurchaseHistoryRow 是商品在某张采购单上的**一行进货事实**(近 180 天窗口)。
+//
+// 采购明细行按 (sheet_id, product_id, unit_no, unit_factor) 分组返回，
+// 一个商品在同一张单上换过单位就会出现多行 —— 这样才判得出"单位不可换算"。
+//
+// ⚠️ 退货单(RO)的 Quantity 在源库里可能是负数(real_qty 负向冲减)，
+//    AmountYuan 在明细表里**恒为正数**(实测两库负数计数为 0,见 schema 注释)
+//    ⇒ 金额的正负由调用方按 DocumentType 决定，这里不做符号推断。
+type PurchaseHistoryRow struct {
+	SheetID      string
+	ProductID    string
+	DocumentType string // PI / RO
+	SheetDate    string // YYYY-MM-DD(制单日期)
+	Quantity     decimal.Decimal
+	AmountYuan   decimal.Decimal
+	UnitNo       string
+	UnitFactor   decimal.Decimal
 }
 
 // ---- DaprCubeQuerier ----
@@ -912,6 +950,87 @@ func (q *DaprCubeQuerier) ListProductNames(ctx context.Context, branchID string,
 	return out, nil
 }
 
+// ListProductUnits 取商品档案上的**基本单位**与规格原文。
+//
+// # 为什么数量判定需要它
+//
+// 采购行的数量是"采购单位"口径，销量是"销售单位"口径 —— 两者能不能相除，
+// 取决于采购行上的单位是否等于商品基本单位（见 service/units.go 的组口径）。
+// 规格原文（如 `1*12`）则用来兜底估算"一件等于多少基本单位"。
+//
+// product 是 duck model（本地副本）⇒ 查询便宜；查不到的货号不会出现在返回里。
+func (q *DaprCubeQuerier) ListProductUnits(ctx context.Context, branchID string, productIDs []string) (map[string]ProductUnitInfo, error) {
+	if len(productIDs) == 0 {
+		return nil, nil
+	}
+	vals := make([]any, 0, len(productIDs))
+	for _, id := range productIDs {
+		vals = append(vals, id)
+	}
+	data, err := q.c.LoadCubeQuery(ctxWithBranch(ctx, branchID), "product", cubeclient.CubeQuery{
+		Measures:   []string{"product.count"},
+		Dimensions: []string{"product.id", "product.unit", "product.spec"},
+		Filters: []cubeclient.CubeFilter{
+			{Member: "product.id", Operator: "in", Values: vals},
+		},
+		Limit: len(productIDs) * 4,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cube product unit query: %w", err)
+	}
+	out := make(map[string]ProductUnitInfo, len(data))
+	for _, r := range data {
+		id := strings.TrimSpace(rowStr(r, "product.id"))
+		if id == "" {
+			continue
+		}
+		out[id] = ProductUnitInfo{
+			Unit: strings.TrimSpace(rowStr(r, "product.unit")),
+			Spec: strings.TrimSpace(rowStr(r, "product.spec")),
+		}
+	}
+	return out, nil
+}
+
+// ListItemCombos 取商品档案里的**组合/拆分关系**（父 → 子 × 数量）。
+//
+// # 为什么要全量
+//
+// 关系表实测只有千余行（源表 t_bd_item_combsplit）⇒ 一次拉全量，
+// 再在本地按"本次审批涉及商品的连通分量"筛选（见 buildProductGroups）。
+// 反过来按商品 id 过滤没有意义：父商品本身可能不在本次采购里，
+// 但它正是我们要找出来的那个"父"。
+//
+// ⚠️ 只采信**可换算**的关系：quantity(item_qty) > 0。
+//
+//	不要按 combo_type 的字面值过滤 —— 实测两个门店库语义不同：
+//	  hbposepro(172.12.1.6): other1 是 item_qty 的数值回显（'50.00'…），
+//	    1150 行里 1148 行 item_qty > 0（包→500g、条→包、组→盒都是这里的关系）；
+//	  hbposv10(192.168.1.200): other1='1' 拆分行 item_qty>0，'6' 组合行 item_qty=0。
+//	⇒ 两边都成立的判据只有"有换算数量"：item_qty=0 的组合行无法换算，直接丢弃。
+func (q *DaprCubeQuerier) ListItemCombos(ctx context.Context, branchID string) ([]ComboRelation, error) {
+	data, err := q.c.LoadCubeQuery(ctxWithBranch(ctx, branchID), "item_combo", cubeclient.CubeQuery{
+		Measures: []string{"item_combo.count"},
+		Dimensions: []string{"item_combo.parent_id", "item_combo.child_id",
+			"item_combo.quantity", "item_combo.combo_type"},
+		Limit: 5000,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cube item_combo query: %w", err)
+	}
+	out := make([]ComboRelation, 0, len(data))
+	for _, r := range data {
+		parent := strings.TrimSpace(rowStr(r, "item_combo.parent_id"))
+		child := strings.TrimSpace(rowStr(r, "item_combo.child_id"))
+		qty := rowDec(r, "item_combo.quantity")
+		if parent == "" || child == "" || !qty.IsPositive() {
+			continue
+		}
+		out = append(out, ComboRelation{ParentID: parent, ChildID: child, Quantity: qty})
+	}
+	return out, nil
+}
+
 // ListSheetLines 按 sheet_id in (...) 查 purchase_sheet_line(商品粒度)。
 func (q *DaprCubeQuerier) ListSheetLines(ctx context.Context, branchID string, sheetIDs []string) ([]SheetLineRow, error) {
 	if len(sheetIDs) == 0 {
@@ -927,7 +1046,8 @@ func (q *DaprCubeQuerier) ListSheetLines(ctx context.Context, branchID string, s
 			"purchase_sheet_line.total_received_quantity",
 			"purchase_sheet_line.total_order_quantity",
 		},
-		Dimensions: []string{"purchase_sheet_line.sheet_id", "purchase_sheet_line.product_id"},
+		Dimensions: []string{"purchase_sheet_line.sheet_id", "purchase_sheet_line.product_id",
+			"purchase_sheet_line.unit_no", "purchase_sheet_line.unit_factor"},
 		Filters: []cubeclient.CubeFilter{
 			{Member: "purchase_sheet_line.sheet_id", Operator: "in", Values: vals},
 		},
@@ -940,10 +1060,12 @@ func (q *DaprCubeQuerier) ListSheetLines(ctx context.Context, branchID string, s
 	for _, r := range data {
 		out = append(out, SheetLineRow{
 			SheetID:          rowStr(r, "purchase_sheet_line.sheet_id"),
-			ProductID:        rowStr(r, "purchase_sheet_line.product_id"),
+			ProductID:        strings.TrimSpace(rowStr(r, "purchase_sheet_line.product_id")),
 			TotalAmountYuan:  rowDec(r, "purchase_sheet_line.total_amount_yuan"),
 			ReceivedQuantity: rowDec(r, "purchase_sheet_line.total_received_quantity"),
 			OrderQuantity:    rowDec(r, "purchase_sheet_line.total_order_quantity"),
+			UnitNo:           strings.TrimSpace(rowStr(r, "purchase_sheet_line.unit_no")),
+			UnitFactor:       rowDec(r, "purchase_sheet_line.unit_factor"),
 		})
 	}
 	return out, nil
@@ -1181,6 +1303,61 @@ func (q *DaprCubeQuerier) ListProductPurchaseDates(ctx context.Context, branchID
 	return out, nil
 }
 
+// ListProductPurchaseHistory 拉商品 [fromDate, toDate) 的采购明细事实(PI + RO)。
+//
+// 与 ListProductPurchaseDates 的差别：那个只取"进货了几次"(PI 制单日期)，
+// 这里要**数量与金额**（算组库存/进货下限/历史均价），并且**含退货**——
+// 净进货 = PI − RO，少算退货只会让判定更严，但会算错下限与价格事实。
+//
+// ⚠️ 维度带上 unit_no / unit_factor：采购数量是"采购单位"口径，
+//    换算成组基准单位之前必须先知道这一行按什么单位录的。
+func (q *DaprCubeQuerier) ListProductPurchaseHistory(ctx context.Context, branchID string, productIDs []string, fromDate, toDate string) ([]PurchaseHistoryRow, error) {
+	if len(productIDs) == 0 {
+		return nil, nil
+	}
+	vals := make([]any, 0, len(productIDs))
+	for _, id := range productIDs {
+		vals = append(vals, id)
+	}
+	limit := len(productIDs) * 200
+	if limit > 50000 {
+		limit = 50000
+	}
+	data, err := q.c.LoadCubeQuery(ctxWithBranch(ctx, branchID), "purchase_sheet_line", cubeclient.CubeQuery{
+		Measures: []string{
+			"purchase_sheet_line.total_received_quantity",
+			"purchase_sheet_line.total_amount_yuan",
+		},
+		Dimensions: []string{"purchase_sheet_line.sheet_id", "purchase_sheet_line.product_id",
+			"purchase_sheet_line.unit_no", "purchase_sheet_line.unit_factor",
+			"purchase_sheet.document_type", "purchase_sheet.created_at"},
+		Filters: []cubeclient.CubeFilter{
+			{Member: "purchase_sheet_line.product_id", Operator: "in", Values: vals},
+			{Member: "purchase_sheet.document_type", Operator: "in", Values: []any{"PI", "RO"}},
+			{Member: "purchase_sheet.created_at", Operator: "gte", Values: []any{fromDate}},
+			{Member: "purchase_sheet.created_at", Operator: "lt", Values: []any{toDate}},
+		},
+		Limit: limit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cube purchase history query: %w", err)
+	}
+	out := make([]PurchaseHistoryRow, 0, len(data))
+	for _, r := range data {
+		out = append(out, PurchaseHistoryRow{
+			SheetID:      strings.TrimSpace(rowStr(r, "purchase_sheet_line.sheet_id")),
+			ProductID:    strings.TrimSpace(rowStr(r, "purchase_sheet_line.product_id")),
+			DocumentType: strings.TrimSpace(rowStr(r, "purchase_sheet.document_type")),
+			SheetDate:    normalizeCubeDate(rowStr(r, "purchase_sheet.created_at")),
+			Quantity:     rowDec(r, "purchase_sheet_line.total_received_quantity"),
+			AmountYuan:   rowDec(r, "purchase_sheet_line.total_amount_yuan"),
+			UnitNo:       strings.TrimSpace(rowStr(r, "purchase_sheet_line.unit_no")),
+			UnitFactor:   rowDec(r, "purchase_sheet_line.unit_factor"),
+		})
+	}
+	return out, nil
+}
+
 // GetSettlementsByIDs 按单号精确查结算单头(**不过滤**审核状态/单据类型)。
 //
 // # 为什么要一个"不过滤"的查询
@@ -1348,12 +1525,30 @@ func (s *Service) listCubeSettlements(ctx context.Context, branchID, from, to, s
 		}
 		rows = matched
 	}
-	if includePaid {
-		return &CubeSettlementList{Rows: rows}, nil
-	}
 	ids := make([]string, 0, len(rows))
 	for _, r := range rows {
 		ids = append(ids, strings.TrimSpace(r.ID))
+	}
+	if includePaid {
+		// 已付款的行必须带上台账标记。
+		//
+		// 这一档会把已付款的单一起返回(初始化页要按「未付款/已付款/全部」
+		// 切换视图),前端只有拿到 paid_status 才能筛/置灰。缺了标记 ⇒
+		// 所有行(含审批流程付掉的)都显示成未付款,点「未付款」后它们仍在
+		// 列表里(2026-11-01 用户口径)。
+		states, err := s.payStatesOf(ctx, branchID, ids)
+		if err != nil {
+			return nil, err
+		}
+		for i := range rows {
+			st, ok := states[strings.TrimSpace(rows[i].ID)]
+			if !ok || !st.IsPaid() {
+				continue
+			}
+			rows[i].PaidStatus = st.PaidStatus
+			rows[i].SetMethod = st.SetMethod
+		}
+		return &CubeSettlementList{Rows: rows}, nil
 	}
 	paid, err := s.ListPaidSettlementIDsOf(ctx, branchID, ids)
 	if err != nil {

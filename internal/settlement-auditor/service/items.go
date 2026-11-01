@@ -5,7 +5,8 @@
 // 「付款审批」不再只有"付供应商货款"这一种。门店实际还会发生：
 //
 //	付款项：水电费 / 租金 / 物业费 / 垃圾处理费 / 软件服务费 / … / 工资 / 其它
-//	收款项：陈列费 / 堆头费 / 补差价 / 兑换 / 纸皮回收 / 扣点 / 其它
+//	收款项：陈列费 / 堆头费 / 补差价 / 兑换 / 纸皮回收 / 扣点 /
+//	        节庆费 / 合同工本费 / POP费 / 条幅费 / 投流费 / 其它
 //
 // 供应商结算单归为**付款类型「货款」**。收款项**冲减**付款金额 ⇒
 //
@@ -64,7 +65,22 @@ const (
 	// 联营商户按销售额给门店的扣点收入（联营账款单上的 sup_ly_amount）；
 	// 它是一笔**收款**，冲减本次付款金额。
 	ReceiptTypeDeduction = "扣点"
-	ReceiptTypeOther     = "其它"
+	// 2026-11-01 用户口径：门店还会收到下面这些供应商/品牌方费用 ⇒ 进收款项下拉。
+	//
+	//	节庆费       —— 节日档期的进场/推广费
+	//	合同工本费   —— 签合同收的工本费
+	//	POP费       —— POP 物料（价签/海报）费
+	//	条幅费       —— 条幅/横幅物料费
+	//	投流费       —— 线上投流（广告投放）费
+	//
+	// ⚠️ 它们**不进放宽额度**（见 buildAllowance：只认陈列费/堆头费/补差价），
+	//    只是下拉里可选，避免店长全填「其它」。
+	ReceiptTypeFestival     = "节庆费"
+	ReceiptTypeContractCost = "合同工本费"
+	ReceiptTypePOP          = "POP费"
+	ReceiptTypeBanner       = "条幅费"
+	ReceiptTypeAdDelivery   = "投流费"
+	ReceiptTypeOther        = "其它"
 
 	// 付款项类型。
 	//
@@ -93,7 +109,10 @@ const (
 func ReceiptTypeOptions() []string {
 	return []string{
 		ReceiptTypeDisplay, ReceiptTypePromotion, ReceiptTypePriceDiff,
-		ReceiptTypeExchange, ReceiptTypePaperRecycl, ReceiptTypeDeduction, ReceiptTypeOther,
+		ReceiptTypeExchange, ReceiptTypePaperRecycl, ReceiptTypeDeduction,
+		ReceiptTypeFestival, ReceiptTypeContractCost, ReceiptTypePOP,
+		ReceiptTypeBanner, ReceiptTypeAdDelivery,
+		ReceiptTypeOther,
 	}
 }
 

@@ -42,6 +42,7 @@ type fakeCube struct {
 	productNames   map[string]string // 货号 → 商品名
 	dailySales     []DailySaleRow    // 备货系数用:逐日销量
 	purchaseDates  []ProductPurchaseDateRow
+	stocks         []StockRow // 库存快照(默认空)
 }
 
 func (f *fakeCube) ListSupplierNames(_ context.Context, _ string) (map[string]string, error) {
@@ -236,8 +237,23 @@ func (l *fakeLoss) SumLossByProduct(ctx context.Context, branchID string, produc
 	return aggregateLoss(rows), nil
 }
 
-func (f *fakeCube) GetStocks(_ context.Context, _ string, _ []string) ([]StockRow, error) {
-	return nil, nil
+func (f *fakeCube) GetStocks(_ context.Context, _ string, productIDs []string) ([]StockRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.stocks) == 0 {
+		return nil, nil
+	}
+	want := make(map[string]bool, len(productIDs))
+	for _, id := range productIDs {
+		want[id] = true
+	}
+	var out []StockRow
+	for _, r := range f.stocks {
+		if want[r.ProductID] {
+			out = append(out, r)
+		}
+	}
+	return out, nil
 }
 
 // ListDailySales / ListProductPurchaseDates 让 fakeCube 实现 stockingQuerier。
@@ -395,6 +411,7 @@ func newTestService(t *testing.T) (*Service, *gorm.DB, *fakeCube, *fakePublisher
 		&model.AuditSupplierFlow{}, &model.AuditPaymentItemFlow{}, &model.AuditRegexPattern{},
 		&model.ApprovalMonthlyItem{}, &model.ApprovalMonthlyBackfill{},
 		&model.StockingCoefficient{},
+		&model.ProductProfile{}, &model.StockingFloor{}, &model.StockingFactCache{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -551,13 +568,13 @@ func TestRunAudit_PassLLM(t *testing.T) {
 		t.Errorf("payload = %+v", p)
 	}
 	// 节点顺序/类型与企微模板的流程设置一致:
-	// 审批人(type=1, 依次审批=3) → 办理人(type=3, 或签=2) → 抄送人(type=2)。
+	// 审批人(type=1, 或签=2) → 办理人(type=3, 或签=2) → 抄送人(type=2)。
 	if p.Process == nil || len(p.Process.NodeList) != 3 {
 		t.Fatalf("process 应有 审批+办理+抄送 3 节点: %+v", p.Process)
 	}
 	n0 := p.Process.NodeList[0]
-	if n0.Type != 1 || n0.ApvRel != ApvRelSerial || len(n0.UserID) != 1 || n0.UserID[0] != "apr1" {
-		t.Errorf("审批节点 = %+v, want type=1 apv_rel=3 [apr1]", n0)
+	if n0.Type != 1 || n0.ApvRel != ApvRelAny || len(n0.UserID) != 1 || n0.UserID[0] != "apr1" {
+		t.Errorf("审批节点 = %+v, want type=1 apv_rel=2 [apr1]", n0)
 	}
 	n1 := p.Process.NodeList[1]
 	if n1.Type != 3 || n1.ApvRel != ApvRelAny || len(n1.UserID) != 1 || n1.UserID[0] != "handler1" {
@@ -1111,12 +1128,14 @@ func TestRunAudit_SuggestStocktake_WarnOnly(t *testing.T) {
 	if cmds := pub.commands(CmdTaskCard); len(cmds) != 0 {
 		t.Errorf("warn 场景不该推盘点卡片, got %d", len(cmds))
 	}
-	var logRow model.AuditLog
-	if err := db.First(&logRow, "approval_id = ? AND step = ?", ap.ID, StepStocktake).Error; err != nil {
-		t.Fatalf("缺 stocktake step 日志: %v", err)
+	// 无阻断信号 ⇒ 引擎**清空**盘点建议（2026-11-01 用户口径：
+	// 判定用确定性代码，LLM 只复述事实，不能凭它的建议建盘点任务）。
+	var verdictRow model.LLMVerdict
+	if err := db.First(&verdictRow, "approval_id = ?", ap.ID).Error; err != nil {
+		t.Fatalf("读结论失败: %v", err)
 	}
-	if !strings.Contains(logRow.OutputSummary, "手动生成") {
-		t.Errorf("step 日志应说明改为手动生成, got %q", logRow.OutputSummary)
+	if len(verdictRow.SuggestStocktake) != 0 {
+		t.Errorf("无阻断信号时不应保留盘点建议, got %s", verdictRow.SuggestStocktake)
 	}
 }
 

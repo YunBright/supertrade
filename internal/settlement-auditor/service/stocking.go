@@ -8,9 +8,17 @@
 // # 两个数怎么用
 //
 //	周期销售数 = 日平均销量 × 备货周期
-//	日平均销量 = 今天往前 **采样天数** 的销量 ÷ 采样天数
+//	日平均销量 = 今天往前 **采样天数** 的销量 ÷ **有货天数**
 //	采样天数   = max(今天 − 该 SKU 最后一次收货日, 备货周期) × 2
+//	有货天数   = 采样窗口内该 SKU **真正有库存**的天数（见 inStockDays）
 //	合理备货量 = 周期销售数 × 备货倍数
+//
+// ⚠️ 分母是**有货天数**，不是采样天数（2026-11-01 用户口径）。
+//
+//	断货期（卖完了等补货）的 0 销量不是"没需求"：水果木瓜-00418 十天卖光
+//	10.36、之后 21 天缺货，按采样天数(54)算日均只有 0.19 ⇒ 周期销售数 1.342
+//	⇒ 11.25 的进货被判 6.4 倍过量;按有货天数(6 天)算日均 1.73 ⇒ 周期销售数
+//	12.1 ⇒ 合理备货量 15.9,同样这批货只有 0.71 倍。差 9 倍,全是缺货天数造的。
 //
 // ⚠️ 采样天数里的「收货日」用**实际收货日**（采购单备注里写的那个，
 // 见 receipt_date.go），不是制单日 —— 延后录入的单这是唯一正确的口径。
@@ -77,15 +85,31 @@ type stockingQuerier interface {
 //
 // ⚠️ 只放**业务事实**，不放原始每日曲线（几十个 SKU × 上百天会把 prompt 撑爆）。
 type StockingFact struct {
-	ProductID     string
-	ProductName   string
-	Multiplier    decimal.Decimal // 备货倍数
-	PeriodDays    int             // 备货周期
-	SampleDays    int             // 采样天数
-	AvgDailySales decimal.Decimal // 日平均销量
+	ProductID   string
+	ProductName string
+	Multiplier  decimal.Decimal // 备货倍数
+	PeriodDays  int             // 备货周期
+	SampleDays  int             // 采样天数（取销量的窗口长度）
+	// InStockDays 是采样窗口内该 SKU **真正有库存**的天数，也是日平均销量的分母
+	//（≠ SampleDays：断货期的 0 销量不算"没需求"，见 inStockDays）。
+	InStockDays    int
+	AvgDailySales  decimal.Decimal // 日平均销量 = 窗口销量 / 有货天数
 	PeriodSalesQty decimal.Decimal // 周期销售数 = 日平均 × 周期
-	StockQty      decimal.Decimal // 当前库存
-	ReceivedQty   decimal.Decimal // 本次进货量
+	StockQty       decimal.Decimal // 当前库存
+	// ReceivedQty 是本次**净进货量**(PI 实收 − RO 退货)。
+	//
+	// ⚠️ 10 天合并付款时它是多日累加值,不能直接比「合理备货量」——
+	// 比较用 CompareQty()(多日取日均),见 purchase_basis.go。
+	ReceivedQty decimal.Decimal
+	// ReturnedQty 是本次结算内的退货量(正数,0 = 无退货)。
+	ReturnedQty decimal.Decimal
+	// PurchaseDays 是有效收货日跨度(含首尾);1 = 单日或非有效多日。
+	PurchaseDays int
+	// DailyAvgQty 是日均采购量 = ReceivedQty / PurchaseDays(单日为 0,不用它)。
+	DailyAvgQty decimal.Decimal
+	// FirstDate / LastDate 是多日收货的首尾收货日(单日为空,回显用)。
+	FirstDate string
+	LastDate  string
 	// ReasonableQty 是合理备货量 = 周期销售数 × 倍数。
 	ReasonableQty decimal.Decimal
 	// CoverageDays 是 (库存 + 本次进货) / 日平均销量 的可售天数（无销量时为 0）。
@@ -94,7 +118,95 @@ type StockingFact struct {
 	Estimated bool
 }
 
+// CompareQty 返回判"进货是否过量"用的量。
+//
+// 多日合并付款 ⇒ 日均采购量;单日 ⇒ 净进货量本身(见 purchase_basis.go)。
+func (f StockingFact) CompareQty() decimal.Decimal {
+	if f.PurchaseDays > 1 {
+		return f.DailyAvgQty
+	}
+	return f.ReceivedQty
+}
+
 // ---- 算法 ----
+
+// firstReceiptDate 返回进货日期里**最早**的一天（不晚于今天）；取不到返回空。
+func firstReceiptDate(dates []string, today time.Time) string {
+	var first time.Time
+	for _, d := range dates {
+		t, ok := parseDateOnly(d)
+		if !ok || t.After(today) {
+			continue
+		}
+		if first.IsZero() || t.Before(first) {
+			first = t
+		}
+	}
+	if first.IsZero() {
+		return ""
+	}
+	return first.Format("2006-01-02")
+}
+
+// lastSaleDate 返回窗口内**最后一次有销量**的日子（售罄日的估计）；取不到返回空。
+func lastSaleDate(daily []DailySaleRow, from, to time.Time) string {
+	last := ""
+	for _, r := range daily {
+		if !r.Quantity.GreaterThan(decimal.Zero) {
+			continue
+		}
+		t, ok := parseCubeTime(r.BusinessDate)
+		if !ok || t.Before(from) || !t.Before(to) {
+			continue
+		}
+		if d := normalizeCubeDate(r.BusinessDate); d > last {
+			last = d
+		}
+	}
+	return last
+}
+
+// inStockDays 估算该 SKU 在采样窗口内**真正有货**的天数（日平均销量的分母）。
+//
+// # 为什么不能直接用采样天数
+//
+// 断货（卖完了等下一次进货）期间的 0 销量不是"没有需求"。水果木瓜-00418：
+// 10-05 进货 18.75 → 10-10 前卖光 → 之后 21 天缺货。按 54 天采样算日均 0.19，
+// 按有货的 6 天算日均 1.73 —— 同一条数据差 9 倍，直接决定"进货是否过量"。
+//
+// # 口径
+//
+//	起点 = 该 SKU 本单采购单里的**最早实际收货日**（早于窗口 ⇒ 用窗口起点）；
+//	终点 = 当前**还有库存** ⇒ 今天（还在卖）；
+//	       已无库存（≈售罄）⇒ 窗口内**最后一次有销量的日子**；
+//	结果夹在 [1, sampleDays]。
+//
+// stockQty/stockKnown 取不到库存时按"还在卖"处理（end=今天）：分母更大 ⇒
+// 日均更小 ⇒ 判过量更严。宁可偏严，也不要因为取不到库存就把过量放过去。
+func inStockDays(windowFrom time.Time, sampleDays int, stockQty decimal.Decimal, stockKnown bool,
+	firstReceipt, lastSale string, today time.Time) int {
+	if sampleDays <= 0 {
+		return 1
+	}
+	start := windowFrom
+	if t, ok := parseDateOnly(firstReceipt); ok && !t.Before(windowFrom) && !t.After(today) {
+		start = t
+	}
+	end := today
+	if stockKnown && !stockQty.GreaterThan(decimal.Zero) {
+		if t, ok := parseDateOnly(lastSale); ok && !t.Before(start) && !t.After(today) {
+			end = t
+		}
+	}
+	n := int(end.Sub(start).Hours()/24) + 1
+	if n < 1 {
+		n = 1
+	}
+	if n > sampleDays {
+		n = sampleDays
+	}
+	return n
+}
 
 // purchaseIntervals 返回商品历史进货的间隔天数中位数与进货次数。
 //
@@ -185,7 +297,12 @@ func dailySalesStats(rows []DailySaleRow, from, to time.Time, sampleDays int) (a
 // computeStockingCoefficient 按历史进货频率 + 日销量波动算一个 SKU 的备货系数。
 //
 // 结果同时落统计快照（采样天数/日均/周期销售数），方便管理后台解释"这个数怎么来的"。
-func computeStockingCoefficient(branchID, productID, name string, daily []DailySaleRow, purchaseDates []string, today time.Time, now time.Time) model.StockingCoefficient {
+//
+// ⚠️ 日均销量/周期销售数的分母同样是**有货天数**（见 inStockDays，2026-11-01 用户口径），
+//
+//	与审批用的口径保持一致，否则后台看到的值和审批判过的值对不上。
+func computeStockingCoefficient(branchID, productID, name string, daily []DailySaleRow, purchaseDates []string,
+	stockQty decimal.Decimal, stockKnown bool, today time.Time, now time.Time) model.StockingCoefficient {
 	intervalMed, intervals := purchaseIntervals(purchaseDates)
 	period := stockingDefaultPeriodDays
 	if intervals > 0 {
@@ -202,7 +319,11 @@ func computeStockingCoefficient(branchID, productID, name string, daily []DailyS
 	}
 	from := today.AddDate(0, 0, -sampleDays+1)
 	to := today.AddDate(0, 0, 1)
-	avg, cv, _ := dailySalesStats(daily, from, to, sampleDays)
+	// 有货天数：起点=最早进货日，终点=还有库存⇒今天 / 已售罄⇒最后一次有销量的日子。
+	firstReceipt := firstReceiptDate(purchaseDates, today)
+	lastSale := lastSaleDate(daily, from, to)
+	inStock := inStockDays(from, sampleDays, stockQty, stockKnown, firstReceipt, lastSale, today)
+	avg, cv, _ := dailySalesStats(daily, from, to, inStock)
 
 	// 倍数 = 1 + 0.5×CV + 周期补偿（周期越长，到货延迟影响越大）。
 	mult := 1.0 + 0.5*cv
@@ -291,8 +412,21 @@ func (s *Service) ensureStockingCoefficients(ctx context.Context, branchID strin
 		purchaseDates[r.ProductID] = append(purchaseDates[r.ProductID], r.SheetDate)
 	}
 	now := s.now()
+	// 库存快照：有货天数的终点（无库存 ⇒ 停在最后一次有销量的日子）。
+	stockQty := make(map[string]decimal.Decimal, len(products))
+	stockKnown := make(map[string]bool, len(products))
+	if rows, err := s.cube.GetStocks(ctx, branchID, products); err != nil {
+		s.logger.Warn("settlement-auditor: 取库存失败,备货系数按\"还在卖\"算有货天数",
+			"branch_id", branchID, "products", len(products), "err", err)
+	} else {
+		for _, r := range rows {
+			stockQty[r.ProductID] = r.Quantity
+			stockKnown[r.ProductID] = true
+		}
+	}
 	for _, pid := range products {
-		row := computeStockingCoefficient(branchID, pid, names[pid], byProduct[pid], purchaseDates[pid], today, now)
+		row := computeStockingCoefficient(branchID, pid, names[pid], byProduct[pid], purchaseDates[pid],
+			stockQty[pid], stockKnown[pid], today, now)
 		if err := s.upsertStockingCoefficient(ctx, &row); err != nil {
 			s.logger.Warn("settlement-auditor: 落库备货系数失败", "product_id", pid, "err", err)
 			continue
@@ -350,7 +484,7 @@ func (s *Service) stockingFactsForAudit(
 	ctx context.Context,
 	branchID string,
 	products []string,
-	received map[string]decimal.Decimal,
+	purchase map[string]purchaseBasis,
 	sheetDates map[string]string,
 	productSheets map[string][]string,
 	names map[string]string,
@@ -390,10 +524,11 @@ func (s *Service) stockingFactsForAudit(
 
 	// 每个商品的采样天数（用户口径：max(今天-实际收货日, 周期)×2）。
 	type skuPlan struct {
-		pid        string
-		sampleDays int
-		period     int
-		mult       decimal.Decimal
+		pid          string
+		sampleDays   int
+		period       int
+		mult         decimal.Decimal
+		firstReceipt string // 窗口内最早的实际收货日(有货天数起点;空=取不到)
 	}
 	plans := make([]skuPlan, 0, len(products))
 	for _, pid := range products {
@@ -407,11 +542,18 @@ func (s *Service) stockingFactsForAudit(
 		}
 		// 该商品在本单涉及的采购单里**最晚**的实际收货日（取不到 ⇒ 今天）。
 		var receipt time.Time
+		// firstReceipt 是**最早**的实际收货日 —— 「有货天数」的起点（见 inStockDays）。
+		firstReceipt := ""
 		for _, sid := range productSheets[pid] {
-			if d, ok := sheetDates[sid]; ok && d != "" {
-				if t, ok := parseCubeTime(d); ok && !t.After(today) && t.After(receipt) {
-					receipt = t
-				}
+			d := strings.TrimSpace(sheetDates[sid])
+			if d == "" {
+				continue
+			}
+			if firstReceipt == "" || d < firstReceipt {
+				firstReceipt = d
+			}
+			if t, ok := parseCubeTime(d); ok && !t.After(today) && t.After(receipt) {
+				receipt = t
 			}
 		}
 		if receipt.IsZero() {
@@ -428,7 +570,7 @@ func (s *Service) stockingFactsForAudit(
 		if sampleDays > stockingSampleDaysCap {
 			sampleDays = stockingSampleDaysCap
 		}
-		plans = append(plans, skuPlan{pid: pid, sampleDays: sampleDays, period: period, mult: c.Multiplier})
+		plans = append(plans, skuPlan{pid: pid, sampleDays: sampleDays, period: period, mult: c.Multiplier, firstReceipt: firstReceipt})
 	}
 	if len(plans) == 0 {
 		return nil
@@ -460,6 +602,9 @@ func (s *Service) stockingFactsForAudit(
 	}
 
 	salesByProduct := make(map[string]float64, len(plans))
+	// lastSaleByProduct 是窗口内**最后一次有销量**的日期 —— 售罄日的估计
+	//（已有库存时不用它，见 inStockDays）。
+	lastSaleByProduct := make(map[string]string, len(plans))
 	for days, pids := range groups {
 		from := today.AddDate(0, 0, -days+1).Format("2006-01-02")
 		to := today.AddDate(0, 0, 1).Format("2006-01-02")
@@ -472,15 +617,24 @@ func (s *Service) stockingFactsForAudit(
 		for _, r := range rows {
 			q, _ := r.Quantity.Float64()
 			salesByProduct[r.ProductID] += q
+			if r.Quantity.GreaterThan(decimal.Zero) {
+				if d := normalizeCubeDate(r.BusinessDate); d > lastSaleByProduct[r.ProductID] {
+					lastSaleByProduct[r.ProductID] = d
+				}
+			}
 		}
 	}
 
 	facts := make([]StockingFact, 0, len(plans))
 	for _, p := range plans {
 		days := windowDays[p.pid]
+		// 日平均销量的分母是**有货天数**，不是采样天数(2026-11-01 用户口径)。
+		stockQty, stockKnown := stocks[p.pid]
+		inStock := inStockDays(today.AddDate(0, 0, -days+1), days, stockQty, stockKnown,
+			p.firstReceipt, lastSaleByProduct[p.pid], today)
 		avg := 0.0
-		if days > 0 {
-			avg = salesByProduct[p.pid] / float64(days)
+		if inStock > 0 {
+			avg = salesByProduct[p.pid] / float64(inStock)
 		}
 		periodSales := avg * float64(p.period)
 		mult, _ := p.mult.Float64()
@@ -488,17 +642,30 @@ func (s *Service) stockingFactsForAudit(
 			mult = 1
 		}
 		reasonable := periodSales * mult
+		basis := purchase[p.pid]
 		f := StockingFact{
 			ProductID:      p.pid,
 			ProductName:    names[p.pid],
 			Multiplier:     p.mult,
 			PeriodDays:     p.period,
 			SampleDays:     days,
+			InStockDays:    inStock,
 			AvgDailySales:  roundDecimal(avg, 3),
 			PeriodSalesQty: roundDecimal(periodSales, 3),
 			StockQty:       stocks[p.pid],
-			ReceivedQty:    received[p.pid],
-			ReasonableQty:  roundDecimal(reasonable, 3),
+			// 净进货量(已扣退货);多日时另给 PurchaseDays/DailyAvgQty,
+			// 比较用 CompareQty()(见 purchase_basis.go)。
+			ReceivedQty:   basis.NetQty,
+			ReturnedQty:   basis.ReturnedQty,
+			PurchaseDays:  basis.Days,
+			FirstDate:     basis.FirstDate,
+			LastDate:      basis.LastDate,
+			ReasonableQty: roundDecimal(reasonable, 3),
+		}
+		if basis.Days > 1 {
+			f.DailyAvgQty = basis.CompareQty()
+		} else if f.PurchaseDays <= 0 {
+			f.PurchaseDays = 1
 		}
 		if avg > 0 {
 			stock, _ := f.StockQty.Float64()
@@ -516,38 +683,14 @@ func (s *Service) stockingFactsForAudit(
 	return facts
 }
 
-// checkStockingExcess 按备货系数判"进货明显过量"（warn，不阻断）。
-//
-// 阈值取 2 倍合理备货量：系数本身已经含了波动缓冲，2 倍以上就不是"多备一点"，
-// 而是明显超出这个 SKU 的消化能力 —— 但仍只提示，让人看事实（不代替人判断）。
-func checkStockingExcess(facts []StockingFact, names map[string]string) []signalDraft {
-	var out []signalDraft
+// stockingFactsMap 把事实列表转成 货号 → 事实 的 map（checkQuantity 判过量用）。
+func stockingFactsMap(facts []StockingFact) map[string]StockingFact {
+	if len(facts) == 0 {
+		return nil
+	}
+	out := make(map[string]StockingFact, len(facts))
 	for _, f := range facts {
-		if f.ReasonableQty.LessThanOrEqual(decimal.Zero) || !f.ReceivedQty.GreaterThan(decimal.Zero) {
-			continue
-		}
-		limit := f.ReasonableQty.Mul(decimal.NewFromInt(2))
-		if !f.ReceivedQty.GreaterThan(limit) {
-			continue
-		}
-		label := ProductLabel(names, f.ProductID)
-		ratio := f.ReceivedQty.Div(f.ReasonableQty)
-		out = append(out, newSignal(model.SignalWarn, SigStockingExcess, "", f.ProductID,
-			fmt.Sprintf("商品 %s 本次进货 %s,按备货系数(周期 %d 天,倍数 %s)估算周期销售数 %s、合理备货量 %s,进货约为其 %s 倍",
-				label, f.ReceivedQty.String(), f.PeriodDays, f.Multiplier.String(),
-				f.PeriodSalesQty.String(), f.ReasonableQty.String(), ratio.StringFixed(1)),
-			map[string]any{
-				"product_id":       f.ProductID,
-				"received":         f.ReceivedQty.String(),
-				"period_days":      f.PeriodDays,
-				"multiplier":       f.Multiplier.String(),
-				"avg_daily_sales":  f.AvgDailySales.String(),
-				"period_sales_qty": f.PeriodSalesQty.String(),
-				"stock_qty":        f.StockQty.String(),
-				"reasonable_qty":   f.ReasonableQty.String(),
-				"sample_days":      f.SampleDays,
-				"coverage_days":    f.CoverageDays.String(),
-			}))
+		out[f.ProductID] = f
 	}
 	return out
 }

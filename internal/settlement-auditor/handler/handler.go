@@ -233,6 +233,7 @@ type settlementInitReq struct {
 	SupplierID    string   `json:"supplier_id"`    // 精确匹配
 	Query         string   `json:"query"`          // 单号/供应商包含匹配
 	DocumentType  string   `json:"document_type"`  // 空 = DP+CP
+	Kind          string   `json:"kind"`           // purchase(默认) / joint / dx
 	PayStatus     string   `json:"pay_status"`     // unpaid / paid / all
 	SettlementIDs []string `json:"settlement_ids"` // 显式勾选;非空时与筛选结果取交集
 	Limit         int      `json:"limit"`          // 只影响回显样本,不影响落库集合
@@ -247,6 +248,7 @@ func (r settlementInitReq) filterOf() service.SettlementFilter {
 		SupplierID:   r.SupplierID,
 		Query:        r.Query,
 		DocumentType: r.DocumentType,
+		Kind:         r.Kind,
 		PayStatus:    r.PayStatus,
 		Ids:          r.SettlementIDs,
 		Limit:        r.Limit,
@@ -341,7 +343,7 @@ func (h *Handler) RevertInit(c *gin.Context) {
 	c.JSON(http.StatusOK, res)
 }
 
-// ListPayStates GET /settlement-init/records?method&pay_status&supplier_id&limit&offset
+// ListPayStates GET /settlement-init/records?method&pay_status&supplier_id&kind&limit&offset
 func (h *Handler) ListPayStates(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "settlement:view") {
@@ -350,7 +352,8 @@ func (h *Handler) ListPayStates(c *gin.Context) {
 	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
 	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
 	rows, total, err := h.svc.ListPayStateRecords(c.Request.Context(), branchID,
-		c.Query("method"), c.Query("pay_status"), c.Query("supplier_id"), limit, offset)
+		c.Query("method"), c.Query("pay_status"), c.Query("supplier_id"),
+		c.Query("kind"), limit, offset)
 	if err != nil {
 		mapErr(c, err)
 		return

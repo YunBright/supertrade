@@ -46,8 +46,12 @@ type Config struct {
 	// ⇒ 模板里配的节点只能"声明在 app 侧",UI 按它渲染、提交按它组装
 	// process.node_list。两边对不上 = 企微里少一个节点(办��人就是这样丢的)。
 	//
-	// 默认值见 DefaultApprovalFlow(对齐 2026-10-23 模板实际配置:
-	// 审批人=申请人自选/依次审批,办理人=申请人自选/单选,抄送人=申请人自选)。
+	// 默认值见 DefaultApprovalFlow(对齐 2026-11-01 模板实际配置:
+	// 审批人=申请人自选/或签,办理人=申请人自选/单选,抄送人=申请人自选)。
+	//
+	// ⚠️ 走 mode=0 时 `apv_rel` 由这份声明决定 —— 管理后台把「依次审批」
+	// 改成「或签」**不会自动生效**,必须同步改这里(env
+	// SETTLEMENT_AUDITOR_APPROVAL_FLOW 或 DefaultApprovalFlow)。
 	ApprovalFlow []ApprovalFlowNode
 	// AmountToleranceYuan 是**数值容差**(默认 0.01 元):同一套源数据内部的勾稽
 	// (结算单明细合计 vs 单头货款)允许的误差,只挡源数据的精度噪声。

@@ -81,6 +81,12 @@ type SettlementFilter struct {
 	Query string
 	// DocumentType 空串 = DP + CP(采购结款单);否则只取指定类型。
 	DocumentType string
+	// Kind 是单类:purchase(购销,默认 DP/CP)/ joint(联营 LY)/ dx(代销 DX)。
+	//
+	// ⚠️ 三类单在思迅是**三张不同的源表**(gx_master / t_fm_recpay_ly_master /
+	// t_fm_recpay_dx_master)⇒ 集合解析必须按 Kind 换数据源,否则联营/代销台账的
+	// 「初始化为已付款」会把购销单当成目标集合(2026-11-01 用户口径)。
+	Kind string
 	// PayStatus:unpaid(默认,只看还没付的)/ paid / all。
 	// 这是台账过滤,与其他条件正交。
 	PayStatus string
@@ -105,6 +111,21 @@ func (f *SettlementFilter) normalize() error {
 	f.SupplierID = strings.TrimSpace(f.SupplierID)
 	f.Query = strings.TrimSpace(f.Query)
 	f.DocumentType = strings.ToUpper(strings.TrimSpace(f.DocumentType))
+	// 单类:三张源表不能混(联营/代销台账的初始化只该作用于各自那张表)。
+	switch strings.ToLower(strings.TrimSpace(f.Kind)) {
+	case "", SettlementKindPurchase:
+		f.Kind = SettlementKindPurchase
+	case SettlementKindJoint:
+		f.Kind = SettlementKindJoint
+	case SettlementKindDelivery:
+		f.Kind = SettlementKindDelivery
+	default:
+		return fmt.Errorf("%w: kind 只能是 purchase / joint / dx,收到 %q", ErrInvalidInput, f.Kind)
+	}
+	// 联营/代销单只有 LY / DX 一种单据类型,DP/CP 的筛选对它们没有意义 ⇒ 忽略。
+	if f.Kind != SettlementKindPurchase {
+		f.DocumentType = ""
+	}
 	switch strings.ToLower(strings.TrimSpace(f.PayStatus)) {
 	case "", "unpaid":
 		f.PayStatus = model.PayStatusUnpaid
@@ -229,8 +250,22 @@ func (s *Service) ResolveSettlementSet(ctx context.Context, branchID string, f S
 		return nil, ErrCubeUnavailable
 	}
 	// 拉满 cap 而不是拉 Limit:Limit 只管展示,集合本身要全。
-	rows, err := s.cube.ListAuditedSettlements(ctx, branchID,
-		f.From, f.To, f.SupplierID, cubeSettlementFetchCap)
+	//
+	// 数据源按 f.Kind 选:购销 / 联营 / 代销是思迅的三张源表,
+	// preview 与 apply 必须看到同一张表(否则「预览说 3 张、执行改了别的单」)。
+	var rows []SettlementRow
+	var err error
+	switch f.Kind {
+	case SettlementKindJoint:
+		rows, err = s.cube.ListAuditedJointSettlements(ctx, branchID,
+			f.From, f.To, f.SupplierID, cubeSettlementFetchCap)
+	case SettlementKindDelivery:
+		rows, err = s.cube.ListAuditedDxSettlements(ctx, branchID,
+			f.From, f.To, f.SupplierID, cubeSettlementFetchCap)
+	default:
+		rows, err = s.cube.ListAuditedSettlements(ctx, branchID,
+			f.From, f.To, f.SupplierID, cubeSettlementFetchCap)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -579,7 +614,14 @@ func (s *Service) RevertSettlementInit(ctx context.Context, branchID string, f S
 }
 
 // ListPayStateRecords 查台账(初始化记录审计页)。
-func (s *Service) ListPayStateRecords(ctx context.Context, branchID string, method, paidStatus, supplierID string, limit, offset int) ([]model.SettlementPayState, int, error) {
+//
+// kind 决定看哪一类单的补录记录(购销 DP/CP / 联营 LY / 代销 DX)。
+// 台账是**门店级一张表**,三类单混在一起 —— 联营/代销台账页签里出现
+// 购销单的补录记录会被读成"我补录了联营单",而实际并没有。
+//
+// 购销口径用 `NOT IN (LY,DX)` 而不是 `IN (DP,CP)`:台账里 document_type
+// 是空串的老行(历史数据)也该算购销,把 null/空串排除掉会让它们从页面上消失。
+func (s *Service) ListPayStateRecords(ctx context.Context, branchID string, method, paidStatus, supplierID, kind string, limit, offset int) ([]model.SettlementPayState, int, error) {
 	q := s.db.WithContext(ctx).Model(&model.SettlementPayState{}).Where("branch_id = ?", branchID)
 	if m := strings.TrimSpace(method); m != "" && m != "all" {
 		q = q.Where("set_method = ?", m)
@@ -589,6 +631,18 @@ func (s *Service) ListPayStateRecords(ctx context.Context, branchID string, meth
 	}
 	if sup := strings.TrimSpace(supplierID); sup != "" {
 		q = q.Where("supplier_id = ?", sup)
+	}
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "":
+		// 不传 = 不过滤(兼容旧客户端)。
+	case SettlementKindJoint:
+		q = q.Where("document_type = ?", DocumentTypeJoint)
+	case SettlementKindDelivery:
+		q = q.Where("document_type = ?", DocumentTypeDelivery)
+	case SettlementKindPurchase:
+		q = q.Where("document_type NOT IN ?", []string{DocumentTypeJoint, DocumentTypeDelivery})
+	default:
+		return nil, 0, fmt.Errorf("%w: kind 只能是 purchase / joint / dx,收到 %q", ErrInvalidInput, kind)
 	}
 	var total int64
 	if err := q.Count(&total).Error; err != nil {

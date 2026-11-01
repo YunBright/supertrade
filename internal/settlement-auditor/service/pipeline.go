@@ -46,9 +46,9 @@ const (
 	//
 	// 与联营扣点同理单独记一步：代销单的"整体实现毛利率是否达标"
 	// 混在金额日志里看不出来。
-	StepCheckDx    = "check_dx"
+	StepCheckDx       = "check_dx"
 	StepCheckQuantity = "check_quantity"
-	StepLLMVerdict       = "llm_verdict"
+	StepLLMVerdict    = "llm_verdict"
 	// StepFlowDecision 是**流程定制**的结论步骤（2026-10-28 用户口径）。
 	//
 	// ⚠️ 与 StepLLMVerdict 分开记：审批详情页的时间线上必须能看出
@@ -658,7 +658,7 @@ func (s *Service) stepCheckAmounts(ctx context.Context, ap *model.ApprovalInstan
 //
 // 信号里写「<商品名称>-<商品货号>」(ProductLabel)⇒ 这里要先把名字查出来。
 // 名字查不到只 warn 不失败:回退成纯货号,不影响主结论。
-func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInstance, linesBySettlement map[string][]SettlementLineRow, sheets []PurchaseSheetRow, signals *[]signalDraft, allowance Allowance) (*MarginSummary, []StockingFact, error) {
+func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInstance, linesBySettlement map[string][]SettlementLineRow, sheets []PurchaseSheetRow, signals *[]signalDraft, allowance Allowance) (*MarginSummary, []StockingGroupFact, error) {
 	start := time.Now()
 	// 仅 PI(进货)单做收货量聚合;RO 退货本期不建信号(见 checks.go 注释)。
 	piSheetSet := make(map[string]struct{})
@@ -700,6 +700,48 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 	}
 	sort.Strings(products)
 
+	// 退货(RO):从采购量里扣掉(2026-11-01 用户口径:水果木瓜-00418 有采购
+	// 退货单,实际采购量必须减去退货数量)。
+	//
+	// ⚠️ 退货**不参与**"有效收货日"判定:一天进货、一天退货不算多日,
+	//   除数仍是 1 —— 否则 (进货−退货)/2 会把真实过量藏掉一半。
+	// ⚠️ 取不到退货明细只告警不失败:少扣退货 ⇒ 采购量偏大 ⇒ 只会更严,不会漏拦。
+	roSheetSet := make(map[string]struct{})
+	for _, lns := range linesBySettlement {
+		for _, ln := range lns {
+			if ln.SourceDocType == "RO" {
+				roSheetSet[ln.VoucherID] = struct{}{}
+			}
+		}
+	}
+	returned := make(map[string]decimal.Decimal)
+	var roLines []SheetLineRow
+	roSheetCount := 0
+	if len(roSheetSet) > 0 {
+		roSheets := make([]string, 0, len(roSheetSet))
+		for v := range roSheetSet {
+			roSheets = append(roSheets, v)
+		}
+		roSheetCount = len(roSheets)
+		roLines, err = s.cube.ListSheetLines(ctx, ap.BranchID, roSheets)
+		if err != nil {
+			s.logger.Warn("settlement-auditor: 取退货明细失败,采购量按未扣退货判定",
+				"approval_id", ap.ID, "err", err)
+		} else {
+			for _, ln := range roLines {
+				if ln.ProductID == "" {
+					continue
+				}
+				q := ln.ReceivedQuantity
+				// 源表 real_qty 在退货单上可能是负数 ⇒ 统一取绝对值。
+				if q.IsNegative() {
+					q = q.Neg()
+				}
+				returned[ln.ProductID] = returned[ln.ProductID].Add(q)
+			}
+		}
+	}
+
 	// 窗口终点 = 明天(开区间)⇒ **今天当天的销售也算在内**。
 	// 源表 t_rm_daysum 当天就有数据(实测卖到当天),用今天做上界会把当天的销量漏掉。
 	now := s.now()
@@ -728,6 +770,20 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 			sheetDates[sh.ID] = d
 		}
 	}
+	// 采购口径(2026-11-01 用户口径):净进货量(扣退货)+ 有效收货日跨度。
+	//
+	// 多日合并付款的 SKU 比较的是**日均采购量**,单日仍是净进货量本身
+	// (见 purchase_basis.go 的口径说明)。
+	purchase := buildPurchaseBasis(received, returned, productSheets, sheetDates)
+	purchaseQty := make(map[string]decimal.Decimal, len(purchase))
+	multiDayCnt := 0
+	for pid, b := range purchase {
+		purchaseQty[pid] = b.CompareQty()
+		if b.Days > 1 {
+			multiDayCnt++
+		}
+	}
+
 	// 取不到采购日期时的回退窗口(老口径:今天往前 SaleWindowDays 天)。
 	fallbackFrom, _ := s.saleWindowDates()
 
@@ -793,20 +849,32 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 		names = nil
 	}
 
-	// ---- 备货系数（2026-10-31 用户口径）----
+	// ---- 组级备货事实（2026-11-01 用户口径）----
 	//
-	// 把本次涉及的 SKU 的备货系数连同库存数、周期销售数一起交给 LLM
-	// （见 service/stocking.go）。缺失的系数在这里现算并落库。
+	// 组合/拆分商品按商品档案的父子关系归并成**组**，库存/销量/进货都换算到
+	// 组基准单位再相加，判的是「补货之后这组货够卖多少天、有没有超过可售上限」
+	// （见 service/stocking_group.go）。
 	//
-	// ⚠️ 全部失败路径都只告警不阻断：备货系数是**参考事实**，
+	// ⚠️ 全部失败路径都只告警不阻断：备货事实是研判依据，
 	//    不是审批结论的必要条件，不能因为它拿不到就把整单审核搞挂。
-	stocking := s.stockingFactsForAudit(ctx, ap.BranchID, products, received, sheetDates, productSheets, names, now)
+	stocking := s.groupStockingFactsForAudit(ctx, ap.BranchID, products, lines, roLines, purchase, names, allowance, now)
 
 	before := len(*signals)
-	*signals = append(*signals, checkQuantity(received, salesByProduct, lossByProduct, s.cfg.QtyDeviationFactor, QuantityContext{
+	qc := QuantityContext{
 		Names:      names,
 		WindowFrom: windowFromByProduct(groups),
-	})...)
+		// 多日合并付款 ⇒ 消息里要写清累计/天数/日均（见 purchase_basis.go）。
+		Purchase: purchase,
+	}
+	if stocking != nil {
+		// 组口径覆盖的货号不再走单 SKU 老口径（组已经把它们归并判过一次）。
+		qc.Groups = stocking.Facts
+		qc.Skip = membersSet(stocking.Members)
+	} else {
+		// cube 不实现组查询能力（测试/降级）⇒ 回退单 SKU 老口径。
+		qc.Stocking = stockingFactsMap(s.stockingFactsForAudit(ctx, ap.BranchID, products, purchase, sheetDates, productSheets, names, now))
+	}
+	*signals = append(*signals, checkQuantity(purchaseQty, salesByProduct, lossByProduct, s.cfg.QtyDeviationFactor, qc)...)
 	// 毛利额度信号(见 service/allowance.go)。
 	//
 	// 成本用**库存加权平均成本价**估算(cube `stock.avg_cost` = 思迅「库存查询」
@@ -825,9 +893,15 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 	gmSignals := checkGrossMarginWithAllowance(gm, allowance, perSKU, names)
 	*signals = append(*signals, gmSignals...)
 
-	// 备货过量提示（2026-10-31 用户口径）:按备货系数估算合理备货量，
-	// 进货明显超出（> 2 倍）时给 warn —— 只提示，不阻断。
-	*signals = append(*signals, checkStockingExcess(stocking, names)...)
+	// 组级数量判定（2026-11-01 用户口径）：
+	// 下限内不判定、可售上限内不判定、超上限才 block/warn（见 checks.go）。
+	// 自动标记也在这一步落库：本次有阻断的组 ⇒ pending（等人工修正），否则 auto。
+	if stocking != nil {
+		groupBefore := len(*signals)
+		*signals = append(*signals, checkGroupQuantity(stocking.Facts, s.cfg.QtyDeviationFactor, today)...)
+		s.storeStockingSuggestions(ctx, ap.BranchID, stocking,
+			blockedGroupKeys(stocking.Facts, quantityBlockedProducts((*signals)[groupBefore:])), now)
+	}
 
 	// ---- 实现毛利（2026-10-29 用户口径）----
 	//
@@ -855,33 +929,39 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 	for _, rm := range realizedNeg {
 		summary.RealizedNegYuan = summary.RealizedNegYuan.Add(rm.AmountYuan)
 	}
-	// 备货系数核对结论（推理时间线可见，2026-10-31 用户要求）。
-	stockingNote := "备货系数核对:未启用"
-	if len(stocking) > 0 {
-		estimatedCnt := 0
-		excessCnt := 0
-		for _, f := range stocking {
-			if f.Estimated {
-				estimatedCnt++
+	// 组级备货核对结论（推理时间线可见，2026-11-01 用户口径）。
+	stockingNote := "备货核对:未启用"
+	var stockingFacts []StockingGroupFact
+	if stocking != nil {
+		stockingFacts = stocking.Facts
+	}
+	if len(stockingFacts) > 0 {
+		overCnt, noSaleCnt, unitCnt := 0, 0, 0
+		for _, f := range stockingFacts {
+			if f.Unconvertible {
+				unitCnt++
 			}
-			if f.ReasonableQty.GreaterThan(decimal.Zero) &&
-				f.ReceivedQty.GreaterThan(f.ReasonableQty.Mul(decimal.NewFromInt(2))) {
-				excessCnt++
+			if f.ZeroSalesCase != "" {
+				noSaleCnt++
+			}
+			if f.CoverageDays.GreaterThan(decimal.Zero) && f.CoverageDays.GreaterThan(
+				decimal.NewFromInt(int64(f.CapDays))) {
+				overCnt++
 			}
 		}
-		stockingNote = fmt.Sprintf("备货系数核对:%d 个商品(其中 %d 个本次现算),进货明显过量 %d 个",
-			len(stocking), estimatedCnt, excessCnt)
+		stockingNote = fmt.Sprintf("备货核对:%d 个商品组,补货后超过可售上限 %d 组,组内无销售记录 %d 组,单位不可换算 %d 组",
+			len(stockingFacts), overCnt, noSaleCnt, unitCnt)
 	}
 	s.logStep(ctx, ap, StepCheckQuantity,
-		fmt.Sprintf("PI 单 %d 张(其中 %d 张按备注实际收货日起算),商品 %d 种,窗口 %s~%s(按各商品最后一次采购收货日起算,取不到则回退 %s)",
-			len(piSheets), extracted, len(products), groups[0].From, toDate, fallbackFrom),
+		fmt.Sprintf("PI 单 %d 张(其中 %d 张按备注实际收货日起算),退货单 %d 张,商品 %d 种(其中 %d 个按多日合并付款取日均采购量),窗口 %s~%s(按各商品最后一次采购收货日起算,取不到则回退 %s)",
+			len(piSheets), extracted, roSheetCount, len(products), multiDayCnt, groups[0].From, toDate, fallbackFrom),
 		fmt.Sprintf("新增 %d 条数量信号;%s;%s;窗口毛利估算 %s 元(成本口径:库存加权平均成本价 %d 个商品,回退本次进货均价 %d 个),补差价额度 %s 元,毛利为负的商品 %d 个;实现毛利为负的商品 %d 个",
 			len(*signals)-before, lossNote, stockingNote, yuanText(gm.AmountYuan), avgCnt, purchaseCnt,
 			yuanText(allowance.PriceDiffYuan),
 			len(negGross),
 			len(realizedNeg)),
 		"", 0)
-	return summary, stocking, nil
+	return summary, stockingFacts, nil
 }
 
 // realizedWindowSales 拉「实现毛利」口径要用的窗口销售汇总。
@@ -1096,6 +1176,28 @@ func (s *Service) stepLLMVerdict(ctx context.Context, ap *model.ApprovalInstance
 		verdict, err = defaultVerdictFn(ctx, in)
 		if err != nil {
 			return nil, fmt.Errorf("rule fallback verdict: %w", err)
+		}
+	}
+	// ---- 结论强制（2026-11-01 用户口径）----
+	//
+	//	「判定用确定性代码，LLM 只复述事实、不判定」。
+	//	有 block ⇒ reject；无 block ⇒ pass。
+	//	LLM 的 conclusion 与引擎不一致时**以引擎为准**，差异写进 trace 供排查。
+	flags := blockMessages(signals)
+	// 盘点建议只按**阻断级**数量信号派生（无数量类阻断 ⇒ 不触发盘点联动）。
+	verdict.SuggestStocktake = stocktakeSuggestionFromBlocks(signals)
+	switch {
+	case len(flags) > 0 && verdict.Conclusion != ConclusionReject:
+		trace += "；LLM 结论与引擎阻断信号不一致，按引擎校正为 reject"
+		verdict.Conclusion = ConclusionReject
+		verdict.Reason = truncate("规则审核拒绝:"+strings.Join(flags, ";"), 2048)
+	case len(flags) == 0 && verdict.Conclusion == ConclusionReject:
+		trace += "；LLM 无阻断依据却给出 reject，按引擎校正为 pass"
+		modelNote := strings.TrimSpace(verdict.Reason)
+		verdict.Conclusion = ConclusionPass
+		verdict.Reason = "规则审核通过:无阻断信号"
+		if modelNote != "" {
+			verdict.Reason = truncate("规则审核通过:无阻断信号;模型说明:"+modelNote, 2048)
 		}
 	}
 	// 通过结论必须带**毛利合计**(2026-10-30 用户口径:不能缺少总和)。

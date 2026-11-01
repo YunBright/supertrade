@@ -77,7 +77,7 @@ func TestComputeStockingCoefficient_PeriodFromIntervals(t *testing.T) {
 		{ProductID: "P1", BusinessDate: "2026-09-29", Quantity: dec("7")},
 	}
 	row := computeStockingCoefficient("B1", "P1", "可乐", daily,
-		[]string{"2026-09-01", "2026-09-08", "2026-09-15"}, today, today)
+		[]string{"2026-09-01", "2026-09-08", "2026-09-15"}, decimal.Zero, false, today, today)
 
 	if row.PeriodDays != 7 {
 		t.Errorf("PeriodDays = %d, want 7（进货间隔中位数）", row.PeriodDays)
@@ -103,7 +103,7 @@ func TestComputeStockingCoefficient_PeriodFromIntervals(t *testing.T) {
 
 func TestComputeStockingCoefficient_DefaultsWithoutHistory(t *testing.T) {
 	today := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
-	row := computeStockingCoefficient("B1", "P1", "新品", nil, nil, today, today)
+	row := computeStockingCoefficient("B1", "P1", "新品", nil, nil, decimal.Zero, false, today, today)
 	if row.PeriodDays != stockingDefaultPeriodDays {
 		t.Errorf("无进货历史 ⇒ 周期应为默认 %d, got %d", stockingDefaultPeriodDays, row.PeriodDays)
 	}
@@ -119,62 +119,38 @@ func TestComputeStockingCoefficient_PeriodClamped(t *testing.T) {
 	today := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
 	// 间隔 200 天 ⇒ 周期应被夹到上限 60。
 	row := computeStockingCoefficient("B1", "P1", "慢销", nil,
-		[]string{"2026-01-01", "2026-07-20"}, today, today)
+		[]string{"2026-01-01", "2026-07-20"}, decimal.Zero, false, today, today)
 	if row.PeriodDays != stockingMaxPeriodDays {
 		t.Errorf("PeriodDays = %d, want clamp 到 %d", row.PeriodDays, stockingMaxPeriodDays)
 	}
 }
 
-func TestCheckStockingExcess(t *testing.T) {
-	base := StockingFact{
-		ProductID:     "P1",
-		PeriodDays:    7,
-		Multiplier:    dec("1.0"),
-		PeriodSalesQty: dec("10"),
-		ReasonableQty: dec("10"),
-		ReceivedQty:   dec("25"),
-	}
-	names := map[string]string{"P1": "可乐"}
-
-	sigs := checkStockingExcess([]StockingFact{base}, names)
-	if len(sigs) != 1 {
-		t.Fatalf("进货 25 > 2×10 ⇒ 应给出 1 条信号, got %d", len(sigs))
-	}
-	if sigs[0].Level != model.SignalWarn || sigs[0].SignalType != SigStockingExcess {
-		t.Errorf("信号类型/级别错误: %+v", sigs[0])
-	}
-
-	// 恰好在 2 倍 ⇒ 不算明显过量（阈值是严格大于）。
-	base.ReceivedQty = dec("20")
-	if sigs := checkStockingExcess([]StockingFact{base}, names); len(sigs) != 0 {
-		t.Errorf("恰好 2 倍不应告警, got %d", len(sigs))
-	}
-
-	// 没有周期销售数（滞销/新商品）⇒ 不判过量（没有依据）。
-	base.ReasonableQty = decimal.Zero
-	if sigs := checkStockingExcess([]StockingFact{base}, names); len(sigs) != 0 {
-		t.Errorf("无合理备货量不应告警, got %d", len(sigs))
-	}
-}
-
 func TestWriteStockingFacts_Prompt(t *testing.T) {
 	var sb strings.Builder
-	writeStockingFacts(&sb, []StockingFact{{
-		ProductID:      "P1",
-		ProductName:    "可乐",
-		Multiplier:     dec("1.20"),
-		PeriodDays:     7,
-		SampleDays:     30,
-		AvgDailySales:  dec("1.000"),
-		PeriodSalesQty: dec("7.000"),
-		StockQty:       dec("5.000"),
-		ReceivedQty:    dec("20.000"),
-		ReasonableQty:  dec("8.400"),
-		CoverageDays:   dec("25.0"),
-		Estimated:      true,
+	writeStockingFacts(&sb, []StockingGroupFact{{
+		GroupKey:      "P1|P2",
+		ProductID:     "P1",
+		Label:         "可乐-P1(组合商品 2 个)",
+		MemberIDs:     []string{"P1", "P2"},
+		BaseUnit:      "瓶",
+		SampleDays:    180,
+		InStockDays:   30,
+		SalesQty:      dec("60"),
+		AvgDailySales: dec("2"),
+		StockQty:      dec("20"),
+		ReceivedQty:   dec("120"),
+		CapDays:       45,
+		CapQty:        dec("90"),
+		AfterQty:      dec("140"),
+		CoverageDays:  dec("70"),
+		FloorQty:      dec("12"),
+		SingleMedian:  dec("60"),
 	}})
 	got := sb.String()
-	for _, want := range []string{"备货系数", "可乐-P1", "周期 7 天", "采样 30 天", "合理备货量 8.400", "系数=本次现算"} {
+	for _, want := range []string{
+		"组级备货核对", "可乐-P1", "本次进货 120 瓶", "组内库存 20 瓶",
+		"可售上限 45 天", "补货后可售 70.0 天", "一次进货下限 12 瓶",
+	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("prompt 缺少 %q:\n%s", want, got)
 		}
@@ -288,7 +264,7 @@ func TestStockingFactsForAudit_SampleDaysUsesReceiptDate(t *testing.T) {
 		{ProductID: "P1", SheetDate: "2026-09-20"},
 	}
 	facts := svc.stockingFactsForAudit(context.Background(), "B1", []string{"P1"},
-		map[string]decimal.Decimal{"P1": dec("30")},
+		map[string]purchaseBasis{"P1": {NetQty: dec("30"), Days: 1}},
 		map[string]string{"PI-1": "2026-09-20"},
 		map[string][]string{"P1": {"PI-1"}},
 		map[string]string{"P1": "可乐"}, today)
@@ -299,15 +275,57 @@ func TestStockingFactsForAudit_SampleDaysUsesReceiptDate(t *testing.T) {
 	if f.SampleDays != 22 {
 		t.Errorf("SampleDays = %d, want 22", f.SampleDays)
 	}
-	// 日均 = 22/22 = 1；周期销售数 = 7；倍数 1 ⇒ 合理备货 7。
-	if !f.AvgDailySales.Equal(dec("1.000")) || !f.PeriodSalesQty.Equal(dec("7.000")) {
+	// 有货天数 = 首收货日 09-20 ~ 今天 10-01 = 12 天（fake 不返库存 ⇒ 按"还在卖"处理）。
+	if f.InStockDays != 12 {
+		t.Errorf("InStockDays = %d, want 12(收货日到今天)", f.InStockDays)
+	}
+	// 日均 = 22/12 = 1.833（分母是有货天数，不是采样天数 22）；周期销售数 = 12.833。
+	if !f.AvgDailySales.Equal(dec("1.833")) || !f.PeriodSalesQty.Equal(dec("12.833")) {
 		t.Errorf("日均/周期销售数不对: %+v", f)
 	}
-	if !f.ReasonableQty.Equal(dec("7.000")) {
-		t.Errorf("合理备货量 = %s, want 7.000", f.ReasonableQty)
+	if !f.ReasonableQty.Equal(dec("12.833")) {
+		t.Errorf("合理备货量 = %s, want 12.833", f.ReasonableQty)
 	}
-	// 可售天数 = (库存 0(fake 不返库存) + 进货 30)/1 = 30。
-	if !f.CoverageDays.Equal(dec("30")) {
-		t.Errorf("CoverageDays = %s, want 30", f.CoverageDays)
+	// 可售天数 = (库存 0(fake 不返库存) + 进货 30)/1.833 = 16.4。
+	if !f.CoverageDays.Equal(dec("16.4")) {
+		t.Errorf("CoverageDays = %s, want 16.4", f.CoverageDays)
+	}
+}
+
+// TestInStockDays_SoldOutStopsAtLastSale 是 2026-11-01 用户口径的回归锁：
+// 卖完就断货的 SKU，缺货期不能算进"有货天数"（水果木瓜-00418 实单：6 天）。
+func TestInStockDays_SoldOutStopsAtLastSale(t *testing.T) {
+	today := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	from := today.AddDate(0, 0, -53) // 采样 54 天
+	// 10-05 收货、10-10 最后一天有销量、当前库存 0 ⇒ 有货 6 天。
+	if got := inStockDays(from, 54, decimal.Zero, true, "2026-10-05", "2026-10-10", today); got != 6 {
+		t.Errorf("有货天数 = %d, want 6(10-05~10-10)", got)
+	}
+}
+
+// TestInStockDays_StillInStockCountsToToday 还有库存 ⇒ 算到今天（断货期不存在）。
+func TestInStockDays_StillInStockCountsToToday(t *testing.T) {
+	today := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	from := today.AddDate(0, 0, -53)
+	if got := inStockDays(from, 54, dec("5"), true, "2026-10-05", "2026-10-10", today); got != 28 {
+		t.Errorf("有货天数 = %d, want 28(10-05~11-01)", got)
+	}
+}
+
+// TestInStockDays_StockUnknownTreatedAsInStock 取不到库存 ⇒ 按还在卖（偏严）。
+func TestInStockDays_StockUnknownTreatedAsInStock(t *testing.T) {
+	today := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	from := today.AddDate(0, 0, -53)
+	if got := inStockDays(from, 54, decimal.Zero, false, "2026-10-05", "2026-10-10", today); got != 28 {
+		t.Errorf("有货天数 = %d, want 28(库存未知按还在卖)", got)
+	}
+}
+
+// TestInStockDays_NoReceiptOrSaleFallsBackToWindow 取不到收货/销量 ⇒ 兜底按窗口长度。
+func TestInStockDays_NoReceiptOrSaleFallsBackToWindow(t *testing.T) {
+	today := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	from := today.AddDate(0, 0, -53)
+	if got := inStockDays(from, 54, decimal.Zero, true, "", "", today); got != 54 {
+		t.Errorf("有货天数 = %d, want 54(起点=窗口起点)", got)
 	}
 }

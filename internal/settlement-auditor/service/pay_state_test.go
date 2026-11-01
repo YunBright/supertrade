@@ -110,10 +110,78 @@ func TestResolveSettlementSet_Filters(t *testing.T) {
 	}
 }
 
+// TestSettlementInit_KindSwitchesSource 锁「联营 / 代销台账的初始化只作用于自己那张表」。
+//
+// 2026-11-01 用户口径：联营单台账、代销单台账也要能「初始化为已付款」。
+// 三类单在思迅是三张源表 ⇒ 集合解析必须按 Kind 换数据源。
+//
+// 若仍固定走购销表，页面会预览出「3 张购销单」并真的把它们标成已付款，
+// 而联营/代销单一张都没动 —— 静默、不可查，而且污染了购销台账。
+func TestSettlementInit_KindSwitchesSource(t *testing.T) {
+	svc, db, cube, _, _ := newTestService(t)
+	seedSettlementRows(t, cube,
+		row("DP0001", "S1", "DP", "100.00"),
+		row("LY0001", "S2", DocumentTypeJoint, "200.00"),
+		row("DX0001", "S3", DocumentTypeDelivery, "300.00"),
+	)
+	ctx := context.Background()
+
+	// 预览：联营只能看到 LY0001。
+	pv, err := svc.PreviewSettlementInit(ctx, "B1", SettlementFilter{Kind: SettlementKindJoint})
+	if err != nil {
+		t.Fatalf("preview kind=joint: %v", err)
+	}
+	if pv.Count != 1 || len(pv.Sample) != 1 || pv.Sample[0].ID != "LY0001" {
+		t.Fatalf("kind=joint 预览应只命中 LY0001,实际 count=%d sample=%+v", pv.Count, pv.Sample)
+	}
+
+	// 执行：只有联营单落成已付款（初始化），购销/代销单不受影响。
+	res, err := svc.ApplySettlementInit(ctx, "B1",
+		SettlementFilter{Kind: SettlementKindJoint}, admin, "上线前已付")
+	if err != nil {
+		t.Fatalf("apply kind=joint: %v", err)
+	}
+	if res.Changed != 1 || res.Matched != 1 {
+		t.Fatalf("kind=joint 应只改 1 张,实际 %+v", res)
+	}
+	if st := payStateOf(t, db, "B1", "LY0001"); st.SetMethod != model.PayMethodInit {
+		t.Errorf("LY0001 设置方式 = %s, want init", st.SetMethod)
+	}
+	var leaked int64
+	if err := db.Model(&model.SettlementPayState{}).
+		Where("branch_id = ? AND settlement_id IN ?", "B1", []string{"DP0001", "DX0001"}).
+		Count(&leaked).Error; err != nil {
+		t.Fatalf("count leaked: %v", err)
+	}
+	if leaked != 0 {
+		t.Errorf("购销/代销单被误标成已付款: %d 张", leaked)
+	}
+
+	// 代销同理：只命中 DX0001（LY0001 已在台账里被记为已付款 ⇒ 默认 unpaid 口径不再返回）。
+	pv, err = svc.PreviewSettlementInit(ctx, "B1", SettlementFilter{Kind: SettlementKindDelivery})
+	if err != nil {
+		t.Fatalf("preview kind=dx: %v", err)
+	}
+	if pv.Count != 1 || len(pv.Sample) != 1 || pv.Sample[0].ID != "DX0001" {
+		t.Fatalf("kind=dx 预览应只命中 DX0001,实际 count=%d sample=%+v", pv.Count, pv.Sample)
+	}
+}
+
+// TestResolveSettlementSet_RejectsUnknownKind —— 单类拼错必须报错。
+//
+// 静默降级成 purchase 会把联营台账的「初始化」变成对购销单的批量改状态。
+func TestResolveSettlementSet_RejectsUnknownKind(t *testing.T) {
+	svc, _, _, _, _ := newTestService(t)
+	if _, err := svc.ResolveSettlementSet(context.Background(), "B1",
+		SettlementFilter{Kind: "jy"}); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("未知 kind 应报 ErrInvalidInput, got %v", err)
+	}
+}
+
 // TestResolveSettlementSet_RejectsBadFilter —— 非法取值必须显式报错。
 //
-// 静默降级成"不限"比报错危险得多:pay_status 拼错一个字母,
-// 页面会变成"把全部门店所有单都标成已付款",而用户以为自己筛的是未付款。
+// normalize 把空串当默认值,把大小写/空白收紧;但**拼错的枚举**不能悄悄
+// 落成默认值,否则页面上"选错了筛选"就变成"什么都没筛"。
 func TestResolveSettlementSet_RejectsBadFilter(t *testing.T) {
 	svc, _, cube, _, _ := newTestService(t)
 	seedSettlementRows(t, cube, row("DP0001", "S1", "DP", "10.00"))
@@ -490,6 +558,59 @@ func TestListCubeSettlements_RevertedBecomesSelectable(t *testing.T) {
 	}
 }
 
+// TestListCubeJointSettlements_IncludePaidMarksRows —— 「未付款」不能靠前端猜。
+//
+// 2026-11-01 用户口径:联营/代销台账点「未付款」后,通过审批流程付掉的单
+// 仍然留在列表里。根因是 include_paid=1 这条路径只把行原样返回、没补台账
+// 标记 ⇒ 前端把每一行都读成"未付款",筛选与置灰全部失效。
+//
+// 判据两条:
+//
+//	a) 未付款视图(includePaid=false)里,审批付掉的联营单不出现;
+//	b) 含已付款视图里它出现,并且**带着 paid_status / set_method**;
+//	    未付款的行不得被贴上标记(否则会被前端置灰,点不动也说不清)。
+func TestListCubeJointSettlements_IncludePaidMarksRows(t *testing.T) {
+	svc, db, cube, _, _ := newTestService(t)
+	seedSettlementRows(t, cube,
+		row("LY0001", "S1", DocumentTypeJoint, "100.00"),
+		row("LY0002", "S2", DocumentTypeJoint, "200.00"),
+	)
+	seedPayState(t, db, "B1", "LY0001", model.PayStatusPaid, model.PayMethodApproval, "u-flow")
+	ctx := context.Background()
+
+	list, err := svc.ListCubeJointSettlements(ctx, "B1", "", "", "", "", 200, false)
+	if err != nil {
+		t.Fatalf("list joint 未付款: %v", err)
+	}
+	if len(list.Rows) != 1 || list.Rows[0].ID != "LY0002" {
+		t.Fatalf("审批付掉的 LY0001 不该出现在未付款列表,实际 %+v", list.Rows)
+	}
+	if list.HiddenPaid != 1 {
+		t.Errorf("hidden_paid 应为 1(前端要据此说明少了几张),实际 %d", list.HiddenPaid)
+	}
+
+	list, err = svc.ListCubeJointSettlements(ctx, "B1", "", "", "", "", 200, true)
+	if err != nil {
+		t.Fatalf("list joint includePaid: %v", err)
+	}
+	if len(list.Rows) != 2 {
+		t.Fatalf("include_paid=1 应返回 2 张,实际 %d", len(list.Rows))
+	}
+	for _, r := range list.Rows {
+		switch r.ID {
+		case "LY0001":
+			if r.PaidStatus != model.PayStatusPaid || r.SetMethod != model.PayMethodApproval {
+				t.Errorf("LY0001 应带台账标记 paid/approval,实际 %q/%q —— "+
+					"缺标记时前端会把已付款的单当成未付款", r.PaidStatus, r.SetMethod)
+			}
+		case "LY0002":
+			if r.PaidStatus != "" || r.SetMethod != "" {
+				t.Errorf("未付款的 LY0002 不该带台账标记,实际 %q/%q", r.PaidStatus, r.SetMethod)
+			}
+		}
+	}
+}
+
 // ---- 审批侧写入 ----
 
 // TestMarkApprovalSettlementsPaid_DoesNotOverwriteInitLedger —— 两个来源互不覆盖。
@@ -635,12 +756,66 @@ func TestListPayStateRecords_FiltersByMethod(t *testing.T) {
 	seedPayState(t, db, "B1", "DP2", model.PayStatusPaid, model.PayMethodApproval, "u2")
 	seedPayState(t, db, "B2", "DP3", model.PayStatusPaid, model.PayMethodInit, "u1")
 
-	rows, total, err := svc.ListPayStateRecords(context.Background(), "B1", "init", "", "", 50, 0)
+	rows, total, err := svc.ListPayStateRecords(context.Background(), "B1", "init", "", "", "", 50, 0)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
 	if total != 1 || len(rows) != 1 || rows[0].SettlementID != "DP1" {
 		t.Fatalf("B1 的 init 记录应只剩 DP1,实际 total=%d rows=%+v", total, rows)
+	}
+}
+
+// TestListPayStateRecords_FiltersByKind —— 台账一张表装三类单,记录页签必须分得清。
+//
+// 若不过滤:联营台账的「补录记录」里会出现购销单的补录行,读起来就像
+// "这间店的联营单被补录过",而实际上联营单一张都没动。
+func TestListPayStateRecords_FiltersByKind(t *testing.T) {
+	svc, db, _, _, _ := newTestService(t)
+	mk := func(sid, docType string) {
+		t.Helper()
+		err := db.Create(&model.SettlementPayState{
+			ID: sid + "-pay", BranchID: "B1", SettlementID: sid,
+			SupplierID: "S1", DocumentType: docType,
+			PaidStatus: model.PayStatusPaid, SetMethod: model.PayMethodInit,
+			OperatorID: "u1", GoodsAmountYuan: dec("100.00"),
+			CreatedAt: fixedNow, UpdatedAt: fixedNow,
+		}).Error
+		if err != nil {
+			t.Fatalf("seed %s: %v", sid, err)
+		}
+	}
+	mk("DP1", "DP")
+	mk("LEGACY1", "") // 历史行没有单据类型 ⇒ 属于购销口径
+	mk("LY1", DocumentTypeJoint)
+	mk("DX1", DocumentTypeDelivery)
+
+	ctx := context.Background()
+	rows, total, err := svc.ListPayStateRecords(ctx, "B1", "", "", "", SettlementKindJoint, 50, 0)
+	if err != nil {
+		t.Fatalf("joint: %v", err)
+	}
+	if total != 1 || rows[0].SettlementID != "LY1" {
+		t.Fatalf("联营记录应只剩 LY1,实际 total=%d rows=%+v", total, rows)
+	}
+
+	rows, total, err = svc.ListPayStateRecords(ctx, "B1", "", "", "", SettlementKindDelivery, 50, 0)
+	if err != nil {
+		t.Fatalf("dx: %v", err)
+	}
+	if total != 1 || rows[0].SettlementID != "DX1" {
+		t.Fatalf("代销记录应只剩 DX1,实际 total=%d rows=%+v", total, rows)
+	}
+
+	rows, total, err = svc.ListPayStateRecords(ctx, "B1", "", "", "", SettlementKindPurchase, 50, 0)
+	if err != nil {
+		t.Fatalf("purchase: %v", err)
+	}
+	if total != 2 {
+		t.Fatalf("购销记录应为 DP1+LEGACY1 共 2 条,实际 total=%d rows=%+v", total, rows)
+	}
+
+	if _, _, err := svc.ListPayStateRecords(ctx, "B1", "", "", "", "jy", 50, 0); !errors.Is(err, ErrInvalidInput) {
+		t.Errorf("未知 kind 应报 ErrInvalidInput, got %v", err)
 	}
 }
 

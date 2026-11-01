@@ -72,12 +72,13 @@ type AuditInput struct {
 	// 有它 ⇒ 库存已被盘点核对过 ⇒ 数量类信号(无销售记录/数量偏离)
 	// 不作为拒绝理由(与陈列费/堆头费的放宽口径同构,见 allowance.go)。
 	Stocktakes []StocktakeVerification
-	// Stocking 是本次涉及的 SKU 的备货系数事实(2026-10-31 用户口径)。
+	// Stocking 是本次涉及的**商品组**的备货事实(2026-11-01 用户口径)。
 	//
-	// 每个 SKU 给:备货倍数/周期、采样天数、日平均销量、周期销售数、
-	// 当前库存、本次进货量、合理备货量、可售天数。
-	// ⚠️ 只放汇总事实,不放逐日曲线(几十个 SKU × 上百天会撑爆 prompt)。
-	Stocking []StockingFact
+	// 每个组给:本次进货、组内库存、补货后合计、组销量与组盘损(有货天数/日均消耗)、
+	// 可售上限天数与量、补货后可售天数、一次进货下限、单次进货中位数、
+	// 组内 180 天无销售时的分类。
+	// ⚠️ 只放汇总事实,不放逐日曲线(几十个组 × 上百天会撑爆 prompt)。
+	Stocking []StockingGroupFact
 	// Joint 是联营( LY )结算单的扣点核对事实(2026-10-31 用户口径)。
 	//
 	// 联营单的"货款"是**毛销售额**,扣点是**收款项**单独冲减 ⇒
@@ -114,8 +115,8 @@ type StocktakeVerification struct {
 type AuditExtras struct {
 	Margins    MarginSummary
 	Stocktakes []StocktakeVerification
-	// Stocking 是备货系数事实(2026-10-31 用户口径,见 AuditInput.Stocking)。
-	Stocking []StockingFact
+	// Stocking 是商品组级备货事实(2026-11-01 用户口径,见 AuditInput.Stocking)。
+	Stocking []StockingGroupFact
 	// Joint 是联营扣点事实(2026-10-31 用户口径,见 AuditInput.Joint)。
 	Joint JointSummary
 	// Dx 是代销毛利事实(2026-11-01 用户口径,见 AuditInput.Dx)。
@@ -220,6 +221,44 @@ func stocktakeSuggestionFromSignals(drafts []signalDraft) *StocktakeSuggestion {
 	ids := make([]string, 0)
 	for _, d := range drafts {
 		if d.ProductID == "" {
+			continue
+		}
+		if d.SignalType != SigPurchaseWithoutSales && d.SignalType != SigQtyDeviation {
+			continue
+		}
+		if _, ok := seen[d.ProductID]; ok {
+			continue
+		}
+		seen[d.ProductID] = struct{}{}
+		ids = append(ids, d.ProductID)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	return &StocktakeSuggestion{Scope: "product", IDs: ids}
+}
+
+// blockMessages 取所有 block 级信号的可读描述（结论强制用）。
+func blockMessages(drafts []signalDraft) []string {
+	out := make([]string, 0, len(drafts))
+	for _, d := range drafts {
+		if d.Level == model.SignalBlock {
+			out = append(out, d.Message)
+		}
+	}
+	return out
+}
+
+// stocktakeSuggestionFromBlocks 只从**阻断级**数量信号派生盘点建议。
+//
+// ⚠️ 与 stocktakeSuggestionFromSignals 的差别：后者把 warn 级的 qty_deviation
+// 也算进去，会在"机器本可以直接放行"的单子上凭空建盘点任务。
+// 2026-11-01 用户口径：只有阻断（需盘点核对）才触发盘点联动。
+func stocktakeSuggestionFromBlocks(drafts []signalDraft) *StocktakeSuggestion {
+	seen := make(map[string]struct{})
+	ids := make([]string, 0)
+	for _, d := range drafts {
+		if d.Level != model.SignalBlock || d.ProductID == "" {
 			continue
 		}
 		if d.SignalType != SigPurchaseWithoutSales && d.SignalType != SigQtyDeviation {
@@ -363,7 +402,7 @@ func buildAuditSystemPrompt() string {
 
 判断要点:
 - 规则引擎已标 block 的信号(单据缺失/未审核/金额勾稽不上/无销售进货/数量严重偏离)
-  通常应 reject,并在 reason 中引用最关键的几条;
+  通常应 reject,并在 reason 中引用最关键的几条(数量类另见下方「组级备货核对」口径);
 - 只有 warn 信号时,结合销售/供应商/商品常识判断是否需要人工复核,
   无明显问题则 pass,把 warn 摘要写进 reason 供人工终审关注;
 - 数据里若给出「已关联盘点单且审核通过」,说明库存已经盘点核对过 ⇒
@@ -446,6 +485,29 @@ func buildAuditSystemPrompt() string {
 - 出现「realized_margin」时,reason 里**只陈述事实**:哪个商品、
   本批次进货均价多少、窗口销售均价多少、按可卖数量算的实现毛利为负多少,请人工终审关注。
   **不要**写成"这单有问题""存在风险""舞弊"这类判断(见上面措辞纪律)。
+
+数量合理性按「组级备货核对」判断(2026-11-01 用户口径,**必须遵守**):
+- 一个**商品组** = 组合/拆分商品归并后的整体(整件进货、拆散零售算同一组);
+  数据里的库存/销量/盘损/进货都已换算到组基准单位再相加,不要自己再做换算;
+- **组消耗 = 组销量 + 组盘损**(报损/盘亏也是货的去向,已审核单据才计入);
+  日均消耗 = 组消耗 / 有货天数 —— 数据里「日均消耗」就是按这个口径算好的,直接用;
+- 判定只看一个事实:**补货之后这组货够卖多少天**(「补货后可售 X 天」)
+  对比「可售上限 C 天」:
+  · 补货后可售 ≤ 可售上限:属正常备货,**不作为拒绝理由**;
+  · 本次进货 ≤「一次进货下限」:按最小包装进了一次货,同样**不作为拒绝理由**;
+  · 超过可售上限:引擎只给 warn(stocking_excess / qty_deviation),写进 reason 作提示,仍应 pass;
+  · 超过可售上限 × 倍数、或超出金额 > 300 元:引擎给 qty_deviation(block),可 reject,
+    reason 写明本次进货、组内库存、补货后可售天数、可售上限天数;
+- **不要**用「这单进了多少 vs 卖了多」当依据 —— 多日合并付款的进货量是累加值,
+  数据里会写清累计/天数/日均;数量判断一律以引擎给的「补货后可售天数」为准;
+- 组内近 180 天无销售时,引擎按「刚收货 / 首单 / 长期无销售 / 账实缺口」分类:
+  只有**长期无销售**(有库存且最后一次进货超过 30 天)才是 block,且阻断条件写明需盘点核对;
+  其余三类是 warn,**不作为拒绝理由**;
+- 组里有采购行单位与商品档案单位不一致(unconvertible)⇒ 该组本次未做数量比较,
+  **不作为拒绝理由**,只陈述事实;
+- 「purchase_price_above_history」(进价高于近 180 天均价)、
+  「stock_ledger_gap」(进货−销售−盘损−库存对不上)是**提示事实**,不作为拒绝理由。
+- 「已扣退货」表示进货量里**已经**减掉了采购退货数量,不要重复扣减。
 
 只输出 JSON,不要 markdown,不要解释:
 {"conclusion":"pass|reject","reason":"中文,200字内","confidence":0.0~1.0,
@@ -566,36 +628,48 @@ func buildAuditUserPrompt(in *AuditInput) string {
 	return sb.String()
 }
 
-// writeStockingFacts 把备货系数事实写进 user prompt（2026-10-31 用户口径）。
+// writeStockingFacts 把**组级**备货事实写进 user prompt（2026-11-01 用户口径）。
 //
-// 每个 SKU 一行，最多 20 个（其余省略）：这种逐 SKU 明细过多会冲淡
-// 真正需要 LLM 关注的信号。
-//
-func writeStockingFacts(sb *strings.Builder, facts []StockingFact) {
+// 每个商品组一行，最多 20 个（其余省略）：逐组明细过多会冲淡真正需要关注的信号。
+func writeStockingFacts(sb *strings.Builder, facts []StockingGroupFact) {
 	if len(facts) == 0 {
 		return
 	}
-	fmt.Fprintf(sb, "备货系数(SKU 级,共 %d 个;合理备货量 = 周期销售数 × 备货倍数,周期销售数 = 日平均销量 × 备货周期):\n",
+	fmt.Fprintf(sb, "组级备货核对(共 %d 个商品组;组 = 组合/拆分商品归并,库存/销量/进货已换算到组基准单位):\n",
 		len(facts))
 	for i, f := range facts {
 		if i >= 20 {
-			fmt.Fprintf(sb, "  ... 其余 %d 个 SKU 略\n", len(facts)-20)
+			fmt.Fprintf(sb, "  ... 其余 %d 个商品组略\n", len(facts)-20)
 			break
 		}
-		label := f.ProductID
-		if name := strings.TrimSpace(f.ProductName); name != "" {
-			label = ProductLabel(map[string]string{f.ProductID: name}, f.ProductID)
+		fmt.Fprintf(sb, "  - 商品组 %s:%s;%s", f.Label, groupPurchaseText(f), groupStockText(f))
+		if f.CoverageDays.GreaterThan(decimal.Zero) {
+			fmt.Fprintf(sb, ";补货后可售 %s 天", f.CoverageDays.StringFixed(1))
 		}
-		estimated := ""
-		if f.Estimated {
-			estimated = ",系数=本次现算"
+		fmt.Fprintf(sb, ";一次进货下限 %s", qtyUnitText(f.FloorQty, f.BaseUnit))
+		if f.Unconvertible {
+			fmt.Fprintf(sb, ";单位说明:%s(该组本次未做数量比较)", f.UnitNote)
 		}
-		fmt.Fprintf(sb, "  - %s:倍数 %s,周期 %d 天,采样 %d 天,日均销量 %s,周期销售数 %s,当前库存 %s,本次进货 %s,合理备货量 %s,可售 %s 天%s\n",
-			label, f.Multiplier.StringFixed(2), f.PeriodDays, f.SampleDays,
-			f.AvgDailySales.StringFixed(3), f.PeriodSalesQty.StringFixed(3),
-			f.StockQty.StringFixed(3), f.ReceivedQty.StringFixed(3),
-			f.ReasonableQty.StringFixed(3), f.CoverageDays.StringFixed(1), estimated)
+		if text := zeroSalesCaseText(f.ZeroSalesCase); text != "" {
+			fmt.Fprintf(sb, ";%s", text)
+		}
+		fmt.Fprintf(sb, "\n")
 	}
+}
+
+// zeroSalesCaseText 把「组内 180 天无销量」的分类翻成事实描述（不做判断）。
+func zeroSalesCaseText(c string) string {
+	switch c {
+	case "recent_receipt":
+		return "组内近 180 天无销售记录(本次到货不足 7 天)"
+	case "new_product":
+		return "组内近 180 天无进货也无销售记录(首单)"
+	case "long_stock":
+		return "组内近 180 天无销售记录,且当前有库存、最后一次进货已超过 30 天"
+	case "ledger_gap":
+		return "组内近 180 天与近 30 天均无销售记录"
+	}
+	return ""
 }
 
 // marginTotalsSentence 生成引擎口径的**毛利合计句**(结论里必须出现的总和)。
