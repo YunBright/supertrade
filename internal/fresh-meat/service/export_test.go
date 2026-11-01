@@ -229,6 +229,47 @@ func BuildSystemPromptForTest(focus []model.CutType) string {
 	return buildSystemPrompt(focus)
 }
 
+// CutChainAnchorForTest 暴露 [cutChainAnchor](成本链的**锚点**查找)。
+//
+// ⚠️ 为什么值得单独暴露:锚点是"有已物化快照 ⇒ 直接拿前一日结余当期初"的**快路径**。
+//
+//	2026-11-01 生产实测发现它**从来没生效过** —— 查锚点时只 SELECT 了日期列,
+//	却用 `ID == ""` 判断"到底查到没查到行" ⇒ ID 永远是零值 ⇒ 锚点恒为"不存在"
+//	⇒ 每次请求都从链起点**逐日重算**整条链(每多一天 = 一次远程销售查询)
+//	⇒ 毛利看板耗时随日期**线性增长**(店 00:10-30 ≈1.2s / 11-01 ≈2.0s / 11-05 ≈3.3s)。
+//
+//	⚠️ 这个 bug **数字全对、只是慢** ⇒ 端到端断言"数字对"永远抓不到它
+//	⇒ 只能**直接锁锚点是否被找到**。
+//
+// 返回 (锚点日期, 是否找到)。
+func CutChainAnchorForTest(ctx context.Context, s *Service, branchID string, from time.Time) (string, bool, error) {
+	day, prev, err := s.cutChainAnchor(ctx, branchID, from)
+	if err != nil {
+		return "", false, err
+	}
+	if prev == nil {
+		return "", false, nil
+	}
+	return day.In(s.bizTZOrUTC()).Format("2006-01-02"), true, nil
+}
+
+// CutChainBaselineForTest 暴露 [cutChainBaseline](链的起点)。
+//
+// ⚠️ 为什么值得单独暴露:链起点决定"回溯时从哪天开始算" ⇒ 它错了,看板就慢一截
+//	(或者把上线前的旧账接回链里)。
+//
+//	同 [CutChainAnchorForTest]:2026-11-01 修掉了"只 SELECT 日期列却拿 ID 判空"的 bug
+//	⇒ 这个函数**曾经**永远拿不到"最早快照日"那个兜底。
+//
+// 返回 (起点日期, 是否找到)。
+func CutChainBaselineForTest(ctx context.Context, s *Service, branchID string) (string, bool, error) {
+	day, err := s.cutChainBaseline(ctx, branchID)
+	if err != nil {
+		return "", false, err
+	}
+	return day, day != "", nil
+}
+
 // BuildUserPromptForTest 暴露 [buildUserPrompt](user 侧点名要补的部位)。
 func BuildUserPromptForTest(pig *model.WholePig, history []model.WholePig, focus []model.CutType) string {
 	return buildUserPrompt(pig, history, focus)

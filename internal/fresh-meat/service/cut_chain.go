@@ -205,9 +205,16 @@ func (s *Service) cutChainBaseline(ctx context.Context, branchID string) (string
 		return best, nil
 	}
 	// ② 没有期初结转 ⇒ 退回"已落库的最早快照日"。
+	//
+	// ⚠️ 2026-11-01 修：**必须把 id 一起查出来**。
+	//
+	//	下面用 `firstSnap.ID != ""` 判断"到底查到没查到行",而
+	//	`Select("biz_date")` **只查了日期列** ⇒ ID 永远是零值
+	//	⇒ 这个"没有期初结转"的兜底分支**永远进不去**
+	//	⇒ 没有期初结转的店,链起点恒为空(链退化成"只算被查的那一天")。
 	var firstSnap model.CutCostDaily
 	if err := s.db.WithContext(ctx).
-		Select("biz_date").
+		Select("id", "biz_date").
 		Where("branch_id = ?", branchID).
 		Order("biz_date ASC").
 		Limit(1).
@@ -239,9 +246,18 @@ func (s *Service) cutChainAnchor(ctx context.Context, branchID string,
 ) (time.Time, *cutOpeningOverride, error) {
 	loc := s.bizTZOrUTC()
 	before := datatypesDate(from.In(loc))
+	// ⚠️ 2026-11-01 修：**必须把 id 一起查出来**。
+	//
+	//	下面用 `latest.ID == ""` 判断"到底查到没查到锚点行",而
+	//	`Select("biz_date")` **只查了日期列** ⇒ ID 永远是零值
+	//	⇒ **锚点永远被判为"不存在"** ⇒ `computeCutChainDays` 每次都
+	//	  从链起点**逐日重算**整条链(每多一天 = 一次远程销售查询)
+	//	  ⇒ 毛利看板的耗时随日期**线性增长**(生产实测 店 00:
+	//	    10-30 ≈1.2s / 10-31 ≈1.6s / 11-01 ≈2.0s,每天 +~0.4s)。
+	//	⇒ 这就是"锚点快路径"从来没生效过的原因。
 	var latest model.CutCostDaily
 	if err := s.db.WithContext(ctx).
-		Select("biz_date").
+		Select("id", "biz_date").
 		Where("branch_id = ? AND biz_date < ?", branchID, before).
 		Order("biz_date DESC").
 		Limit(1).
