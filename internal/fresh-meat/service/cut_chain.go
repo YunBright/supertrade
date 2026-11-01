@@ -61,7 +61,9 @@ type cutChainDay struct {
 	// shortSellKg 是当天的**总量短卖**(kg)—— owner 口径(口径见 CutDailyCost.ShortSellKg)。
 	//
 	// ⚠️ 分部位的账面不足**不算**在这里(那是 CutShortSellKg)⇒
-	//   >0 ⇒ ① 报表描红 ② 审计结转被拒 ③ 结转给下一天(累计短卖)。
+	//   >0 ⇒ ① 那部分货**必须计成本** ② 结转给下一天(累计短卖)。
+	//
+	// ⚠️ 2026-11-01 owner：**短卖拦截规则废止** ⇒ 不再拦结算、不再描红。
 	shortSellKg decimal.Decimal
 	// costIncomplete = true ⇒ 当天有部位的成本**算不出来**(不是成本为 0)。
 	costIncomplete bool

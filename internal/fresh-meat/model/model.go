@@ -552,7 +552,7 @@ func (PromoSku) TableName() string { return "promo_skus" }
 //	⇒ 它需要**自己的一条成本线**(搭赠成本),并**扣毛利**(owner 2026-10-31 拍板)。
 //
 // ⚠️ 搭赠为什么必须有:搭赠的货**从库存里出去了但没有任何销售记录**
-// (没过称、没过账)⇒ 链上看就是「盘亏」⇒ 会被误判成短卖 ⇒ 审计结转被拒。
+// (没过称、没过账)⇒ 链上看就是「盘亏」⇒ 会被误判成短卖 ⇒ 缺口算到别的出口头上。
 type WasteLog struct {
 	ID            string          `gorm:"primaryKey;column:id;type:varchar(64)" json:"id"`
 	BranchID      string          `gorm:"column:branch_id;type:varchar(64);not null;index:idx_branch_recorded,priority:1" json:"branch_id"`
@@ -901,7 +901,12 @@ type CutCostDaily struct {
 	//
 	// = max(0, Σ(期初+进货) − Σ(卖出+统收+报损) − Σ期末)
 	// ⚠️ 生产实测 店 00:10-29 = 0(总量够);10-30 = 62.512(账面只剩 20.9kg 却卖了 83.4kg)。
-	// ⇒ >0 ⇒ ① 报表描红 ② **审计结转被拒** ③ 结转给下一天(累计短卖)。
+	// ⇒ >0 ⇒ ① 那部分货**必须计成本**(否则销售成本 = 0 ⇒ 毛利虚高)
+	//   ② 结转给下一天(累计短卖)。
+	//
+	// ⚠️ 2026-11-01 owner：**短卖拦截规则废止**
+	//   (原「任何一日出现短卖都不允许审批结算」—— 它的拦截点随审计端点一起下线)
+	//   ⇒ 不再拦结算、不再描红 ⇒ 这里只留**成本**与**传递**两件事。
 	ShortSellKg decimal.Decimal `gorm:"column:short_sell_kg;type:decimal(14,3);not null;default:0" json:"short_sell_kg"`
 	// CarriedShortSellKg 是**从上一期结转过来**的短卖(kg)—— 累计口径。
 	CarriedShortSellKg decimal.Decimal `gorm:"column:carried_short_sell_kg;type:decimal(14,3);not null;default:0" json:"carried_short_sell_kg"`

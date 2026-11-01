@@ -147,7 +147,6 @@ func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation, ref R
 	}
 	tot.ShortSellKg = shortSellKg
 	tot.CarriedShortSellKg = carriedShortSellKg
-	tot.ShortSell = shortSellKg.IsPositive()
 
 	perCut := make([]PerCutGrossMargin, 0, len(mids))
 	for _, m := range mids {

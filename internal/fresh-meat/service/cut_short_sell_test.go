@@ -11,16 +11,20 @@ package service_test
 //	    ⇒ 链把它当次日期初 ⇒ 门店看到"期初有负数"。
 //	2026-10-30:无盘点、Σ期初 20.879kg、Σ销售 83.391kg ⇒ 缺口 **62.512kg** ⇒ **真短卖**。
 //
-// # 锁的六条口径
+// # 锁的口径
 //
 //	R1 期末量永远 ≥0(盘到的部位用实盘,**含 0 kg**)⇒ 次日期初不会有负数;
 //	R2 分部位的账面不足只作提示(cut_short_sell_kg),**不进链**;
 //	R3 当日**总量**短卖才算数(short_sell_kg);
 //	R4 真短卖才结转(累计短卖),且**绝不回写成负库存**;
 //	R5 短卖的那部分货**必须计成本**(不许成本算不出来 ⇒ 不许毛利虚高);
-//	R6 描红(报表出参)。
-//	   ⚠️ 2026-11-01 owner：审计端点下线 ⇒ 原 R6 的「阻断审计结转」那半条随之退休
-//	   (锁它的两个用例已删,原因见本文件 TestShortSell_AuditRejected 原来的位置)。
+//
+//	⚠️ 2026-11-01 owner：**「短卖拦截规则」整条废止** ——
+//	  原 R6 = 「报表描红 + 任何一日短卖都不允许审批结算」。
+//	  描红随账面链退休(页面不再展示);拦截点随审计端点下线。
+//	  ⇒ owner 拍板这条规则不要了 ⇒ 出参里的 `short_sell` 布尔位也一并删除
+//	    (它**只**服务于描红)⇒ 本文件不再锁它。
+//	  ⇒ **短卖作为成本事实仍由 R3/R4/R5 锁着**(计成本 + 传递不许塌)。
 //
 // # 为什么这些用例必须走**公开 API + 真实 SQLite**
 //
@@ -268,9 +272,6 @@ func TestShortSell_PerCutShortage_NotRealShortSell(t *testing.T) {
 	if !rep.Total.ShortSellKg.IsZero() {
 		t.Errorf("★ 总量够(25kg 可售 ≥ 23kg 卖出)就不算短卖, got %s", rep.Total.ShortSellKg)
 	}
-	if rep.Total.ShortSell {
-		t.Errorf("★ 总量够时 total.short_sell 必须是 false")
-	}
 	// ② 分部位的账面不足要看得见。
 	belly := findPerCut(t, rep.PerCut, model.CutBelly)
 	if !belly.CutShortSellKg.Equal(d("3")) {
@@ -299,7 +300,7 @@ func TestShortSell_PerCutShortage_NotRealShortSell(t *testing.T) {
 //
 // # 期望
 //
-//	① 当日**总量**短卖 = 30kg(卖 50 − 可售 20)⇒ 报表描红;
+//	① 当日**总量**短卖 = 30kg(卖 50 − 可售 20)⇒ 这部分货**必须计成本**;
 //	② **结转到下一期**(累计短卖 30kg)⇒ 但**绝不回写成负库存**(次日期初 ≥ 0)。
 //
 // # 判别力
@@ -341,9 +342,6 @@ func TestShortSell_TotalShortSell_Carried(t *testing.T) {
 	if !rep.Total.ShortSellKg.Equal(d("30")) {
 		t.Errorf("★ 当日总量短卖应是 30kg(卖 50 − 可售 20), got %s", rep.Total.ShortSellKg)
 	}
-	if !rep.Total.ShortSell {
-		t.Errorf("★ 有短卖时 total.short_sell 必须是 true")
-	}
 	ssAssertReconBalanced(t, rep, "2026-10-30")
 
 	// ② 结转到下一期,但期初仍 ≥ 0。
@@ -356,14 +354,13 @@ func TestShortSell_TotalShortSell_Carried(t *testing.T) {
 	ssAssertNoNegativeOpening(t, rep3, "2026-10-31")
 }
 
-// ⚠️ 2026-11-01 owner：审计结转端点(`/stock/audit` 及其 precheck)已下线
-//   ⇒ 原 R6 的「阻断审计结转」那半条(① `TestShortSell_AuditRejected`：
-//      审计结转被拒 + 预检点名短卖那天；② `TestShortSell_PrecheckReportsMissingStocktakeAndShortSellTogether`：
-//      预检一次报全"缺盘点 + 短卖")**随端点一起退休** —— 它们锁的是端点行为，
-//   不是短卖口径本身。
-//   ⇒ R6 剩余部分(报表描红)仍由本文件其它用例锁定，未受影响。
-//
-// (原 R6 全文) R6 描红(报表出参)+ 阻断审计结转(POST /stock/audit 拒绝、precheck 列出那天)。
+// ⚠️ 2026-11-01 owner：**「短卖拦截规则」整条废止** ——
+//   原 R6 = 「报表描红 + 任何一日短卖都不允许审批结算」：
+//   - 描红随账面链退休(页面不再展示)⇒ 出参的 `short_sell` 布尔位也删了;
+//   - 阻断审计结转那半条随 `/stock/audit` 及其 precheck 端点一起下线
+//     (锁它的那两个用例已随之退休 —— 它们锁的是**端点行为**,不是短卖口径本身)。
+//   ⇒ owner 拍板这条规则不要了 ⇒ 本文件不再锁 R6。
+//   ⇒ **短卖作为成本事实仍由 R3/R4/R5 锁着**(计成本 + 传递不许塌 + 总量口径)。
 
 // TestShortSell_ClampNonNegative 锁「读到负的期末 ⇒ 裁成 0(kg 与金额一起)」。
 //
