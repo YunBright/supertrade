@@ -333,8 +333,19 @@ type PerCutGrossMargin struct {
 	// ⚠️ nil = 这个部位取不到成本单价 ⇒ 算不出来 ⇒ 前端显示「—」。
 	ReferenceGrossMarginYuan *decimal.Decimal `json:"reference_gross_margin_yuan,omitempty"`
 	// ReferenceGrossMarginPct 是**参考毛利率**(%)—— 分母 = 营收。
-	ReferenceGrossMarginPct *float64        `json:"reference_gross_margin_pct,omitempty"`
-	RevenueYuan             decimal.Decimal `json:"revenue_yuan"`
+	ReferenceGrossMarginPct *float64 `json:"reference_gross_margin_pct,omitempty"`
+	// ValueCoefficient 是该部位的**价值系数**(2026-11-01 owner 拍板):
+	//	该部位的单位重量市场价值 ÷ 整扇猪分割后所有可售部位的平均单位重量价值。
+	//
+	// ⚠️ >1 = 这个部位比全店平均**更值钱**
+	//	(生产实测 店 00 10-30:猪肚 2.998 / 肋排 2.294 / 五花 0.800 / 猪油 0.301)。
+	// ⚠️ nil = 算不出来(当天没有「有产出且有价」的部位可作分母,
+	//   或该部位当天没卖过、取不到零售均价)⇒ 前端显示「—」(不是 0)。
+	//
+	// ⚠️ 分母是**产出加权**的平均 ⇒ 详见 value_coefficient.go 里的恒等式说明
+	//   (owner 原话里的「加权价值产出」按字面算恒等于产出总重 ⇒ 已改成产出估值)。
+	ValueCoefficient *decimal.Decimal `json:"value_coefficient,omitempty"`
+	RevenueYuan      decimal.Decimal `json:"revenue_yuan"`
 	// ⚠️ 改名(2026-10-23):旧字段 `purchase_cost_yuan` 是"按消耗比例摊销的猪采购成本";
 	// 新字段是**本期销售成本**(移动加权结转)—— 两者语义不同,不是同一个数。
 	// 旧的"摊销采购成本"在"今天没进猪的部位今天在卖"时会算成 0 ⇒ 毛利虚高。
@@ -467,6 +478,22 @@ type TotalGrossMargin struct {
 	//	⇒ >100% 说明**搬台没登记**或**盘点漏了部位**(生产实测 店 00 10-30 = 106.4%)。
 	// ⚠️ nil = 算不出来(没有完整日终盘点 / 当天没进猪)⇒ 前端显示「—」。
 	YieldRate *float64 `json:"yield_rate,omitempty"`
+	// ---- 价值系数 / 产出估值(2026-11-01 owner)----
+	//
+	// OutputValueYuan 是**产出估值**(元) = Σ(该部位实际产出重量 × 该部位零售均价)。
+	//
+	// 含义:**今天切出来的货,按零售价算值多少钱**(含还没卖掉的、损耗的、搭赠的)
+	//	⇒ 与当日营收对照,差值就是「切出来但还没变成现金」的那部分价值。
+	// 生产实测 店 00:10-29 = 3892.61 / 10-30 = 4761.13 / 10-31 = 4341.13。
+	//
+	// ⚠️ nil = 算不出来(当天没有「有产出且有价」的部位)⇒ 前端显示「—」。
+	OutputValueYuan *decimal.Decimal `json:"output_value_yuan,omitempty"`
+	// OutputAvgUnitValueYuan 是**整扇猪分割后所有可售部位的平均单位重量价值**(元/kg)
+	// = Σ(kg×price) ÷ Σ(kg) —— 也就是「价值系数」那个分母。
+	//
+	// 生产实测 店 00 10-30 = 19.944 元/kg。
+	// ⚠️ nil = 算不出来(同 OutputValueYuan)⇒ 前端显示「—」。
+	OutputAvgUnitValueYuan *decimal.Decimal `json:"output_avg_unit_value_yuan,omitempty"`
 }
 
 // ComputeGrossMargin 按 (branchID, day) 算毛利。
@@ -503,6 +530,15 @@ func (s *Service) ComputeGrossMargin(ctx context.Context, branchID string, day t
 	}
 
 	perCut, total := rollUpPerCutCuts(cutRows, promoAlloc, refTotals)
+
+	// ---- 价值系数 / 产出估值(2026-11-01 owner)----
+	//
+	// ⚠️ 就地写回 perCut 每行的 ValueCoefficient(切片共享底层数组 ⇒ 可见)。
+	// ⚠️ 这两个数**依赖分割产出**(actual_split_kg 多为倒推值)⇒ 切不准会跟着偏,
+	//   详见 value_coefficient.go 顶部的前提说明。
+	vc := applyValueCoefficients(perCut)
+	total.OutputAvgUnitValueYuan = vc.AvgUnitValueYuan
+	total.OutputValueYuan = vc.OutputValueYuan
 
 	dataSource := dataSourceEstimated
 	isComplete := false
