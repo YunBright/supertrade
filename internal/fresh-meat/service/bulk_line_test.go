@@ -58,7 +58,7 @@ func TestBulkLinePosSaleIsNotRetail(t *testing.T) {
 		t.Fatalf("装配大宗线 POS 货号: %v", err)
 	}
 
-	// 零售线要有**能摊到的货**（猪 + 分割 + 日终盘点 ⇒ 一袋），
+	// 零售线要有**能摊到的货**（猪 + 分割 + 日终盘点 ⇒ 一批），
 	// 否则零售那一行会因"反查不到猪"被丢 ⇒ 就分不清是"被大宗线规则排除"还是"没猪"。
 	pig, err := svc.RecordWholePig(ctx, "S001", model.RecordWholePigInput{
 		EarTag: "BL-1", GrossWeightKg: d("200"), PurchaseUnitPriceYuan: d("20"),

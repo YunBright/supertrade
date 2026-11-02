@@ -44,7 +44,7 @@ func StockOpeningID(branchID, cutType string) string {
 	return surrogateID("SSO", branchID, cutType)
 }
 
-// StockOpeningBagID 期初那一行**结转记录(袋子)**的确定性代理主键(按部位)。
+// StockOpeningBagID 期初那一行**结转记录**的确定性代理主键(按部位)。
 //
 // ⚠️ 不按生效日：生效日可以被改 ⇒ 主键跟着变就变成"多出一行"
 // ⇒ 按 (门店, 部位) ⇒ 改期初 = 覆盖同一行。
@@ -117,7 +117,7 @@ func (s *Service) ListStockOpenings(ctx context.Context, branchID string) (*Stoc
 	return &StockOpeningsView{BranchID: branchID, Openings: out}, nil
 }
 
-// applyOpeningToStock 把**期初**落进「位置表(冷库)」与「结转记录(袋子)」。
+// applyOpeningToStock 把**期初**落进「位置表(冷库)」与「结转记录」。
 //
 // # 为什么两处都要落(2026-10-25 模拟一周时抓到的断链)
 //
@@ -157,7 +157,7 @@ func (s *Service) applyOpeningToStock(
 			return err
 		}
 	}
-	// 结转记录(袋子):source='opening' ⇒ 进 FIFO 队列(可领用/可结掉)。
+	// 结转记录:source='opening' ⇒ 进 FIFO 队列(可领用/可结掉)。
 	sku, err := s.bulkCutSkuFrom(ctx, tx, branchID, cutType)
 	if err != nil {
 		s.pubLogger.Warn("applyOpeningToStock: 部位没有映射 SKU,期初不进队列",
@@ -166,7 +166,7 @@ func (s *Service) applyOpeningToStock(
 	}
 	now := s.now()
 	if newKg.IsZero() {
-		// 期初被清零/删掉 ⇒ 这一行不该留在队列里(留着会看到一条 0kg 的"袋")。
+		// 期初被清零/删掉 ⇒ 这一行不该留在队列里(留着会看到一条 0kg 的"批次")。
 		if err := tx.WithContext(ctx).
 			Where("id = ?", StockOpeningBagID(branchID, string(cutType))).
 			Delete(&model.StockBag{}).Error; err != nil {
@@ -339,7 +339,7 @@ func (s *Service) SaveStockOpenings(ctx context.Context, branchID string, items 
 			}).Create(&rec).Error; err != nil {
 				return fmt.Errorf("upsert sku_stock_opening %s: %w", rec.ID, err)
 			}
-			// ⚠️ **期初也要落进「位置表」与「结转记录(袋子)」** —— 2026-10-25 模拟一周时抓到的断链。
+			// ⚠️ **期初也要落进「位置表」与「结转记录」** —— 2026-10-25 模拟一周时抓到的断链。
 			//
 			// 只写 `sku_stock_openings` 的话，期初的货**只活在链里**：
 			//	- 库存查询(位置表)看不到它 ⇒ 门店说"冷库是空的"，报表说 100kg；

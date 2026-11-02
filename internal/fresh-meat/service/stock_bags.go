@@ -1,11 +1,11 @@
 package service
 
-// internal/fresh-meat/service/stock_bags.go —— **按日结转记录**(袋子台账)。
+// internal/fresh-meat/service/stock_bags.go —— **按日结转记录**(结转记录台账)。
 //
 // # ⚠️ 2026-11-02 owner:标签号玩法整套下线
 //
-// 原来这张表装的是「袋 + 标签号」:门店盘点时给每袋夹一个标签,
-// 次日「按标签整袋搬」上猪肉台。搬台不再有标签这条路、盘点也不再填标签号
+// 原来这张表装的是「批 + 标签号」:门店盘点时给每批夹一个标签,
+// 次日「按标签整批搬」上猪肉台。搬台不再有标签这条路、盘点也不再填标签号
 // ⇒ 这张表退化成「**按日结转台账**」:一行 = (归属日 + SKU + 重量 + 猪归属快照)。
 //
 // # 这张表现在还解决三件事
@@ -18,8 +18,8 @@ package service
 //
 // # 粒度:同一 (归属日, SKU) 一行
 //
-// 拆袋(同一 SKU 分多袋)是"每袋一个标签号"的衍生物 ⇒ 标签号下线后没有多袋的身份
-// ⇒ 前端不再拆袋;老 APK 若仍拆着提交 ⇒ 后端**合并求和**(见 registerStockBags)。
+// 拆批(同一 SKU 分多批)是"每批一个标签号"的衍生物 ⇒ 标签号下线后没有多批的身份
+// ⇒ 前端不再拆批;老 APK 若仍拆着提交 ⇒ 后端**合并求和**(见 registerStockBags)。
 
 import (
 	"context"
@@ -42,13 +42,13 @@ const (
 	// BagStatusReleased 已搬上猪肉台。
 	//
 	// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 不再有"搬上台 ⇒ 释放标签号"这条路径
-	//   ⇒ 新行一律 active;released 只剩历史行(按标签整袋搬时代写的)。
+	//   ⇒ 新行一律 active;released 只剩历史行(按标签整批搬时代写的)。
 	BagStatusReleased = "released"
 )
 
-// 结转记录(袋子)的**来源**(2026-10-25)。
+// 结转记录的**来源**(2026-10-25)。
 //
-// ⚠️ 为什么袋子要记来源:「同一天重提交盘点 ⇒ 清掉这次没出现的旧行」这条清理
+// ⚠️ 为什么结转记录要记来源:「同一天重提交盘点 ⇒ 清掉这次没出现的旧行」这条清理
 // 只能清**盘点来的**行 ⇒ 手工补录的冷库货必须活着(货还在冷库里)。
 const (
 	// BagSourceStocktake 日终盘点登记(主路径)。
@@ -77,7 +77,7 @@ const (
 //   - 同一天同 SKU 的两行会**撞成一行** ⇒ 所以同一 (归属日, SKU) 只允许一行
 //     (校验见 registerStockBags)。
 //
-// ⚠️ 2026-11-02 owner:标签号下线 ⇒ 原本「带标签的袋子」用
+// ⚠️ 2026-11-02 owner:标签号下线 ⇒ 原本「带标签的结转记录」用
 // (门店, 产生日, 标签号) 参与哈希的那套 ID(StockBagID)已删除。
 func StockCarryOverID(branchID string, origin datatypes.Date, cubeProductID string) string {
 	return surrogateID("SCO", branchID, dateKey(origin), cubeProductID)
@@ -94,7 +94,7 @@ func StockBulkManualBagID(branchID string, productionID string) string {
 	return surrogateID("SBM", branchID, productionID)
 }
 
-// bagPigAllocItem 袋子归属快照里的一项(一头猪的份额)。
+// bagPigAllocItem 结转记录归属快照里的一项(一头猪的份额)。
 type bagPigAllocItem struct {
 	PigID string `json:"pig_id"`
 	QtyKg string `json:"qty_kg"`
@@ -106,7 +106,7 @@ type bagPigAllocItem struct {
 //
 // 「盘点时将剩余的鲜肉商品按 sku 打包过秤然后登记」
 //
-// 「每袋有自己的产生日,这个产生日就是盘点归属日」
+// 「每批有自己的产生日,这个产生日就是盘点归属日」
 //
 // ⇒ **每一行**盘点明细都落一行结转记录 ⇒ 它是 **FIFO 队列**的一员:
 // 毛利按 FIFO 回归到猪时按产生日先后摊(见 service/pig_fifo.go)。
@@ -120,7 +120,7 @@ func (s *Service) registerStockBags(ctx context.Context, branchID string, origin
 	originDate := datatypesDate(origin.In(s.bizTZOrUTC()))
 	now := s.now()
 
-	// ⚠️ 2026-11-02 owner:标签号下线 ⇒ **拆袋(同 SKU 分多行)在前端一起下线**。
+	// ⚠️ 2026-11-02 owner:标签号下线 ⇒ **拆批(同 SKU 分多行)在前端一起下线**。
 	//
 	//   但**老 APK** 仍可能拆着提交 ⇒ 这里**按 SKU 合并求和**,不报错、也不静默覆盖:
 	//   - 静默覆盖(ID 按 SKU 定)⇒ "位置表 20kg / 结转记录 5kg" ⇒ FIFO 归摊用错重量;
@@ -292,12 +292,12 @@ func (s *Service) dropStaleStockBags(ctx context.Context, branchID string, origi
 	return nil
 }
 
-// bagPigAlloc 这袋货的**归属快照**:当日该 SKU 由哪几头猪产出、各多少 kg。
+// bagPigAlloc 这批货的**归属快照**:当日该 SKU 由哪几头猪产出、各多少 kg。
 //
 // ⚠️ 为什么在盘点那一刻就把归属**钉死**:后来猪被改名/归档/补录都不该影响
-// 这袋货的毛利归属 ⇒ 存快照,而不是实时去查。
+// 这批货的毛利归属 ⇒ 存快照,而不是实时去查。
 //
-// ⚠️ 没补录分割(pig_cuts 为空)时 ⇒ 归属为空 ⇒ 这袋货的毛利回归不到具体猪
+// ⚠️ 没补录分割(pig_cuts 为空)时 ⇒ 归属为空 ⇒ 这批货的毛利回归不到具体猪
 // (退化成"按当日各猪毛重比例"的兜底,见 gross_margin 侧)。
 func (s *Service) bagPigAlloc(ctx context.Context, branchID string, cutType model.CutType, cubeProductID string, day time.Time) (datatypes.JSON, error) {
 	startOfDay, endOfDay := s.businessDayBounds(day)
@@ -380,11 +380,11 @@ func (s *Service) ListStockBags(ctx context.Context, branchID, location, originD
 //	当日分割量 = 销售重量 + 日终盘点重量 − 搬上台重量
 //
 // 而它的两个输入**都来自"贴标签"这套机制**:
-//   - 「日终盘点重量」只认**带标签号的袋子**(label <> '');
-//   - 「搬上台重量」只认**按标签整袋搬**时写下的 moved_at。
+//   - 「日终盘点重量」只认**带标签号的结转记录**(label <> '');
+//   - 「搬上台重量」只认**按标签整批搬**时写下的 moved_at。
 //
 // ⇒ 标签号下线 ⇒ 两个输入同时消失 ⇒ 这条兜底**恒不生效**
-// (生产实测:除契约测试门店外,没有任何一袋带标签 ⇒ 从未生效过)。
+// (生产实测:除契约测试门店外,没有任何一批带标签 ⇒ 从未生效过)。
 //
 // ⇒ 把它**改成"算全部结转行"**看着像修 bug,实际是**启用一条从未跑过的路径**
 //   ⇒ 会让"门店没补录分割"那几天的成本口径突变 ⇒ 不能这么干。

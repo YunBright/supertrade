@@ -141,17 +141,17 @@ type BulkProductionInput struct {
 // RecordBulkProduction 录当日大宗产出(进冷库)。
 //
 // ⚠️ **手工兜底路径**。**主路径是"日终盘点自动结转"**
-// (盘点会把剩余的货按 SKU 登记成**结转记录/袋子**,见 registerStockBags):
+// (盘点会把剩余的货按 SKU 登记成**结转记录**,见 registerStockBags):
 // 手工录 = 同一个数字记两处,迟早不一致。
 // 与自动结转**互斥**:当天该部位已有盘点结转 ⇒ 400。
 //
-// # 2026-10-25:它记的是**袋子**,不是台账
+// # 2026-10-25:它记的是**结转记录**,不是台账
 //
-// ⇒ 大宗结算的 FIFO 队列 = 袋子队列(见 service/bulk_fifo.go)
+// ⇒ 大宗结算的 FIFO 队列 = 结转记录队列(见 service/bulk_fifo.go)
 // ⇒ 手工补录的货**也必须进队列**,否则它结不出去(冷库里有、账上没有)。
 //
 // ⇒ 返回体保持 BulkProduction 的形状(前端不用改),
-// 但数据源已经是袋子了 —— 里面的 ID 是**这张手工单**的 ID。
+// 但数据源已经是结转记录了 —— 里面的 ID 是**这张手工单**的 ID。
 func (s *Service) RecordBulkProduction(ctx context.Context, branchID string, in BulkProductionInput, operatorID string) (*model.BulkProduction, error) {
 	if branchID == "" {
 		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
@@ -187,7 +187,7 @@ func (s *Service) RecordBulkProduction(ctx context.Context, branchID string, in 
 	}
 	// 与自动结转互斥:当天该部位已有**盘点结转记录** ⇒ 不要再手工录。
 	//
-	// ⚠️ 2026-10-25:判据从"台账 bulk_productions"改成"**结转记录(袋子)**"
+	// ⚠️ 2026-10-25:判据从"台账 bulk_productions"改成"**结转记录**"
 	//   —— 台账已停写,判据必须跟队列一致,否则同一个数字记两处。
 	startOfDay, endOfDay := s.businessDayBounds(time.Time(bizDate))
 	var autoCnt int64
@@ -259,10 +259,10 @@ func (s *Service) RecordBulkProduction(ctx context.Context, branchID string, in 
 // ListBulkProductions 列某店的大宗结转记录。
 //
 // ⚠️ 2026-10-25:台账表(bulk_productions)已**停写** —— 同一事实不再记两处
-//   (台账记一份、袋子记一份 ⇒ 结算按台账扣、零售按袋子扣 ⇒ 同一批货卖两遍)。
-//   ⇒ 这里返回的是**从结转记录(袋子)派生**的视图,**字段形状不变**
+//   (台账记一份、结转记录记一份 ⇒ 结算按台账扣、零售按结转记录扣 ⇒ 同一批货卖两遍)。
+//   ⇒ 这里返回的是**从结转记录派生**的视图,**字段形状不变**
 //   (前端与契约测试不用改):
-//   - 一行 = 一个批次(一个袋子 / 一行散货结转记录);
+//   - 一行 = 一个批次(批次行 / 散货结转记录行);
 //   - qty_kg = 那批货的重量;
 //   - settled_qty_kg = 那批货被**大宗结算**领用了多少(按分摊凭据聚合);
 //   - source = stocktake(日终盘点) | manual(手工补录)。
@@ -334,7 +334,7 @@ func (s *Service) ListBulkProductions(ctx context.Context, branchID string) ([]m
 	return out, nil
 }
 
-// bulkSettledKgByBag 每个**结转记录(袋子)**被大宗结算领用了多少(按分摊凭据聚合)。
+// bulkSettledKgByBag 每个**结转记录**被大宗结算领用了多少(按分摊凭据聚合)。
 //
 // ⚠️ 只认**交付口径**(delivery):价差结算(price_diff)不动库存。
 func (s *Service) bulkSettledKgByBag(ctx context.Context, branchID string) (map[string]decimal.Decimal, error) {
@@ -429,16 +429,16 @@ func newBulkSettlementView(row model.BulkSettlement, items []model.BulkSettlemen
 
 // CreateBulkSettlement 酒店统收结算(交付离店口径),**表头 + 明细**。
 //
-// # 流程(2026-10-25 改:FIFO 队列统一到**袋子**)
+// # 流程(2026-10-25 改:FIFO 队列统一到**结转记录**)
 //
 //  1. 校验表头(结算日期/对方)与每条明细(品项/数量/单价);
 //  2. 建表头(拿到**单号**);
-//  3. **逐条明细** FIFO 吃「结算日期之前(含当天)」的**结转记录(袋子)**;
-//  4. 每袋的 kg 按**袋子的归属快照**(PigAlloc)摊到猪(没有快照才按毛重兜底);
+//  3. **逐条明细** FIFO 吃「结算日期之前(含当天)」的**结转记录**;
+//  4. 每批的 kg 按**这批货的归属快照**(PigAlloc)摊到猪(没有快照才按毛重兜底);
 //  5. 写 line_sales_by_pigs(source="bulk", 记在**产生日**)⇒ 产出它的猪当天就有收入;
-//  6. 扣这袋的 consumed_kg(与零售**共用同一个水位**)⇒ 同一批货不会被卖两遍;
+//  6. 扣这批的 consumed_kg(与零售**共用同一个水位**)⇒ 同一批货不会被卖两遍;
 //     交付口径再按**领用时所在位置**扣库存;
-//  7. 存明细行 + allocations(结算 → 明细 → **袋子** → 猪 的凭据)。
+//  7. 存明细行 + allocations(结算 → 明细 → **结转记录** → 猪 的凭据)。
 //
 // ⚠️ 全部在**一个事务**里:中途某条明细的可领用不足 ⇒ 整单回滚
 // (不能出现"半张单已出库")。
@@ -546,11 +546,11 @@ func (s *Service) CreateBulkSettlement(ctx context.Context, branchID string, in 
 			if err := tx.Create(&item).Error; err != nil {
 				return fmt.Errorf("create bulk_settlement_item: %w", err)
 			}
-			// ---- FIFO:从**结转记录(袋子)**队列领用 ----
+			// ---- FIFO:从**结转记录**队列领用 ----
 			//
 			// ⚠️ 2026-10-25 口径修正:队列不再吃 bulk_productions 台账,
-			//   而是吃**袋子**(与零售 FIFO 同一套队列、共用 consumed_kg 水位)
-			//   ⇒ 「结算的领用」与「袋子」是同一批货 ⇒ 不会被卖两遍。
+			//   而是吃**结转记录**(与零售 FIFO 同一套队列、共用 consumed_kg 水位)
+			//   ⇒ 「结算的领用」与「结转记录」是同一批货 ⇒ 不会被卖两遍。
 			takes, short, err := s.allocateBulkByBIFO(ctx, tx, branchID, sku, settleDate, it.QtyKg)
 			if err != nil {
 				return err
@@ -560,7 +560,7 @@ func (s *Service) CreateBulkSettlement(ctx context.Context, branchID string, in 
 					ErrInvalidInput, prod.Name, short.String(), dateKey(settleDate))
 			}
 			for _, tk := range takes {
-				// 猪份额:袋子的归属快照 → 当天各猪毛重 → 结算当天各猪毛重
+				// 猪份额:这批货的归属快照 → 当天各猪毛重 → 结算当天各猪毛重
 				// (见 bulkBagShares)。
 				kgByPig := map[string]decimal.Decimal{}
 				for _, sh := range tk.Shares {
@@ -576,7 +576,7 @@ func (s *Service) CreateBulkSettlement(ctx context.Context, branchID string, in 
 				}
 				for _, sp := range split {
 					// ⚠️ PosLineID 必须**短**:它进 `line_sales_by_pigs` 的唯一键
-					// (varchar(64))。用"结算单+明细+袋子+猪"的 id **拼**会超长
+					// (varchar(64))。用"结算单+明细+结转记录+猪"的 id **拼**会超长
 					// ⇒ 改成**哈希**:短、定长、且天然带上全部四个维度。
 					posLineID := "BULK" + hashKey(settlement.ID, item.ID, tk.Bag.ID, sp.PigID)
 					row := model.LineSalesByPig{
@@ -619,7 +619,7 @@ func (s *Service) CreateBulkSettlement(ctx context.Context, branchID string, in 
 						return err
 					}
 				}
-				// ★ 扣这袋的"已消耗" —— 与零售**共用同一个水位**
+				// ★ 扣这批的"已消耗" —— 与零售**共用同一个水位**
 				// ⇒ 同一批货不可能既被零售卖掉、又被大宗结一遍。
 				if err := s.consumeFIFO(ctx, tx, map[string]decimal.Decimal{tk.Bag.ID: tk.QtyKg}); err != nil {
 					return err
@@ -731,7 +731,7 @@ type BulkBalance struct {
 
 // ListBulkBalances 查某店各大宗品项的结存。
 //
-// # 2026-10-25:三条口径都从**结转记录(袋子)**派生
+// # 2026-10-25:三条口径都从**结转记录**派生
 //
 //   - 还能领用(队列剩余)—— 结算 FIFO 吃它
 //   - 冷库实际余额(位置表)—— **物理真相**
@@ -765,7 +765,7 @@ func (s *Service) ListBulkBalances(ctx context.Context, branchID string) ([]Bulk
 		if skuErr == nil {
 			coldKg = cold[sku]
 			unitCost = s.bulkUnitCost(ctx, branchID, p.CutType, now)
-			// 该 SKU 的**全部结转记录**(袋子 + 散货行)⇒ 产出与队列剩余。
+			// 该 SKU 的**全部结转记录**(批次 + 散货行)⇒ 产出与队列剩余。
 			var bags []model.StockBag
 			if err := s.db.WithContext(ctx).
 				Where("branch_id = ? AND cube_product_id = ?", branchID, sku).
@@ -776,7 +776,7 @@ func (s *Service) ListBulkBalances(ctx context.Context, branchID string) ([]Bulk
 				produced = produced.Add(bag.QtyKg)
 				settled = settled.Add(settledByBag[bag.ID])
 				if bag.Status != BagStatusActive {
-					continue // 已搬上台的袋子不再是"可领用"的货
+					continue // 已搬上台的结转记录不再是"可领用"的货
 				}
 				remain := bag.QtyKg.Sub(bag.ConsumedKg)
 				if remain.IsPositive() {

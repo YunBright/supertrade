@@ -649,10 +649,10 @@ func (s *Service) RecordPigCut(ctx context.Context, branchID string, in model.Re
 //
 // TakenDate 指定这张盘点单归属**哪一天**(空 = 今天):
 //
-//   - 「每袋有自己的产生日,这个产生日就是盘点归属日(也就是补录指定日)」
+//   - 「每批有自己的产生日,这个产生日就是盘点归属日(也就是补录指定日)」
 //   - 「不装录昨天,就无法录今天」⇒ 补录是**常态**,不是例外。
 //
-// ⇒ 盘点单 / 按日结转记录 / 袋子,全部记在**归属日**那天。
+// ⇒ 盘点单 / 按日结转记录 / 批次,全部记在**归属日**那天。
 // ⇒ 同一 (门店, 归属日) 只有**一张**盘点单(确定性主键 + upsert)。
 //
 // # 补录往日的记录**参与那一天的毛利回归**(时间线必须连续)
@@ -665,7 +665,7 @@ func (s *Service) RecordPigCut(ctx context.Context, branchID string, in model.Re
 //
 // 位置表(sku_stock_positions)与移动加权成本状态(sku_cost_states)目前仍是
 // 「**当前余额**」口径 ⇒ 补录往日写下的**记录层**数据(盘点单 / 按日结转记录 /
-// 袋子)已经进 FIFO 队列并参与毛利回归,但**那一天的结余与成本快照**
+// 批次)已经进 FIFO 队列并参与毛利回归,但**那一天的结余与成本快照**
 // 还没有按营业日重新推导。
 //
 // ⇒ 下一步(见交付报告「未做」一节):
@@ -898,9 +898,9 @@ func (s *Service) RecordPorkCutsStocktake(ctx context.Context, branchID string, 
 			s.pubLogger.Error("RecordPorkCutsStocktake: 过夜搬运失败(库存位置没更新,下次盘点会自愈)",
 				"branch_id", branchID, "stocktake_id", st.ID, "err", err)
 		}
-		// ② 大宗品项的**结转记录(袋子)**在 registerStockBags 里登记
+		// ② 大宗品项的**结转记录**在 registerStockBags 里登记
 		// (2026-10-25:不再单独写 bulk_productions 台账 —— 同一事实只记一处,
-		//  否则结算按台账扣、零售按袋子扣 ⇒ 同一批货会被卖两遍)。
+		//  否则结算按台账扣、零售按结转记录扣 ⇒ 同一批货会被卖两遍)。
 		// ③ 按营业日推导**结余快照**(柜台实盘 / 冷库余额分开)+ 重算成本日快照。
 		if err := s.recomputeCostSnapshots(ctx, branchID, takenDate); err != nil {
 			s.pubLogger.Error("RecordPorkCutsStocktake: 结余快照重算失败(按日结余会缺,下次盘点会自愈)",
@@ -932,11 +932,11 @@ func (s *Service) RecordPorkCutsStocktake(ctx context.Context, branchID string, 
 		s.pubLogger.Error("RecordPorkCutsStocktake: 营业日状态推进失败(状态落后,下次盘点会自愈)",
 			"branch_id", branchID, "stocktake_id", st.ID, "err", err)
 	}
-	// ④ **按日结转记录登记**(2026-10-24):袋子(带标签号)+ 不装袋的散货。
+	// ④ **按日结转记录登记**(2026-10-24):批次(带标签号)+ 散货。
 	//
 	// ⇒ 它是"**记录**"(归属日 + SKU + 重量 + 猪归属快照),两天都要写
 	// (毛利 FIFO 回归到猪要靠它)。
-	// ⇒ 袋子还让"次日整袋搬上台"成立,也让"当日搬上台了多少"有流水
+	// ⇒ 结转记录还让"次日整批搬上台"成立,也让"当日搬上台了多少"有流水
 	// (每日毛利的分摊重量要用它:搬上台的是老货,不能再摊一次猪成本)。
 	if err := s.registerStockBags(ctx, branchID, takenAt, in.Cuts); err != nil {
 		s.pubLogger.Error("RecordPorkCutsStocktake: 结转记录登记失败(标签号/归属丢失,下次盘点会自愈)",
@@ -971,9 +971,9 @@ func (s *Service) RecordPorkCutsStocktake(ctx context.Context, branchID string, 
 // ① **有没有进猪**:whole_pigs.arrived_at 落在归属日的营业日窗口内;
 // ② **有没有搬冷库商品上猪肉台**:**搬台流水**(counter_loads,归属日 = 当天)
 //
-//	—— 两种搬法都记(整袋搬 / 按 SKU+kg 搬)⇒ 不会漏判。
+//	—— 两种搬法都记(整批搬 / 按 SKU+kg 搬)⇒ 不会漏判。
 //
-// ⚠️ 老数据(没有搬台流水之前)回退到 stock_bags.moved_at(只有整袋搬留痕)。
+// ⚠️ 老数据(没有搬台流水之前)回退到 stock_bags.moved_at(只有整批搬留痕)。
 func (s *Service) isRestDay(ctx context.Context, branchID string, takenDate time.Time) (bool, error) {
 	startOfDay, endOfDay := s.businessDayBounds(takenDate)
 
@@ -1008,7 +1008,7 @@ func (s *Service) isRestDay(ctx context.Context, branchID string, takenDate time
 		return false, nil // 搬上台了 ⇒ 不是休市
 	}
 
-	// ③ 老数据回退:整袋搬的 moved_at(没有流水表的时代)
+	// ③ 老数据回退:整批搬的 moved_at(没有流水表的时代)
 	var moved int64
 	if err := s.db.WithContext(ctx).Model(&model.StockBag{}).
 		Where("branch_id = ? AND moved_at >= ? AND moved_at < ?", branchID, startOfDay, endOfDay).
@@ -1029,8 +1029,8 @@ func (s *Service) isRestDay(ctx context.Context, branchID string, takenDate time
 // 返回 (归属日的零点, 是不是今天)。
 //
 // ⚠️ 为什么归属日要单独一个字段:门店要能**补录往日**
-// (「每袋有自己的产生日,这个产生日就是盘点归属日(也就是补录指定日)」)
-// ⇒ 盘点单 / 结转记录 / 袋子都要记在**那一天**,而不是提交那天。
+// (「每批有自己的产生日,这个产生日就是盘点归属日(也就是补录指定日)」)
+// ⇒ 盘点单 / 结转记录 / 批次都要记在**那一天**,而不是提交那天。
 func (s *Service) resolveTakenDate(takenDate string, now time.Time) (time.Time, bool, error) {
 	loc := s.bizTZOrUTC()
 	local := now.In(loc)

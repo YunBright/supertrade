@@ -73,12 +73,12 @@ func BulkPositionKey(productCode string) string { return BulkPositionKeyPrefix +
 // CounterLoadLine 搬上猪肉台的一行。
 //
 // ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ **只有「按 SKU + kg」一种搬法**
-// (不再支持「按标签号整袋搬」)。
+// (不再支持「按标签号整批搬」)。
 type CounterLoadLine struct {
 	// ID 是这一行的**行号**(可选)。
 	//
 	// ⚠️ 给了 id ⇒ **覆盖**那一行(幂等:同一份重复提交不会多搬一次);
-	//    不给 ⇒ **新增**一行 —— 门店"早上一袋,卖完了中午再加一袋"就是这么用。
+	//    不给 ⇒ **新增**一行 —— 门店"早上一批,卖完了中午再加一批"就是这么用。
 	ID            string          `json:"id,omitempty"`
 	CubeProductID string          `json:"cube_product_id"`
 	QtyKg         decimal.Decimal `json:"qty_kg"`
@@ -160,13 +160,13 @@ func isCounterLoadMarkerOnly(lines []CounterLoadLine) bool {
 //
 // # 一行一个动作(2026-10-24 门店口径)
 //
-// 「一个 sku 在当天搬台里可以有多条记录,早上一袋,卖完了,中午加一袋,
+// 「一个 sku 在当天搬台里可以有多条记录,早上一批,卖完了,中午加一批,
 //
 //	可以随时修改,甚至过一天修改。」
 //
 // ⇒ **一行 = 一次搬台动作**:
 //   - 行里**带 id** ⇒ **覆盖**那一行(幂等:同一份重复提交不会多搬一次);
-//   - 行里**不带 id** ⇒ **新增**一行(中午加一袋)—— 序号自动接续;
+//   - 行里**不带 id** ⇒ **新增**一行(中午加一批)—— 序号自动接续;
 //   - 改一行重量 ⇒ PUT /stock/counter-load/:id;
 //   - 撤掉一行 ⇒ DELETE /stock/counter-load/:id;
 //   - 改/撤**过往**某天的一行也允许(过一天修改)⇒ 只影响那一天的余额链。
@@ -185,7 +185,7 @@ func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLo
 	if len(in.Lines) == 0 {
 		return nil, fmt.Errorf("%w: lines 不能为空", ErrInvalidInput)
 	}
-	// ⚠️ 老客户端探测器:还在发 label ⇒ 那是「按标签整袋搬」的老玩法
+	// ⚠️ 老客户端探测器:还在发 label ⇒ 那是「按标签整批搬」的老玩法
 	//   (2026-11-02 已下线)⇒ 当场报错,**别静默忽略**。
 	//
 	//   为什么必须报错而不是忽略:老包发的是 `{"label":"BAG-001"}`
@@ -196,7 +196,7 @@ func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLo
 	//     比"昨天没盘点"更该先说。
 	for i, ln := range in.Lines {
 		if strings.TrimSpace(ln.Label) != "" {
-			return nil, fmt.Errorf("%w: lines[%d].label —— 搬台的「标签 / 整袋搬」玩法已于 2026-11-02 下线,"+
+			return nil, fmt.Errorf("%w: lines[%d].label —— 搬台的「标签 / 整批搬」玩法已于 2026-11-02 下线,"+
 				"请升级 App 后按 SKU + 重量搬台", ErrInvalidInput, i)
 		}
 	}
@@ -227,7 +227,7 @@ func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLo
 	// ---- 解析每一行 ----
 	//
 	// ⚠️ 每行都带**部位**(cut_type):库存/结余按部位记(门店口径),
-	//   SKU 只是那一袋实物的溯源属性。
+	//   SKU 只是那一批实物的溯源属性。
 	cutOfSku, _, err := s.loadSkuCatalog(ctx, branchID, nil)
 	if err != nil {
 		return nil, err

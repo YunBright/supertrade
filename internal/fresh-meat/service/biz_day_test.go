@@ -430,7 +430,7 @@ func TestBizDay_BackfillRecomputesThatDayOnly(t *testing.T) {
 //
 // ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 只剩「按 SKU + kg」一种搬法,
 //   但**一行一个动作**不变 ⇒ 同一 SKU 当天可以有多条流水
-//   (门店"早上一袋,卖完了中午再加一袋")。
+//   (门店"早上一批,卖完了中午再加一批")。
 // ⇒ 否则休市判定与按日结余都会误判(之前按 SKU+kg 搬完全不留痕)。
 func TestBizDay_CounterLoadLeavesLedger(t *testing.T) {
 	svc, ctx, sku := fmBizSetup(t)
@@ -444,7 +444,7 @@ func TestBizDay_CounterLoadLeavesLedger(t *testing.T) {
 	}, "u-1")
 	mustNoErr(t, err, "10-01 盘点")
 
-	// 10-02:同一 SKU 搬两次(早上一袋、中午加一袋)。
+	// 10-02:同一 SKU 搬两次(早上一批、中午加一批)。
 	svc.SetClock(fmClock(fmDay2))
 	_, err = svc.CounterLoad(ctx, "S001", service.CounterLoadInput{
 		Lines: []service.CounterLoadLine{

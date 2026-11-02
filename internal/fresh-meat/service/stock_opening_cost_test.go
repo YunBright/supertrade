@@ -142,7 +142,7 @@ func TestStockOpening_UnitPriceEntersCostChain(t *testing.T) {
 //
 // 期初的货必须同时在：
 //
-//	① 成本链（上面的用例已验）；② 位置表(冷库)；③ FIFO 队列（袋子）。
+//	① 成本链（上面的用例已验）；② 位置表(冷库)；③ FIFO 队列（结转记录）。
 //
 // 且**队列那一行的成本快照 = 门店给的单价** ⇒ 大宗结算领用它时成本不为 0。
 func TestStockOpening_UnitPriceInThreePlaces(t *testing.T) {
@@ -159,7 +159,7 @@ func TestStockOpening_UnitPriceInThreePlaces(t *testing.T) {
 		t.Errorf("★ 位置表(冷库)应是 100kg, got %s —— 门店在库存查询里看不到这批货", cold)
 	}
 
-	// ③ 队列（袋子）：source='opening'、100kg、成本快照 = 18 元/kg。
+	// ③ 队列（结转记录）：source='opening'、100kg、成本快照 = 18 元/kg。
 	bags, err := svc.ListStockBags(ctx, "S001", "", "")
 	mustNoErr(t, err, "ListStockBags")
 	var openBag *model.StockBag

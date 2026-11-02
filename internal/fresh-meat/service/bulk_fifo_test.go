@@ -1,23 +1,23 @@
 package service_test
 
-// 2026-10-25:大宗结算的 FIFO 队列统一到**袋子**的回归锁。
+// 2026-10-25:大宗结算的 FIFO 队列统一到**结转记录**的回归锁。
 //
 // # 为什么锁这条
 //
 // 旧实现:大宗结算 FIFO 吃的是 **bulk_productions 台账**,而零售/搬台吃的是
-// **stock_bags 袋子** ⇒ 同一批冷库货有**两份"还剩多少"的账**
-// ⇒ 结算按台账扣、零售按袋子扣 ⇒ **同一批货能被卖两遍**
+// **stock_bags 结转记录** ⇒ 同一批冷库货有**两份"还剩多少"的账**
+// ⇒ 结算按台账扣、零售按结转记录扣 ⇒ **同一批货能被卖两遍**
 // (结算说"还有 10kg 可结",零售把那 10kg 也卖了 ⇒ 收入算两遍、库存算负)。
 //
 // # 三条不变量
 //
-//  ① 结算的「领用」落在**袋子**上:分摊凭据带 bag_id、袋子的 consumed_kg 增加;
+//  ① 结算的「领用」落在**结转记录**上:分摊凭据带 bag_id、结转记录的 consumed_kg 增加;
 //  ② 结存(balance_kg)与冷库余额一致 —— 同一本账;
 //  ③ 同一批货**不能结两遍**:第二次结算报「可领用量不足」。
 //
 // # 顺带锁住
 //
-//  ④ 大宗台账(bulk_productions)**停写**:结转记录改由**结转记录(袋子)**派生;
+//  ④ 大宗台账(bulk_productions)**停写**:改由**结转记录**派生;
 //  ⑤ 手工兜底产出也进队列(它冷库里有货、账上也得有,否则结不出去)。
 
 import (
@@ -30,7 +30,7 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// fmBulkBagSetup 铺一个「一头猪 + 一袋板油」的场景。
+// fmBulkBagSetup 铺一个「一头猪 + 一批板油」的场景。
 //
 // 返回 (服务, ctx, 部位主 SKU, 猪 ID, 营业日 "YYYY-MM-DD")。
 func fmBulkBagSetup(t *testing.T) (*service.Service, context.Context, string, string, string) {
@@ -77,7 +77,7 @@ func fmBulkBagSetup(t *testing.T) (*service.Service, context.Context, string, st
 	return svc, ctx, sku, pig.ID, "2026-10-01"
 }
 
-// TestBulkFifo_SettlementConsumesBag 锁「结算的领用落在袋子上」。
+// TestBulkFifo_SettlementConsumesBag 锁「结算的领用落在结转记录上」。
 func TestBulkFifo_SettlementConsumesBag(t *testing.T) {
 	svc, ctx, _, pigID, date := fmBulkBagSetup(t)
 
@@ -125,17 +125,17 @@ func TestBulkFifo_SettlementConsumesBag(t *testing.T) {
 		t.Errorf("总金额应 = 6×6 = 36, got %s", view.TotalAmountYuan)
 	}
 
-	// ★ 袋子被扣了 6kg —— 结算的「领用」落在**袋子**上。
+	// ★ 结转记录被扣了 6kg —— 结算的「领用」落在**结转记录**上。
 	after, err := svc.ListStockBags(ctx, "S001", "", date)
 	mustNoErr(t, err, "ListStockBags(after)")
 	if len(after) != 1 {
 		t.Fatalf("应有 1 行结转记录, got %d", len(after))
 	}
 	if !after[0].ConsumedKg.Equal(d("6")) {
-		t.Errorf("袋子的已消耗量应 = 6kg, got %s", after[0].ConsumedKg)
+		t.Errorf("结转记录的已消耗量应 = 6kg, got %s", after[0].ConsumedKg)
 	}
 
-	// 分摊凭据必须指向**袋子**(bag_id 非空)—— 这是"领用与袋子对齐"的凭据。
+	// 分摊凭据必须指向**结转记录**(bag_id 非空)—— 这是"领用与结转记录对齐"的凭据。
 	var allocCount int64
 	if err := testDBSingleton.Model(&model.BulkSettlementAllocation{}).
 		Where("settlement_id = ? AND bag_id <> ''", view.ID).
@@ -143,7 +143,7 @@ func TestBulkFifo_SettlementConsumesBag(t *testing.T) {
 		t.Fatalf("count allocations: %v", err)
 	}
 	if allocCount == 0 {
-		t.Fatalf("分摊凭据应带 bag_id(结算领用的是袋子), got 0")
+		t.Fatalf("分摊凭据应带 bag_id(结算领用的是结转记录), got 0")
 	}
 
 	// 收入归到**产出它的那头猪**(归属快照)。
@@ -175,7 +175,7 @@ func TestBulkFifo_SettlementConsumesBag(t *testing.T) {
 
 // TestBulkFifo_CannotSettleSameGoodsTwice 锁「同一批货不能结两遍」。
 //
-// ⚠️ 这就是老实现最大的洞:结算按台账扣、零售按袋子扣 ⇒ 同一批货能被卖两遍。
+// ⚠️ 这就是老实现最大的洞:结算按台账扣、零售按结转记录扣 ⇒ 同一批货能被卖两遍。
 // ⇒ 现在两边共用 consumed_kg 水位 ⇒ 结完就没了 ⇒ 再结必报"可领用量不足"。
 func TestBulkFifo_CannotSettleSameGoodsTwice(t *testing.T) {
 	svc, ctx, _, _, date := fmBulkBagSetup(t)

@@ -7,7 +7,7 @@ package service_test
 // 现有用例都是**单日**的 ⇒ 抓不到跨日才暴露的问题：
 //
 //	① 余额链逐日自洽：冷库 = 上期 + 结转 − 搬上台 − 大宗出库 + 大宗进冷库；
-//	② 袋子水位不超卖：零售 + 大宗**共用** consumed_kg ⇒ 同一批货不被卖两遍；
+//	② 结转记录水位不超卖：零售 + 大宗**共用** consumed_kg ⇒ 同一批货不被卖两遍；
 //	③ 队列剩余与冷库余额是**同一本账**（差额 = 0）—— 差了就说明"记了两本账"；
 //	④ 审计结转已下线 ⇒ **不再有冻结期**（历史营业日仍可改；账面链实时可算）；
 //	⑤ 跨日**顺序校验**：前一天没盘点 ⇒ 今天不能录猪/搬台（且错误点名要补哪天）。
@@ -223,7 +223,7 @@ func TestMultiDaySim_OneWeekBusiness(t *testing.T) {
 	// ---- ⑦ 统收结算：把攒着的板油结掉 30kg（6 元/kg）----
 	//
 	// ⚠️ 这一步会暴露「期初的货没有进 FIFO 队列」的问题：
-	//   期初的板油 40kg 在**冷库位置**里，但没有结转记录(袋子)
+	//   期初的板油 40kg 在**冷库位置**里，但没有结转记录
 	//   ⇒ 队列里只有攒出来的 70kg ⇒ 要看 30kg 能不能领到。
 	svc.SetClock(fmClock(simDay(simDays - 1)))
 	settle, err := svc.CreateBulkSettlement(ctx, simBranch, service.BulkSettlementInput{
@@ -271,7 +271,7 @@ func TestMultiDaySim_OneWeekBusiness(t *testing.T) {
 		}
 	}
 
-	// ---- ② 袋子水位不超卖：零售 + 大宗 共用一个 consumed_kg ----
+	// ---- ② 结转记录水位不超卖：零售 + 大宗 共用一个 consumed_kg ----
 	//
 	// 零售卖掉的：6 天 × 10kg = 60kg；大宗结掉的：30kg ⇒ Σ consumed = 90kg。
 	var totalQty, totalConsumed decimal.Decimal
@@ -280,7 +280,7 @@ func TestMultiDaySim_OneWeekBusiness(t *testing.T) {
 		totalConsumed = totalConsumed.Add(b.ConsumedKg)
 	}
 	if totalConsumed.GreaterThan(totalQty) {
-		t.Errorf("袋子水位超卖: consumed %s > qty %s", totalConsumed, totalQty)
+		t.Errorf("结转记录水位超卖: consumed %s > qty %s", totalConsumed, totalQty)
 	}
 	if !totalConsumed.Equal(d("90")) {
 		t.Errorf("Σ consumed 应 = 60(零售) + 30(大宗) = 90, got %s", totalConsumed)

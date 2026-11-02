@@ -1,14 +1,14 @@
 package service_test
 
-// 2026-10-24:**按日结转记录**(袋子台账)的回归锁。
+// 2026-10-24:**按日结转记录**(结转记录台账)的回归锁。
 //
-// ⚠️ 2026-11-02 owner:标签号玩法整套下线 ⇒ 这里不再有"袋子 / 标签号"的概念,
+// ⚠️ 2026-11-02 owner:标签号玩法整套下线 ⇒ 这里不再有"批次 / 标签号"的概念,
 // 盘点只按 SKU 登记**一行结转记录**(归属日 + SKU + 重量 + 猪归属快照)。
 //
 // ⇒ 剩下的不变量:
 //  ① 盘点每一行 ⇒ 登记一行结转记录(进冷库、FIFO 队列的一员);
 //  ② 同一天重复提交同一份盘点 = **覆盖**同一行(不多出一行 ⇒ 冷库余额不虚高);
-//  ③ 同一 SKU 盘多行(老 APK 拆袋)⇒ **合并求和**(与位置表同口径 ⇒ 不丢数据);
+//  ③ 同一 SKU 盘多行(老 APK 拆批)⇒ **合并求和**(与位置表同口径 ⇒ 不丢数据);
 //  ④ 能按产生日过滤(结转台账 / FIFO 排队都按产生日)。
 
 import (
@@ -108,7 +108,7 @@ func TestStockBag_SameDayResubmitIsUpsert(t *testing.T) {
 
 // TestStockBag_SameSkuRowsMerged 锁 ③:同一 SKU 盘多行 ⇒ **合并求和**,不丢数据。
 //
-// ⚠️ 2026-11-02 owner:拆袋(同 SKU 分多袋)在前端随标签号一起下线,
+// ⚠️ 2026-11-02 owner:拆批(同 SKU 分多批)在前端随标签号一起下线,
 // 但**老 APK** 仍可能拆着提交 ⇒ 后端必须合并,而不是静默覆盖。
 // (静默覆盖 ⇒ "位置表 20kg / 结转记录 5kg" ⇒ FIFO 归摊用错重量。)
 func TestStockBag_SameSkuRowsMerged(t *testing.T) {
@@ -121,7 +121,7 @@ func TestStockBag_SameSkuRowsMerged(t *testing.T) {
 			{CutType: model.CutBelly, CubeProductID: sku, ActualRemainKg: d("5")},
 		},
 	}, "u-1")
-	mustNoErr(t, err, "同 SKU 多行应被合并(老 APK 拆袋提交不丢数据)")
+	mustNoErr(t, err, "同 SKU 多行应被合并(老 APK 拆批提交不丢数据)")
 
 	bags, err := svc.ListStockBags(ctx, "S001", "", "")
 	mustNoErr(t, err, "ListStockBags")

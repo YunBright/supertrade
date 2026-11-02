@@ -26,6 +26,7 @@ import (
 
 	"github.com/YunBright/supertrade/internal/fresh-meat/model"
 	"github.com/YunBright/supertrade/internal/fresh-meat/service"
+	"github.com/shopspring/decimal"
 )
 
 // fmExtSetup 起服务 + 部位映射(belly → P-BELLY),时钟停在 10-01。
@@ -255,4 +256,68 @@ func TestExternalPurchase_EntersColdStoreChain(t *testing.T) {
 	if !cold.Equal(d("10")) {
 		t.Errorf("10-02 日终冷库应是 10kg(外采进链), got %s", cold)
 	}
+}
+
+// ---- ⑦ 外采的量与金额真的进了「本期入库」 ----
+
+// TestExternalPurchase_AddsToProducedKgAndAmount 锁 ⑦。
+//
+// ⚠️ owner 最关心的那一句:「进货成本变高了」
+//   ⇒ 外采必须真的进**本期入库**(kg + 金额)⇒ 卖掉的那些成本进销售成本。
+//
+// # 为什么用「差值」断言
+//
+// ⚠️ 本期入库量里的猪分割部分 = **调整后分割权重 W**(applySplitWeights 的结果),
+//   而 W 取决于建议/实际分割 ⇒ 在单测里不好直接写死。
+// ⇒ 改用**差值**:同一场景跑两遍(有/无外采)⇒ 差值必须**精确等于**外采的 kg 与金额。
+//
+// ⚠️ 判别力:把 cut_cost.go 的 8c-2 叠加去掉 ⇒ 差值变成 0 ⇒ 本用例必红。
+func TestExternalPurchase_AddsToProducedKgAndAmount(t *testing.T) {
+	baseKg, baseAmount := fmExtProduced(t, false)
+	withKg, withAmount := fmExtProduced(t, true)
+
+	diffKg := withKg.Sub(baseKg)
+	diffAmount := withAmount.Sub(baseAmount)
+	if !diffKg.Equal(d("10")) {
+		t.Errorf("★ 外采的 10kg 必须进本期入库量,实际只多了 %s kg", diffKg)
+	}
+	if !diffAmount.Equal(d("240")) {
+		t.Errorf("★ 外采的 240 元必须进本期入库金额,实际只多了 %s 元", diffAmount)
+	}
+}
+
+// fmExtProduced 跑一遍「录猪 + 分割」场景,返回该部位的**本期入库**(kg / 元)。
+//
+// withExternal=true 时额外录一笔 10kg / 24 元每kg 的外采。
+func fmExtProduced(t *testing.T, withExternal bool) (decimal.Decimal, decimal.Decimal) {
+	t.Helper()
+	svc, ctx, sku := fmExtSetup(t)
+	// ⚠️ 注入**同步**物化执行器(生产是异步)⇒ 断言不用等后台任务。
+	svc.SetChainMaterializer(func(f func()) { f() })
+
+	pigID := fmSeedPigAt(t, svc, "EB-1", "50", fmDay1)
+	fmSeedPigCut(t, svc, pigID, sku, "10")
+	if withExternal {
+		if _, err := svc.RecordExternalPurchase(ctx, "S001", service.ExternalPurchaseInput{
+			CubeProductID: sku, QtyKg: d("10"), UnitPriceYuan: d("24"),
+		}, "u-1"); err != nil {
+			t.Fatalf("RecordExternalPurchase: %v", err)
+		}
+	}
+	// ⚠️ **两个场景必须走同一条物化触发路径**，否则差值没意义。
+	//   `ComputeGrossMargin` 是**读**路径(不落快照)⇒ 这里用**盘点**触发链物化
+	//   (盘 0kg ⇒ 不改变本期入库量,只负责把快照写出来)。
+	if _, err := svc.RecordPorkCutsStocktake(ctx, "S001", model.RecordPorkCutsStocktakeInput{
+		IsComplete: true,
+		Cuts: []model.CutInput{
+			{CutType: model.CutBelly, CubeProductID: sku, ActualRemainKg: d("0")},
+		},
+	}, "u-1"); err != nil {
+		t.Fatalf("10-01 盘点(触发链物化): %v", err)
+	}
+	rec, ok := fmCutCostDaily(t, "S001", "2026-10-01", model.CutBelly)
+	if !ok {
+		t.Fatalf("成本日快照里没有五花肉这一行(withExternal=%v)", withExternal)
+	}
+	return rec.ProducedKg, rec.ProducedAmount
 }

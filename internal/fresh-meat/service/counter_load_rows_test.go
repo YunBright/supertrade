@@ -6,14 +6,14 @@ package service_test
 // 门店原话:
 //
 //	「期初转结可以放在鲜肉-设置里」
-//	「一个 sku 在当天搬台里可以有多条记录,早上一袋,卖完了,中午加一袋,
+//	「一个 sku 在当天搬台里可以有多条记录,早上一批,卖完了,中午加一批,
 //	  可以随时修改,甚至过一天修改(但修改值造成负库存时,需要在每日毛利的 alert 上
 //	  红字显示)」
 //
 // ⇒ 三条不变量:
 //
 //	① 期初结转 = 按营业日推导的冷库余额链的**起点**;
-//	② 搬台流水**一行一个动作**:不带 id = 新增(中午加一袋),带 id = 覆盖,
+//	② 搬台流水**一行一个动作**:不带 id = 新增(中午加一批),带 id = 覆盖,
 //	   还能改一行 / 撤一行(过一天也能改);
 //	③ 改出来的**负库存不拦**,但要在每日毛利的 alert 里**红字**显示。
 
@@ -73,7 +73,7 @@ func TestOpening_SeedsTheDailyBalanceChain(t *testing.T) {
 
 // TestCounterLoadRows_AppendEditDelete 锁 ②。
 //
-// ⇒ 一个 SKU 当天可以有多条搬台记录(早上一袋、中午加一袋);
+// ⇒ 一个 SKU 当天可以有多条搬台记录(早上一批、中午加一批);
 // ⇒ 带 id 重复提交 = 覆盖(不重复搬);改一行 / 撤一行都按差额调整余额。
 func TestCounterLoadRows_AppendEditDelete(t *testing.T) {
 	svc, ctx, sku := fmBizSetup(t)
@@ -106,7 +106,7 @@ func TestCounterLoadRows_AppendEditDelete(t *testing.T) {
 		t.Fatalf("早上搬台总量应是 22,got %s", view.TotalKg)
 	}
 
-	// 中午:卖完了,再加一袋(**不带 id = 新增一行**)。
+	// 中午:卖完了,再加一批(**不带 id = 新增一行**)。
 	_, err = svc.CounterLoad(ctx, "S001", service.CounterLoadInput{
 		Lines: []service.CounterLoadLine{{CubeProductID: sku, QtyKg: d("3")}},
 	}, "u-1")
@@ -333,7 +333,7 @@ func TestCounterLoad_LegacyLabelRejected(t *testing.T) {
 	}, "u-1")
 	mustNoErr(t, err, "10-01 盘点")
 
-	// 10-02:老客户端的「按标签整袋搬」⇒ 当场被拒。
+	// 10-02:老客户端的「按标签整批搬」⇒ 当场被拒。
 	svc.SetClock(fmClock(fmDay2))
 	_, err = svc.CounterLoad(ctx, "S001", service.CounterLoadInput{
 		Lines: []service.CounterLoadLine{{Label: "BAG-OLD"}},

@@ -7,7 +7,7 @@ package service
 // 「位置表只记余额、不留痕」⇒ 「当天搬上台了多少」查不到
 // ⇒ 而三件事都要它:
 //   ① **休市判定**:「当天既没有卖猪、也没有搬冷库商品上猪肉台」⇒ 鲜肉休市。
-//      (历史:建这张表时只有"按标签整袋搬"留痕,"按 SKU+kg 搬"完全不留痕
+//      (历史:建这张表时只有"按标签整批搬"留痕,"按 SKU+kg 搬"完全不留痕
 //       ⇒ 搬了台的休市日会被误判成休市。标签号玩法已于 2026-11-02 下线。)
 //   ② **按营业日推导的冷库余额**:「冷库余额 = 上期冷库 + 本期结转 − 本期搬上台
 //      − 本期大宗结算出库」⇒ 本期搬上台必须有流水。
@@ -17,7 +17,7 @@ package service
 //
 //	source = sku  按 **SKU + kg** 搬。
 //
-//	(历史行里还可能有 source = bag ——「按标签整袋搬」,那套玩法已下线。)
+//	(历史行里还可能有 source = bag ——「按标签整批搬」,那套玩法已下线。)
 //
 // # 归属日
 //
@@ -40,7 +40,7 @@ import (
 const (
 	// CounterLoadSourceSKU 按 SKU + kg 搬。
 	//
-	// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 「按标签整袋搬」(source=bag)不再产生
+	// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 「按标签整批搬」(source=bag)不再产生
 	//   ⇒ 新行恒为 sku;历史行仍可能是 bag(只读展示)。
 	CounterLoadSourceSKU = "sku"
 )
@@ -64,7 +64,7 @@ type counterLoadLine struct {
 // # 幂等
 //
 // - 带 id ⇒ 覆盖那一行(重复提交同一份不会多搬一次);
-// - 不带 id ⇒ 新增一行,序号接续(门店"中午再加一袋")。
+// - 不带 id ⇒ 新增一行,序号接续(门店"中午再加一批")。
 //
 // ⇒ 位置差额由调用方按 (新重量 − 旧重量) 算(见 service/stock.go::CounterLoad)。
 func (s *Service) upsertCounterLoadLine(ctx context.Context, tx *gorm.DB, branchID string, bizDate time.Time,
@@ -286,7 +286,7 @@ type CounterLoadLineView struct {
 	Seq           int             `json:"seq"`
 	CubeProductID string          `json:"cube_product_id"`
 	QtyKg         decimal.Decimal `json:"qty_kg"`
-	// Source:sku(按 SKU+kg 搬)。历史行里还可能有 bag(按标签整袋搬,已下线)。
+	// Source:sku(按 SKU+kg 搬)。历史行里还可能有 bag(按标签整批搬,已下线)。
 	Source     string    `json:"source"`
 	OperatorID string    `json:"operator_id"`
 	CreatedAt  time.Time `json:"created_at"`

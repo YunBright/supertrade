@@ -158,7 +158,7 @@ func ApplyPreMigrateFixups(db *gorm.DB) error {
 
 	// ⑥ stock_bags.label 改成**可空**(2026-10-24)。
 	//
-	// 语义:空 label = **不装袋的散货结转记录**(只有归属日 + SKU + 重量),
+	// 语义:空 label = **散货结转记录**(只有归属日 + SKU + 重量),
 	// 它同样进 FIFO 队列(毛利回归到猪要靠它)。
 	//
 	// ⚠️ 为什么必须手写 DDL:GORM 的 AutoMigrate **不会把 NOT NULL 改成可空**
@@ -262,10 +262,10 @@ ORDER BY array_position(i.indkey, a.attnum)`, bulkProductionIndex).Scan(&cols).E
 
 // ApplySchemaFixups 执行 AutoMigrate 之外的结构修正。
 //
-// # 袋子的标签号:部分唯一索引(2026-10-24)
+// # 结转记录的标签号:部分唯一索引(2026-10-24)
 //
-// 语义:「**在用中**的袋子,标签号在门店内唯一」。
-// ⇒ 袋子搬上猪肉台后标签号释放 ⇒ 同一个标签号可以贴在别的袋子上。
+// 语义:「**在用中**的结转记录,标签号在门店内唯一」。
+// ⇒ 这批货搬上猪肉台后标签号释放 ⇒ 同一个标签号可以贴在别的批次上。
 //
 // ⚠️ 2026-11-02 owner:**标签号玩法整套下线** ⇒ 再也没有新的带标签的行。
 //
@@ -284,9 +284,9 @@ func ApplySchemaFixups(db *gorm.DB) error {
 		return fmt.Errorf("fresh-meat: ApplySchemaFixups: db 为 nil")
 	}
 
-	// 0) 袋子的标签号:部分唯一索引(`WHERE status='active' AND label <> ''`)。
+	// 0) 结转记录的标签号:部分唯一索引(`WHERE status='active' AND label <> ''`)。
 	//
-	// ⚠️ 2026-10-24:label 变成**可空**了 —— 空 label = 不装袋的散货结转记录
+	// ⚠️ 2026-10-24:label 变成**可空**了 —— 空 label = 散货结转记录
 	// (同一 SKU 每天一行 ⇒ 同一门店同一天会有**多行** label='' )
 	// ⇒ 索引必须把空 label 排除掉,否则这些行会互相冲突(唯一索引直接报错)。
 	//
@@ -303,14 +303,14 @@ func ApplySchemaFixups(db *gorm.DB) error {
 		}
 	}
 
-	// 0b) 2026-10-25:大宗结算的 FIFO 队列统一到**袋子** ⇒ 两张表加列。
+	// 0b) 2026-10-25:大宗结算的 FIFO 队列统一到**结转记录** ⇒ 两张表加列。
 	//
 	// ⚠️ 为什么手写 DDL:老库里 stock_bags.source / unit_cost_yuan 不存在,
 	//   而 AutoMigrate 加 NOT NULL 列时,历史行会先拿到默认值 ⇒ 语义正好
 	//   (历史行全是盘点来的 ⇒ 'stocktake')。这里再兜一次底,保证列一定在。
 	//
 	// ⚠️ bulk_settlement_allocations.bag_id / location 是**可空**的:
-	//   老数据(台账时代)扣的是 bulk_productions ⇒ 没有袋子 ⇒ 留空即可。
+	//   老数据(台账时代)扣的是 bulk_productions ⇒ 没有结转记录 ⇒ 留空即可。
 	if db.Dialector.Name() == "postgres" {
 		if err := db.Exec(`
 		DO $$ BEGIN

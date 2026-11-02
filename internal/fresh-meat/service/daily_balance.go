@@ -212,7 +212,7 @@ func (s *Service) loadDailyTerms(ctx context.Context, branchID string) (map[stri
 
 	// ---- ④ 大宗手工进冷库(按部位)----
 	//
-	// ⚠️ 2026-10-25:大宗台账(bulk_productions)已**停写** ⇒ 改从**结转记录(袋子)**读
+	// ⚠️ 2026-10-25:大宗台账(bulk_productions)已**停写** ⇒ 改从**结转记录**读
 	//   (source='bulk_manual' 的行 = 手工补录进冷库的货)。
 	//
 	// ⚠️ 只取**进冷库那一刻的重量**(qty_kg),不是"现在还剩多少"

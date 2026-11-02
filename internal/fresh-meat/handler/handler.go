@@ -116,7 +116,7 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	//                              前端第②步(已搬台?)与休市判定都靠它。
 	r.GET("/stock/counter-load", requireBranch, h.ListCounterLoads)
 	// PUT/DELETE /stock/counter-load/:id —— 改/撤**一行**搬台。
-	//   (门店口径:「一个 sku 当天可以有多条记录,早上一袋中午加一袋,可以随时修改,
+	//   (门店口径:「一个 sku 当天可以有多条记录,早上一批中午加一批,可以随时修改,
 	//     甚至过一天修改」⇒ 改出来的负库存在每日毛利的 alert 里红字显示。)
 	r.PUT("/stock/counter-load/:id", requireBranch, h.UpdateCounterLoad)
 	r.DELETE("/stock/counter-load/:id", requireBranch, h.DeleteCounterLoad)

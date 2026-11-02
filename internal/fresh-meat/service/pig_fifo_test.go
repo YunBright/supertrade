@@ -4,10 +4,10 @@ package service_test
 //
 // 门店口径(用户原话):
 //
-//	「盘点时将剩余的鲜肉商品按 sku 打包过秤然后登记,每个袋子夹上标签,
+//	「盘点时将剩余的鲜肉商品按 sku 打包过秤然后登记,每批货夹上标签,
 //	  方便次日搬上猪肉台继续售卖和毛利回归。」
-//	「每袋有自己的产生日,这个产生日就是盘点归属日(也就是补录指定日),
-//	  不装袋的 sku+kg 也根据盘点归属日做记录。」
+//	「每批有自己的产生日,这个产生日就是盘点归属日(也就是补录指定日),
+//	  散货的 sku+kg 也根据盘点归属日做记录。」
 //	「每天都有盘点单,没有任何剩余也要创建一个空的,标记为『售罄』」
 //	「当天既没有卖猪、也没有搬冷库商品上猪肉台」⇒「鲜肉休市」
 //	「做毛利回归到具体猪(如无标签,则按结转(日终盘点)的先后顺序归摊。)」
@@ -17,7 +17,7 @@ package service_test
 //	① 同一天重复提交 ⇒ **仍然只有一张盘点单**;
 //	② 空盘点 ⇒ **售罄**标记;
 //	③ 当天无进猪无搬台 ⇒ **休市**标记;
-//	④ 不装袋的 SKU **也有按归属日的结转记录**;
+//	④ 散货的 SKU **也有按归属日的结转记录**;
 //	⑤ FIFO 归摊把一笔销售的收入**摊回多头猪**(一头猪一行,总量守恒);
 //	⑥ 重投同一笔销售**不会重复吃 FIFO**(幂等)。
 
@@ -86,7 +86,7 @@ func fmStocktakes(t *testing.T) []model.PorkCutsStocktake {
 	return rows
 }
 
-// fmBags 查某店的全部结转记录(袋子 + 不装袋的散货)。
+// fmBags 查某店的全部结转记录(批次 + 散货)。
 func fmBags(t *testing.T) []model.StockBag {
 	t.Helper()
 	var rows []model.StockBag
@@ -340,7 +340,7 @@ func TestStocktake_RestDayFalseWhenMovedToCounter(t *testing.T) {
 
 // TestStocktake_CarryOverRow 锁 ④:盘点的**每一行**都有按归属日的结转记录。
 //
-// ⇒ 「不装袋的 sku+kg 也根据盘点归属日做记录」
+// ⇒ 「散货的 sku+kg 也根据盘点归属日做记录」
 // ⇒ 盘点时**每一行**都要有一行记录(FIFO 归摊 + 猪归属都靠它)。
 func TestStocktake_CarryOverRow(t *testing.T) {
 	svc, ctx, sku := fmFifoSetup(t)
@@ -400,7 +400,7 @@ func TestStocktake_CarryOverRow(t *testing.T) {
 // 场景:
 //
 //	D1: 猪 A(200kg)与猪 B(100kg)各分割出五花 10kg(都有分割补录)
-//	    → 日终盘点五花剩 20kg(不装袋)
+//	    → 日终盘点五花剩 20kg(散货)
 //	D2: 卖五花 15kg @ 10 元/kg = 150 元
 //
 // ⇒ 收入必须**摊回 A 与 B**(各 7.5kg / 75 元),而不是"今天碰巧在场的猪"。
@@ -412,7 +412,7 @@ func TestFifo_SaleSplitAcrossPigs(t *testing.T) {
 	fmSeedPigCut(t, svc, pigA, sku, "10")
 	fmSeedPigCut(t, svc, pigB, sku, "10")
 
-	// D1 日终盘点:五花 20kg,**不装袋**。
+	// D1 日终盘点:五花 20kg,**散货**。
 	_, err := svc.RecordPorkCutsStocktake(ctx, "S001", model.RecordPorkCutsStocktakeInput{
 		IsComplete: true,
 		Cuts: []model.CutInput{
@@ -490,7 +490,7 @@ func TestFifo_BulkSettlementConsumesCarryOver(t *testing.T) {
 	}
 	fmSeedPig(t, svc, "EB-B1", "200")
 
-	// 日终盘点:belly 20kg(不装袋)⇒ 一条按日结转记录 + 一条大宗台账。
+	// 日终盘点:belly 20kg(散货)⇒ 一条按日结转记录 + 一条大宗台账。
 	_, err := svc.RecordPorkCutsStocktake(ctx, "S001", model.RecordPorkCutsStocktakeInput{
 		IsComplete: true,
 		Cuts: []model.CutInput{

@@ -14,7 +14,7 @@ package service_test
 // # 为什么判据不能是「入库量」
 //
 // 录了猪但**还没补录分割**(pig_cuts)时,入库量同样是 0
-// (applyProducedFallback 在"没有袋子"时直接返回 ⇒ 不兜底)
+// (applyProducedFallback 在"没有结转记录"时直接返回 ⇒ 不兜底)
 // ⇒ 用入库量当判据 ⇒ 那种情况下**会误报"没录猪"**。
 // ⇒ 只能由后端直接告诉前端"今天到底有没有进猪"。
 //
@@ -193,7 +193,7 @@ func TestGrossMargin_PigsRecorded_IndependentFromPurchasedKg(t *testing.T) {
 	svc, _ := setupTestService(t)
 	day := time.Date(2026, 10, 2, 6, 0, 0, 0, time.UTC) // = 2026-10-02 14:00 +08
 
-	// 只录猪,**不**补录分割 ⇒ 没有袋子 ⇒ 没有兜底入库。
+	// 只录猪,**不**补录分割 ⇒ 没有结转记录 ⇒ 没有兜底入库。
 	insertPigRow(t, "S001", "WP-NOCUT", day)
 
 	report, err := svc.ComputeGrossMargin(context.Background(), "S001", day)

@@ -586,16 +586,16 @@ func ValidWasteType(t string) bool {
 // TableName 显式表名。
 func (WasteLog) TableName() string { return "waste_logs" }
 
-// ---- 表7b:stock_bags(结转记录 / 袋子台账)----
+// ---- 表7b:stock_bags(结转记录台账)----
 //
 // StockBag 一行**结转记录**:门店日终盘点时,按 SKU 把剩余的鲜肉**打包过秤**
 // 后登记的一条「归属日 + SKU + 重量」。
 //
-// ⚠️ **2026-11-02 owner:标签号玩法整套下线** —— 搬台不再「按标签整袋搬」,
+// ⚠️ **2026-11-02 owner:标签号玩法整套下线** —— 搬台不再「按标签整批搬」,
 // 盘点也不再填标签号 ⇒ 库里再没有新行带标签 ⇒ 这张表退化成
 // 「按日结转台账」(FIFO 队列 + 猪归属快照)。
 //
-// # 为什么还要保留"袋子"这个粒度
+// # 为什么还要保留"结转记录"这个粒度
 //
 // ① **搬上台要有流水**:每日毛利的"分摊重量"需要知道当日搬上台了多少
 //
@@ -610,7 +610,7 @@ func (WasteLog) TableName() string { return "waste_logs" }
 //
 // # label 列的历史遗留
 //
-// 标签号(袋标)曾是这一行的身份(也是「按标签整袋搬」的钥匙)⇒ 现在不再产生
+// 标签号曾是这一行的身份(也是「按标签整批搬」的钥匙)⇒ 现在不再产生
 // ⇒ 新行的 label 为 NULL。**列与部分唯一索引都保留**(历史数据 + 迁移不动),
 // 但**代码不再读也不再写**它(见 internal/fresh-meat/migrate.go 的注释)。
 type StockBag struct {
@@ -620,11 +620,11 @@ type StockBag struct {
 	// ⚠️ 同一 (归属日, SKU) 只登记**一行**(同 SKU 多行 ⇒ 合并求和)。
 	ID       string `gorm:"primaryKey;column:id;type:varchar(64)" json:"id"`
 	BranchID string `gorm:"column:branch_id;type:varchar(64);not null;index" json:"branch_id"`
-	// CubeProductID 是这袋货的 SKU(= 思迅货号)。
+	// CubeProductID 是这批货的 SKU(= 思迅货号)。
 	CubeProductID string `gorm:"column:cube_product_id;type:varchar(64);not null;index" json:"cube_product_id"`
 	// CutType 是这个 SKU 归属的部位(冗余一份,便于按部位汇总)。
 	CutType CutType `gorm:"column:cut_type;type:varchar(32);not null" json:"cut_type"`
-	// QtyKg 是这袋的**过秤重量**(不装袋的行 = 当天结转的散货重量)。
+	// QtyKg 是这批的**过秤重量**(散货的行 = 当天结转的散货重量)。
 	QtyKg decimal.Decimal `gorm:"column:qty_kg;type:decimal(12,3);not null" json:"qty_kg"`
 	// ConsumedKg 是这条结转记录**已经被 FIFO 卖掉**的重量(2026-10-24)。
 	//
@@ -632,19 +632,19 @@ type StockBag struct {
 	// 「还没卖掉的重量」⇒ 不落库就会**每次重算都把同一批货再摊一次**。
 	// ⇒ 结存 = qty_kg − consumed_kg。
 	ConsumedKg decimal.Decimal `gorm:"column:consumed_kg;type:decimal(14,3);not null;default:0" json:"consumed_kg"`
-	// OriginDate 是这袋货**产生**的日期(哪天的盘点结转出来的)。
+	// OriginDate 是这批货**产生**的日期(哪天的盘点结转出来的)。
 	//
 	// ⚠️ 它同时是"先进先出"的排序依据:冷库里的货按它排队,
 	// 结算/出库时先出最早的那批。
 	OriginDate datatypes.Date `gorm:"column:origin_date;not null;index" json:"origin_date"`
-	// Location 是这袋当前在哪:cold_store(冷库)| counter(猪肉台)。
+	// Location 是这批当前在哪:cold_store(冷库)| counter(猪肉台)。
 	Location string `gorm:"column:location;type:varchar(16);not null;default:'cold_store'" json:"location"`
 	// Status:active(在用)| released(已搬上台)。
 	//
 	// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 不再有"搬上台 ⇒ 释放标签号"这条路径
 	//   ⇒ 新行一律 active;released 只剩历史行。
 	Status string `gorm:"column:status;type:varchar(16);not null;default:'active'" json:"status"`
-	// PigAlloc 是**归属快照**:这袋货由哪几头猪产出、各多少 kg。
+	// PigAlloc 是**归属快照**:这批货由哪几头猪产出、各多少 kg。
 	//
 	// ⚠️ 存成 JSON 是为了"盘点那一刻就把归属钉死"——后来猪被删/改名都不影响它。
 	//
@@ -663,7 +663,7 @@ type StockBag struct {
 	Source string `gorm:"column:source;type:varchar(16);not null;default:'stocktake'" json:"source"`
 	// UnitCostYuan 是**入冷库那一刻**快照的移动加权单价(元/kg)—— 这就是"记录分摊成本"。
 	//
-	// ⚠️ 为什么要落在袋子上:大宗结算可能隔好几天才结账(单价那时才定),
+	// ⚠️ 为什么要落在结转记录上:大宗结算可能隔好几天才结账(单价那时才定),
 	//   若结算时用"当日单价"会把成本算歪 ⇒ 必须钉在**入库那一刻**。
 	UnitCostYuan decimal.Decimal `gorm:"column:unit_cost_yuan;type:decimal(16,4);not null;default:0" json:"unit_cost_yuan"`
 	// MovedAt 是最近一次**搬上台**的时间(用于"当日搬上台了多少"的流水口径)。
@@ -1157,10 +1157,10 @@ type BulkSettlementAllocation struct {
 	// ⚠️ 可空:老数据(单品项时代)没有它。
 	ItemID       string `gorm:"column:item_id;type:varchar(64);index" json:"item_id,omitempty"`
 	ProductionID string `gorm:"column:production_id;type:varchar(64);not null;index" json:"production_id"`
-	// BagID 是这条分摊吃掉的**结转记录(袋子)**的 ID(2026-10-25)。
+	// BagID 是这条分摊吃掉的**结转记录**的 ID(2026-10-25)。
 	//
-	// ⚠️ 为什么要有它:大宗结算的 FIFO 队列**就是袋子队列**(2026-10-25 口径)
-	// ⇒ 「结算领用了哪几袋、每袋多少」必须能回溯,否则"领用"与"袋子"对不上,
+	// ⚠️ 为什么要有它:大宗结算的 FIFO 队列**就是结转记录队列**(2026-10-25 口径)
+	// ⇒ 「结算领用了哪几批、每批多少」必须能回溯,否则"领用"与"结转记录"对不上,
 	//   同一批货可能被零售再卖一遍(卖两遍)。
 	//
 	// ⚠️ 老数据(台账时代)没有它 ⇒ 为空 ⇒ 那时扣的是 bulk_productions。
@@ -1424,7 +1424,7 @@ func (BusinessDay) TableName() string { return "business_days" }
 //
 // ⇒ **只有一种搬法**(2026-11-02 owner:标签号玩法下线):按 **SKU + kg** 搬。
 //
-// (历史行里还可能有 source='bag'(按标签整袋搬),那套玩法已下线。)
+// (历史行里还可能有 source='bag'(按标签整批搬),那套玩法已下线。)
 //
 // # 归属日(BizDate)
 //
@@ -1440,7 +1440,7 @@ type CounterLoadRecord struct {
 	Seq int `gorm:"column:seq;not null;uniqueIndex:idx_counter_load_branch_date_seq,priority:3" json:"seq"`
 	// CubeProductID 是搬上柜台的 SKU(= 思迅货号)。
 	//
-	// ⚠️ SKU 只是**溯源属性**(那一袋实物是哪个货号);**库存/结余按部位记**
+	// ⚠️ SKU 只是**溯源属性**(那一批实物是哪个货号);**库存/结余按部位记**
 	//   (门店口径:「这个模块只管部位数据,不管 SKU」)⇒ 部位见 CutType。
 	CubeProductID string `gorm:"column:cube_product_id;type:varchar(64);not null;index" json:"cube_product_id"`
 	// CutType 是搬上柜台的**部位**(SKU 映射 ⇒ 部位)。
@@ -1449,7 +1449,7 @@ type CounterLoadRecord struct {
 	QtyKg decimal.Decimal `gorm:"column:qty_kg;type:decimal(14,3);not null" json:"qty_kg"`
 	// ⚠️ **label 列已废弃**(2026-11-02 owner:标签号玩法下线)⇒ 代码不再读写它。
 	//   列保留(历史行仍有值)⇒ 迁移不动。
-	// Source:sku(按 SKU+kg 搬)。历史行里还可能有 bag(按标签整袋搬,已下线)。
+	// Source:sku(按 SKU+kg 搬)。历史行里还可能有 bag(按标签整批搬,已下线)。
 	Source     string    `gorm:"column:source;type:varchar(16);not null;default:'sku'" json:"source"`
 	OperatorID string    `gorm:"column:operator_id;type:varchar(64);not null" json:"operator_id"`
 	CreatedAt  time.Time `gorm:"column:created_at;not null" json:"created_at"`
@@ -1684,7 +1684,7 @@ func (CutPresale) TableName() string { return "cut_presale_settlements" }
 //
 //	(与 service/pig_fifo.go 的零售毛利回归同一套归属快照);
 //
-// ② FIFO 摊不完的部分(没有袋子/没有归属)⇒ **兜底**按本次审计范围内
+// ② FIFO 摊不完的部分(没有结转记录/没有归属)⇒ **兜底**按本次审计范围内
 //
 //	各猪的**毛重比例**摊(与 applyProducedFallback 同一套口径)。
 //
@@ -1709,7 +1709,7 @@ type PigPresaleMargin struct {
 	ExpectedRevenueYuan decimal.Decimal `gorm:"column:expected_revenue_yuan;type:decimal(14,2);not null;default:0" json:"expected_revenue_yuan"`
 	CostAmountYuan      decimal.Decimal `gorm:"column:cost_amount_yuan;type:decimal(14,2);not null;default:0" json:"cost_amount_yuan"`
 	MarginYuan          decimal.Decimal `gorm:"column:margin_yuan;type:decimal(14,2);not null;default:0" json:"margin_yuan"`
-	// AllocRule 是归属规则:fifo(按袋子归属)| scope_fallback(按审计范围内猪的毛重比例)。
+	// AllocRule 是归属规则:fifo(按结转记录归属)| scope_fallback(按审计范围内猪的毛重比例)。
 	AllocRule string    `gorm:"column:alloc_rule;type:varchar(16);not null;default:''" json:"alloc_rule"`
 	CreatedAt time.Time `gorm:"column:created_at;not null" json:"created_at"`
 }
@@ -1809,7 +1809,7 @@ type RecordPigCutInput struct {
 // CutInput POST /pork-cuts-stocktake 入参的 cuts 数组元素(per-SKU 一行)。
 //
 // ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ **同一 SKU 只有一行**
-// (拆袋是"每袋一个标签号"的衍生物 ⇒ 没有标签号就没有多袋的身份)。
+// (拆批是"每批一个标签号"的衍生物 ⇒ 没有标签号就没有多批的身份)。
 type CutInput struct {
 	CutType        CutType         `json:"cut_type" binding:"required"`
 	CubeProductID  string          `json:"cube_product_id" binding:"required"` // 必填;后端校验在 branch_cut_mapping 中存在
@@ -1819,7 +1819,7 @@ type CutInput struct {
 // RecordPorkCutsStocktakeInput POST /pork-cuts-stocktake 入参。
 type RecordPorkCutsStocktakeInput struct {
 	IsComplete bool `json:"is_complete"`
-	// Cuts 是盘点明细(per-SKU 一行 = 一袋,或一行散货)。
+	// Cuts 是盘点明细(per-SKU 一行 = 一批,或一行散货)。
 	//
 	// ⚠️ 2026-10-24:**可以是空数组**(当天一点货都没剩 ⇒ 售罄),
 	// 但**字段必须存在** —— 缺失时 service 返 400(防止"忘了传 cuts"被当成售罄)。
@@ -1827,11 +1827,11 @@ type RecordPorkCutsStocktakeInput struct {
 	Cuts []CutInput `json:"cuts"`
 	// TakenDate 是这张盘点单的**归属日**(YYYY-MM-DD,可选;空 = 今天)。
 	//
-	// 门店口径(2026-10-24):「每袋有自己的产生日,这个产生日就是盘点归属日
-	// (也就是补录指定日)」⇒ 补录往日时传它 ⇒ 盘点单、结转记录、袋子
+	// 门店口径(2026-10-24):「每批有自己的产生日,这个产生日就是盘点归属日
+	// (也就是补录指定日)」⇒ 补录往日时传它 ⇒ 盘点单、结转记录、批次
 	// 全部记在**那一天**,而不是今天。
 	//
-	// ⚠️ 补录往日的**记录层**数据(盘点单 / 按日结转记录 / 袋子)已经照常参与
+	// ⚠️ 补录往日的**记录层**数据(盘点单 / 按日结转记录 / 批次)已经照常参与
 	// 那一天的毛利回归(FIFO);**余额与成本快照的按营业日推导**尚未实现
 	// —— 见 service 注释与交付报告「未做」一节。
 	TakenDate string `json:"taken_date,omitempty"`
