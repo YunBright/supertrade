@@ -1899,3 +1899,55 @@ type WasteLogRecordedEventData struct {
 	RecordedAt time.Time `json:"recorded_at"`
 	OperatorID string    `json:"operator_id"`
 }
+
+// ---- 表:external_purchases(**外采**) ----
+//
+// 2026-11-03 owner：「鲜肉 · 每日作业」在「录入猪」与「搬上台」之间加一步
+// 「**录入外采**」—— 门店额外采购某个部位的货。
+//
+// 例(owner 原话)：「11 月 1 日采购了 20 斤货号 01401 对应部位肋排/排骨」。
+//
+// # 与「进猪」的区别(这是外采这个概念的**全部**要点)
+//
+//   进猪:一整头猪进来 ⇒ 分割出各部位 ⇒ 成本按**猪价**摊到各部位。
+//   外采:**已经切好的某个部位**的一笔额外进货 ⇒ 没有产出猪、没有分割。
+//
+// ⇒ 所以外采的成本是**门店给的单价**(像期初结转那样),不是猪成本摊出来的。
+//
+// # 口径
+//
+//   - QtyKg / UnitPriceYuan 都是**门店给的**(重量 kg、单价 元/kg)；
+//   - TotalAmountYuan = 重量 × 单价 ⇒ **服务端算,不可填**。
+//
+// ⚠️ 单位统一 kg / 元每kg(前端按门店习惯可按「斤」录,换算在前端做)。
+type ExternalPurchase struct {
+	// ID 是**确定性**代理主键(surrogateID("SEP", branch_id, biz_date, seq))。
+	ID       string `gorm:"primaryKey;column:id;type:varchar(64)" json:"id"`
+	BranchID string `gorm:"column:branch_id;type:varchar(64);not null;index" json:"branch_id"`
+	// BizDate 是**归属营业日**("YYYY-MM-DD" 折算成 datatypes.Date)。
+	BizDate datatypes.Date `gorm:"column:biz_date;not null;index" json:"biz_date"`
+	// CubeProductID 是**货号**(owner 口径:门店按货号录,如 01401)。
+	CubeProductID string `gorm:"column:cube_product_id;type:varchar(64);not null;index" json:"cube_product_id"`
+	// CutType 是这个货号对应的**部位**(从 branch_cut_mappings 反查后冗余存一份)。
+	//
+	// ⚠️ 冗余存的理由:成本链是**部位级**的(见 service/cut_cost.go),
+	//   而货号↔部位映射以后可能被改 ⇒ 存一份当时的部位,报表口径稳定。
+	CutType CutType `gorm:"column:cut_type;type:varchar(32);not null" json:"cut_type"`
+	// QtyKg 是**采购重量**(kg)。
+	QtyKg decimal.Decimal `gorm:"column:qty_kg;type:decimal(14,3);not null;default:0" json:"qty_kg"`
+	// UnitPriceYuan 是**门店给的采购单价**(元/kg)。
+	//
+	// ⚠️ 为什么必须门店给(与期初结转同理):外采的成本不在本系统的进货流水里
+	//   ⇒ 单价 0 ⇒ 那批货**零成本** ⇒ 卖出去全是利润(毛利虚高)。
+	UnitPriceYuan decimal.Decimal `gorm:"column:unit_price_yuan;type:decimal(14,4);not null;default:0" json:"unit_price_yuan"`
+	// TotalAmountYuan 是**总价**(元)= 重量 × 单价 ⇒ **服务端算,不可填**。
+	TotalAmountYuan decimal.Decimal `gorm:"column:total_amount_yuan;type:decimal(16,2);not null;default:0" json:"total_amount_yuan"`
+	// Note 是备注(如「供应商 X 送的」)。
+	Note      string    `gorm:"column:note;type:varchar(255)" json:"note,omitempty"`
+	OperatorID string   `gorm:"column:operator_id;type:varchar(64)" json:"operator_id,omitempty"`
+	CreatedAt time.Time `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
+}
+
+// TableName 显式表名。
+func (ExternalPurchase) TableName() string { return "external_purchases" }

@@ -659,6 +659,17 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 		return nil, nil, nil, nil, err
 	}
 
+	// ---- 2c. **外采入库**(2026-11-03 owner)----
+	//
+	// 外采 = 额外采购某个部位的货 ⇒ 它是「本期入库」的**另一个来源**
+	// (与猪的分割产出并列):本期入库量 += 外采 kg;本期入库金额 += 外采金额。
+	//
+	// ⚠️ 这里**只取数**;真正叠加在 applySplitWeights **之后**(见 8c-2)。
+	extProducedKg, extProducedAmount, err := s.loadExternalPurchaseTotals(ctx, branchID, startOfDay, endOfDay)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
 	// ---- 3. 卖出 / 统收 / 报损 / 搭赠(SKU 级读,后面汇总到部位) ----
 	soldKg, soldAmount, bulkKg, bulkAmount, wasteKg, giftKg, cutFromSales, err :=
 		s.loadSkuFlows(ctx, branchID, startOfDay, endOfDay)
@@ -879,6 +890,11 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 	for c := range closeKg {
 		cuts[c] = struct{}{}
 	}
+	// ⚠️ 2026-11-03 owner:**外采的部位**也要出行
+	//   (那天只外采、没进猪也没卖 ⇒ 它是当天唯一有货的部位)。
+	for c := range extProducedKg {
+		cuts[c] = struct{}{}
+	}
 	for c := range presaleUnits {
 		// 预售按 SKU 记 ⇒ 它的部位也必须有行(哪怕当期没有销售)。
 		if cut := string(cutOfSku[c]); cut != "" {
@@ -937,6 +953,25 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 	//
 	// ⚠ ΣW == 0(没有建议分割)⇒ 完全不接管 ⇒ 与今天逐字一致(见 applySplitWeights)。
 	prodKg, prodAmount := applySplitWeights(split, partProducedKg, partProducedAmount)
+
+	// ---- 8c-2. **外采入库叠加**(2026-11-03 owner)----
+	//
+	// ⚠ **必须在 applySplitWeights 之后**:
+	//   那个函数把入库量整体**替换成分割权重 W**、并把入库金额按 W 的**比例重分**
+	//   ⇒ 外采放进去会被 W 顶掉(kg 丢了)、金额会被摊到别的部位。
+	//
+	// ⇒ 这里叠加的是「本期入库」的另一个来源:
+	//   本期入库量   += 外采 kg(按部位)
+	//   本期入库金额 += 外采金额(kg × 门店给的采购单价)
+	//
+	// ⇒ 卖掉的那些外采 ⇒ 成本进销售成本 ⇒ **毛利下降**;
+	//   还没卖掉的 ⇒ 留在期末存货里 ⇒ 不影响当天的毛利。
+	for c, v := range extProducedKg {
+		prodKg[c] = prodKg[c].Add(v)
+	}
+	for c, v := range extProducedAmount {
+		prodAmount[c] = prodAmount[c].Add(v)
+	}
 
 	// 今日可摊猪成本合计(元)= Σ 入库金额(按 W 重分后**总量不变**)。
 	//

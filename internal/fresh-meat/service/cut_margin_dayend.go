@@ -125,6 +125,9 @@ func applyReferenceMargin(mids []cutRollupMid, tot *TotalGrossMargin, ref Refere
 	tot.PurchasedKg = ref.PurchasedKg
 	tot.PurchasedYuan = ref.PurchasedYuan
 	tot.PurchaseAvgYuan = ref.PurchaseAvgYuan
+	// 外采(2026-11-03 owner):单列一栏,不动进猪口径。
+	tot.ExternalPurchaseKg = ref.ExternalKg
+	tot.ExternalPurchaseYuan = ref.ExternalYuan
 	tot.ReferenceRemainKg = ref.RemainKg
 	tot.ReferenceRemainYuan = ref.RemainKg.Mul(ref.PurchaseAvgYuan)
 

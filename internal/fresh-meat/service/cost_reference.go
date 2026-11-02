@@ -63,6 +63,14 @@ type ReferenceDayTotals struct {
 	PurchaseAvgYuan decimal.Decimal
 	// RemainKg 是**期末猪肉台实盘**(kg)—— **不含冷库**。
 	RemainKg decimal.Decimal
+	// ExternalKg / ExternalYuan 是当日**外采**的合计(kg / 元)。
+	//
+	// ⚠️ **与进猪口径分开**(owner 2026-11-03 拍板):
+	//   进猪(whole_pigs)是"一整头猪",外采是"已经切好的某个部位的额外进货"
+	//   ⇒ 两者不能合并成一个"总进货"数(合并了门店就看不出外采花了多少钱)。
+	// ⇒ 这里只**展示**,不参与 PurchasedKg/PurchaseAvgYuan 的计算。
+	ExternalKg   decimal.Decimal
+	ExternalYuan decimal.Decimal
 	// HasRemain = false ⇒ 当天没有完整日终盘点 ⇒ 剩余算不出来。
 	//
 	// ⚠️ 这时**不能**给毛利(前端显示「—」),也不能给 0
@@ -150,6 +158,23 @@ func (s *Service) referenceDayTotalsOf(ctx context.Context, branchID string, day
 	}
 	if out.PurchasedKg.IsPositive() {
 		out.PurchaseAvgYuan = out.PurchasedYuan.Div(out.PurchasedKg)
+	}
+
+	// 外采(2026-11-03 owner):单独一栏,**不并进 PurchasedKg/PurchasedYuan**。
+	//
+	// ⚠️ 为什么分开:外采是"已经切好的某个部位",进猪是"一整头猪"
+	//   ⇒ 合并后门店看不出"今天额外买了多少某部位的货、花了多少钱"。
+	// ⚠️ 日期用**区间**而不是等值:datatypes.Date 落库是"带时区的零点",
+	//   PG 里 `date = timestamp` 会按会话时区折算 ⇒ 等值不可靠。
+	var extRows []model.ExternalPurchase
+	if err := s.db.WithContext(ctx).
+		Where("branch_id = ? AND biz_date >= ? AND biz_date < ?", branchID, startOfDay, endOfDay).
+		Find(&extRows).Error; err != nil {
+		return out, fmt.Errorf("query external_purchases(reference): %w", err)
+	}
+	for _, r := range extRows {
+		out.ExternalKg = out.ExternalKg.Add(r.QtyKg)
+		out.ExternalYuan = out.ExternalYuan.Add(r.TotalAmountYuan)
 	}
 
 	// 期末猪肉台实盘:只认**完整盘点单**的那个数据源标记。

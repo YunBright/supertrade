@@ -471,6 +471,13 @@ type TotalGrossMargin struct {
 	// PurchaseAvgYuan 是**采购均价**(元/kg)= 采购金额 ÷ 采购重量
 	// ⇒ 它是**期末剩余成本**的估值价(owner:「可以用采购均价计算」)。
 	PurchaseAvgYuan decimal.Decimal `json:"purchase_avg_yuan"`
+	// ExternalPurchaseKg / ExternalPurchaseYuan 是当日**外采进货**(kg / 元)。
+	//
+	// ⚠️ **与进猪分开**(owner 2026-11-03 拍板):进猪口径不动,
+	//   外采单列一栏 ⇒ 门店看得见"今天额外买了某部位的货、花了多少钱"。
+	// ⚠️ **不并进 PurchasedKg / PurchasedYuan**(合并就看不出外采花了多少)。
+	ExternalPurchaseKg   decimal.Decimal `json:"external_purchase_kg"`
+	ExternalPurchaseYuan decimal.Decimal `json:"external_purchase_yuan"`
 	// ReferenceRemainKg / ReferenceRemainYuan 是**期末猪肉台剩余**(kg/元)
 	// —— **不含冷库**(owner:「总剩余不含冷库」)。
 	ReferenceRemainKg   decimal.Decimal `json:"reference_remain_kg"`

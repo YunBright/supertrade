@@ -92,6 +92,12 @@ func PurgeRegistry() *purge.Registry {
 		purge.Model{Table: "pig_forecast_baselines", Model: &model.PigForecastBaseline{}},
 		purge.Model{Table: "pig_cut_estimates", Model: &model.PigCutEstimate{}},
 		purge.Model{Table: "pig_forecast_baseline_borrows", Model: &model.PigForecastBaselineBorrow{}},
+		// 外采(2026-11-03 owner):契约测试会写 ⇒ 必须能清得掉,
+		// 否则每跑一次契约测试就往生产表里多留一行外采单。
+		//
+		// ⚠️ 主键是**单列代理主键**("SEP" + 门店 + 归属日 + 货号 + 序号)
+		//   ⇒ 进得了 PurgeRegistry ⇒ 清得掉。
+		purge.Model{Table: "external_purchases", Model: &model.ExternalPurchase{}},
 	)
 }
 

@@ -59,6 +59,15 @@ const (
 	//
 	// ⚠️ 它**没有产出猪** ⇒ 归属为空 ⇒ FIFO 领用它时收入记「未归属」。
 	BagSourceOpening = "opening"
+	// BagSourceExternal **外采**(2026-11-03 owner):额外采购某个部位的货。
+	//
+	// ⚠️ 它同样**没有产出猪** ⇒ 归属为空 ⇒ FIFO 领用它时收入记「未归属」
+	//   (与期初同一处理,见 pig_fifo.go 的 fifoRecordShares)。
+	//
+	// ⚠️ FIFO 消费顺序:外采的行**先于**盘点结转的行被领用
+	//   ⇒ 否则同一天的两行(外采 + 盘点结转)按 id 排序 ⇒ 谁先被领是随机的
+	//   ⇒ 外采的收入可能摊到猪身上(那会让单猪毛利失真)。
+	BagSourceExternal = "external"
 )
 
 // StockCarryOverID **按日结转记录**的确定性代理主键。
@@ -138,6 +147,35 @@ func (s *Service) registerStockBags(ctx context.Context, branchID string, origin
 	submittedIDs := make([]string, 0, len(cuts))
 	submittedSKUs := map[string]bool{}
 
+	// ---- 当天**外采**的剩余量(按货号)----
+	//
+	// ⚠️ 2026-11-03 owner:盘点盘的是**猪肉台**上的货,
+	//   其中可能就有**外采**没卖完的那部分(外采的货进了冷库、搬上台、卖不完)。
+	//
+	// ⇒ 外采自己有一行结转记录(source='external')⇒ 这一部分**归它**
+	// ⇒ 这里从盘点这一行里**扣掉** ⇒ 否则同一批货在 FIFO 队列里出现两次
+	//   ⇒ FIFO 会把同一笔收入摊两遍(猪的毛利被摊空)。
+	extRemaining := map[string]decimal.Decimal{}
+	{
+		type extRow struct {
+			CubeProductID string
+			Remaining     decimal.Decimal
+		}
+		var extRows []extRow
+		if err := s.db.WithContext(ctx).
+			Table("stock_bags").
+			Select("cube_product_id AS cube_product_id, (qty_kg - consumed_kg) AS remaining").
+			Where("branch_id = ? AND origin_date = ? AND source = ?", branchID, originDate, BagSourceExternal).
+			Scan(&extRows).Error; err != nil {
+			return fmt.Errorf("query stock_bags(external remaining): %w", err)
+		}
+		for _, r := range extRows {
+			if r.Remaining.IsPositive() {
+				extRemaining[r.CubeProductID] = extRemaining[r.CubeProductID].Add(r.Remaining)
+			}
+		}
+	}
+
 	// 成本快照(按**部位**):入冷库那一刻的移动加权单价 —— 这就是"记录分摊成本"。
 	//
 	// ⚠️ **一次性**算齐(不能逐部位调):兜底路径会算一整天的成本
@@ -162,13 +200,21 @@ func (s *Service) registerStockBags(ctx context.Context, branchID string, origin
 			return err
 		}
 		unitCost := unitCosts[mc.cutType]
+		// ⚠️ 扣掉当天外采的那部分(它归外采自己的结转记录)⇒ 不重复入队。
+		kg := mc.kg
+		if ext := extRemaining[mc.sku]; ext.IsPositive() {
+			kg = kg.Sub(ext)
+			if kg.IsNegative() {
+				kg = decimal.Zero
+			}
+		}
 		// ---- 一行结转记录(归属日 + SKU + 重量 + 归属快照)----
 		bag := model.StockBag{
 			ID:            StockCarryOverID(branchID, originDate, mc.sku),
 			BranchID:      branchID,
 			CubeProductID: mc.sku,
 			CutType:       mc.cutType,
-			QtyKg:         mc.kg,
+			QtyKg:         kg,
 			OriginDate:    originDate,
 			Location:      string(model.StockLocationColdStore),
 			Status:        BagStatusActive,

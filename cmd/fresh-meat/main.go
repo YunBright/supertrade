@@ -116,6 +116,12 @@ func initApp() error {
 		//   ⇒ 上面两行保留在列表里(表还得在,历史数据还要能读)。
 		&model.CutCostDaily{},
 		&model.CutCostState{},
+		// 2026-11-03:**外采**(每日作业第②步:额外采购某个部位的货)。
+		//
+		// ⚠️ **必须在这里**:AutoMigrate 是本服务自己建表(生产上 fresh-meat 与其它服务
+		//   共用同一个 PG)⇒ 漏登记 ⇒ 部署后第一次录外采就报
+		//   "relation external_purchases does not exist" ⇒ **上线即炸**。
+		&model.ExternalPurchase{},
 		// 2026-10-30:分割基线的**估计样本**(A 方案)+ 跨门店选用的预留表。
 		//
 		// ⚠️ `pig_cut_estimates` 是**新表** ⇒ 生产上第一次部署时由 AutoMigrate 建

@@ -120,6 +120,8 @@ func setupTestServiceMode(t *testing.T, syncAdvice bool) (*service.Service, *rec
 		&model.PigCutPriceSample{},
 		&model.PigCutPriceBaseline{},
 		&model.CutUnitPriceCache{},
+		// 2026-11-03:**外采**(额外采购某个部位的货)。
+		&model.ExternalPurchase{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

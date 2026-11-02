@@ -132,6 +132,13 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/stock/bags", requireBranch, h.ListStockBags)
 	r.GET("/stock", requireBranch, h.ListStock)
 
+	// ---- 外采(2026-11-03 owner)----
+	// 每日作业的第②步:额外采购某个部位的货 ⇒ 录完触发成本链重算。
+	r.GET("/external-purchases", requireBranch, h.ListExternalPurchases)
+	r.POST("/external-purchases", requireBranch, h.RecordExternalPurchase)
+	r.PUT("/external-purchases/:id", requireBranch, h.UpdateExternalPurchase)
+	r.DELETE("/external-purchases/:id", requireBranch, h.DeleteExternalPurchase)
+
 	// GET /business-day —— **营业日状态机**:
 	// 未进猪 → 已进猪 → 已搬台 → 已盘点(售罄|休市)。
 	// 顺带给出"前一个营业日是否已盘点"(不补录昨天就无法录今天)。
@@ -955,6 +962,89 @@ func (h *Handler) ListStockBags(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+// ---- 外采(2026-11-03 owner)----
+//
+// 「鲜肉 · 每日作业」在「① 录入猪」与「② 搬上台」之间的一步:
+// 额外采购某个部位的货(如 11-01 采购 10kg 货号 01401 = 肋排/排骨)。
+//
+// ⇒ 录完会**触发成本链重算** ⇒ 当天与往后的毛利、进货成本跟着变。
+
+// RecordExternalPurchase POST /external-purchases
+//
+// 录一笔外采(货号 + 重量 + 单价)。
+func (h *Handler) RecordExternalPurchase(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	var in service.ExternalPurchaseInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
+		return
+	}
+	cl, _ := claims.FromContext(c.Request.Context())
+	out, err := h.svc.RecordExternalPurchase(c.Request.Context(), branchID, in, actorIDFromClaims(cl))
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// ListExternalPurchases GET /external-purchases?date=YYYY-MM-DD
+//
+// 某营业日的外采清单(前端「录入外采」那一步要显示"今天录了什么")。
+//
+// `date` 省略 = 今天(营业日界时区)。
+func (h *Handler) ListExternalPurchases(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:view") {
+		return
+	}
+	out, err := h.svc.ListExternalPurchases(c.Request.Context(), branchID, c.Query("date"))
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// UpdateExternalPurchase PUT /external-purchases/:id
+//
+// 改一笔外采(重量 / 单价 / 备注)。
+func (h *Handler) UpdateExternalPurchase(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	var in service.ExternalPurchaseInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
+		return
+	}
+	out, err := h.svc.UpdateExternalPurchase(c.Request.Context(), branchID, c.Param("id"), in)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// DeleteExternalPurchase DELETE /external-purchases/:id
+//
+// 撤一笔外采(货回不到店里 ⇒ 冷库余额与成本链一起回退)。
+func (h *Handler) DeleteExternalPurchase(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	if err := h.svc.DeleteExternalPurchase(c.Request.Context(), branchID, c.Param("id")); err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 // ListStock GET /stock

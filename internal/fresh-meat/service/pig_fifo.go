@@ -124,7 +124,7 @@ func (s *Service) allocateSaleByFIFO(
 	if err := tx.WithContext(ctx).
 		Where("branch_id = ? AND cube_product_id = ? AND origin_date <= ?",
 			branchID, cubeProductID, saleDate).
-		Order("origin_date ASC, id ASC").
+		Order(fmt.Sprintf("origin_date ASC, CASE WHEN source = '%s' THEN 0 ELSE 1 END, id ASC", BagSourceExternal)).
 		Find(&records).Error; err != nil {
 		return nil, fmt.Errorf("query stock_bags(fifo): %w", err)
 	}
@@ -190,7 +190,10 @@ func (s *Service) fifoRecordShares(
 	//
 	// ⇒ 它的重量照样能被消耗（货确实卖掉了）⇒ 归到「**未归属**」(pigID="")：
 	//   钱不丢（结算金额/毛利对得上），但也不硬塞给某头猪（那会让单猪毛利失真）。
-	if rec.Source == BagSourceOpening {
+	//
+	// ⚠️ **外采**同理（2026-11-03 owner）：额外采购的某个部位的货没有产出猪
+	//   ⇒ 它的收入也不能摊给某头猪 ⇒ 同样记「未归属」。
+	if rec.Source == BagSourceOpening || rec.Source == BagSourceExternal {
 		return []fifoShare{{pigID: "", kg: rec.QtyKg}}, nil
 	}
 	if len(rec.PigAlloc) > 0 {
