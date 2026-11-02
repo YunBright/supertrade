@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -135,6 +136,201 @@ func (s *Service) CashDayRows(ctx context.Context, branchID string, from, to tim
 	}
 	rows, err := s.localCashFlows(ctx, branchID, from, to, rules)
 	return rows, CashSourceLocal, err
+}
+
+// CashierDay 是「门店 × 业务日 × 收银员 × pay_way」的收银净额聚合。
+//
+// 收银员姓名在 cube 侧来自 operator 模型（payflow 只有 oper_id）；
+// 本地侧直接取 pay_flows.cashier_name。
+type CashierDay struct {
+	CashierID   string
+	CashierName string
+	PayWay      string
+	Method      string
+	AmountNet   decimal.Decimal
+	TxnCount    int
+}
+
+// CashierDayRows 返回单日按收银员拆分的收银流水（收银流水页的卡片数据）。
+//
+// ⚠️ 不做 join：cube 的 ON 渲染会把维度表达式整体加别名前缀
+// （`t0.RTRIM(cashier_id)` 在 T-SQL 里非法），所以姓名是**第二次查询** operator
+// 模型后回填的。姓名查询失败只降级为"只有工号"，不能让整页金额消失。
+func (s *Service) CashierDayRows(ctx context.Context, branchID string, day time.Time) ([]CashierDay, string, error) {
+	if err := s.validateRange(branchID, day, day); err != nil {
+		return nil, "", err
+	}
+	rules, err := s.LoadRules(ctx, branchID)
+	if err != nil {
+		return nil, "", err
+	}
+	useCube, err := s.readPath(ctx, branchID)
+	if err != nil {
+		return nil, "", err
+	}
+	if useCube {
+		rows, err := s.cubeCashierDay(ctx, branchID, day, rules)
+		if err != nil {
+			return nil, "", err
+		}
+		return rows, CashSourceCube, nil
+	}
+	rows, err := s.localCashierDay(ctx, branchID, day, rules)
+	if err != nil {
+		return nil, "", err
+	}
+	return rows, CashSourceLocal, nil
+}
+
+// cubeCashierDay 查单个业务日的按收银员聚合。
+func (s *Service) cubeCashierDay(ctx context.Context, branchID string, day time.Time, rules Rules) ([]CashierDay, error) {
+	qctx, cancel := context.WithTimeout(ctx, s.cfg.CubeTimeout)
+	defer cancel()
+	qctx = cubeclient.WithBranchID(qctx, branchID)
+
+	dayStr := day.Format("2006-01-02")
+	data, _, err := s.reader.LoadCubeQueryPage(qctx, "payflow", cubeclient.CubeQuery{
+		Measures:   []string{"payflow.count", "payflow.total_pay_amount_yuan"},
+		Dimensions: []string{"payflow.pay_way", "payflow.cashier_id", "payflow.branch_no"},
+		Filters: []cubeclient.CubeFilter{
+			cuberead.Filter("payflow.paid_at", "gte", dayStr+" 00:00:00"),
+			cuberead.Filter("payflow.paid_at", "lte", dayStr+" 23:59:59"),
+		},
+		// 日 × pay_way × 收银员 ≤ 500（正常单店远低于它）。
+		Limit: 500,
+		Total: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: cube payflow(cashier) %s: %v", model.ErrCubeQueryFailed, dayStr, err)
+	}
+
+	m := methodMap(rules)
+	filterBranches := make(map[string]bool, len(rules.CashSourceBranchNos))
+	for _, b := range rules.CashSourceBranchNos {
+		filterBranches[strings.TrimSpace(b)] = true
+	}
+
+	type key struct{ cashier, payWay string }
+	agg := map[key]*CashierDay{}
+	ids := make(map[string]bool)
+	for _, r := range data {
+		srcBranch := cuberead.Str(r, "payflow.branch_no")
+		if len(filterBranches) > 0 && !filterBranches[srcBranch] {
+			continue
+		}
+		payWay := strings.TrimSpace(cuberead.Str(r, "payflow.pay_way"))
+		cashier := strings.TrimSpace(cuberead.Str(r, "payflow.cashier_id"))
+		if payWay == "" {
+			continue
+		}
+		// 工号为空也保留：宁可显示「未登记收银员」，也不能把这组金额静默吞掉。
+		k := key{cashier: cashier, payWay: payWay}
+		row, ok := agg[k]
+		if !ok {
+			row = &CashierDay{CashierID: cashier, PayWay: payWay, Method: methodOf(m, payWay)}
+			agg[k] = row
+		}
+		row.AmountNet = row.AmountNet.Add(cuberead.Dec(r, "payflow.total_pay_amount_yuan"))
+		row.TxnCount += int(cuberead.Dec(r, "payflow.count").IntPart())
+		ids[cashier] = true
+	}
+
+	rows := make([]CashierDay, 0, len(agg))
+	for _, v := range agg {
+		rows = append(rows, *v)
+	}
+	names := s.cubeOperatorNames(qctx, branchID, ids)
+	for i := range rows {
+		rows[i].CashierName = names[rows[i].CashierID]
+	}
+	sortCashierDays(rows)
+	return rows, nil
+}
+
+// cubeOperatorNames 查 operator 模型回填姓名（best-effort）。
+//
+// 失败只记日志并返回空 map：姓名是展示信息，不能因为它把金额整页打没。
+func (s *Service) cubeOperatorNames(ctx context.Context, branchID string, ids map[string]bool) map[string]string {
+	out := make(map[string]string, len(ids))
+	if len(ids) == 0 || s.reader == nil {
+		return out
+	}
+	list := make([]string, 0, len(ids))
+	for id := range ids {
+		list = append(list, id)
+	}
+	sortStrings(list)
+
+	qctx, cancel := context.WithTimeout(ctx, s.cfg.CubeTimeout)
+	defer cancel()
+	qctx = cubeclient.WithBranchID(qctx, branchID)
+	data, _, err := s.reader.LoadCubeQueryPage(qctx, "operator", cubeclient.CubeQuery{
+		Measures:   []string{"operator.count"},
+		Dimensions: []string{"operator.id", "operator.name"},
+		Filters:    []cubeclient.CubeFilter{cuberead.InFilter("operator.id", list)},
+		Limit:      len(list) + 10,
+	})
+	if err != nil {
+		s.cfg.Logger.Warn("cash-recon: 收银员姓名查询失败（仅显示工号）", "branch", branchID, "err", err)
+		return out
+	}
+	for _, r := range data {
+		id := strings.TrimSpace(cuberead.Str(r, "operator.id"))
+		name := strings.TrimSpace(cuberead.Str(r, "operator.name"))
+		if id != "" && name != "" {
+			out[id] = name
+		}
+	}
+	return out
+}
+
+// localCashierDay 从 transaction 域 pay_flows 读按收银员聚合（只读）。
+func (s *Service) localCashierDay(ctx context.Context, branchID string, day time.Time, rules Rules) ([]CashierDay, error) {
+	if s.db == nil {
+		return nil, model.ErrInvalidInput
+	}
+	m := methodMap(rules)
+	var raw []struct {
+		CashierID   string          `gorm:"column:cashier_id"`
+		CashierName string          `gorm:"column:cashier_name"`
+		PayWay      string          `gorm:"column:pay_way"`
+		AmountNet   decimal.Decimal `gorm:"column:amount_net"`
+		TxnCount    int             `gorm:"column:txn_count"`
+	}
+	err := s.db.WithContext(ctx).Raw(`
+SELECT cashier_id, MAX(cashier_name) AS cashier_name, pay_way,
+       SUM(pay_amount * exchange_rate) AS amount_net, COUNT(*) AS txn_count
+  FROM pay_flows
+ WHERE branch_id = ? AND paid_at >= ? AND paid_at < ?
+ GROUP BY cashier_id, pay_way
+ ORDER BY cashier_id, pay_way`,
+		branchID, day, day.AddDate(0, 0, 1),
+	).Scan(&raw).Error
+	if err != nil {
+		return nil, fmt.Errorf("cash-recon: 本地收银流水查询失败: %w", err)
+	}
+	out := make([]CashierDay, 0, len(raw))
+	for _, r := range raw {
+		out = append(out, CashierDay{
+			CashierID:   strings.TrimSpace(r.CashierID),
+			CashierName: strings.TrimSpace(r.CashierName),
+			PayWay:      strings.TrimSpace(r.PayWay),
+			Method:      methodOf(m, r.PayWay),
+			AmountNet:   r.AmountNet,
+			TxnCount:    r.TxnCount,
+		})
+	}
+	return out, nil
+}
+
+// sortCashierDays 按 (收银员, pay_way) 稳定排序。
+func sortCashierDays(rows []CashierDay) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i].CashierID != rows[j].CashierID {
+			return rows[i].CashierID < rows[j].CashierID
+		}
+		return rows[i].PayWay < rows[j].PayWay
+	})
 }
 
 // cashAggregatesOf 把 CashDay 转成引擎输入。

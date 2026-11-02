@@ -100,6 +100,7 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	// ---- S1：取数 / 建账 / 导入 ----
 	r.GET("/flows/cash", requireBranch, guard(ScopeView), h.GetCashFlows)
 	r.GET("/flows/payment-methods", requireBranch, guard(ScopeView), h.GetPaymentMethods)
+	r.GET("/flows/cashiers", requireBranch, guard(ScopeView), h.GetCashierFlows)
 
 	r.POST("/imports/bank", requireBranch, guard(ScopeOperate), h.ImportBank)
 	r.GET("/imports", requireBranch, guard(ScopeView), h.ListImports)
@@ -673,6 +674,80 @@ func (h *Handler) GetPaymentMethods(c *gin.Context) {
 		"date":        d.Format("2006-01-02"),
 		"items":       cashItems(rows),
 		"unmapped":    unmapped,
+	})
+}
+
+// cashierPayWayView 是一张收银员卡片里的一个支付方式。
+type cashierPayWayView struct {
+	PayWay    string `json:"pay_way"`
+	Method    string `json:"method"`
+	AmountNet string `json:"amount_net"`
+	TxnCount  int    `json:"txn_count"`
+}
+
+// cashierFlowItem 是一个收银员当日的收银聚合（前端渲染成一张卡片）。
+//
+// Shift 恒为 ALL：数据源 payflow.shift_no 实测全空（sale_detail 也为空），
+// 没有班次口径时**不猜班次**，由前端把"班次 ALL"作为显式提示。
+type cashierFlowItem struct {
+	CashierID   string              `json:"cashier_id"`
+	CashierName string              `json:"cashier_name"`
+	Shift       string              `json:"shift"`
+	TxnCount    int                 `json:"txn_count"`
+	PayWays     []cashierPayWayView `json:"pay_ways"`
+}
+
+// cashierFlowsResp 是 /flows/cashiers 的响应体。
+type cashierFlowsResp struct {
+	DataSource string            `json:"data_source"`
+	Date       string            `json:"date"`
+	Items      []cashierFlowItem `json:"items"`
+}
+
+// GetCashierFlows GET /flows/cashiers?date=
+//
+// 单日按收银员拆分（收银流水页卡片）。`date` 必填：跨日会把收银员混在一起。
+func (h *Handler) GetCashierFlows(c *gin.Context) {
+	d, ok := dayFromQuery(c, "date")
+	if !ok {
+		if strings.TrimSpace(c.Query("date")) == "" {
+			writeError(c, http.StatusBadRequest, "bad_request", "date 必填（单日有界查询）")
+		}
+		return
+	}
+	rows, src, err := h.svc.CashierDayRows(c.Request.Context(), branchIDOf(c), d)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+
+	items := make([]cashierFlowItem, 0)
+	byCashier := map[string]int{}
+	for _, r := range rows {
+		pw := cashierPayWayView{
+			PayWay:    r.PayWay,
+			Method:    r.Method,
+			AmountNet: r.AmountNet.StringFixed(4),
+			TxnCount:  r.TxnCount,
+		}
+		if idx, ok := byCashier[r.CashierID]; ok {
+			items[idx].TxnCount += r.TxnCount
+			items[idx].PayWays = append(items[idx].PayWays, pw)
+			continue
+		}
+		byCashier[r.CashierID] = len(items)
+		items = append(items, cashierFlowItem{
+			CashierID:   r.CashierID,
+			CashierName: r.CashierName,
+			Shift:       "ALL",
+			TxnCount:    r.TxnCount,
+			PayWays:     []cashierPayWayView{pw},
+		})
+	}
+	c.JSON(http.StatusOK, cashierFlowsResp{
+		DataSource: src,
+		Date:       d.Format("2006-01-02"),
+		Items:      items,
 	})
 }
 

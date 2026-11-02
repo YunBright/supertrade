@@ -219,6 +219,84 @@ func TestMethodMap_UnknownPayWayIsUnmapped(t *testing.T) {
 	require.Equal(t, model.MethodUnmapped, methodOf(m, "ABC"))
 }
 
+// TestCashierDayRows_CubeGroupsAndNames 锁住按收银员聚合 + 姓名回填。
+func TestCashierDayRows_CubeGroupsAndNames(t *testing.T) {
+	svc, _ := newTestService(t)
+	fake := cubereadfake.New()
+	fake.Handler = func(modelName string, _ cubeclient.CubeQuery) ([]map[string]any, int, error) {
+		switch modelName {
+		case "payflow":
+			return []map[string]any{
+				{"payflow.pay_way": "RMB", "payflow.cashier_id": "1011", "payflow.branch_no": "01",
+					"payflow.count": "10", "payflow.total_pay_amount_yuan": "100.00"},
+				{"payflow.pay_way": "SWX", "payflow.cashier_id": "1011", "payflow.branch_no": "01",
+					"payflow.count": "5", "payflow.total_pay_amount_yuan": "50.00"},
+				{"payflow.pay_way": "RMB", "payflow.cashier_id": "1012", "payflow.branch_no": "01",
+					"payflow.count": "3", "payflow.total_pay_amount_yuan": "30.00"},
+			}, 3, nil
+		case "operator":
+			return []map[string]any{
+				{"operator.id": "1011", "operator.name": "谢梅坤", "operator.count": "1"},
+			}, 1, nil
+		default:
+			return nil, 0, nil
+		}
+	}
+	svc.SetCashSource(cubeSource(), fake)
+
+	rows, src, err := svc.CashierDayRows(context.Background(), "00", day(2026, 10, 31))
+	require.NoError(t, err)
+	require.Equal(t, CashSourceCube, src)
+	require.Len(t, rows, 3, "两个收银员 × 支付方式 = 3 行")
+
+	require.Equal(t, "1011", rows[0].CashierID)
+	require.Equal(t, "谢梅坤", rows[0].CashierName)
+	require.Equal(t, "RMB", rows[0].PayWay)
+	require.Equal(t, model.MethodCash, rows[0].Method)
+	require.Equal(t, "100", rows[0].AmountNet.String())
+	require.Equal(t, 10, rows[0].TxnCount)
+
+	// 姓名缺失的收银员只返回工号，不阻断金额。
+	require.Equal(t, "1012", rows[2].CashierID)
+	require.Equal(t, "", rows[2].CashierName)
+
+	// payflow 查询：单日、只按 paid_at 过滤、带 cashier_id 维度。
+	qs := fake.QueriesFor("payflow")
+	require.Len(t, qs, 1)
+	require.Contains(t, qs[0].Query.Dimensions, "payflow.cashier_id")
+	require.LessOrEqual(t, qs[0].Query.Limit, 500)
+	for _, f := range qs[0].Query.Filters {
+		require.Equal(t, "payflow.paid_at", f.Member)
+	}
+
+	// operator 查询：按工号集合 IN。
+	ops := fake.QueriesFor("operator")
+	require.Len(t, ops, 1)
+	require.ElementsMatch(t, []any{"1011", "1012"}, ops[0].FilterValues("operator.id"))
+}
+
+// TestCashierDayRows_NameLookupFailureKeepsAmounts 锁住"姓名查询失败不丢金额"。
+func TestCashierDayRows_NameLookupFailureKeepsAmounts(t *testing.T) {
+	svc, _ := newTestService(t)
+	fake := cubereadfake.New()
+	fake.Handler = func(modelName string, _ cubeclient.CubeQuery) ([]map[string]any, int, error) {
+		if modelName == "operator" {
+			return nil, 0, errors.New("operator model unavailable")
+		}
+		return []map[string]any{
+			{"payflow.pay_way": "RMB", "payflow.cashier_id": "1011", "payflow.branch_no": "01",
+				"payflow.count": "1", "payflow.total_pay_amount_yuan": "10.00"},
+		}, 1, nil
+	}
+	svc.SetCashSource(cubeSource(), fake)
+
+	rows, _, err := svc.CashierDayRows(context.Background(), "00", day(2026, 10, 31))
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Equal(t, "10", rows[0].AmountNet.String())
+	require.Equal(t, "", rows[0].CashierName)
+}
+
 // TestSaveRule_InvalidValueRejected 锁住 fail-closed：配错的规则不许入库。
 func TestSaveRule_InvalidValueRejected(t *testing.T) {
 	svc, _ := newTestService(t)
