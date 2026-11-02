@@ -52,7 +52,6 @@ var bindFieldLabels = map[string]string{
 	"IsComplete":     "是否完成",
 	"Cuts":           "盘点明细",
 	"QtyKg":          "数量 kg",
-	"Label":          "标签号",
 	"Lines":          "明细行",
 	// 期初 / 大宗 / 其它
 	"ColdStoreKg":   "冷库 kg",

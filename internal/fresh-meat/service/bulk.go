@@ -211,11 +211,10 @@ func (s *Service) RecordBulkProduction(ctx context.Context, branchID string, in 
 	if err != nil {
 		return nil, err
 	}
-	// 建**结转记录(袋子)** —— 它才是 FIFO 队列的一员。
+	// 建**结转记录** —— 它才是 FIFO 队列的一员。
 	bag := model.StockBag{
 		ID:            StockBulkManualBagID(branchID, productionID),
 		BranchID:      branchID,
-		Label:         "", // 手工补录没有标签号 ⇒ 是"不装袋的散货结转记录"
 		CubeProductID: sku,
 		CutType:       prod.CutType,
 		QtyKg:         in.QtyKg,
@@ -721,7 +720,8 @@ type BulkBalance struct {
 	//
 	// 正常应为 0。不为 0 的常见原因:
 	//   - 冷库里有**期初**的货(没经过盘点结转 ⇒ 不在队列里)⇒ 差值为负;
-	//   - 按 kg 搬上台(没按标签搬)⇒ 货在台上、袋子还在冷库 ⇒ 差值为正。
+	//   - 按 kg 搬上台(2026-11-02 起是**唯一**搬法)⇒ 货在台上、结转记录还在冷库
+	//     ⇒ 差值为正。
 	//
 	// ⇒ **显式给出差额**,不藏:这类差额藏起来就变成"库存说不清"。
 	LedgerVsColdDiffKg decimal.Decimal `json:"ledger_vs_cold_diff_kg"`

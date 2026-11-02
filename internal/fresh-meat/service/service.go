@@ -801,15 +801,6 @@ func (s *Service) RecordPorkCutsStocktake(ctx context.Context, branchID string, 
 		}
 	}
 	var cutSnapshots []model.CutSnapshot
-	// SKU → 标签号(2026-10-24):快照要带上 label,否则前端「载入并编辑」会清空标签号。
-	labelOfSku := map[string]string{}
-	for _, c := range in.Cuts {
-		if l := strings.TrimSpace(c.Label); l != "" {
-			if _, ok := labelOfSku[c.CubeProductID]; !ok {
-				labelOfSku[c.CubeProductID] = l
-			}
-		}
-	}
 	for cutType, skuActuals := range callerActual {
 		cutTotalActual := decimal.Zero
 		for _, sa := range skuActuals {
@@ -841,7 +832,6 @@ func (s *Service) RecordPorkCutsStocktake(ctx context.Context, branchID string, 
 				TotalRemainKg:    fullKg,
 				ExpectedRemainKg: skuExpected,
 				VarianceKg:       variance,
-				Label:            labelOfSku[sa.CubeProductID],
 			})
 		}
 	}

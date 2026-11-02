@@ -421,11 +421,6 @@ type CutSnapshot struct {
 	TotalRemainKg    decimal.Decimal `json:"total_remain_kg,omitempty"`
 	ExpectedRemainKg decimal.Decimal `json:"expected_remain_kg"`
 	VarianceKg       decimal.Decimal `json:"variance_kg"`
-	// Label 是这一袋的**标签号**(2026-10-24)。
-	//
-	// ⚠️ 为什么要在响应里带上:前端的「载入并编辑」会把上次的盘点单灌回表单
-	// ⇒ 不带 label ⇒ 门店重新打开时**标签号被清空**、拆袋结构也丢了。
-	Label string `json:"label,omitempty"`
 }
 
 // ---- 表4:line_sales_by_pig ----
@@ -591,53 +586,40 @@ func ValidWasteType(t string) bool {
 // TableName 显式表名。
 func (WasteLog) TableName() string { return "waste_logs" }
 
-// ---- 表7b:stock_bags(袋子 / 标签号)----
+// ---- 表7b:stock_bags(结转记录 / 袋子台账)----
 //
-// StockBag 一**袋**货:门店日终盘点时,按 SKU 把剩余的鲜肉**打包过秤**,
-// 每袋夹一个**标签号**(袋标),次日可整袋搬上猪肉台继续卖。
+// StockBag 一行**结转记录**:门店日终盘点时,按 SKU 把剩余的鲜肉**打包过秤**
+// 后登记的一条「归属日 + SKU + 重量」。
 //
-// # 为什么要有"袋子"这个粒度
+// ⚠️ **2026-11-02 owner:标签号玩法整套下线** —— 搬台不再「按标签整袋搬」,
+// 盘点也不再填标签号 ⇒ 库里再没有新行带标签 ⇒ 这张表退化成
+// 「按日结转台账」(FIFO 队列 + 猪归属快照)。
 //
-// ① **搬上台要能整袋搬**:门店说"明天直接整袋搬上台",按 kg 搬就搬不干净
+// # 为什么还要保留"袋子"这个粒度
 //
-//	(半袋留在冷库、半袋在台上 ⇒ 盘点对不上)。
-//
-// ② **搬上台要有流水**:每日毛利的"分摊重量"需要知道当日搬上台了多少
+// ① **搬上台要有流水**:每日毛利的"分摊重量"需要知道当日搬上台了多少
 //
 //	(搬上台的是**老货**,不能当成当日新分割的货再摊一次猪成本)。
-//	⇒ 位置表只记余额、不留痕 ⇒ 袋子就是那条流水。
+//	⇒ 位置表只记余额、不留痕 ⇒ 结转记录就是那条流水。
 //
-// ③ **每袋要有归属**:这袋货是当天哪几头猪的产出 ⇒ 卖掉时毛利能**回归**
+// ② **每行要有归属**:这批货是当天哪几头猪的产出 ⇒ 卖掉时毛利能**回归**
 //
 //	到产出它的那头猪(而不是今天碰巧在场的猪)。
 //
-// # 标签号可以复用
+// ③ **FIFO 队列**:按产生日排队 ⇒ 卖掉一笔货时,收入按「结转先后顺序」摊回猪。
 //
-// 袋子搬上猪肉台后标签号**释放**(status=released)⇒ 同一个标签号下次可以
-// 贴在别的袋子上 ⇒ 唯一性只约束**在用中的**袋子(部分唯一索引)。
+// # label 列的历史遗留
 //
-// # label 可空 = 不装袋的散货结转记录(2026-10-24)
-//
-// 门店口径:「盘点时将剩余的鲜肉商品按 sku 打包过秤然后登记,每个袋子夹上标签」
-// ⇒ **装了袋的**行带 label;**不装袋的**行只有「归属日 + SKU + 重量」,
-// 但它同样要进这张表 —— 因为**毛利的 FIFO 归摊**要靠它:
-// 卖掉一笔货时,收入要按「结转先后顺序」摊回产出它的那头猪。
-//
-// ⇒ label 为空 ⇒ 这行是**散货结转记录**(不是袋子 ⇒ 不可按标签搬上台)。
-// ⇒ 同一 (归属日, SKU) 只允许**一行**无 label(前端多袋请分行并各自带 label)。
+// 标签号(袋标)曾是这一行的身份(也是「按标签整袋搬」的钥匙)⇒ 现在不再产生
+// ⇒ 新行的 label 为 NULL。**列与部分唯一索引都保留**(历史数据 + 迁移不动),
+// 但**代码不再读也不再写**它(见 internal/fresh-meat/migrate.go 的注释)。
 type StockBag struct {
-	// ID 是**确定性**代理主键:同一 (门店, 产生日, 标签号) 永远是同一行
-	// ⇒ 重复提交同一天的盘点 = 覆盖,不会多出一袋。
+	// ID 是**确定性**代理主键:同一 (门店, 产生日, SKU) 永远是同一行
+	// ⇒ 重复提交同一天的盘点 = 覆盖,不会多出一行。
 	//
-	// ⚠️ 无 label 的行不能用 label 参与主键(会撞)⇒ 改用
-	// (门店, 产生日, SKU) 参与哈希(见 service.StockCarryOverID)。
+	// ⚠️ 同一 (归属日, SKU) 只登记**一行**(同 SKU 多行 ⇒ 合并求和)。
 	ID       string `gorm:"primaryKey;column:id;type:varchar(64)" json:"id"`
 	BranchID string `gorm:"column:branch_id;type:varchar(64);not null;index" json:"branch_id"`
-	// Label 是标签号(袋标)。门店自己贴,人可读即可。
-	//
-	// ⚠️ 2026-10-24:**可空** —— 空 = 不装袋的散货结转记录。
-	// (PG 侧 NOT NULL → 可空的手写 DDL 见 internal/fresh-meat/migrate.go。)
-	Label string `gorm:"column:label;type:varchar(64);index" json:"label,omitempty"`
 	// CubeProductID 是这袋货的 SKU(= 思迅货号)。
 	CubeProductID string `gorm:"column:cube_product_id;type:varchar(64);not null;index" json:"cube_product_id"`
 	// CutType 是这个 SKU 归属的部位(冗余一份,便于按部位汇总)。
@@ -657,7 +639,10 @@ type StockBag struct {
 	OriginDate datatypes.Date `gorm:"column:origin_date;not null;index" json:"origin_date"`
 	// Location 是这袋当前在哪:cold_store(冷库)| counter(猪肉台)。
 	Location string `gorm:"column:location;type:varchar(16);not null;default:'cold_store'" json:"location"`
-	// Status:active(在用,标签号被占用)| released(已搬上台并释放标签号)。
+	// Status:active(在用)| released(已搬上台)。
+	//
+	// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 不再有"搬上台 ⇒ 释放标签号"这条路径
+	//   ⇒ 新行一律 active;released 只剩历史行。
 	Status string `gorm:"column:status;type:varchar(16);not null;default:'active'" json:"status"`
 	// PigAlloc 是**归属快照**:这袋货由哪几头猪产出、各多少 kg。
 	//
@@ -1408,7 +1393,7 @@ type BusinessDay struct {
 	Status string `gorm:"column:status;type:varchar(16);not null;default:'no_pig'" json:"status"`
 	// HasPig:当天有猪进场(录猪动作推进)。
 	HasPig bool `gorm:"column:has_pig;not null;default:false" json:"has_pig"`
-	// HasCounterLoad:当天有搬上台流水(含整袋搬与按 SKU+kg 搬)。
+	// HasCounterLoad:当天有搬上台流水(按 SKU+kg 搬)。
 	HasCounterLoad bool `gorm:"column:has_counter_load;not null;default:false" json:"has_counter_load"`
 	// HasStocktake:当天提交过盘点单。
 	HasStocktake bool `gorm:"column:has_stocktake;not null;default:false" json:"has_stocktake"`
@@ -1437,9 +1422,9 @@ func (BusinessDay) TableName() string { return "business_days" }
 // 「位置表只记余额、不留痕」⇒ 「当日搬上台了多少」查不到
 // ⇒ 而休市判定、当日分摊重量、按营业日推导的冷库余额**都要它**。
 //
-// ⇒ **两种搬法都记**:
-//   - 按 **label** 整袋搬(门店主路径):Label 非空,SKU/重量取自袋子;
-//   - 按 **SKU + kg** 搬:Label 为空。
+// ⇒ **只有一种搬法**(2026-11-02 owner:标签号玩法下线):按 **SKU + kg** 搬。
+//
+// (历史行里还可能有 source='bag'(按标签整袋搬),那套玩法已下线。)
 //
 // # 归属日(BizDate)
 //
@@ -1462,9 +1447,9 @@ type CounterLoadRecord struct {
 	CutType CutType `gorm:"column:cut_type;type:varchar(32);not null;index" json:"cut_type"`
 	// QtyKg 是搬上柜台的重量。
 	QtyKg decimal.Decimal `gorm:"column:qty_kg;type:decimal(14,3);not null" json:"qty_kg"`
-	// Label 非空 = **按标签整袋搬**(门店主路径);空 = 按 SKU + kg 搬。
-	Label string `gorm:"column:label;type:varchar(64);index" json:"label,omitempty"`
-	// Source:bag(整袋搬)| sku(按 SKU+kg 搬)。
+	// ⚠️ **label 列已废弃**(2026-11-02 owner:标签号玩法下线)⇒ 代码不再读写它。
+	//   列保留(历史行仍有值)⇒ 迁移不动。
+	// Source:sku(按 SKU+kg 搬)。历史行里还可能有 bag(按标签整袋搬,已下线)。
 	Source     string    `gorm:"column:source;type:varchar(16);not null;default:'sku'" json:"source"`
 	OperatorID string    `gorm:"column:operator_id;type:varchar(64);not null" json:"operator_id"`
 	CreatedAt  time.Time `gorm:"column:created_at;not null" json:"created_at"`
@@ -1823,17 +1808,12 @@ type RecordPigCutInput struct {
 
 // CutInput POST /pork-cuts-stocktake 入参的 cuts 数组元素(per-SKU 一行)。
 //
-// ⚠️ 2026-10-24:同一 SKU 可以有**多行** —— 每行 = **一袋**
-// (门店按 SKU 打包过秤,每袋夹一个标签号)。
+// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ **同一 SKU 只有一行**
+// (拆袋是"每袋一个标签号"的衍生物 ⇒ 没有标签号就没有多袋的身份)。
 type CutInput struct {
 	CutType        CutType         `json:"cut_type" binding:"required"`
 	CubeProductID  string          `json:"cube_product_id" binding:"required"` // 必填;后端校验在 branch_cut_mapping 中存在
 	ActualRemainKg decimal.Decimal `json:"actual_remain_kg" binding:"required"`
-	// Label 是这一袋的**标签号**(袋标)。可选:
-	// 填了 ⇒ 登记成"袋子"(可整袋搬上台、标签号可复用);
-	// 不填 ⇒ 登记成"**不装袋的散货结转记录**"(只有归属日 + SKU + 重量,
-	//        但同样进 FIFO 队列 ⇒ 毛利照样能回归到猪)。
-	Label string `json:"label,omitempty"`
 }
 
 // RecordPorkCutsStocktakeInput POST /pork-cuts-stocktake 入参。

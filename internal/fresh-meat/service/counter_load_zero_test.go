@@ -32,7 +32,7 @@ func fmCounterLoadZero(t *testing.T, svc *service.Service, branchID string, day 
 	t.Helper()
 	_, err := svc.CounterLoad(context.Background(), branchID, service.CounterLoadInput{
 		Lines: []service.CounterLoadLine{
-			// ⚠️ 0 kg ⇒ 没有货号(没搬任何货)⇒ 也不填标签号。
+			// ⚠️ 0 kg ⇒ 没有货号(没搬任何货)。
 			{QtyKg: d("0")},
 		},
 		TakenDate: day.Format("2006-01-02"),

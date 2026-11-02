@@ -1,31 +1,29 @@
 package service
 
-// internal/fresh-meat/service/stock_bags.go —— **袋子 / 标签号**。
+// internal/fresh-meat/service/stock_bags.go —— **按日结转记录**(袋子台账)。
 //
-// # 门店口径(2026-10-24)
+// # ⚠️ 2026-11-02 owner:标签号玩法整套下线
 //
-// 「盘点时将剩余的鲜肉商品按 sku 打包过秤然后登记,每个袋子夹上标签,
-// 方便次日搬上猪肉台继续售卖和毛利回归。」
+// 原来这张表装的是「袋 + 标签号」:门店盘点时给每袋夹一个标签,
+// 次日「按标签整袋搬」上猪肉台。搬台不再有标签这条路、盘点也不再填标签号
+// ⇒ 这张表退化成「**按日结转台账**」:一行 = (归属日 + SKU + 重量 + 猪归属快照)。
 //
-// ⇒ 一次盘点 = 若干**袋**(每袋:SKU + 过秤重量 + 一个**标签号**)。
+// # 这张表现在还解决三件事
 //
-// # 袋子解决的三件事
-//
-// ① **整袋搬上台**:门店按袋搬,不是按 kg 搬 ⇒ 搬完冷库和猪肉台都对得上。
-// ② **搬上台留下流水**:位置表只记余额、不留痕 ⇒ "当日搬上台了多少"查不到
-//    ⇒ 而每日毛利的"分摊重量"需要它(搬上台的是**老货**,不能再摊一次猪成本)。
-// ③ **每袋有归属**:这袋货是当天哪几头猪的产出 ⇒ 卖掉时毛利能**回归**
+// ① **每行要有归属**:这批货是当天哪几头猪的产出 ⇒ 卖掉时毛利能**回归**
 //    到产出它的那头猪(而不是今天碰巧在场的猪)。
+// ② **FIFO 队列**:按产生日排队 ⇒ 卖掉一笔货时,收入按「结转先后顺序」摊回猪。
+// ③ **成本锚点**:每行钉着「入冷库那一刻的移动加权单价」⇒ 大宗隔几天才结账时
+//    成本不会被"当日单价"摊歪。
 //
-// # 标签号可复用
+// # 粒度:同一 (归属日, SKU) 一行
 //
-// 袋子搬上猪肉台后标签号**释放**(status=released)⇒ 同一个标签号下次贴在别的
-// 袋子上 ⇒ 唯一性只约束**在用中**的袋子(部分唯一索引,migrate.go)。
+// 拆袋(同一 SKU 分多袋)是"每袋一个标签号"的衍生物 ⇒ 标签号下线后没有多袋的身份
+// ⇒ 前端不再拆袋;老 APK 若仍拆着提交 ⇒ 后端**合并求和**(见 registerStockBags)。
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -37,11 +35,14 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// 袋子的状态。
+// 结转记录的状态。
 const (
-	// BagStatusActive 在用(标签号被占用)。
+	// BagStatusActive 在用。
 	BagStatusActive = "active"
-	// BagStatusReleased 标签号已释放(袋子已搬上猪肉台,标签可以再贴别处)。
+	// BagStatusReleased 已搬上猪肉台。
+	//
+	// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 不再有"搬上台 ⇒ 释放标签号"这条路径
+	//   ⇒ 新行一律 active;released 只剩历史行(按标签整袋搬时代写的)。
 	BagStatusReleased = "released"
 )
 
@@ -60,24 +61,15 @@ const (
 	BagSourceOpening = "opening"
 )
 
-// StockBagID 袋子的**确定性**代理主键(带标签号的行)。
+// StockCarryOverID **按日结转记录**的确定性代理主键。
 //
-// ⇒ 同一 (门店, 产生日, 标签号) 永远是同一行 ⇒ 重复提交同一天的盘点 = 覆盖,
-// 不会"多出一袋"(多一袋 ⇒ 冷库余额虚高)。
-func StockBagID(branchID string, origin datatypes.Date, label string) string {
-	return surrogateID("SBG", branchID, dateKey(origin), label)
-}
-
-// StockCarryOverID **不装袋的散货结转记录**的确定性代理主键。
+// ⇒ 同一 (门店, 产生日, SKU) 永远是同一行 ⇒
+//   - 重复提交同一天的盘点 = 覆盖同一行(ID 相同 ⇒ upsert);
+//   - 同一天同 SKU 的两行会**撞成一行** ⇒ 所以同一 (归属日, SKU) 只允许一行
+//     (校验见 registerStockBags)。
 //
-// ⚠️ 为什么不能沿用 StockBagID:无 label 的行没有标签号可参与主键
-// ⇒ 同一天同 SKU 的两行会**撞成一行** ⇒ 一行被悄悄覆盖。
-//
-// ⇒ 改用 (门店, 产生日, SKU) 参与哈希 ⇒
-//   - 同一 (归属日, SKU) 只有**一行**无 label;
-//   - 重复提交同一天的盘点 = 覆盖同一行(ID 相同 ⇒ upsert)。
-//
-// (同一天同 SKU 想多袋 ⇒ 前端**分行**并各自带 label ⇒ 各有各的标签号 ⇒ 各有各的行。)
+// ⚠️ 2026-11-02 owner:标签号下线 ⇒ 原本「带标签的袋子」用
+// (门店, 产生日, 标签号) 参与哈希的那套 ID(StockBagID)已删除。
 func StockCarryOverID(branchID string, origin datatypes.Date, cubeProductID string) string {
 	return surrogateID("SCO", branchID, dateKey(origin), cubeProductID)
 }
@@ -99,46 +91,47 @@ type bagPigAllocItem struct {
 	QtyKg string `json:"qty_kg"`
 }
 
-// registerStockBags 盘点时登记**按日结转记录**(袋子 + 不装袋的散货)。
+// registerStockBags 盘点时登记**按日结转记录**(归属日 + SKU + 重量 + 猪归属)。
 //
-// # 2026-10-24 的门店口径
+// # 门店口径(2026-10-24,标签号部分已于 2026-11-02 下线)
 //
-// 「盘点时将剩余的鲜肉商品按 sku 打包过秤然后登记,每个袋子夹上标签,
+// 「盘点时将剩余的鲜肉商品按 sku 打包过秤然后登记」
 //
-//	方便次日搬上猪肉台继续售卖和毛利回归。」
+// 「每袋有自己的产生日,这个产生日就是盘点归属日」
 //
-// 「每袋有自己的产生日,这个产生日就是盘点归属日;
-//
-//	不装袋的 sku+kg 也根据盘点归属日做记录。」
-//
-// ⇒ **每一行**盘点明细都要落一行:
-//   - 带 label ⇒ **一袋**(可整袋搬上台、标签号搬完释放可复用);
-//   - 无 label ⇒ **不装袋的散货结转记录**(只有归属日 + SKU + 重量)。
-//
-// ⇒ 两者都是 **FIFO 队列**的一员:毛利按 FIFO 回归到猪时按产生日先后摊
-// (见 service/pig_fifo.go)。
+// ⇒ **每一行**盘点明细都落一行结转记录 ⇒ 它是 **FIFO 队列**的一员:
+// 毛利按 FIFO 回归到猪时按产生日先后摊(见 service/pig_fifo.go)。
 //
 // # 幂等与"重提交"的清理
 //
 //   - ID 是确定性的 ⇒ 同一天重复提交同一份盘点 = **覆盖**同一批行;
-//   - 同一天重提交时**这次没出现的行要清掉**(同一 SKU 下、且还没搬上台的)
+//   - 同一天重提交时**这次没出现的行要清掉**(同一 SKU 下、且还在冷库的)
 //     ⇒ 否则 FIFO 队列里留着上一版的行 ⇒ 同一批货被摊两次。
 func (s *Service) registerStockBags(ctx context.Context, branchID string, origin time.Time, cuts []model.CutInput) error {
 	originDate := datatypesDate(origin.In(s.bizTZOrUTC()))
 	now := s.now()
 
-	// 同一 (归属日, SKU) 只允许**一行**无 label(前端多袋请分行并各自带标签号)。
-	noLabelSeen := map[string]bool{}
+	// ⚠️ 2026-11-02 owner:标签号下线 ⇒ **拆袋(同 SKU 分多行)在前端一起下线**。
+	//
+	//   但**老 APK** 仍可能拆着提交 ⇒ 这里**按 SKU 合并求和**,不报错、也不静默覆盖:
+	//   - 静默覆盖(ID 按 SKU 定)⇒ "位置表 20kg / 结转记录 5kg" ⇒ FIFO 归摊用错重量;
+	//   - 报错 ⇒ 门店当天**盘不了**(老 APK 没有新口径可用)。
+	//   ⇒ 求和 = 与位置表(counterActualKg)的口径一致 ⇒ 数据自洽。
+	type mergedCut struct {
+		cutType model.CutType
+		sku     string
+		kg      decimal.Decimal
+	}
+	merged := make([]mergedCut, 0, len(cuts))
+	idxOf := map[string]int{}
 	for _, c := range cuts {
-		if strings.TrimSpace(c.Label) != "" {
+		sku := strings.TrimSpace(c.CubeProductID)
+		if at, ok := idxOf[sku]; ok {
+			merged[at].kg = merged[at].kg.Add(c.ActualRemainKg)
 			continue
 		}
-		sku := strings.TrimSpace(c.CubeProductID)
-		if noLabelSeen[sku] {
-			return fmt.Errorf("%w: 归属日 %s 的 SKU %s 只能有一行不装袋的记录(多袋请分行并各自带标签号)",
-				ErrInvalidInput, dateKey(originDate), sku)
-		}
-		noLabelSeen[sku] = true
+		idxOf[sku] = len(merged)
+		merged = append(merged, mergedCut{cutType: c.CutType, sku: sku, kg: c.ActualRemainKg})
 	}
 
 	// 本次提交涉及的行(用于最后清掉"这次没出现的旧行")。
@@ -163,51 +156,19 @@ func (s *Service) registerStockBags(ctx context.Context, branchID string, origin
 	}
 	unitCosts := s.bulkUnitCostMap(ctx, branchID, origin, cutList)
 
-	for _, c := range cuts {
-		label := strings.TrimSpace(c.Label)
-		alloc, err := s.bagPigAlloc(ctx, branchID, c.CutType, c.CubeProductID, origin)
+	for _, mc := range merged {
+		alloc, err := s.bagPigAlloc(ctx, branchID, mc.cutType, mc.sku, origin)
 		if err != nil {
 			return err
 		}
-		unitCost := unitCosts[c.CutType]
-		if label == "" {
-			// ---- 不装袋的散货结转记录 ----
-			bag := model.StockBag{
-				ID:            StockCarryOverID(branchID, originDate, c.CubeProductID),
-				BranchID:      branchID,
-				Label:         "",
-				CubeProductID: c.CubeProductID,
-				CutType:       c.CutType,
-				QtyKg:         c.ActualRemainKg,
-				OriginDate:    originDate,
-				Location:      string(model.StockLocationColdStore),
-				Status:        BagStatusActive,
-				Source:        BagSourceStocktake,
-				PigAlloc:      alloc,
-				UnitCostYuan:  unitCost,
-				CreatedAt:     now,
-				UpdatedAt:     now,
-			}
-			if err := s.upsertStockBag(ctx, nil, bag); err != nil {
-				return err
-			}
-			submittedIDs = append(submittedIDs, bag.ID)
-			submittedSKUs[c.CubeProductID] = true
-			continue
-		}
-
-		// ---- 一袋(带标签号)----
-		bagID := StockBagID(branchID, originDate, label)
-		if err := s.assertLabelUsable(ctx, branchID, label, bagID, c.CubeProductID, originDate); err != nil {
-			return err
-		}
+		unitCost := unitCosts[mc.cutType]
+		// ---- 一行结转记录(归属日 + SKU + 重量 + 归属快照)----
 		bag := model.StockBag{
-			ID:            bagID,
+			ID:            StockCarryOverID(branchID, originDate, mc.sku),
 			BranchID:      branchID,
-			Label:         label,
-			CubeProductID: c.CubeProductID,
-			CutType:       c.CutType,
-			QtyKg:         c.ActualRemainKg,
+			CubeProductID: mc.sku,
+			CutType:       mc.cutType,
+			QtyKg:         mc.kg,
 			OriginDate:    originDate,
 			Location:      string(model.StockLocationColdStore),
 			Status:        BagStatusActive,
@@ -221,11 +182,11 @@ func (s *Service) registerStockBags(ctx context.Context, branchID string, origin
 			return err
 		}
 		submittedIDs = append(submittedIDs, bag.ID)
-		submittedSKUs[c.CubeProductID] = true
+		submittedSKUs[mc.sku] = true
 	}
 
 	// 同一天重提交 ⇒ 把"这次没出现"的旧行清掉(**只限本次涉及的 SKU**,
-	// 且只清 active 的 —— 已搬上台(released)的行保留:那是"搬上台流水")。
+	// 且只清 active 的 —— released 的行是历史"搬上台流水",保留)。
 	return s.dropStaleStockBags(ctx, branchID, originDate, submittedSKUs, submittedIDs)
 }
 
@@ -235,7 +196,8 @@ func (s *Service) registerStockBags(ctx context.Context, branchID string, origin
 // (否则同一批货会被 FIFO 再摊一次)。
 //
 // ⚠️ tx 可空:传 nil 时用 s.db(非事务场景);
-//   改期初那种"多张表一起动"的事务场景要传 tx ⇒ 期初/位置表/队列要么全成要么全滚。
+//
+//	改期初那种"多张表一起动"的事务场景要传 tx ⇒ 期初/位置表/队列要么全成要么全滚。
 func (s *Service) upsertStockBag(ctx context.Context, tx *gorm.DB, bag model.StockBag) error {
 	if tx == nil {
 		tx = s.db
@@ -252,41 +214,12 @@ func (s *Service) upsertStockBag(ctx context.Context, tx *gorm.DB, bag model.Sto
 	return nil
 }
 
-// assertLabelUsable 校验标签号可用(没被别的在用袋子占用)。
-//
-// ⚠️ 为什么在 service 层查:DB 侧那是**部分唯一索引**(`WHERE status='active'`),
-// 是手写 DDL 建的 ⇒ **只在 Postgres 上存在** ⇒ SQLite 单测库里没有
-// ⇒ 行为会不一致 ⇒ service 层查一遍,两个库行为一样。
-func (s *Service) assertLabelUsable(ctx context.Context, branchID, label, bagID, cubeProductID string, originDate datatypes.Date) error {
-	var clashes []model.StockBag
-	err := s.db.WithContext(ctx).
-		Where("branch_id = ? AND label = ? AND status = ?", branchID, label, BagStatusActive).
-		Find(&clashes).Error
-	if err != nil {
-		return fmt.Errorf("query stock_bags(label clash): %w", err)
-	}
-	for _, cl := range clashes {
-		if cl.ID == bagID {
-			// 同一行(同一天同一标签号)⇒ 是覆盖,不是冲突;
-			// 但**不能挂到别的 SKU 上**(主键是 (门店, 产生日, 标签号) ⇒ 会被覆盖)。
-			if cl.CubeProductID != cubeProductID {
-				return fmt.Errorf("%w: 归属日 %s 的标签号 %s 已经挂在 SKU %s 上,不能再挂 %s",
-					ErrInvalidInput, dateKey(originDate), label, cl.CubeProductID, cubeProductID)
-			}
-			continue
-		}
-		return fmt.Errorf("%w: 标签号 %s 已经用在 %s 的袋子上了(搬上台释放后才能复用)",
-			ErrInvalidInput, label, dateKey(cl.OriginDate))
-	}
-	return nil
-}
-
 // dropStaleStockBags 清掉"同一天重提交时这次没出现"的旧行。
 //
-// ⚠️ 作用域严格限定:**本次提交涉及的 SKU** + **active**(没搬上台的)
+// ⚠️ 作用域严格限定:**本次提交涉及的 SKU** + **active**
 //   - **source='stocktake'**(盘点来的)。
 //   - 别的 SKU 的行不动(盘点可能是部分盘点 is_complete=false);
-//   - released(已搬上台)的行不动 —— 那是"搬上台流水",毛利要靠它;
+//   - released 的行不动 —— 那是历史"搬上台流水"(标签号玩法时代写的);
 //   - **大宗手工兜底**(source='bulk_manual')的行不动 ——
 //     那不是"这次盘点没出现的行",而是**另一笔单据**记的冷库货
 //     (删了就等于把还在冷库里的货抹掉)。
@@ -361,28 +294,20 @@ func (s *Service) bagPigAlloc(ctx context.Context, branchID string, cutType mode
 	return datatypes.JSON(raw), nil
 }
 
-// ListStockBags 列某店的袋子(可按位置/标签过滤)。
+// ListStockBags 列某店的**按日结转记录**(可按位置/产生日过滤)。
 //
-// ⚠️ 2026-10-24:这张表现在也装**不装袋的散货结转记录**(label 为空)
-// ⇒ 列表里会出现 label="" 的行:它们**不是袋子**,不能按标签搬上台,
+// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 不再有"按标签过滤"这个维度。
+// (库里 label 列的历史值只作留档,不再作为筛选口径。)
 //
-//	只是"这一天的结转 + 猪归属"的台账行(毛利 FIFO 回归靠它)。
-//
-// ListStockBags 列某店的袋子(可按位置/标签/产生日过滤)。
-//
-// ⚠️ `originDate` 过滤是给前端「载入并编辑」用的:
-// 盘点单的快照是**按 SKU 聚合**的 ⇒ 一个 SKU 拆成多袋时,快照里只有一个 label
-// ⇒ **还原不了多袋结构** ⇒ 前端要按 `origin_date` 把当天的袋子全查出来才能还原。
-func (s *Service) ListStockBags(ctx context.Context, branchID, location, label, originDate string) ([]model.StockBag, error) {
+// ⚠️ `originDate` 过滤是给「按产生日核对结转台账」用的。
+// (毛利 FIFO 归摊、大宗 FIFO 领用都按产生日排队。)
+func (s *Service) ListStockBags(ctx context.Context, branchID, location, originDate string) ([]model.StockBag, error) {
 	if branchID == "" {
 		return nil, fmt.Errorf("%w: branch_id 必填", ErrInvalidInput)
 	}
 	q := s.db.WithContext(ctx).Where("branch_id = ?", branchID)
 	if loc := strings.TrimSpace(location); loc != "" {
 		q = q.Where("location = ?", loc)
-	}
-	if l := strings.TrimSpace(label); l != "" {
-		q = q.Where("label = ?", l)
 	}
 	if d := strings.TrimSpace(originDate); d != "" {
 		day, err := time.ParseInLocation("2006-01-02", d, s.bizTZOrUTC())
@@ -393,206 +318,30 @@ func (s *Service) ListStockBags(ctx context.Context, branchID, location, label, 
 		q = q.Where("origin_date >= ? AND origin_date < ?", start, end)
 	}
 	var rows []model.StockBag
-	if err := q.Order("origin_date ASC, label ASC").Find(&rows).Error; err != nil {
+	if err := q.Order("origin_date ASC, id ASC").Find(&rows).Error; err != nil {
 		return nil, fmt.Errorf("query stock_bags: %w", err)
 	}
 	return rows, nil
 }
 
-// moveBagToCounter 按**标签号**整袋搬上猪肉台。
+// ⚠️ 2026-11-02 owner:随「贴标签」一起下线的是**入库量兜底**
+// (applyProducedFallback / bagOriginKgBySku / movedToCounterKgBySku)。
 //
-// ⇒ 袋子的位置改成猪肉台、**标签号释放**(可复用)、moved_at = 归属日。
+// # 为什么它跟着下线
 //
-// # ⚠️ 这里**不动位置表**
-//
-// 位置差额由 CounterLoad 按「当天搬台集合的新旧差额」统一调整
-// ⇒ 这样"同一归属日重复提交同一份"才是幂等的(余额不会翻倍)。
-//
-// # movedAt = **归属日**(2026-10-24)
-//
-// 搬台有归属日 ⇒ 补录往期的搬台,moved_at 记在**那一天**
-// ⇒ 「当日搬上台了多少」(每日毛利的分摊口径)按归属日归集,不是按提交那天。
-//
-// # 幂等
-//
-// 同一归属日重复提交**同一袋** ⇒ 第二次直接返回(不重复搬)。
-// (换一天再搬同一袋 ⇒ 400:这袋已经在别的日子搬走了。)
-func (s *Service) moveBagToCounter(ctx context.Context, tx *gorm.DB, branchID, label string, movedAt time.Time) (model.StockBag, error) {
-	var bag model.StockBag
-	// ⚠️ 空标签号 = **不装袋的散货结转记录** ⇒ 它不是袋子,搬不了
-	// (否则会把"今天新结转的散货"当成"昨天的一袋"搬上台)。
-	if strings.TrimSpace(label) == "" {
-		return bag, fmt.Errorf("%w: 标签号不能为空(没有标签的结转记录不能整袋搬)", ErrInvalidInput)
-	}
-	err := tx.WithContext(ctx).
-		Where("branch_id = ? AND label = ? AND status = ?", branchID, label, BagStatusActive).
-		First(&bag).Error
-	if err != nil {
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return bag, fmt.Errorf("query stock_bag %s: %w", label, err)
-		}
-		// 没有在用的袋子 ⇒ 可能是"同一归属日已经搬过"(幂等)⇒ 找出来核对。
-		var done model.StockBag
-		qErr := tx.WithContext(ctx).
-			Where("branch_id = ? AND label = ? AND status = ?", branchID, label, BagStatusReleased).
-			Order("origin_date DESC").
-			First(&done).Error
-		if qErr != nil {
-			if errors.Is(qErr, gorm.ErrRecordNotFound) {
-				return bag, fmt.Errorf("%w: 标签号 %s 没有在用的袋子", ErrInvalidInput, label)
-			}
-			return bag, fmt.Errorf("query stock_bag %s: %w", label, qErr)
-		}
-		if done.MovedAt != nil && s.sameBizDay(*done.MovedAt, movedAt) {
-			return done, nil // 同一归属日已搬过 ⇒ 幂等返回
-		}
-		movedKey := ""
-		if done.MovedAt != nil {
-			movedKey = done.MovedAt.In(s.bizTZOrUTC()).Format("2006-01-02")
-		}
-		return bag, fmt.Errorf("%w: 标签号 %s 已经于 %s 搬上猪肉台", ErrInvalidInput, label, movedKey)
-	}
-	now := s.now()
-	if err := tx.WithContext(ctx).Model(&bag).Updates(map[string]any{
-		"location":   string(model.StockLocationCounter),
-		"status":     BagStatusReleased,
-		"moved_at":   movedAt,
-		"updated_at": now,
-	}).Error; err != nil {
-		return bag, fmt.Errorf("update stock_bag %s: %w", label, err)
-	}
-	return bag, nil
-}
-
-// sameBizDay 两个时间点是不是同一个**营业日**(营业日界时区)。
-func (s *Service) sameBizDay(a, b time.Time) bool {
-	loc := s.bizTZOrUTC()
-	la, lb := a.In(loc), b.In(loc)
-	return la.Year() == lb.Year() && la.YearDay() == lb.YearDay()
-}
-
-// bagOriginKgBySku 某天**结转**的重量(按 SKU):当天产生的袋子的重量之和。
-//
-// ⚠️ 这就是门店口径里的"**日终盘点重量**":盘点盘出来的、留在台面/进冷库的那部分。
-//
-// ⚠️ 2026-10-24:**只算带标签号的袋子**(label <> ”)。
-//
-// ⇒ 为什么不装袋的散货结转行不算:这个口径是**移动加权成本引擎**的"入库量兜底"
-// (applyProducedFallback)的输入,而那条兜底路径的**前提就是"门店贴了标签"**
-// (没贴标签就没有袋子 ⇒ 不兜底,避免凭空造入库量)。
-// ⇒ 本轮需求要求"不影响现有的移动加权成本引擎" ⇒ 这里保持原口径不变。
-// (FIFO 归摊用的是**全部**结转行,见 service/pig_fifo.go。)
-func (s *Service) bagOriginKgBySku(ctx context.Context, branchID string, day time.Time) (map[string]decimal.Decimal, error) {
-	startOfDay, endOfDay := s.businessDayBounds(day)
-	type row struct {
-		CubeProductID string
-		QtyKg         decimal.Decimal
-	}
-	var rows []row
-	err := s.db.WithContext(ctx).
-		Model(&model.StockBag{}).
-		Select("cube_product_id AS cube_product_id, qty_kg AS qty_kg").
-		Where("branch_id = ? AND origin_date >= ? AND origin_date < ? AND label <> ''",
-			branchID, startOfDay, endOfDay).
-		Scan(&rows).Error
-	if err != nil {
-		return nil, fmt.Errorf("query bag origin: %w", err)
-	}
-	out := map[string]decimal.Decimal{}
-	for _, r := range rows {
-		out[r.CubeProductID] = out[r.CubeProductID].Add(r.QtyKg)
-	}
-	return out, nil
-}
-
-// applyProducedFallback **入库量兜底**:某个 SKU 当天**没有分割补录**时,
-// 用门店口径倒推它当天分割出了多少:
+// 那条兜底是"门店没补录分割时,用日终盘点重量倒推当天分割了多少":
 //
 //	当日分割量 = 销售重量 + 日终盘点重量 − 搬上台重量
 //
-// # 为什么是这个式子
+// 而它的两个输入**都来自"贴标签"这套机制**:
+//   - 「日终盘点重量」只认**带标签号的袋子**(label <> '');
+//   - 「搬上台重量」只认**按标签整袋搬**时写下的 moved_at。
 //
-//   - 「销售 + 日终盘点」= 当日**台面**的总流量(卖掉的 + 剩着的)
-//   - 减掉「搬上台」:搬上台的是**前几天就分割出来、成本早就摊过**的老货
-//     ⇒ 不减 ⇒ 同一批成本会被摊两次。
+// ⇒ 标签号下线 ⇒ 两个输入同时消失 ⇒ 这条兜底**恒不生效**
+// (生产实测:除契约测试门店外,没有任何一袋带标签 ⇒ 从未生效过)。
 //
-// ⚠️ 「日终盘点重量」与「搬上台重量」都来自**袋子表**(标签号):
-// 结转 = 今天产生的袋子的重量;搬上台 = 今天被搬上台的袋子的重量。
+// ⇒ 把它**改成"算全部结转行"**看着像修 bug,实际是**启用一条从未跑过的路径**
+//   ⇒ 会让"门店没补录分割"那几天的成本口径突变 ⇒ 不能这么干。
 //
-// # 为什么只在"没有补录"时兜底
-//
-// 有分割补录(pig_cuts)时,**按补录的 kg 逐猪摊**更精确(能落到具体猪)
-// ⇒ 不用兜底。兜底只在"门店没补录"时救场(否则那天成本就摊不出去)。
-func (s *Service) applyProducedFallback(
-	ctx context.Context, branchID string, bizDate time.Time,
-	producedKg map[string]decimal.Decimal,
-	producedByPigKg map[string]map[string]decimal.Decimal,
-	pigs []model.WholePig,
-	soldKg map[string]decimal.Decimal,
-) error {
-	stocktakeKg, err := s.bagOriginKgBySku(ctx, branchID, bizDate)
-	if err != nil {
-		return err
-	}
-	if len(stocktakeKg) == 0 {
-		return nil // 门店没贴标签 ⇒ 没有袋子 ⇒ 不兜底(避免凭空造入库量)
-	}
-	movedKg, err := s.movedToCounterKgBySku(ctx, branchID, bizDate)
-	if err != nil {
-		return err
-	}
-	totalW := decimal.Zero
-	for _, p := range pigs {
-		totalW = totalW.Add(p.GrossWeightKg)
-	}
-	if !totalW.IsPositive() {
-		return nil // 当日没猪 ⇒ 没有成本可摊
-	}
-	for sku, kg := range stocktakeKg {
-		if producedKg[sku].IsPositive() {
-			continue // 有分割补录 ⇒ 用补录的(更精确)
-		}
-		qty := soldKg[sku].Add(kg).Sub(movedKg[sku])
-		if !qty.IsPositive() {
-			continue
-		}
-		producedKg[sku] = qty
-		// 按当日各猪的**毛重比例**分摊(没有分割记录 ⇒ 只能到猪这一层)
-		for _, p := range pigs {
-			if producedByPigKg[p.ID] == nil {
-				producedByPigKg[p.ID] = map[string]decimal.Decimal{}
-			}
-			share := p.GrossWeightKg.Div(totalW)
-			producedByPigKg[p.ID][sku] = producedByPigKg[p.ID][sku].Add(qty.Mul(share))
-		}
-	}
-	return nil
-}
-
-// movedToCounterKgBySku 当日**搬上台**的重量(按 SKU),用于每日毛利的分摊口径。
-//
-// ⚠️ 为什么需要它:搬上台的是**老货**(前几天分割的、成本早就摊过)
-// ⇒ 当日分摊猪成本时必须**减掉**它,否则同一批成本会被摊两次。
-//
-// ⇒ 数据来源 = 袋子表(标签号搬上台时记了 moved_at)。
-func (s *Service) movedToCounterKgBySku(ctx context.Context, branchID string, day time.Time) (map[string]decimal.Decimal, error) {
-	startOfDay, endOfDay := s.businessDayBounds(day)
-	type row struct {
-		CubeProductID string
-		QtyKg         decimal.Decimal
-	}
-	var rows []row
-	err := s.db.WithContext(ctx).
-		Model(&model.StockBag{}).
-		Select("cube_product_id AS cube_product_id, qty_kg AS qty_kg").
-		Where("branch_id = ? AND moved_at >= ? AND moved_at < ?", branchID, startOfDay, endOfDay).
-		Scan(&rows).Error
-	if err != nil {
-		return nil, fmt.Errorf("query moved bags: %w", err)
-	}
-	out := map[string]decimal.Decimal{}
-	for _, r := range rows {
-		out[r.CubeProductID] = out[r.CubeProductID].Add(r.QtyKg)
-	}
-	return out, nil
-}
+// ⇒ 所以按 owner 的口径**整条删掉**:它不是"规则",是"贴标签"的附属品。
+// (FIFO 归摊用的是**全部**结转行,不受影响 —— 见 service/pig_fifo.go。)

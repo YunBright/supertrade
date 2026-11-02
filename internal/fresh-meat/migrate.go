@@ -267,6 +267,13 @@ ORDER BY array_position(i.indkey, a.attnum)`, bulkProductionIndex).Scan(&cols).E
 // 语义:「**在用中**的袋子,标签号在门店内唯一」。
 // ⇒ 袋子搬上猪肉台后标签号释放 ⇒ 同一个标签号可以贴在别的袋子上。
 //
+// ⚠️ 2026-11-02 owner:**标签号玩法整套下线** ⇒ 再也没有新的带标签的行。
+//
+// ⇒ 这个索引**永远匹配不到新数据** ⇒ 保留它只是为了不动历史 schema
+// (生产库里还有 6 行历史带标签的数据 + 索引)。
+//
+// ⇒ **代码不再读也不再写** stock_bags.label(见 service/stock_bags.go)。
+//
 // ⚠️ GORM 的 `uniqueIndex` tag **表达不了** `WHERE` ⇒ 必须手写 DDL。
 //
 // 调用顺序:**必须在 AutoMigrate 之后** ——

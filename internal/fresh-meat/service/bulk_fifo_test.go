@@ -65,11 +65,11 @@ func fmBulkBagSetup(t *testing.T) (*service.Service, context.Context, string, st
 	}, "u-1"); err != nil {
 		t.Fatalf("RecordPigCut: %v", err)
 	}
-	// 日终盘点:板油实盘 10kg,贴标签 BAG-FAT-1 ⇒ 登记成一袋(进冷库)。
+	// 日终盘点:板油实盘 10kg ⇒ 登记成一行结转记录(进冷库)。
 	if _, err := svc.RecordPorkCutsStocktake(ctx, "S001", model.RecordPorkCutsStocktakeInput{
 		IsComplete: true,
 		Cuts: []model.CutInput{
-			{CutType: model.CutFat, CubeProductID: sku, ActualRemainKg: d("10"), Label: "BAG-FAT-1"},
+			{CutType: model.CutFat, CubeProductID: sku, ActualRemainKg: d("10")},
 		},
 	}, "u-1"); err != nil {
 		t.Fatalf("RecordPorkCutsStocktake: %v", err)
@@ -81,18 +81,18 @@ func fmBulkBagSetup(t *testing.T) (*service.Service, context.Context, string, st
 func TestBulkFifo_SettlementConsumesBag(t *testing.T) {
 	svc, ctx, _, pigID, date := fmBulkBagSetup(t)
 
-	// 盘点后:一袋 10kg,还没被消耗。
-	bags, err := svc.ListStockBags(ctx, "S001", "", "BAG-FAT-1", "")
+	// 盘点后:一行结转记录 10kg,还没被消耗。
+	bags, err := svc.ListStockBags(ctx, "S001", "", date)
 	mustNoErr(t, err, "ListStockBags")
 	if len(bags) != 1 {
-		t.Fatalf("应登记 1 袋, got %d: %+v", len(bags), bags)
+		t.Fatalf("应登记 1 行结转记录, got %d: %+v", len(bags), bags)
 	}
 	bag := bags[0]
 	if !bag.ConsumedKg.IsZero() {
-		t.Fatalf("新登记的袋子不该有消耗量, got %s", bag.ConsumedKg)
+		t.Fatalf("新登记的结转行不该有消耗量, got %s", bag.ConsumedKg)
 	}
 	if bag.Source != "stocktake" {
-		t.Errorf("袋子来源应是 stocktake, got %q", bag.Source)
+		t.Errorf("结转行来源应是 stocktake, got %q", bag.Source)
 	}
 
 	// 结存:可领用 10kg、冷库 10kg(同一本账 ⇒ 差额 0)。
@@ -126,10 +126,10 @@ func TestBulkFifo_SettlementConsumesBag(t *testing.T) {
 	}
 
 	// ★ 袋子被扣了 6kg —— 结算的「领用」落在**袋子**上。
-	after, err := svc.ListStockBags(ctx, "S001", "", "BAG-FAT-1", "")
+	after, err := svc.ListStockBags(ctx, "S001", "", date)
 	mustNoErr(t, err, "ListStockBags(after)")
 	if len(after) != 1 {
-		t.Fatalf("应有 1 袋, got %d", len(after))
+		t.Fatalf("应有 1 行结转记录, got %d", len(after))
 	}
 	if !after[0].ConsumedKg.Equal(d("6")) {
 		t.Errorf("袋子的已消耗量应 = 6kg, got %s", after[0].ConsumedKg)

@@ -22,9 +22,9 @@ package service_test
 //	每天 10-01 .. 10-07：
 //	  ① 进猪 200kg @ 20 元/kg（成本侧）
 //	  ② 分割补录：五花 50kg、板油 10kg（成本侧 + 归属快照）
-//	  ③ 搬台：把**前一天的袋子整袋搬上猪肉台**（门店口径：整袋搬）
+//	  ③ 搬台：把**前一天的结转货**搬上猪肉台（按 SKU + kg）
 //	  ④ 零售：卖五花 10kg（POS 事件 ⇒ 毛利按 FIFO 归摊到猪）
-//	  ⑤ 日终盘点：五花剩 10kg（贴标签）+ 板油 10kg（不装袋）⇒ 夜里进冷库
+//	  ⑤ 日终盘点：五花剩 10kg + 板油 10kg ⇒ 夜里进冷库
 //	10-07：统收结算把攒着的板油结掉 30kg（6 元/kg）
 //
 // ⚠️ 2026-11-01 owner：审计结转端点(`/stock/audit`)与预期毛利端点(`/stock/presale`)已下线
@@ -86,7 +86,7 @@ func simSetup(t *testing.T) (*service.Service, context.Context) {
 
 // simRunDay 跑完第 n 天（进猪 → 分割 → 搬台 → 零售 → 日终盘点）。
 //
-// ⚠️ 每天的**盘点实盘** = 柜台上的货：五花 10kg（贴标签）+ 板油 10kg（不装袋）。
+// ⚠️ 每天的**盘点实盘** = 柜台上的货：五花 10kg + 板油 10kg。
 func simRunDay(t *testing.T, svc *service.Service, ctx context.Context, n int) {
 	t.Helper()
 	svc.SetClock(fmClock(simDay(n)))
@@ -118,15 +118,17 @@ func simRunDay(t *testing.T, svc *service.Service, ctx context.Context, n int) {
 		mustNoErr(t, err, "RecordPigCut")
 	}
 
-	// ③ 搬台：把**前一天的袋子**整袋搬上猪肉台（D1 没有袋子 ⇒ 不搬）。
+	// ③ 搬台：把**前一天结转的五花**搬上猪肉台（D1 还没货 ⇒ 不搬）。
+	//
+	// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 只剩「按 SKU + kg」一种搬法。
 	if n > 0 {
 		_, err := svc.CounterLoad(ctx, simBranch, service.CounterLoadInput{
 			TakenDate: day,
 			Lines: []service.CounterLoadLine{
-				{Label: fmt.Sprintf("BAG-BELLY-%s", simKey(n-1))},
+				{CubeProductID: simBellySKU, QtyKg: d("10")},
 			},
 		}, "u-1")
-		mustNoErr(t, err, "CounterLoad(整袋搬)")
+		mustNoErr(t, err, "CounterLoad(按 SKU 搬)")
 	}
 
 	// ④ 零售：卖五花 10kg @ 30 元（D1 不卖：柜台上还没有货）。
@@ -147,13 +149,12 @@ func simRunDay(t *testing.T, svc *service.Service, ctx context.Context, n int) {
 		mustNoErr(t, err, "OnSaleCompleted")
 	}
 
-	// ⑤ 日终盘点：五花 10kg（贴标签）+ 板油 10kg（不装袋）⇒ 夜里进冷库。
+	// ⑤ 日终盘点：五花 10kg + 板油 10kg ⇒ 夜里进冷库。
 	_, err = svc.RecordPorkCutsStocktake(ctx, simBranch, model.RecordPorkCutsStocktakeInput{
 		IsComplete: true,
 		TakenDate:  day,
 		Cuts: []model.CutInput{
-			{CutType: model.CutBelly, CubeProductID: simBellySKU, ActualRemainKg: d("10"),
-				Label: fmt.Sprintf("BAG-BELLY-%s", day)},
+			{CutType: model.CutBelly, CubeProductID: simBellySKU, ActualRemainKg: d("10")},
 			{CutType: model.CutFat, CubeProductID: simFatSKU, ActualRemainKg: d("10")},
 		},
 	}, "u-1")

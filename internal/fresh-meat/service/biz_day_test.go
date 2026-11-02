@@ -16,7 +16,7 @@ package service_test
 //	① 前一营业日未盘点 ⇒ 录猪被拒(并说清要补哪天);
 //	② 同一归属日重复盘点 ⇒ 只有一张单(且营业日状态 = 已盘点);
 //	③ 补录往日的盘点 ⇒ 那天的结余/成本快照**重算**,今天的不被写脏;
-//	④ 两种搬台方式(整袋搬 / 按 SKU+kg 搬)**都留流水**;
+//	④ 搬台**留流水**(按 SKU+kg 搬也要留 ⇒ 休市判定才有依据);
 //	⑤ 搬台支持**归属日**(补录往期的搬台);
 //	⑥ 盘点**实盘只报柜台**,冷库余额**另列**。
 
@@ -424,31 +424,32 @@ func TestBizDay_BackfillRecomputesThatDayOnly(t *testing.T) {
 	}
 }
 
-// ---- ④ 两种搬台方式都留流水 ----
+// ---- ④ 搬台留流水(一行一个动作) ----
 
-// TestBizDay_CounterLoadLeavesLedgerForBothModes 锁 ④。
+// TestBizDay_CounterLoadLeavesLedger 锁 ④。
 //
-// 「按标签整袋搬」与「按 SKU + kg 搬」**都要留流水**
+// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 只剩「按 SKU + kg」一种搬法,
+//   但**一行一个动作**不变 ⇒ 同一 SKU 当天可以有多条流水
+//   (门店"早上一袋,卖完了中午再加一袋")。
 // ⇒ 否则休市判定与按日结余都会误判(之前按 SKU+kg 搬完全不留痕)。
-func TestBizDay_CounterLoadLeavesLedgerForBothModes(t *testing.T) {
+func TestBizDay_CounterLoadLeavesLedger(t *testing.T) {
 	svc, ctx, sku := fmBizSetup(t)
 
-	// 10-01:盘点两行 —— 一袋带标签号(20kg)+ 一行不装袋的散货(10kg)⇒ 冷库 30kg。
+	// 10-01:盘点一行 20kg ⇒ 冷库 20kg。
 	_, err := svc.RecordPorkCutsStocktake(ctx, "S001", model.RecordPorkCutsStocktakeInput{
 		IsComplete: true,
 		Cuts: []model.CutInput{
-			{CutType: model.CutBelly, CubeProductID: sku, ActualRemainKg: d("20"), Label: "BAG-9"},
-			{CutType: model.CutBelly, CubeProductID: sku, ActualRemainKg: d("10")},
+			{CutType: model.CutBelly, CubeProductID: sku, ActualRemainKg: d("20")},
 		},
 	}, "u-1")
 	mustNoErr(t, err, "10-01 盘点")
 
-	// 10-02:两种搬法各来一次(整袋搬 20kg + 按 SKU+kg 搬 2kg)。
+	// 10-02:同一 SKU 搬两次(早上一袋、中午加一袋)。
 	svc.SetClock(fmClock(fmDay2))
 	_, err = svc.CounterLoad(ctx, "S001", service.CounterLoadInput{
 		Lines: []service.CounterLoadLine{
-			{Label: "BAG-9"},
 			{CubeProductID: sku, QtyKg: d("2")},
+			{CubeProductID: sku, QtyKg: d("18")},
 		},
 	}, "u-1")
 	mustNoErr(t, err, "10-02 搬台")
@@ -456,31 +457,21 @@ func TestBizDay_CounterLoadLeavesLedgerForBothModes(t *testing.T) {
 	view, err := svc.ListCounterLoads(ctx, "S001", fmDay2)
 	mustNoErr(t, err, "ListCounterLoads")
 	if len(view.Lines) != 2 {
-		t.Fatalf("两种搬法应留 2 条流水,got %d: %+v", len(view.Lines), view.Lines)
+		t.Fatalf("搬台应留 2 条流水,got %d: %+v", len(view.Lines), view.Lines)
 	}
-	bySource := map[string]service.CounterLoadLineView{}
 	for _, l := range view.Lines {
-		bySource[l.Source] = l
+		if l.Source != service.CounterLoadSourceSKU {
+			t.Errorf("搬台流水 source 应是 sku,got %q", l.Source)
+		}
+		if l.BizDate != "2026-10-02" {
+			t.Errorf("流水归属日应是 2026-10-02,got %s", l.BizDate)
+		}
+		if l.CubeProductID != sku {
+			t.Errorf("流水货号应是 %s,got %s", sku, l.CubeProductID)
+		}
 	}
-	bag, ok := bySource[service.CounterLoadSourceBag]
-	if !ok {
-		t.Fatalf("应有整袋搬(source=bag)的流水: %+v", view.Lines)
-	}
-	if bag.Label != "BAG-9" || !bag.QtyKg.Equal(d("20")) {
-		t.Errorf("整袋搬流水不对: %+v", bag)
-	}
-	if bag.BizDate != "2026-10-02" {
-		t.Errorf("流水归属日应是 2026-10-02,got %s", bag.BizDate)
-	}
-	skuLine, ok := bySource[service.CounterLoadSourceSKU]
-	if !ok {
-		t.Fatalf("应有按 SKU+kg 搬(source=sku)的流水: %+v", view.Lines)
-	}
-	if !skuLine.QtyKg.Equal(d("2")) || skuLine.CubeProductID != sku {
-		t.Errorf("按 SKU 搬的流水不对: %+v", skuLine)
-	}
-	if !view.TotalKg.Equal(d("22")) {
-		t.Errorf("当天搬台总量应是 22kg,got %s", view.TotalKg)
+	if !view.TotalKg.Equal(d("20")) {
+		t.Errorf("当天搬台总量应是 20kg,got %s", view.TotalKg)
 	}
 	if !view.HasCounterLoad {
 		t.Errorf("当天应标记 has_counter_load=true")

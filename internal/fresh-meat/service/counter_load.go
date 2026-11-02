@@ -7,16 +7,17 @@ package service
 // 「位置表只记余额、不留痕」⇒ 「当天搬上台了多少」查不到
 // ⇒ 而三件事都要它:
 //   ① **休市判定**:「当天既没有卖猪、也没有搬冷库商品上猪肉台」⇒ 鲜肉休市。
-//      之前只有"按标签整袋搬"留痕(moved_at),"按 SKU+kg 搬"**完全不留痕**
-//      ⇒ 搬了台的休市日会被误判成休市。
+//      (历史:建这张表时只有"按标签整袋搬"留痕,"按 SKU+kg 搬"完全不留痕
+//       ⇒ 搬了台的休市日会被误判成休市。标签号玩法已于 2026-11-02 下线。)
 //   ② **按营业日推导的冷库余额**:「冷库余额 = 上期冷库 + 本期结转 − 本期搬上台
 //      − 本期大宗结算出库」⇒ 本期搬上台必须有流水。
 //   ③ **每日毛利的分摊重量**:搬上台的是**老货**,不能再摊一次猪成本。
 //
-// # 两种搬法都记
+// # 只有一种搬法(2026-11-02 owner:标签号玩法下线)
 //
-//	source = bag  按 **label** 整袋搬(门店主路径):SKU 与重量取自袋子。
 //	source = sku  按 **SKU + kg** 搬。
+//
+//	(历史行里还可能有 source = bag ——「按标签整袋搬」,那套玩法已下线。)
 //
 // # 归属日
 //
@@ -37,9 +38,10 @@ import (
 
 // 搬台流水的来源。
 const (
-	// CounterLoadSourceBag 按标签整袋搬。
-	CounterLoadSourceBag = "bag"
 	// CounterLoadSourceSKU 按 SKU + kg 搬。
+	//
+	// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 「按标签整袋搬」(source=bag)不再产生
+	//   ⇒ 新行恒为 sku;历史行仍可能是 bag(只读展示)。
 	CounterLoadSourceSKU = "sku"
 )
 
@@ -53,7 +55,6 @@ type counterLoadLine struct {
 	kg  decimal.Decimal
 	// prevKg 是**覆盖前**那一行的重量(算位置差额用)。
 	prevKg decimal.Decimal
-	label  string
 	// cut 是这一行的**部位**(库存/结余按部位记)。
 	cut model.CutType
 }
@@ -91,9 +92,6 @@ func (s *Service) upsertCounterLoadLine(ctx context.Context, tx *gorm.DB, branch
 		rowID = CounterLoadID(branchID, dateKey(date), seq)
 	}
 	source := CounterLoadSourceSKU
-	if nl.label != "" {
-		source = CounterLoadSourceBag
-	}
 	rec := model.CounterLoadRecord{
 		ID:            rowID,
 		BranchID:      branchID,
@@ -102,7 +100,6 @@ func (s *Service) upsertCounterLoadLine(ctx context.Context, tx *gorm.DB, branch
 		CubeProductID: nl.sku,
 		CutType:       nl.cut,
 		QtyKg:         nl.kg,
-		Label:         nl.label,
 		Source:        source,
 		OperatorID:    operatorID,
 		CreatedAt:     s.now(),
@@ -114,7 +111,6 @@ func (s *Service) upsertCounterLoadLine(ctx context.Context, tx *gorm.DB, branch
 			"cube_product_id": rec.CubeProductID,
 			"cut_type":        rec.CutType,
 			"qty_kg":          rec.QtyKg,
-			"label":           rec.Label,
 			"source":          rec.Source,
 			"operator_id":     rec.OperatorID,
 			"updated_at":      rec.UpdatedAt,
@@ -123,32 +119,6 @@ func (s *Service) upsertCounterLoadLine(ctx context.Context, tx *gorm.DB, branch
 		return fmt.Errorf("upsert counter_load %s: %w", rec.ID, err)
 	}
 	return nil
-}
-
-// findBagForCounterLoad 按标签号找要搬的那一袋(事务外只读)。
-//
-// ⚠️ 同一归属日**已经搬过**的那袋也算找到(幂等:重复提交不重复搬)。
-func (s *Service) findBagForCounterLoad(ctx context.Context, branchID, label string, bizDate time.Time) (model.StockBag, error) {
-	var bag model.StockBag
-	err := s.db.WithContext(ctx).
-		Where("branch_id = ? AND label = ? AND status = ?", branchID, label, BagStatusActive).
-		Order("origin_date DESC").
-		First(&bag).Error
-	if err == nil {
-		return bag, nil
-	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return bag, fmt.Errorf("query stock_bag %s: %w", label, err)
-	}
-	var done model.StockBag
-	qErr := s.db.WithContext(ctx).
-		Where("branch_id = ? AND label = ? AND status = ?", branchID, label, BagStatusReleased).
-		Order("origin_date DESC").
-		First(&done).Error
-	if qErr == nil && done.MovedAt != nil && s.sameBizDay(*done.MovedAt, bizDate) {
-		return done, nil // 同一归属日已搬过 ⇒ 幂等
-	}
-	return bag, fmt.Errorf("%w: 标签号 %s 没有在用的袋子", ErrInvalidInput, label)
 }
 
 // UpdateCounterLoad 改一行的搬台重量(PUT /stock/counter-load/:id)。
@@ -264,8 +234,9 @@ func (s *Service) DeleteCounterLoad(ctx context.Context, branchID, id string) (*
 // ⇒ 「按营业日推导的冷库余额」要用它。
 //
 // ⚠️ 日期用**区间**而不是等值:gorm.io/datatypes 的 Date 落库是"带时区的零点",
-//   PG 里 `date = timestamp` 会按会话时区折算 ⇒ 等值不可靠;区间两边各留一天
-//   的余量,两个时区下都只命中那一天。
+//
+//	PG 里 `date = timestamp` 会按会话时区折算 ⇒ 等值不可靠;区间两边各留一天
+//	的余量,两个时区下都只命中那一天。
 func (s *Service) counterLoadKgByDay(ctx context.Context, tx *gorm.DB, branchID string, bizDate time.Time) (
 	map[string]decimal.Decimal, error) {
 	if tx == nil {
@@ -315,8 +286,7 @@ type CounterLoadLineView struct {
 	Seq           int             `json:"seq"`
 	CubeProductID string          `json:"cube_product_id"`
 	QtyKg         decimal.Decimal `json:"qty_kg"`
-	Label         string          `json:"label,omitempty"`
-	// Source:bag(整袋搬)| sku(按 SKU+kg 搬)。
+	// Source:sku(按 SKU+kg 搬)。历史行里还可能有 bag(按标签整袋搬,已下线)。
 	Source     string    `json:"source"`
 	OperatorID string    `json:"operator_id"`
 	CreatedAt  time.Time `json:"created_at"`
@@ -406,7 +376,6 @@ func (s *Service) ListCounterLoads(ctx context.Context, branchID string, day tim
 			Seq:           r.Seq,
 			CubeProductID: r.CubeProductID,
 			QtyKg:         r.QtyKg,
-			Label:         r.Label,
 			Source:        r.Source,
 			OperatorID:    r.OperatorID,
 			CreatedAt:     r.CreatedAt,

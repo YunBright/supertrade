@@ -307,21 +307,21 @@ func TestStocktake_RestDayWhenNoPigAndNoMove(t *testing.T) {
 func TestStocktake_RestDayFalseWhenMovedToCounter(t *testing.T) {
 	svc, ctx, sku := fmFifoSetup(t)
 
-	// 10-01:盘一袋(带标签号)⇒ 袋子进冷库。
+	// 10-01:盘 12kg ⇒ 结转记录进冷库。
 	_, err := svc.RecordPorkCutsStocktake(ctx, "S001", model.RecordPorkCutsStocktakeInput{
 		IsComplete: true,
 		Cuts: []model.CutInput{
-			{CutType: model.CutBelly, CubeProductID: sku, ActualRemainKg: d("12"), Label: "BAG-R1"},
+			{CutType: model.CutBelly, CubeProductID: sku, ActualRemainKg: d("12")},
 		},
 	}, "u-1")
 	mustNoErr(t, err, "10-01 盘点")
 
-	// 10-02:按标签整袋搬上猪肉台(⇒ 当天有"搬冷库商品上猪肉台")。
+	// 10-02:按 SKU + kg 搬上猪肉台(⇒ 当天有"搬冷库商品上猪肉台")。
 	svc.SetClock(fmClock(fmDay2))
 	if _, err := svc.CounterLoad(ctx, "S001", service.CounterLoadInput{
-		Lines: []service.CounterLoadLine{{Label: "BAG-R1"}},
+		Lines: []service.CounterLoadLine{{CubeProductID: sku, QtyKg: d("12")}},
 	}, "u-1"); err != nil {
-		t.Fatalf("CounterLoad(按标签): %v", err)
+		t.Fatalf("CounterLoad(按 SKU 搬): %v", err)
 	}
 
 	// 10-02 的盘点:没有进猪,但**搬了台** ⇒ 不是休市。
@@ -338,14 +338,14 @@ func TestStocktake_RestDayFalseWhenMovedToCounter(t *testing.T) {
 	}
 }
 
-// TestStocktake_CarryOverRowWithoutLabel 锁 ④:不装袋的 SKU **也有按归属日的结转记录**。
+// TestStocktake_CarryOverRow 锁 ④:盘点的**每一行**都有按归属日的结转记录。
 //
 // ⇒ 「不装袋的 sku+kg 也根据盘点归属日做记录」
-// ⇒ 盘点时**每一行**都要有一行记录(带 label = 一袋;无 label = 散货结转)。
-func TestStocktake_CarryOverRowWithoutLabel(t *testing.T) {
+// ⇒ 盘点时**每一行**都要有一行记录(FIFO 归摊 + 猪归属都靠它)。
+func TestStocktake_CarryOverRow(t *testing.T) {
 	svc, ctx, sku := fmFifoSetup(t)
 
-	// ① 不装袋的行 ⇒ 一条 label 为空的结转记录。
+	// ① 盘点一行 ⇒ 一条结转记录。
 	_, err := svc.RecordPorkCutsStocktake(ctx, "S001", model.RecordPorkCutsStocktakeInput{
 		IsComplete: true,
 		Cuts: []model.CutInput{
@@ -356,12 +356,9 @@ func TestStocktake_CarryOverRowWithoutLabel(t *testing.T) {
 
 	bags := fmBags(t)
 	if len(bags) != 1 {
-		t.Fatalf("不装袋的行也要有结转记录, got %d 行: %+v", len(bags), bags)
+		t.Fatalf("盘点行也要有结转记录, got %d 行: %+v", len(bags), bags)
 	}
 	bg := bags[0]
-	if bg.Label != "" {
-		t.Errorf("不装袋的结转行 label 应为空, got %q", bg.Label)
-	}
 	if bg.CubeProductID != sku {
 		t.Errorf("sku = %q, want %q", bg.CubeProductID, sku)
 	}

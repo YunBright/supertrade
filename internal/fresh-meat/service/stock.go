@@ -72,9 +72,8 @@ func BulkPositionKey(productCode string) string { return BulkPositionKeyPrefix +
 
 // CounterLoadLine 搬上猪肉台的一行。
 //
-// ⚠️ 2026-10-24:可以按 **标签号**整袋搬(门店口径:「每个袋子夹上标签,
-// 方便次日搬上猪肉台继续售卖」)⇒ 填了 label 就**按袋子搬**:
-// SKU 与重量都取自袋子,不用再填。
+// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ **只有「按 SKU + kg」一种搬法**
+// (不再支持「按标签号整袋搬」)。
 type CounterLoadLine struct {
 	// ID 是这一行的**行号**(可选)。
 	//
@@ -83,7 +82,14 @@ type CounterLoadLine struct {
 	ID            string          `json:"id,omitempty"`
 	CubeProductID string          `json:"cube_product_id"`
 	QtyKg         decimal.Decimal `json:"qty_kg"`
-	// Label 是要搬的那一袋的标签号(可选)。
+	// Label 是**老客户端探测器**(2026-11-02 owner:标签号玩法下线)。
+	//
+	// ⚠️ **不实现任何标签语义** —— 只是为了认出「还在发 label 的老 APK」并当场报错:
+	// 老包发的是 `{"label":"BAG-001"}`(没有货号、没有重量)
+	// ⇒ 若静默忽略,这一行会被当成「0 kg = 今天不搬台」的标记 ⇒ **搬台被悄悄吞掉**。
+	// ⇒ 认出它 ⇒ 明确告诉门店「这套玩法没了,请升级 App」。
+	//
+	// ⚠️ 新客户端**不要**下发这个字段。
 	Label string `json:"label,omitempty"`
 }
 
@@ -101,8 +107,6 @@ type CounterLoadInput struct {
 }
 
 // CounterLoadUpdateInput PUT /stock/counter-load/:id 入参(改一行的重量)。
-//
-// ⚠️ **标签号不可改**:标签号绑着**那一袋实物**(搬上台后标签就释放了)。
 type CounterLoadUpdateInput struct {
 	QtyKg decimal.Decimal `json:"qty_kg" binding:"required"`
 }
@@ -129,19 +133,19 @@ type StockSnapshot struct {
 
 // isCounterLoadMarkerOnly 判断这次搬台提交是不是**纯标记**（"今天不搬台"）。
 //
-// ⚠️ 纯标记 = **每一行都是 0 kg**、且没有标签号（没搬任何货）。
+// ⚠️ 纯标记 = **每一行都是 0 kg**(没搬任何货)。
 //
 //	⇒ 数值上等于"没搬"⇒ 不动货、不改余额链
 //	⇒ 所以它**不需要**"前一个营业日已盘点"这条前置条件
 //	（那条校验是为真搬台服务的:搬货要拿昨天的日终当基线）。
 //
-//	⚠️ 只要有一行 > 0 或带 label ⇒ 就是真搬台 ⇒ 校验照走。
+//	⚠️ 只要有一行 > 0 ⇒ 就是真搬台 ⇒ 校验照走。
 func isCounterLoadMarkerOnly(lines []CounterLoadLine) bool {
 	if len(lines) == 0 {
 		return false
 	}
 	for _, ln := range lines {
-		if !ln.QtyKg.IsZero() || strings.TrimSpace(ln.Label) != "" {
+		if !ln.QtyKg.IsZero() {
 			return false
 		}
 	}
@@ -156,7 +160,7 @@ func isCounterLoadMarkerOnly(lines []CounterLoadLine) bool {
 //
 // # 一行一个动作(2026-10-24 门店口径)
 //
-// 「一个 sku 在当天搬台里可以有多条记录,多个标签袋,早上一袋,卖完了,中午加一袋,
+// 「一个 sku 在当天搬台里可以有多条记录,早上一袋,卖完了,中午加一袋,
 //
 //	可以随时修改,甚至过一天修改。」
 //
@@ -171,8 +175,8 @@ func isCounterLoadMarkerOnly(lines []CounterLoadLine) bool {
 //
 //	⇒ 见 service/gross_margin.go 的 MarginAlert。
 //
-// ⚠️ 2026-10-24:**两种搬法都留流水**(counter_loads 表):
-// 按标签整袋搬 / 按 SKU+kg 搬 ⇒ 都有 (归属日, SKU, 重量, 操作人)。
+// ⚠️ 搬台**只有「按 SKU + kg」一种搬法**(2026-11-02 owner:标签号玩法下线)
+// ⇒ 但两种搬法都要留流水(counter_loads 表):(归属日, SKU, 重量, 操作人)
 // ⇒ 休市判定与"按营业日推导的冷库余额"才有依据。
 func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLoadInput, operatorID string) (*StockSnapshot, error) {
 	if branchID == "" {
@@ -180,6 +184,21 @@ func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLo
 	}
 	if len(in.Lines) == 0 {
 		return nil, fmt.Errorf("%w: lines 不能为空", ErrInvalidInput)
+	}
+	// ⚠️ 老客户端探测器:还在发 label ⇒ 那是「按标签整袋搬」的老玩法
+	//   (2026-11-02 已下线)⇒ 当场报错,**别静默忽略**。
+	//
+	//   为什么必须报错而不是忽略:老包发的是 `{"label":"BAG-001"}`
+	//   (没有货号、没有重量)⇒ 静默忽略的话,这一行会被当成
+	//   「0 kg = 今天不搬台」的标记 ⇒ **门店以为搬了台,其实啥也没搬**。
+	//
+	//   ⇒ 这个检查放在**最前面**:老客户端的问题是"版本太旧",
+	//     比"昨天没盘点"更该先说。
+	for i, ln := range in.Lines {
+		if strings.TrimSpace(ln.Label) != "" {
+			return nil, fmt.Errorf("%w: lines[%d].label —— 搬台的「标签 / 整袋搬」玩法已于 2026-11-02 下线,"+
+				"请升级 App 后按 SKU + 重量搬台", ErrInvalidInput, i)
+		}
 	}
 	now := s.now()
 	// ---- 归属日(与盘点一致)----
@@ -194,7 +213,7 @@ func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLo
 	// ---- 跨日顺序校验:前一个营业日必须已盘点 ----
 	//
 	// ⚠️ 2026-10-30 owner:「今天不搬台」的**纯标记**请求
-	//   (每一行都是 0 kg、没有标签号)⇒ **跳过**这条校验。
+	//   (每一行都是 0 kg)⇒ **跳过**这条校验。
 	//   理由:它不动任何货、不改余额链 ⇒ 不需要"昨天的盘点"做基线
 	//   ⇒ 不能因为昨天没盘点,就把门店"记一笔今天没搬台"这件事也挡住。
 	if !isCounterLoadMarkerOnly(in.Lines) {
@@ -205,7 +224,7 @@ func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLo
 	// ⚠️ 2026-11-01 owner：审计结转下线 ⇒ 冻结机制一并下线
 	//   ⇒ 搬台(含补录)不再被「截止日已冻结」拦截。
 
-	// ---- 解析每一行(整袋搬的 SKU 与重量取自袋子)----
+	// ---- 解析每一行 ----
 	//
 	// ⚠️ 每行都带**部位**(cut_type):库存/结余按部位记(门店口径),
 	//   SKU 只是那一袋实物的溯源属性。
@@ -215,23 +234,6 @@ func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLo
 	}
 	lines := make([]counterLoadLine, 0, len(in.Lines))
 	for i, ln := range in.Lines {
-		if label := strings.TrimSpace(ln.Label); label != "" {
-			// 按**标签号**整袋搬 ⇒ SKU 与重量都取自袋子,不用填。
-			bag, err := s.findBagForCounterLoad(ctx, branchID, label, takenDate)
-			if err != nil {
-				return nil, err
-			}
-			// ⚠️ **新增**一行时:这袋今天已经搬过 ⇒ 不能再搬一次
-			//   (覆盖同一行 id 的幂等重提交不走这里)。
-			if strings.TrimSpace(ln.ID) == "" && bag.Status == BagStatusReleased {
-				return nil, fmt.Errorf("%w: 标签号 %s 今天已经搬上柜台了(要再搬请用新的标签袋)", ErrInvalidInput, label)
-			}
-			lines = append(lines, counterLoadLine{
-				id: strings.TrimSpace(ln.ID), sku: bag.CubeProductID, kg: bag.QtyKg, label: label,
-				cut: bag.CutType,
-			})
-			continue
-		}
 		sku := strings.TrimSpace(ln.CubeProductID)
 		// ⚠️ 2026-10-30 owner：「今天整日都不搬台」也是一个**合法的动作**
 		//   ⇒ 允许 qty_kg = 0(之前是"必须 > 0" ⇒ 门店根本没法表达"今天不搬台")。
@@ -246,10 +248,10 @@ func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLo
 			return nil, fmt.Errorf("%w: lines[%d].qty_kg 必须 >= 0", ErrInvalidInput, i)
 		}
 		if sku == "" && !zeroKg {
-			return nil, fmt.Errorf("%w: lines[%d].cube_product_id 必填(或填 label 按整袋搬)", ErrInvalidInput, i)
+			return nil, fmt.Errorf("%w: lines[%d].cube_product_id 必填", ErrInvalidInput, i)
 		}
 		lines = append(lines, counterLoadLine{
-			id: strings.TrimSpace(ln.ID), sku: sku, kg: ln.QtyKg, label: "",
+			id: strings.TrimSpace(ln.ID), sku: sku, kg: ln.QtyKg,
 			cut: cutOfSku[sku],
 		})
 	}
@@ -271,9 +273,8 @@ func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLo
 					ErrInvalidInput, lines[i].id, curDate, reqDate)
 			}
 			lines[i].prevKg = cur.QtyKg
-			if lines[i].label == "" {
-				lines[i].sku = cur.CubeProductID // SKU 不可改(那批货已经搬走了)
-			}
+			// ⚠️ SKU 不可改(那批货已经搬走了)⇒ 一律沿用原行的 SKU。
+			lines[i].sku = cur.CubeProductID
 			continue
 		}
 		if !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -305,22 +306,13 @@ func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLo
 	}
 
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// ① 整袋搬:袋子的位置/状态(标签释放)。
-		for _, nl := range lines {
-			if nl.label == "" {
-				continue
-			}
-			if _, err := s.moveBagToCounter(ctx, tx, branchID, nl.label, takenDate); err != nil {
-				return err
-			}
-		}
-		// ② 流水:带 id 的覆盖、不带 id 的新增(序号接续)。
+		// ① 流水:带 id 的覆盖、不带 id 的新增(序号接续)。
 		for _, nl := range lines {
 			if err := s.upsertCounterLoadLine(ctx, tx, branchID, takenDate, nl, operatorID); err != nil {
 				return err
 			}
 		}
-		// ③ 位置:按**每行的差额**调整(冷库 −、柜台 +)⇒ 幂等。
+		// ② 位置:按**每行的差额**调整(冷库 −、柜台 +)⇒ 幂等。
 		for _, nl := range lines {
 			delta := nl.kg.Sub(nl.prevKg)
 			if delta.IsZero() {

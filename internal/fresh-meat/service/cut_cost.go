@@ -699,16 +699,19 @@ func (s *Service) computeCutDailyCostsChained(ctx context.Context, branchID stri
 			"branch_id", branchID, "biz_date", baselineKey)
 	}
 
-	// ---- 2b. 入库量兜底(门店没贴标签 ⇒ 没有袋子 ⇒ 不兜底) ----
+	// ---- 2b. 入库量兜底 ⚠️ 已下线(2026-11-02 owner:标签号玩法整套下线)----
 	//
+	// 那条兜底是"门店没补录分割时,用日终盘点重量倒推当天产出",
+	// 它的两个输入(**带标签号的结转行** + **按标签整袋搬**写下的 moved_at)
+	// 都来自"贴标签"这套机制 ⇒ 标签号下线 ⇒ 它恒不生效 ⇒ 整条删除。
+	//
+	// ⚠️ **不要**把它改成"算全部结转行":那等于启用一条从未跑过的路径
+	//   ⇒ "门店没补录分割"那几天的成本口径会突变。
+	//
+	// (FIFO 归摊用的是**全部**结转行,不受影响 —— 见 service/pig_fifo.go。)
+
 	// ⚠️ **必须先兜底再汇总到部位**:兜底改的是 SKU 级的 producedKg / producedByPigKg,
 	//   汇总之后就没法把兜底量算进部位了。
-	//
-	// ⚠️ 兜底本身仍是 **SKU 级**(袋子表按货号记)⇒ 兜底完再按部位汇总。
-	if err := s.applyProducedFallback(ctx, branchID, bizDate,
-		producedKg, producedByPigKg, pigs, soldKg); err != nil {
-		return nil, nil, nil, nil, err
-	}
 	partProducedKg := map[string]decimal.Decimal{}
 	for sku, v := range producedKg {
 		cut := string(cutOfSku[sku])

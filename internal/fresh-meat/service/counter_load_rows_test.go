@@ -6,7 +6,7 @@ package service_test
 // 门店原话:
 //
 //	「期初转结可以放在鲜肉-设置里」
-//	「一个 sku 在当天搬台里可以有多条记录,多个标签袋,早上一袋,卖完了,中午加一袋,
+//	「一个 sku 在当天搬台里可以有多条记录,早上一袋,卖完了,中午加一袋,
 //	  可以随时修改,甚至过一天修改(但修改值造成负库存时,需要在每日毛利的 alert 上
 //	  红字显示)」
 //
@@ -78,21 +78,20 @@ func TestOpening_SeedsTheDailyBalanceChain(t *testing.T) {
 func TestCounterLoadRows_AppendEditDelete(t *testing.T) {
 	svc, ctx, sku := fmBizSetup(t)
 
-	// 10-01:盘点两行(一袋 20kg + 散货 10kg)⇒ 冷库 30kg。
+	// 10-01:盘点一行 30kg ⇒ 冷库 30kg。
 	_, err := svc.RecordPorkCutsStocktake(ctx, "S001", model.RecordPorkCutsStocktakeInput{
 		IsComplete: true,
 		Cuts: []model.CutInput{
-			{CutType: model.CutBelly, CubeProductID: sku, ActualRemainKg: d("20"), Label: "BAG-A"},
-			{CutType: model.CutBelly, CubeProductID: sku, ActualRemainKg: d("10")},
+			{CutType: model.CutBelly, CubeProductID: sku, ActualRemainKg: d("30")},
 		},
 	}, "u-1")
 	mustNoErr(t, err, "10-01 盘点")
 
-	// 10-02 早上:搬一袋(BAG-A)+ 搬 2kg。
+	// 10-02 早上:搬 20kg + 搬 2kg(两行)。
 	svc.SetClock(fmClock(fmDay2))
 	_, err = svc.CounterLoad(ctx, "S001", service.CounterLoadInput{
 		Lines: []service.CounterLoadLine{
-			{Label: "BAG-A"},
+			{CubeProductID: sku, QtyKg: d("20")},
 			{CubeProductID: sku, QtyKg: d("2")},
 		},
 	}, "u-1")
@@ -312,5 +311,47 @@ func TestCounterLoadRows_LineCarriesCutTypeAndProductName(t *testing.T) {
 	}
 	if got["cube_product_name"] != "五花肉" {
 		t.Errorf("cube_product_name 应是 五花肉,got %v", got["cube_product_name"])
+	}
+}
+
+// TestCounterLoad_LegacyLabelRejected 锁「老客户端的标签搬法被当场拒」。
+//
+// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 还在发 `label` 的老 APK 必须**当场报错**。
+//
+// ⇒ 为什么不能静默忽略:老包发的是 `{"label":"BAG-001"}`
+// (没有货号、没有重量)⇒ 静默忽略的话,这一行会被当成
+// 「0 kg = 今天不搬台」的标记 ⇒ **门店以为搬了台,其实啥也没搬**。
+func TestCounterLoad_LegacyLabelRejected(t *testing.T) {
+	svc, ctx, sku := fmBizSetup(t)
+
+	// 10-01:先盘一次(否则跨日顺序校验会先报错,盖住要验的那条)。
+	_, err := svc.RecordPorkCutsStocktake(ctx, "S001", model.RecordPorkCutsStocktakeInput{
+		IsComplete: true,
+		Cuts: []model.CutInput{
+			{CutType: model.CutBelly, CubeProductID: sku, ActualRemainKg: d("20")},
+		},
+	}, "u-1")
+	mustNoErr(t, err, "10-01 盘点")
+
+	// 10-02:老客户端的「按标签整袋搬」⇒ 当场被拒。
+	svc.SetClock(fmClock(fmDay2))
+	_, err = svc.CounterLoad(ctx, "S001", service.CounterLoadInput{
+		Lines: []service.CounterLoadLine{{Label: "BAG-OLD"}},
+	}, "u-1")
+	if err == nil {
+		t.Fatalf("还在发 label 的老搬法应被拒(不能静默当成'今天不搬台')")
+	}
+	if !strings.Contains(err.Error(), "label") {
+		t.Errorf("报错要点名 label 这个字段,got %v", err)
+	}
+
+	// ⇒ 一条流水都不能留下。
+	view, err := svc.ListCounterLoads(ctx, "S001", fmDay2)
+	mustNoErr(t, err, "ListCounterLoads")
+	if len(view.Lines) != 0 {
+		t.Errorf("被拒的搬台不该留下流水,got %d 条: %+v", len(view.Lines), view.Lines)
+	}
+	if view.HasCounterLoad {
+		t.Errorf("被拒的搬台不该把当天标成'已搬台'")
 	}
 }

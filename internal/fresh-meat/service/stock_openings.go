@@ -177,7 +177,6 @@ func (s *Service) applyOpeningToStock(
 	bag := model.StockBag{
 		ID:            StockOpeningBagID(branchID, string(cutType)),
 		BranchID:      branchID,
-		Label:         "", // 期初没有标签号 ⇒ 是"不装袋的散货结转记录"
 		CubeProductID: sku,
 		CutType:       cutType,
 		QtyKg:         newKg,

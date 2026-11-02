@@ -160,7 +160,7 @@ func TestStockOpening_UnitPriceInThreePlaces(t *testing.T) {
 	}
 
 	// ③ 队列（袋子）：source='opening'、100kg、成本快照 = 18 元/kg。
-	bags, err := svc.ListStockBags(ctx, "S001", "", "", "")
+	bags, err := svc.ListStockBags(ctx, "S001", "", "")
 	mustNoErr(t, err, "ListStockBags")
 	var openBag *model.StockBag
 	for i := range bags {
