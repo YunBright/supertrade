@@ -327,7 +327,22 @@ owner 原话：「这个表包含了没有袋标签的普通搬上台数据？�
 | deployer | `48f5253` | 契约加**位置断言**（录完 ⇒ 猪肉台 10kg / 冷库 0kg；撤 ⇒ 回退） |
 | tradewind_app | `e17f707` | 每日作业第 ② 步 + 看板外采栏 + 前端单测 |
 | tradewind_app | `70e05d6` | 外采文案改成「直接上猪肉台、录完不用再搬台」 |
+| **supertrade** | **`5bcfc5f`** | **第二次拍板四条**：长期毛利含外采 + 参考毛利按量加权 + 采样含外采 + `stock_bags`→`carryover_records`（含迁移与新单测） |
+| **deployer** | **`b43a213`** | 契约端点改名（`/stock/bags`→`/stock/carryovers`）+ 去掉「袋」措辞 + label 断言改看字段名 |
+| **tradewind_app** | **`e894401`** | 长期毛利外采字段 + 参考成本单价两个新来源文案 + 彻底去掉搬袋标签措辞 |
 
 ⚠️ `89644f9` 已部署生产（fresh-meat）⇒ 生产库里外采相关行数为 **0**
 ⇒ 口径变更对**存量数据是 no-op**（旧实现的 `externalIn` 在没有外采单时也是空 map
 ⇒ 链值逐位相同；位置表一行没动）。
+
+### 11.1 `5bcfc5f` 部署生产后的复核（2026-11-03）
+
+- **迁移实况**（生产库只读复核）：`stock_bags` 已不存在 ⇒ `carryover_records` **194 行逐行保留**；
+  `label` 列已删；`bulk_settlement_allocations.bag_id`→`carryover_id`（**6 行非空数据保留**）；
+  索引与主键约束全部改名、**无重复索引**；`pig_cut_price_samples.external_kg` 已建。
+- **存量数字逐位复核**（部署前后快照对比，10-29 / 10-30 / 10-31 / 11-01 四天）：
+  每日看板 `total`、**部位行（含参考成本单价 / 来源 / 参考毛利 / 参考毛利率）**、长期毛利的
+  所有既有数字 **逐位相同**；唯一差异是长期毛利每日行**新增**的 `external_kg` / `external_yuan`
+  两个字段（值都是 `0` ⇒ 生产暂无外采）⇒ **口径变更对存量数据是 no-op**。
+- 生产库 `external_purchases` **0 行**、`carryover_records` 里 `source='external'` **0 行**、
+  `pig_cut_price_samples` 里 `external_kg > 0` **0 行** ⇒ 与上面互相印证。
