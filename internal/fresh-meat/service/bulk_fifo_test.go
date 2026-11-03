@@ -5,13 +5,13 @@ package service_test
 // # 为什么锁这条
 //
 // 旧实现:大宗结算 FIFO 吃的是 **bulk_productions 台账**,而零售/搬台吃的是
-// **stock_bags 结转记录** ⇒ 同一批冷库货有**两份"还剩多少"的账**
+// **carryover_records 结转记录** ⇒ 同一批冷库货有**两份"还剩多少"的账**
 // ⇒ 结算按台账扣、零售按结转记录扣 ⇒ **同一批货能被卖两遍**
 // (结算说"还有 10kg 可结",零售把那 10kg 也卖了 ⇒ 收入算两遍、库存算负)。
 //
 // # 三条不变量
 //
-//  ① 结算的「领用」落在**结转记录**上:分摊凭据带 bag_id、结转记录的 consumed_kg 增加;
+//  ① 结算的「领用」落在**结转记录**上:分摊凭据带 carryover_id、结转记录的 consumed_kg 增加;
 //  ② 结存(balance_kg)与冷库余额一致 —— 同一本账;
 //  ③ 同一批货**不能结两遍**:第二次结算报「可领用量不足」。
 //
@@ -30,10 +30,10 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// fmBulkBagSetup 铺一个「一头猪 + 一批板油」的场景。
+// fmBulkCarryoverSetup 铺一个「一头猪 + 一批板油」的场景。
 //
 // 返回 (服务, ctx, 部位主 SKU, 猪 ID, 营业日 "YYYY-MM-DD")。
-func fmBulkBagSetup(t *testing.T) (*service.Service, context.Context, string, string, string) {
+func fmBulkCarryoverSetup(t *testing.T) (*service.Service, context.Context, string, string, string) {
 	t.Helper()
 	svc, _ := setupTestService(t)
 	ctx := context.Background()
@@ -77,22 +77,22 @@ func fmBulkBagSetup(t *testing.T) (*service.Service, context.Context, string, st
 	return svc, ctx, sku, pig.ID, "2026-10-01"
 }
 
-// TestBulkFifo_SettlementConsumesBag 锁「结算的领用落在结转记录上」。
-func TestBulkFifo_SettlementConsumesBag(t *testing.T) {
-	svc, ctx, _, pigID, date := fmBulkBagSetup(t)
+// TestBulkFifo_SettlementConsumesCarryover 锁「结算的领用落在结转记录上」。
+func TestBulkFifo_SettlementConsumesCarryover(t *testing.T) {
+	svc, ctx, _, pigID, date := fmBulkCarryoverSetup(t)
 
 	// 盘点后:一行结转记录 10kg,还没被消耗。
-	bags, err := svc.ListStockBags(ctx, "S001", "", date)
-	mustNoErr(t, err, "ListStockBags")
-	if len(bags) != 1 {
-		t.Fatalf("应登记 1 行结转记录, got %d: %+v", len(bags), bags)
+	records, err := svc.ListCarryoverRecords(ctx, "S001", "", date)
+	mustNoErr(t, err, "ListCarryoverRecords")
+	if len(records) != 1 {
+		t.Fatalf("应登记 1 行结转记录, got %d: %+v", len(records), records)
 	}
-	bag := bags[0]
-	if !bag.ConsumedKg.IsZero() {
-		t.Fatalf("新登记的结转行不该有消耗量, got %s", bag.ConsumedKg)
+	rec := records[0]
+	if !rec.ConsumedKg.IsZero() {
+		t.Fatalf("新登记的结转行不该有消耗量, got %s", rec.ConsumedKg)
 	}
-	if bag.Source != "stocktake" {
-		t.Errorf("结转行来源应是 stocktake, got %q", bag.Source)
+	if rec.Source != "stocktake" {
+		t.Errorf("结转行来源应是 stocktake, got %q", rec.Source)
 	}
 
 	// 结存:可领用 10kg、冷库 10kg(同一本账 ⇒ 差额 0)。
@@ -126,8 +126,8 @@ func TestBulkFifo_SettlementConsumesBag(t *testing.T) {
 	}
 
 	// ★ 结转记录被扣了 6kg —— 结算的「领用」落在**结转记录**上。
-	after, err := svc.ListStockBags(ctx, "S001", "", date)
-	mustNoErr(t, err, "ListStockBags(after)")
+	after, err := svc.ListCarryoverRecords(ctx, "S001", "", date)
+	mustNoErr(t, err, "ListCarryoverRecords(after)")
 	if len(after) != 1 {
 		t.Fatalf("应有 1 行结转记录, got %d", len(after))
 	}
@@ -135,15 +135,15 @@ func TestBulkFifo_SettlementConsumesBag(t *testing.T) {
 		t.Errorf("结转记录的已消耗量应 = 6kg, got %s", after[0].ConsumedKg)
 	}
 
-	// 分摊凭据必须指向**结转记录**(bag_id 非空)—— 这是"领用与结转记录对齐"的凭据。
+	// 分摊凭据必须指向**结转记录**(carryover_id 非空)—— 这是"领用与结转记录对齐"的凭据。
 	var allocCount int64
 	if err := testDBSingleton.Model(&model.BulkSettlementAllocation{}).
-		Where("settlement_id = ? AND bag_id <> ''", view.ID).
+		Where("settlement_id = ? AND carryover_id <> ''", view.ID).
 		Count(&allocCount).Error; err != nil {
 		t.Fatalf("count allocations: %v", err)
 	}
 	if allocCount == 0 {
-		t.Fatalf("分摊凭据应带 bag_id(结算领用的是结转记录), got 0")
+		t.Fatalf("分摊凭据应带 carryover_id(结算领用的是结转记录), got 0")
 	}
 
 	// 收入归到**产出它的那头猪**(归属快照)。
@@ -178,7 +178,7 @@ func TestBulkFifo_SettlementConsumesBag(t *testing.T) {
 // ⚠️ 这就是老实现最大的洞:结算按台账扣、零售按结转记录扣 ⇒ 同一批货能被卖两遍。
 // ⇒ 现在两边共用 consumed_kg 水位 ⇒ 结完就没了 ⇒ 再结必报"可领用量不足"。
 func TestBulkFifo_CannotSettleSameGoodsTwice(t *testing.T) {
-	svc, ctx, _, _, date := fmBulkBagSetup(t)
+	svc, ctx, _, _, date := fmBulkCarryoverSetup(t)
 
 	// 第一次:结掉 8kg。
 	if _, err := svc.CreateBulkSettlement(ctx, "S001", service.BulkSettlementInput{
@@ -253,16 +253,16 @@ func TestBulkFifo_ManualProductionEntersQueue(t *testing.T) {
 	mustNoErr(t, err, "RecordBulkProduction")
 
 	// 它必须在队列里(结转记录 source=bulk_manual)。
-	var bags []model.StockBag
+	var records []model.CarryoverRecord
 	if err := testDBSingleton.Where("branch_id = ? AND source = ?", "S001", "bulk_manual").
-		Find(&bags).Error; err != nil {
-		t.Fatalf("query stock_bags: %v", err)
+		Find(&records).Error; err != nil {
+		t.Fatalf("query carryover_records: %v", err)
 	}
-	if len(bags) != 1 {
-		t.Fatalf("手工补录应登记 1 行结转记录, got %d: %+v", len(bags), bags)
+	if len(records) != 1 {
+		t.Fatalf("手工补录应登记 1 行结转记录, got %d: %+v", len(records), records)
 	}
-	if !bags[0].QtyKg.Equal(d("4")) {
-		t.Errorf("结转记录重量应 = 4kg, got %s", bags[0].QtyKg)
+	if !records[0].QtyKg.Equal(d("4")) {
+		t.Errorf("结转记录重量应 = 4kg, got %s", records[0].QtyKg)
 	}
 
 	// 大宗台账**停写** ⇒ 表里不该有这行(同一事实只记一处)。

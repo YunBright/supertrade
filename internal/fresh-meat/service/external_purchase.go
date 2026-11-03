@@ -144,8 +144,8 @@ func ExternalPurchaseID(branchID, bizDate, sku string, seq int) string {
 	return surrogateID("SEP", branchID, bizDate, sku, fmt.Sprintf("%03d", seq))
 }
 
-// ExternalPurchaseBagID 外采那一行**结转记录**的确定性代理主键。
-func ExternalPurchaseBagID(externalID string) string {
+// ExternalPurchaseCarryoverID 外采那一行**结转记录**的确定性代理主键。
+func ExternalPurchaseCarryoverID(externalID string) string {
 	return surrogateID("SBE", externalID)
 }
 
@@ -226,7 +226,7 @@ func (s *Service) RecordExternalPurchase(ctx context.Context, branchID string, i
 			return err
 		}
 		// 结转记录(source='external'):FIFO 队列的一员(大宗可领用、零售归摊不落到猪)。
-		return s.registerExternalStockBag(ctx, tx, row)
+		return s.registerExternalCarryoverRecord(ctx, tx, row)
 	})
 	if err != nil {
 		return nil, err
@@ -293,7 +293,7 @@ func (s *Service) UpdateExternalPurchase(ctx context.Context, branchID, id strin
 		cur.Note = strings.TrimSpace(in.Note)
 		cur.UpdatedAt = now
 		// 结转记录:重量与成本快照同步。
-		return s.registerExternalStockBag(ctx, tx, cur)
+		return s.registerExternalCarryoverRecord(ctx, tx, cur)
 	})
 	if err != nil {
 		return nil, err
@@ -331,9 +331,9 @@ func (s *Service) DeleteExternalPurchase(ctx context.Context, branchID, id strin
 			return err
 		}
 		// 结转记录:删掉(只代表这批外采的货)。
-		if err := tx.WithContext(ctx).Where("id = ?", ExternalPurchaseBagID(cur.ID)).
-			Delete(&model.StockBag{}).Error; err != nil {
-			return fmt.Errorf("delete external stock_bag: %w", err)
+		if err := tx.WithContext(ctx).Where("id = ?", ExternalPurchaseCarryoverID(cur.ID)).
+			Delete(&model.CarryoverRecord{}).Error; err != nil {
+			return fmt.Errorf("delete external carryover_record: %w", err)
 		}
 		return nil
 	})
@@ -441,7 +441,7 @@ func (s *Service) nextExternalPurchaseSeq(ctx context.Context, branchID string,
 	return int(n) + 1, nil
 }
 
-// registerExternalStockBag 外采那一行**结转记录**(FIFO 队列的一员)。
+// registerExternalCarryoverRecord 外采那一行**结转记录**(FIFO 队列的一员)。
 //
 // ⚠️ **归属快照为空** ⇒ FIFO 领用它时收入记「未归属」
 //   (外采没有产出猪 ⇒ 不能摊给某头猪,见 pig_fifo.go 的期初处理)。
@@ -449,23 +449,23 @@ func (s *Service) nextExternalPurchaseSeq(ctx context.Context, branchID string,
 //
 // ⚠️ location = **猪肉台**(2026-11-03 owner 拍板):外采录完直接上台、不占冷库
 //   ⇒ 大宗从它领用时记在台面(不是冷库),见 bulk_fifo.go 的 location 判断。
-func (s *Service) registerExternalStockBag(ctx context.Context, tx *gorm.DB, row model.ExternalPurchase) error {
+func (s *Service) registerExternalCarryoverRecord(ctx context.Context, tx *gorm.DB, row model.ExternalPurchase) error {
 	now := s.now()
-	bag := model.StockBag{
-		ID:            ExternalPurchaseBagID(row.ID),
+	rec := model.CarryoverRecord{
+		ID:            ExternalPurchaseCarryoverID(row.ID),
 		BranchID:      row.BranchID,
 		CubeProductID: row.CubeProductID,
 		CutType:       row.CutType,
 		QtyKg:         row.QtyKg,
 		OriginDate:    row.BizDate,
 		Location:      string(model.StockLocationCounter),
-		Status:        BagStatusActive,
-		Source:        BagSourceExternal,
+		Status:        CarryoverStatusActive,
+		Source:        CarryoverSourceExternal,
 		UnitCostYuan:  row.UnitPriceYuan,
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
-	return s.upsertStockBag(ctx, tx, bag)
+	return s.upsertCarryoverRecord(ctx, tx, rec)
 }
 
 // loadExternalPurchaseTotals 某营业日的外采入库(按**部位**汇总:kg / 金额)。

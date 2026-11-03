@@ -128,8 +128,8 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	// ⚠️ 2026-11-01 owner：审计结转(`/stock/audit` ×3)、预期毛利(`/stock/presale` ×2)端点已下线。
 	//   账面链改为「实时可改」：不再有快照冻结，不再有预售结转写入口。
 	//   历史 `biz_audits` / `cut_presale_settlements` 行仍保留，仅供余额链基线与期末重估只读。
-	// GET /stock/bags —— 按日结转台账:各天结转下来的货(SKU / 重量 / 猪归属)。
-	r.GET("/stock/bags", requireBranch, h.ListStockBags)
+	// GET /stock/carryovers —— 按日结转台账:各天结转下来的货(SKU / 重量 / 猪归属)。
+	r.GET("/stock/carryovers", requireBranch, h.ListCarryoverRecords)
 	r.GET("/stock", requireBranch, h.ListStock)
 
 	// ---- 外采(2026-11-03 owner)----
@@ -943,19 +943,19 @@ func (h *Handler) DeleteStockOpening(c *gin.Context) {
 //   账面链改为「实时可改」：无快照冻结、无预售结转写入口。
 //   替代口径：长期毛利用 GET /long-term-margin（ComputeLongTermMargin，已上线，勿动）。
 
-// ListStockBags GET /stock/bags?location=&origin_date=
+// ListCarryoverRecords GET /stock/carryovers?location=&origin_date=
 //
 // **按日结转台账**:某店各天结转下来的货(SKU / 重量 / 猪归属 / FIFO 消耗进度)。
 //
-// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 不再有「按标签过滤」这个维度。
+// ⚠️ 2026-11-02 owner:旧玩法下线 ⇒ 不再有「按批次标记过滤」这个维度。
 //
 // ⚠️ `location` 省略 = 全部;`cold_store` 只看冷库,`counter` 只看猪肉台。
-func (h *Handler) ListStockBags(c *gin.Context) {
+func (h *Handler) ListCarryoverRecords(c *gin.Context) {
 	branchID := middleware.SingleBranchFromCtx(c)
 	if !h.requireScope(c, branchID, "freshmeat:view") {
 		return
 	}
-	out, err := h.svc.ListStockBags(c.Request.Context(), branchID,
+	out, err := h.svc.ListCarryoverRecords(c.Request.Context(), branchID,
 		c.Query("location"), c.Query("origin_date"))
 	if err != nil {
 		mapErr(c, err)

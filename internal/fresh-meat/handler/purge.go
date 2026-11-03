@@ -48,7 +48,7 @@ func PurgeRegistry() *purge.Registry {
 		purge.Model{Table: "whole_pigs", Model: &model.WholePig{}},
 		// 登记的表必须有**单列主键**(复合主键进不了 PurgeRegistry ⇒ 永远清不掉)。
 		// 停写的历史表(sku_cost_daily / sku_cost_states)仍保留登记,以清理残留行。
-		purge.Model{Table: "stock_bags", Model: &model.StockBag{}},
+		purge.Model{Table: "carryover_records", Model: &model.CarryoverRecord{}},
 		purge.Model{Table: "sku_stock_positions", Model: &model.SkuStockPosition{}},
 		purge.Model{Table: "sku_cost_states", Model: &model.SkuCostState{}},
 		purge.Model{Table: "sku_cost_daily", Model: &model.SkuCostDaily{}},

@@ -271,23 +271,46 @@ func (s *Service) collectCutPriceSamples(ctx context.Context, branchID string, d
 	if err != nil {
 		return res, err
 	}
+	// ⚠️ owner 2026-11-03:外采的**真实进货价**也要进样本(基线)
+	//   ⇒ 该部位当天的样本值 = 「倒推单价 与 外采价 **按量加权**」。
+	extByCut, _, _, err := s.externalByCutOf(ctx, branchID, day)
+	if err != nil {
+		return res, err
+	}
 	keepIDs := map[string]bool{}
 	now := s.now()
 	samples := make([]model.PigCutPriceSample, 0, len(rows))
 	for _, r := range rows {
 		soldKg := r.SoldKg.Add(r.BulkSoldKg)
-		if !soldKg.IsPositive() {
-			// ⚠️ **当天没卖出过** ⇒ 不产样本(owner:搭赠等无记录的部位保持无单价基线)。
+		ext := extByCut[string(r.CutType)]
+		extKg := ext.Kg
+		if !soldKg.IsPositive() && !extKg.IsPositive() {
+			// ⚠️ **当天没卖出过、也没有外采** ⇒ 不产样本(owner:搭赠等无记录的部位保持无单价基线)。
 			res.NoSaleCutCount++
 			continue
 		}
-		retail := r.RevenueYuan.Div(soldKg)
-		// ⚠️ **倒推口径(owner 2026-10-31 拍板)**:进货单价 = 零售均价 ÷ (1 + 整体毛利率)。
-		//
-		//	owner 原话(统计栏「日终剩余」那一格):「用零售均价/(1+今日毛利率)」
-		//	⇒ 本仓**统一**用这一条(单价样本的倒推、建议成本单价、日终剩余估值
-		//	  全都走它)⇒ 三处数字自洽,不会出现"两个成本价口径"。
-		costPrice := retail.Div(decimal.NewFromInt(1).Add(margin))
+		var retail, costPrice decimal.Decimal
+		if soldKg.IsPositive() {
+			retail = r.RevenueYuan.Div(soldKg)
+			// ⚠️ **倒推口径(owner 2026-10-31 拍板)**:进货单价 = 零售均价 ÷ (1 + 整体毛利率)。
+			//
+			//	owner 原话(统计栏「日终剩余」那一格):「用零售均价/(1+今日毛利率)」
+			//	⇒ 本仓**统一**用这一条(单价样本的倒推、建议成本单价、日终剩余估值
+			//	  全都走它)⇒ 三处数字自洽,不会出现"两个成本价口径"。
+			//
+			// ⚠️ m **含外采**(owner 2026-11-03)⇒ 倒推单价本身已经反映外采拉低毛利率的影响。
+			costPrice = retail.Div(decimal.NewFromInt(1).Add(margin))
+		}
+		// ⚠️ **外采价按量加权**(owner 2026-11-03:「求均值」,不是直接换)
+		//   ⇒ 样本值 = 该部位当天的加权进货单价 ⇒ 外采价因此进得了单价基线。
+		if extKg.IsPositive() && ext.UnitPriceYuan.IsPositive() {
+			if costPrice.IsPositive() {
+				costPrice = costPrice.Mul(soldKg).Add(ext.UnitPriceYuan.Mul(extKg)).Div(soldKg.Add(extKg))
+			} else {
+				// 只有外采、没卖出 ⇒ 样本值就是**外采的真实进货价**。
+				costPrice = ext.UnitPriceYuan
+			}
+		}
 		if !costPrice.IsPositive() {
 			// 倒推出非正数(营收为 0 之类)⇒ 不产样本。
 			res.NoSaleCutCount++
@@ -301,6 +324,7 @@ func (s *Service) collectCutPriceSamples(ctx context.Context, branchID string, d
 			BizDate:         dayKey,
 			CutType:         r.CutType,
 			SoldKg:          soldKg,
+			ExternalKg:      extKg,
 			RevenueYuan:     r.RevenueYuan,
 			RetailPriceYuan: retail,
 			MarginRate:      margin,
@@ -329,6 +353,7 @@ func (s *Service) collectCutPriceSamples(ctx context.Context, branchID string, d
 					},
 					DoUpdates: clause.Assignments(map[string]any{
 						"sold_kg":           rec.SoldKg,
+						"external_kg":       rec.ExternalKg,
 						"revenue_yuan":      rec.RevenueYuan,
 						"retail_price_yuan": rec.RetailPriceYuan,
 						"margin_rate":       rec.MarginRate,
@@ -631,16 +656,21 @@ func (s *Service) RecomputeCutPriceBaselines(ctx context.Context, branchID strin
 }
 
 // aggregatePriceBaselines 把日样本聚合成单价基线(**按销量加权**)。
+//
+// ⚠️ owner 2026-11-03:权重 = **销量 + 外采量**
+//   ⇒ 外采那天该部位的样本(可能只有外采、没有零售)也能进基线
+//   ⇒ 外采的真实进货价因此进得了单价基线。
+// ⚠️ 历史样本的 external_kg = 0 ⇒ 权重与从前**逐字一致** ⇒ 历史基线数字不变。
 func aggregatePriceBaselines(samples []model.PigCutPriceSample) map[model.CutType]priceBaselineValue {
 	numCost := map[model.CutType]decimal.Decimal{}
 	numPig := map[model.CutType]decimal.Decimal{}
 	den := map[model.CutType]decimal.Decimal{}
 	cnt := map[model.CutType]int{}
 	for _, r := range samples {
-		if !r.SoldKg.IsPositive() || !r.CostPriceYuan.IsPositive() {
+		w := r.SoldKg.Add(r.ExternalKg)
+		if !w.IsPositive() || !r.CostPriceYuan.IsPositive() {
 			continue
 		}
-		w := r.SoldKg
 		numCost[r.CutType] = numCost[r.CutType].Add(r.CostPriceYuan.Mul(w))
 		numPig[r.CutType] = numPig[r.CutType].Add(r.PigPriceYuan.Mul(w))
 		den[r.CutType] = den[r.CutType].Add(w)

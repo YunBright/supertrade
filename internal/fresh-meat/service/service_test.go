@@ -93,7 +93,7 @@ func setupTestServiceMode(t *testing.T, syncAdvice bool) (*service.Service, *rec
 		&model.SkuCostDaily{},
 		&model.PromoSku{},
 		// 2026-10-23:大宗台账 + 分割重量统计基线。
-		&model.StockBag{},
+		&model.CarryoverRecord{},
 		&model.BulkProduct{},
 		&model.BulkProduction{},
 		&model.BulkSettlement{},

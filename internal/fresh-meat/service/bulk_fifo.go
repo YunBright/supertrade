@@ -5,11 +5,11 @@ package service
 // # 2026-10-25 口径修正(为什么改)
 //
 // 旧实现:大宗结算 FIFO 吃的是 **bulk_productions 台账**,而零售/搬台吃的是
-// **stock_bags 结转记录** ⇒ 同一批冷库货有**两份"还剩多少"的账**
+// **carryover_records 结转记录** ⇒ 同一批冷库货有**两份"还剩多少"的账**
 // ⇒ 结算按台账扣、零售按结转记录扣 ⇒ 同一批货**能被卖两遍**
 // (结算说"还有 10kg 可结",零售把那 10kg 也卖了 ⇒ 收入算两遍、库存算负)。
 //
-// ⇒ 改成**一个队列**(stock_bags):
+// ⇒ 改成**一个队列**(carryover_records):
 //
 //	结算按产生日(origin_date)FIFO 领用**结转记录**;
 //	领用就扣 consumed_kg ⇒ 与零售**共用同一个消耗水位** ⇒ 不可能卖两遍;
@@ -33,10 +33,10 @@ import (
 	"gorm.io/gorm"
 )
 
-// bulkBagTake 结算从某一条结转记录上领用的一笔。
-type bulkBagTake struct {
-	// Bag 是被领用的那条结转记录。
-	Bag model.StockBag
+// bulkCarryoverTake 结算从某一条结转记录上领用的一笔。
+type bulkCarryoverTake struct {
+	// Record 是被领用的那条结转记录。
+	Record model.CarryoverRecord
 	// QtyKg 是从它上面领用了多少。
 	QtyKg decimal.Decimal
 	// Shares 是这批货的**猪份额**(摊到哪几头猪、各多少 kg)。
@@ -61,20 +61,20 @@ type bulkBagTake struct {
 func (s *Service) allocateBulkByBIFO(
 	ctx context.Context, tx *gorm.DB,
 	branchID, cubeProductID string, uptoDate datatypes.Date, qtyKg decimal.Decimal,
-) ([]bulkBagTake, decimal.Decimal, error) {
+) ([]bulkCarryoverTake, decimal.Decimal, error) {
 	if !qtyKg.IsPositive() {
 		return nil, decimal.Zero, nil
 	}
-	var records []model.StockBag
+	var records []model.CarryoverRecord
 	if err := tx.WithContext(ctx).
 		Where("branch_id = ? AND cube_product_id = ? AND status = ? AND origin_date <= ?",
-			branchID, cubeProductID, BagStatusActive, uptoDate).
+			branchID, cubeProductID, CarryoverStatusActive, uptoDate).
 		Order("origin_date ASC, id ASC").
 		Find(&records).Error; err != nil {
-		return nil, decimal.Zero, fmt.Errorf("query stock_bags(bulk fifo): %w", err)
+		return nil, decimal.Zero, fmt.Errorf("query carryover_records(bulk fifo): %w", err)
 	}
 	need := qtyKg
-	out := make([]bulkBagTake, 0, len(records))
+	out := make([]bulkCarryoverTake, 0, len(records))
 	pigCache := map[string][]model.WholePig{}
 	for _, rec := range records {
 		if !need.IsPositive() {
@@ -88,17 +88,17 @@ func (s *Service) allocateBulkByBIFO(
 		if take.GreaterThan(need) {
 			take = need
 		}
-		shares, err := s.bulkBagShares(ctx, tx, rec, uptoDate, pigCache)
+		shares, err := s.bulkCarryoverShares(ctx, tx, rec, uptoDate, pigCache)
 		if err != nil {
 			return nil, decimal.Zero, err
 		}
-		out = append(out, bulkBagTake{Bag: rec, QtyKg: take, Shares: shares})
+		out = append(out, bulkCarryoverTake{Record: rec, QtyKg: take, Shares: shares})
 		need = need.Sub(take)
 	}
 	return out, need, nil
 }
 
-// bulkBagShares 这批货的**猪份额**(结算收入摊到哪几头猪)。
+// bulkCarryoverShares 这批货的**猪份额**(结算收入摊到哪几头猪)。
 //
 // # 三级归属(前两级与零售 FIFO 完全一致)
 //
@@ -111,9 +111,9 @@ func (s *Service) allocateBulkByBIFO(
 // ⚠️ 三级都没有 ⇒ 返回空 ⇒ 调用方记一行**无归属猪**的收入
 //
 //	(钱不能凭空消失,但也不能硬塞给某头猪)。
-func (s *Service) bulkBagShares(
+func (s *Service) bulkCarryoverShares(
 	ctx context.Context, tx *gorm.DB,
-	rec model.StockBag, settleDate datatypes.Date, pigCache map[string][]model.WholePig,
+	rec model.CarryoverRecord, settleDate datatypes.Date, pigCache map[string][]model.WholePig,
 ) ([]fifoShare, error) {
 	shares, err := s.fifoRecordShares(ctx, tx, rec, pigCache)
 	if err != nil {
@@ -141,9 +141,9 @@ func (s *Service) bulkBagShares(
 	return out, nil
 }
 
-// bulkBagLocation 结算领用时这批货所在的位置(空 ⇒ 冷库)。
-func bulkBagLocation(bag model.StockBag) model.StockLocation {
-	if bag.Location == string(model.StockLocationCounter) {
+// bulkCarryoverLocation 结算领用时这批货所在的位置(空 ⇒ 冷库)。
+func bulkCarryoverLocation(rec model.CarryoverRecord) model.StockLocation {
+	if rec.Location == string(model.StockLocationCounter) {
 		return model.StockLocationCounter
 	}
 	return model.StockLocationColdStore

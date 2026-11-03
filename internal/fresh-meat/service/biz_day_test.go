@@ -428,7 +428,7 @@ func TestBizDay_BackfillRecomputesThatDayOnly(t *testing.T) {
 
 // TestBizDay_CounterLoadLeavesLedger 锁 ④。
 //
-// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 只剩「按 SKU + kg」一种搬法,
+// ⚠️ 2026-11-02 owner:旧玩法下线 ⇒ 只剩「按 SKU + kg」一种搬法,
 //   但**一行一个动作**不变 ⇒ 同一 SKU 当天可以有多条流水
 //   (门店"早上一批,卖完了中午再加一批")。
 // ⇒ 否则休市判定与按日结余都会误判(之前按 SKU+kg 搬完全不留痕)。

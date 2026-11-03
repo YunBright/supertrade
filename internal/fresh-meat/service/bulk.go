@@ -141,7 +141,7 @@ type BulkProductionInput struct {
 // RecordBulkProduction 录当日大宗产出(进冷库)。
 //
 // ⚠️ **手工兜底路径**。**主路径是"日终盘点自动结转"**
-// (盘点会把剩余的货按 SKU 登记成**结转记录**,见 registerStockBags):
+// (盘点会把剩余的货按 SKU 登记成**结转记录**,见 registerCarryoverRecords):
 // 手工录 = 同一个数字记两处,迟早不一致。
 // 与自动结转**互斥**:当天该部位已有盘点结转 ⇒ 400。
 //
@@ -191,12 +191,12 @@ func (s *Service) RecordBulkProduction(ctx context.Context, branchID string, in 
 	//   —— 台账已停写,判据必须跟队列一致,否则同一个数字记两处。
 	startOfDay, endOfDay := s.businessDayBounds(time.Time(bizDate))
 	var autoCnt int64
-	if err := s.db.WithContext(ctx).Model(&model.StockBag{}).
+	if err := s.db.WithContext(ctx).Model(&model.CarryoverRecord{}).
 		Where("branch_id = ? AND cube_product_id = ? AND source = ? AND qty_kg > ?",
-			branchID, sku, BagSourceStocktake, decimal.Zero).
+			branchID, sku, CarryoverSourceStocktake, decimal.Zero).
 		Where("origin_date >= ? AND origin_date < ?", startOfDay, endOfDay).
 		Count(&autoCnt).Error; err != nil {
-		return nil, fmt.Errorf("query stock_bags(bulk manual guard): %w", err)
+		return nil, fmt.Errorf("query carryover_records(bulk manual guard): %w", err)
 	}
 	if autoCnt > 0 {
 		return nil, fmt.Errorf("%w: %s 当天的日终盘点已经登记过结转记录了,不用再手工录", ErrInvalidInput, prod.Name)
@@ -207,28 +207,28 @@ func (s *Service) RecordBulkProduction(ctx context.Context, branchID string, in 
 	unitCost := s.bulkUnitCost(ctx, branchID, prod.CutType, time.Time(bizDate))
 	productionID := generateID(now, "BKP")
 	// 归属快照:这批货是当天哪几头猪的产出(按分割补录;没有就空 ⇒ 结算时按毛重兜底)。
-	alloc, err := s.bagPigAlloc(ctx, branchID, prod.CutType, sku, time.Time(bizDate))
+	alloc, err := s.carryoverPigAlloc(ctx, branchID, prod.CutType, sku, time.Time(bizDate))
 	if err != nil {
 		return nil, err
 	}
 	// 建**结转记录** —— 它才是 FIFO 队列的一员。
-	bag := model.StockBag{
-		ID:            StockBulkManualBagID(branchID, productionID),
+	rec := model.CarryoverRecord{
+		ID:            StockBulkManualCarryoverID(branchID, productionID),
 		BranchID:      branchID,
 		CubeProductID: sku,
 		CutType:       prod.CutType,
 		QtyKg:         in.QtyKg,
 		OriginDate:    bizDate,
 		Location:      string(model.StockLocationColdStore),
-		Status:        BagStatusActive,
-		Source:        BagSourceBulkManual,
+		Status:        CarryoverStatusActive,
+		Source:        CarryoverSourceBulkManual,
 		PigAlloc:      alloc,
 		UnitCostYuan:  unitCost,
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
-	if err := s.db.WithContext(ctx).Create(&bag).Error; err != nil {
-		return nil, fmt.Errorf("create bulk manual stock_bag: %w", err)
+	if err := s.db.WithContext(ctx).Create(&rec).Error; err != nil {
+		return nil, fmt.Errorf("create bulk manual carryover_record: %w", err)
 	}
 	// 冷库 +=(记在**部位主 SKU** 上 ⇒ 与零售/盘点共用同一个 SKU,成本跟着货走)
 	if err := s.addPosition(ctx, s.db, branchID, sku, model.StockLocationColdStore, in.QtyKg); err != nil {
@@ -294,63 +294,63 @@ func (s *Service) ListBulkProductions(ctx context.Context, branchID string) ([]m
 	for sku := range skuToCode {
 		skus = append(skus, sku)
 	}
-	var bags []model.StockBag
+	var records []model.CarryoverRecord
 	if err := s.db.WithContext(ctx).
 		Where("branch_id = ? AND cube_product_id IN ?", branchID, skus).
 		Order("origin_date ASC, id ASC").
-		Find(&bags).Error; err != nil {
-		return nil, fmt.Errorf("query stock_bags(bulk ledger): %w", err)
+		Find(&records).Error; err != nil {
+		return nil, fmt.Errorf("query carryover_records(bulk ledger): %w", err)
 	}
-	settled, err := s.bulkSettledKgByBag(ctx, branchID)
+	settled, err := s.bulkSettledKgByCarryover(ctx, branchID)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]model.BulkProduction, 0, len(bags))
-	for _, bag := range bags {
-		code := skuToCode[bag.CubeProductID]
+	out := make([]model.BulkProduction, 0, len(records))
+	for _, rec := range records {
+		code := skuToCode[rec.CubeProductID]
 		if code == "" {
 			continue
 		}
 		src := BulkSourceStocktake
 		note := "日终盘点结转"
-		if bag.Source == BagSourceBulkManual {
+		if rec.Source == CarryoverSourceBulkManual {
 			src = BulkSourceManual
 			note = "手工补录"
 		}
 		out = append(out, model.BulkProduction{
-			ID:            bag.ID,
+			ID:            rec.ID,
 			BranchID:      branchID,
 			ProductCode:   code,
-			BizDate:       bag.OriginDate,
-			QtyKg:         bag.QtyKg,
-			SettledQtyKg:  settled[bag.ID],
+			BizDate:       rec.OriginDate,
+			QtyKg:         rec.QtyKg,
+			SettledQtyKg:  settled[rec.ID],
 			Source:        src,
-			CubeProductID: bag.CubeProductID,
-			UnitCostYuan:  bag.UnitCostYuan,
+			CubeProductID: rec.CubeProductID,
+			UnitCostYuan:  rec.UnitCostYuan,
 			Note:          note,
-			CreatedAt:     bag.CreatedAt,
+			CreatedAt:     rec.CreatedAt,
 		})
 	}
 	return out, nil
 }
 
-// bulkSettledKgByBag 每个**结转记录**被大宗结算领用了多少(按分摊凭据聚合)。
+// bulkSettledKgByCarryover 每个**结转记录**被大宗结算领用了多少(按分摊凭据聚合)。
 //
 // ⚠️ 只认**交付口径**(delivery):价差结算(price_diff)不动库存。
-func (s *Service) bulkSettledKgByBag(ctx context.Context, branchID string) (map[string]decimal.Decimal, error) {
+func (s *Service) bulkSettledKgByCarryover(ctx context.Context, branchID string) (map[string]decimal.Decimal, error) {
 	type row struct {
-		BagID string
+		CarryoverID string
 		QtyKg string
 	}
 	var rows []row
 	if err := s.db.WithContext(ctx).
 		Table("bulk_settlement_allocations AS a").
-		Select("a.bag_id AS bag_id, CAST(SUM(a.qty_kg) AS TEXT) AS qty_kg").
+		Select("a.carryover_id AS carryover_id, CAST(SUM(a.qty_kg) AS TEXT) AS qty_kg").
 		Joins("JOIN bulk_settlements AS s ON s.id = a.settlement_id").
-		Where("s.branch_id = ? AND s.mode = ? AND a.bag_id <> ''", branchID, BulkModeDelivery).
-		Group("a.bag_id").
+		Where("s.branch_id = ? AND s.mode = ? AND a.carryover_id <> ''", branchID, BulkModeDelivery).
+		Group("a.carryover_id").
 		Scan(&rows).Error; err != nil {
-		return nil, fmt.Errorf("query bulk allocations(by bag): %w", err)
+		return nil, fmt.Errorf("query bulk allocations(by carryover): %w", err)
 	}
 	out := map[string]decimal.Decimal{}
 	for _, r := range rows {
@@ -358,7 +358,7 @@ func (s *Service) bulkSettledKgByBag(ctx context.Context, branchID string) (map[
 		if perr != nil {
 			continue
 		}
-		out[r.BagID] = kg
+		out[r.CarryoverID] = kg
 	}
 	return out, nil
 }
@@ -561,7 +561,7 @@ func (s *Service) CreateBulkSettlement(ctx context.Context, branchID string, in 
 			}
 			for _, tk := range takes {
 				// 猪份额:这批货的归属快照 → 当天各猪毛重 → 结算当天各猪毛重
-				// (见 bulkBagShares)。
+				// (见 bulkCarryoverShares)。
 				kgByPig := map[string]decimal.Decimal{}
 				for _, sh := range tk.Shares {
 					kgByPig[sh.pigID] = kgByPig[sh.pigID].Add(sh.kg)
@@ -578,10 +578,10 @@ func (s *Service) CreateBulkSettlement(ctx context.Context, branchID string, in 
 					// ⚠️ PosLineID 必须**短**:它进 `line_sales_by_pigs` 的唯一键
 					// (varchar(64))。用"结算单+明细+结转记录+猪"的 id **拼**会超长
 					// ⇒ 改成**哈希**:短、定长、且天然带上全部四个维度。
-					posLineID := "BULK" + hashKey(settlement.ID, item.ID, tk.Bag.ID, sp.PigID)
+					posLineID := "BULK" + hashKey(settlement.ID, item.ID, tk.Record.ID, sp.PigID)
 					row := model.LineSalesByPig{
 						BranchID:      branchID,
-						SaleDate:      tk.Bag.OriginDate,
+						SaleDate:      tk.Record.OriginDate,
 						PigID:         sp.PigID,
 						CutType:       prod.CutType,
 						CubeProductID: sku,
@@ -605,14 +605,14 @@ func (s *Service) CreateBulkSettlement(ctx context.Context, branchID string, in 
 						SettlementID:   settlement.ID,
 						ItemID:         item.ID,
 						ProductionID:   "", // 2026-10-25:不再指向台账(台账停写)
-						BagID:          tk.Bag.ID,
-						Location:       tk.Bag.Location,
+						CarryoverID:          tk.Record.ID,
+						Location:       tk.Record.Location,
 						CubeProductID:  sku,
 						CutType:        prod.CutType,
 						PigID:          sp.PigID,
 						QtyKg:          sp.QtyKg,
 						AmountYuan:     sp.AmountYuan,
-						ProductionDate: tk.Bag.OriginDate,
+						ProductionDate: tk.Record.OriginDate,
 						CreatedAt:      now,
 					}
 					if err := tx.Create(&alloc).Error; err != nil {
@@ -621,13 +621,13 @@ func (s *Service) CreateBulkSettlement(ctx context.Context, branchID string, in 
 				}
 				// ★ 扣这批的"已消耗" —— 与零售**共用同一个水位**
 				// ⇒ 同一批货不可能既被零售卖掉、又被大宗结一遍。
-				if err := s.consumeFIFO(ctx, tx, map[string]decimal.Decimal{tk.Bag.ID: tk.QtyKg}); err != nil {
+				if err := s.consumeFIFO(ctx, tx, map[string]decimal.Decimal{tk.Record.ID: tk.QtyKg}); err != nil {
 					return err
 				}
 				// 交付口径:按**领用时那批货所在的位置**扣库存
 				// (冷库里的扣冷库、搬上台过的扣柜台)⇒ 位置表与日余额链都对得上。
 				if mode == BulkModeDelivery {
-					if err := s.addPosition(ctx, tx, branchID, sku, bulkBagLocation(tk.Bag), tk.QtyKg.Neg()); err != nil {
+					if err := s.addPosition(ctx, tx, branchID, sku, bulkCarryoverLocation(tk.Record), tk.QtyKg.Neg()); err != nil {
 						return err
 					}
 				}
@@ -744,7 +744,7 @@ func (s *Service) ListBulkBalances(ctx context.Context, branchID string) ([]Bulk
 	if err != nil {
 		return nil, err
 	}
-	settledByBag, err := s.bulkSettledKgByBag(ctx, branchID)
+	settledByCarryover, err := s.bulkSettledKgByCarryover(ctx, branchID)
 	if err != nil {
 		return nil, err
 	}
@@ -766,19 +766,19 @@ func (s *Service) ListBulkBalances(ctx context.Context, branchID string) ([]Bulk
 			coldKg = cold[sku]
 			unitCost = s.bulkUnitCost(ctx, branchID, p.CutType, now)
 			// 该 SKU 的**全部结转记录**(批次 + 散货行)⇒ 产出与队列剩余。
-			var bags []model.StockBag
+			var records []model.CarryoverRecord
 			if err := s.db.WithContext(ctx).
 				Where("branch_id = ? AND cube_product_id = ?", branchID, sku).
-				Find(&bags).Error; err != nil {
-				return nil, fmt.Errorf("query stock_bags(bulk balance): %w", err)
+				Find(&records).Error; err != nil {
+				return nil, fmt.Errorf("query carryover_records(bulk balance): %w", err)
 			}
-			for _, bag := range bags {
-				produced = produced.Add(bag.QtyKg)
-				settled = settled.Add(settledByBag[bag.ID])
-				if bag.Status != BagStatusActive {
+			for _, rec := range records {
+				produced = produced.Add(rec.QtyKg)
+				settled = settled.Add(settledByCarryover[rec.ID])
+				if rec.Status != CarryoverStatusActive {
 					continue // 已搬上台的结转记录不再是"可领用"的货
 				}
-				remain := bag.QtyKg.Sub(bag.ConsumedKg)
+				remain := rec.QtyKg.Sub(rec.ConsumedKg)
 				if remain.IsPositive() {
 					available = available.Add(remain)
 				}

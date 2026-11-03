@@ -102,16 +102,16 @@ func applyDayEndRemain(mids []cutRollupMid, tot *TotalGrossMargin, purchaseAvg d
 
 // applyReferenceMargin 回填**参考口径**的成本单价与毛利(部位 + 全店)。
 //
-// # 口径(B 口径,owner 2026-11-01 拍板)
+// # 口径(B 口径,owner 2026-11-01 拍板 + 2026-11-03 补外采)
 //
 //	成本单价_c = **建议成本单价**(分割基线 × 今天这头猪的进价折算)
+//	            **与外采价按量加权**(owner 2026-11-03:「求均值」)
 //	参考毛利_c = 营收_c − 成本单价_c×(销量_c + 搭赠_c + 报损_c)
 //	全店参考毛利 = **Σ 部位参考毛利** ⇒ 头与部位同源。
 //
 // ⚠️ **不再需要日终实盘**(旧口径要它)⇒ 门店没做日终盘点也有数。
 //
-// ⚠️ 兜底:某部位没有基线价 ⇒ 用**全店采购均价**;
-//
+// ⚠️ 兜底:某部位没有基线价 ⇒ 用**进猪采购均价**;
 //	连采购均价都没有(当天没进货)⇒ 该部位算不出来(「—」),
 //	此时全店也给不出来(Σ 里缺一块 ⇒ 会把毛利算高)⇒ 全店给 nil。
 //
@@ -129,7 +129,9 @@ func applyReferenceMargin(mids []cutRollupMid, tot *TotalGrossMargin, ref Refere
 	tot.ExternalPurchaseKg = ref.ExternalKg
 	tot.ExternalPurchaseYuan = ref.ExternalYuan
 	tot.ReferenceRemainKg = ref.RemainKg
-	tot.ReferenceRemainYuan = ref.RemainKg.Mul(ref.PurchaseAvgYuan)
+	// ⚠️ 期末剩余的估值价用**含外采**的采购均价(owner 2026-11-03):
+	//   剩下的货里有外采那部分 ⇒ 它的成本就该按含外采的均价估。
+	tot.ReferenceRemainYuan = ref.RemainKg.Mul(ref.TotalPurchaseAvgYuan())
 
 	// ---- 部位 ----
 	partial := false
@@ -137,7 +139,9 @@ func applyReferenceMargin(mids []cutRollupMid, tot *TotalGrossMargin, ref Refere
 	for i := range mids {
 		mid := &mids[i]
 		soldAll := mid.soldKg.Add(mid.bulkKg)
-		unit, source := referenceCutUnitPriceFromBaseline(mid.src.SuggestedCostUnitPriceYuan, ref.PurchaseAvgYuan)
+		ext := ref.ExternalByCut[string(mid.src.CutType)]
+		unit, source := referenceCutUnitPrice(mid.src.SuggestedCostUnitPriceYuan,
+			ref.PurchaseAvgYuan, ref.TotalPurchaseAvgYuan(), pigSplitKgOf(&mid.src), ext)
 		if source == referencePriceSourceNone {
 			partial = true
 			mid.row.ReferenceCostUnitPriceYuan = nil

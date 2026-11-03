@@ -99,22 +99,22 @@ func TestExternalPurchase_RecordWritesFactStockAndCarryover(t *testing.T) {
 	}
 
 	// 结转记录:source='external'、归属快照为空(外采没有产出猪)。
-	bags := fmBags(t)
-	if len(bags) != 1 {
-		t.Fatalf("应登记 1 行结转记录, got %d: %+v", len(bags), bags)
+	records := fmRecords(t)
+	if len(records) != 1 {
+		t.Fatalf("应登记 1 行结转记录, got %d: %+v", len(records), records)
 	}
-	bag := bags[0]
-	if bag.Source != service.BagSourceExternal {
-		t.Errorf("结转记录来源应是 %q, got %q", service.BagSourceExternal, bag.Source)
+	rec := records[0]
+	if rec.Source != service.CarryoverSourceExternal {
+		t.Errorf("结转记录来源应是 %q, got %q", service.CarryoverSourceExternal, rec.Source)
 	}
-	if bag.Location != string(model.StockLocationCounter) {
-		t.Errorf("结转记录的位置应是猪肉台 %q, got %q", model.StockLocationCounter, bag.Location)
+	if rec.Location != string(model.StockLocationCounter) {
+		t.Errorf("结转记录的位置应是猪肉台 %q, got %q", model.StockLocationCounter, rec.Location)
 	}
-	if len(bag.PigAlloc) != 0 {
-		t.Errorf("外采没有产出猪 ⇒ 归属快照必须为空, got %s", string(bag.PigAlloc))
+	if len(rec.PigAlloc) != 0 {
+		t.Errorf("外采没有产出猪 ⇒ 归属快照必须为空, got %s", string(rec.PigAlloc))
 	}
-	if !bag.UnitCostYuan.Equal(d("24")) {
-		t.Errorf("结转记录的成本快照应是门店给的单价 24, got %s", bag.UnitCostYuan)
+	if !rec.UnitCostYuan.Equal(d("24")) {
+		t.Errorf("结转记录的成本快照应是门店给的单价 24, got %s", rec.UnitCostYuan)
 	}
 }
 
@@ -192,8 +192,8 @@ func TestExternalPurchase_UpdateAndDelete(t *testing.T) {
 	if !counter.IsZero() {
 		t.Errorf("撤后猪肉台应回到 0, got %s", counter)
 	}
-	if bags := fmBags(t); len(bags) != 0 {
-		t.Errorf("撤后结转记录应删掉, got %d 行", len(bags))
+	if records := fmRecords(t); len(records) != 0 {
+		t.Errorf("撤后结转记录应删掉, got %d 行", len(records))
 	}
 	if rows := fmExtRows(t, "S001"); len(rows) != 0 {
 		t.Errorf("撤后外采单应删掉, got %d 行", len(rows))

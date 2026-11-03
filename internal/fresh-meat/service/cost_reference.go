@@ -50,32 +50,113 @@ import (
 
 // ReferenceDayTotals 参考口径的**当日总量输入**。
 //
-// ⚠️ 全部来自**事实**:猪(whole_pigs)、销售(cube)、盘点单(猪肉台实盘)。
+// ⚠️ 全部来自**事实**:猪(whole_pigs)、外采(external_purchases)、销售(cube)、盘点单(猪肉台实盘)。
 // ⚠️ 没有任何一项来自分割建议 ⇒ 切割不准也不影响这里。
 type ReferenceDayTotals struct {
-	// PurchasedKg / PurchasedYuan 是当日进店的猪的合计。
+	// PurchasedKg / PurchasedYuan 是当日进店的**猪**的合计。
+	//
+	// ⚠️ 这是**进猪口径**(owner 2026-11-03 拍板:看板的进货栏一个字不动)。
 	PurchasedKg   decimal.Decimal
 	PurchasedYuan decimal.Decimal
-	// PurchaseAvgYuan 是**采购均价**(元/kg)= 采购金额 ÷ 采购重量。
+	// PurchaseAvgYuan 是**进猪**的采购均价(元/kg)= 进猪金额 ÷ 进猪重量。
 	//
 	// ⚠️ 它是**剩余成本**的估值价(owner:「可以用采购均价计算」)——
 	//   也是**部位成本单价取不到零售均价时的兜底价**。
 	PurchaseAvgYuan decimal.Decimal
-	// RemainKg 是**期末猪肉台实盘**(kg)—— **不含冷库**。
-	RemainKg decimal.Decimal
 	// ExternalKg / ExternalYuan 是当日**外采**的合计(kg / 元)。
 	//
 	// ⚠️ **与进猪口径分开**(owner 2026-11-03 拍板):
 	//   进猪(whole_pigs)是"一整头猪",外采是"已经切好的某个部位的额外进货"
 	//   ⇒ 两者不能合并成一个"总进货"数(合并了门店就看不出外采花了多少钱)。
-	// ⇒ 这里只**展示**,不参与 PurchasedKg/PurchaseAvgYuan 的计算。
 	ExternalKg   decimal.Decimal
 	ExternalYuan decimal.Decimal
+	// ExternalByCut 是**按部位**的外采合计(owner 2026-11-03:参考毛利的成本单价
+	// 要按量加权,必须知道每个部位各外采了多少、什么价)。
+	//
+	// ⚠️ key = cut_type(部位);一个部位多笔不同价 ⇒ 单价按**量加权**(金额 ÷ 重量)。
+	ExternalByCut map[string]ExternalCutTotals
+	// RemainKg 是**期末猪肉台实盘**(kg)—— **不含冷库**。
+	RemainKg decimal.Decimal
 	// HasRemain = false ⇒ 当天没有完整日终盘点 ⇒ 剩余算不出来。
 	//
 	// ⚠️ 这时**不能**给毛利(前端显示「—」),也不能给 0
 	//   (0 会被门店误读成"当天一点货都没剩、还亏了本")。
 	HasRemain bool
+}
+
+// ExternalCutTotals 某个部位当天的**外采**合计。
+type ExternalCutTotals struct {
+	// Kg 是该部位当天外采的重量(kg)。
+	Kg decimal.Decimal
+	// AmountYuan 是该部位当天外采的金额(元)。
+	AmountYuan decimal.Decimal
+	// UnitPriceYuan 是该部位外采的**加权单价**(元/kg)= 金额 ÷ 重量。
+	UnitPriceYuan decimal.Decimal
+}
+
+// TotalPurchasedKg 当日**含外采**的进货量(kg)= 进猪 + 外采。
+//
+// ⚠️ 与 [ReferenceDayTotals.PurchasedKg](进猪口径)**刻意分开**:
+//   看板的进货栏要保持"进猪口径"(owner 2026-11-03 拍板),
+//   而长期毛利的「期间采购」与采样用的采购均价**要含外采**(owner 同日拍板)。
+func (t ReferenceDayTotals) TotalPurchasedKg() decimal.Decimal {
+	return t.PurchasedKg.Add(t.ExternalKg)
+}
+
+// TotalPurchasedYuan 当日**含外采**的进货金额(元)= 进猪 + 外采。
+func (t ReferenceDayTotals) TotalPurchasedYuan() decimal.Decimal {
+	return t.PurchasedYuan.Add(t.ExternalYuan)
+}
+
+// TotalPurchaseAvgYuan 当日**含外采**的采购均价(元/kg)= 总金额 ÷ 总重量。
+//
+// ⚠️ 这就是 owner 说的「**求均值**」:不是把成本单价直接换成外采价,
+//   而是按**重量**把外采并进均价里。
+func (t ReferenceDayTotals) TotalPurchaseAvgYuan() decimal.Decimal {
+	kg := t.TotalPurchasedKg()
+	if !kg.IsPositive() {
+		return decimal.Zero
+	}
+	return t.TotalPurchasedYuan().Div(kg)
+}
+
+// externalByCutOf 某营业日的**外采**:按部位汇总(kg / 金额 / 加权单价)+ 全店合计。
+//
+// ⚠️ 日期用**区间**而不是等值:datatypes.Date 落库是"带时区的零点",
+//   PG 里 `date = timestamp` 会按会话时区折算 ⇒ 等值不可靠。
+//
+// ⚠️ 同一部位多笔不同价 ⇒ 单价按**量加权**(金额 ÷ 重量)。
+func (s *Service) externalByCutOf(ctx context.Context, branchID string, day time.Time) (
+	map[string]ExternalCutTotals, decimal.Decimal, decimal.Decimal, error,
+) {
+	byCut := map[string]ExternalCutTotals{}
+	startOfDay, endOfDay := s.businessDayBounds(day)
+	var rows []model.ExternalPurchase
+	if err := s.db.WithContext(ctx).
+		Where("branch_id = ? AND biz_date >= ? AND biz_date < ?", branchID, startOfDay, endOfDay).
+		Find(&rows).Error; err != nil {
+		return nil, decimal.Zero, decimal.Zero, fmt.Errorf("query external_purchases(reference): %w", err)
+	}
+	var totalKg, totalYuan decimal.Decimal
+	for _, r := range rows {
+		totalKg = totalKg.Add(r.QtyKg)
+		totalYuan = totalYuan.Add(r.TotalAmountYuan)
+		cut := string(r.CutType)
+		if cut == "" {
+			continue
+		}
+		v := byCut[cut]
+		v.Kg = v.Kg.Add(r.QtyKg)
+		v.AmountYuan = v.AmountYuan.Add(r.TotalAmountYuan)
+		byCut[cut] = v
+	}
+	for cut, v := range byCut {
+		if v.Kg.IsPositive() {
+			v.UnitPriceYuan = v.AmountYuan.Div(v.Kg)
+		}
+		byCut[cut] = v
+	}
+	return byCut, totalKg, totalYuan, nil
 }
 
 // referenceMarginRate 算当日**总毛利率** m(**旧口径 A**)。
@@ -97,8 +178,12 @@ type ReferenceDayTotals struct {
 //
 // ⚠️ **剩余 → 0 时 m = (营收 − 采购)/营收** ⇒ 精确(owner 的收敛判据)。
 //
+// ⚠️ **采购与采购均价都含外采**(owner 2026-11-03 拍板:「采样算当日毛利率时
+// 用含外采的采购均价」)⇒ 外采的成本进 m ⇒ 倒推出的进货单价含外采
+// ⇒ **单价基线也就含了外采**。
+//
 // ⚠️ 返回 ok=false 的三种情况(都**不能**给 0):
-//   - 当天**没有进货** ⇒ 参考口径整体失效(见下);
+//   - 当天**没有进货**(进猪 + 外采都没有)⇒ 参考口径整体失效(见下);
 //   - 当天没有完整日终盘点 ⇒ 剩余算不出来;
 //   - 当天没有营收 ⇒ 毛利率没有意义。
 //
@@ -113,14 +198,14 @@ type ReferenceDayTotals struct {
 //	⇒ 而当天其实只是**还没录猪**(毛利看板本来就有「今天还没录猪」提示)。
 //	⇒ 这种日子只能显示「—」(算不出来),不能给一个假的 100%。
 func referenceMarginRate(tot ReferenceDayTotals, revenue decimal.Decimal) (decimal.Decimal, bool) {
-	if !tot.PurchasedKg.IsPositive() {
+	if !tot.TotalPurchasedKg().IsPositive() {
 		return decimal.Zero, false
 	}
 	if !tot.HasRemain || !revenue.IsPositive() {
 		return decimal.Zero, false
 	}
-	remainYuan := tot.RemainKg.Mul(tot.PurchaseAvgYuan)
-	gm := revenue.Sub(tot.PurchasedYuan).Add(remainYuan)
+	remainYuan := tot.RemainKg.Mul(tot.TotalPurchaseAvgYuan())
+	gm := revenue.Sub(tot.TotalPurchasedYuan()).Add(remainYuan)
 	return gm.Div(revenue), true
 }
 
@@ -164,18 +249,13 @@ func (s *Service) referenceDayTotalsOf(ctx context.Context, branchID string, day
 	//
 	// ⚠️ 为什么分开:外采是"已经切好的某个部位",进猪是"一整头猪"
 	//   ⇒ 合并后门店看不出"今天额外买了多少某部位的货、花了多少钱"。
-	// ⚠️ 日期用**区间**而不是等值:datatypes.Date 落库是"带时区的零点",
-	//   PG 里 `date = timestamp` 会按会话时区折算 ⇒ 等值不可靠。
-	var extRows []model.ExternalPurchase
-	if err := s.db.WithContext(ctx).
-		Where("branch_id = ? AND biz_date >= ? AND biz_date < ?", branchID, startOfDay, endOfDay).
-		Find(&extRows).Error; err != nil {
-		return out, fmt.Errorf("query external_purchases(reference): %w", err)
+	extByCut, extKg, extYuan, err := s.externalByCutOf(ctx, branchID, day)
+	if err != nil {
+		return out, err
 	}
-	for _, r := range extRows {
-		out.ExternalKg = out.ExternalKg.Add(r.QtyKg)
-		out.ExternalYuan = out.ExternalYuan.Add(r.TotalAmountYuan)
-	}
+	out.ExternalByCut = extByCut
+	out.ExternalKg = extKg
+	out.ExternalYuan = extYuan
 
 	// 期末猪肉台实盘:只认**完整盘点单**的那个数据源标记。
 	for _, r := range rows {
@@ -188,34 +268,74 @@ func (s *Service) referenceDayTotalsOf(ctx context.Context, branchID string, day
 	return out, nil
 }
 
-// referenceCutUnitPriceFromBaseline 取某个部位当天的**参考成本单价**(元/kg)。
+// referenceCutUnitPrice 取某个部位当天的**参考成本单价**(元/kg)—— **含外采加权**。
 //
-// # 口径(B 口径,owner 2026-11-01 拍板)
+// # 口径(owner 2026-11-03 拍板:「求均值」)
 //
-//	成本单价_c = **建议成本单价**(基线单价 × 今天这头猪的进价折算)
+//	unit_c = (base_c × pigKg_c + extPrice_c × extKg_c) ÷ (pigKg_c + extKg_c)
 //
-// ⇒ **不需要日终实盘** ⇒ 没做盘点的日子照样有毛利。
+//	base_c     = 建议成本单价(基线折算);取不到 ⇒ 用**进猪**采购均价
+//	             (⚠️ **进猪口径、不含外采** ⇒ 免得外采被算两遍)
+//	pigKg_c    = 该部位今天的**猪分割产出**(kg,不含外采)
+//	extPrice_c = 该部位当天外采的加权单价;extKg_c = 外采量
 //
-// # 兜底链
+// ⇒ **不是**把成本单价直接换成外采价(owner 明确否掉)
+//   ⇒ 而是按**重量**把两批货的成本合到一起 ⇒ 这才是该部位当天的真实成本。
 //
-//	建议成本单价 → 全店采购均价 → 取不到(= none)
+// # 兜底链(没有外采时与从前一致)
+//
+//	建议成本单价 → 全店采购均价(含外采) → 取不到(= none)
 //
 // ⚠️ 为什么要有兜底:某个部位可能**没有自己的基线价**
 //
 //	(部位单价基线覆盖不到、或退取链只走到了整店均价)⇒ 它也要计成本
 //	(搭赠/报损这类"有量、无销售"的部位也要计成本)⇒ 单价不能是空。
 //
-// ⚠️ 返回 source 让调用方能说清"这个单价是基线折算的还是兜底的"。
-func referenceCutUnitPriceFromBaseline(suggested *decimal.Decimal, purchaseAvg decimal.Decimal) (
-	decimal.Decimal, string,
-) {
-	if suggested != nil && suggested.IsPositive() {
-		return *suggested, referencePriceSourceBaseline
+// ⚠️ 返回 source 让调用方能说清"这个单价是怎么来的"。
+func referenceCutUnitPrice(suggested *decimal.Decimal, pigAvg decimal.Decimal, totalAvg decimal.Decimal,
+	pigKg decimal.Decimal, ext ExternalCutTotals) (decimal.Decimal, string) {
+	// ---- base:建议成本单价优先;取不到 ⇒ 进猪采购均价(不含外采)----
+	base := decimal.Zero
+	baseSource := referencePriceSourceNone
+	switch {
+	case suggested != nil && suggested.IsPositive():
+		base = *suggested
+		baseSource = referencePriceSourceBaseline
+	case pigAvg.IsPositive():
+		base = pigAvg
+		baseSource = referencePriceSourcePurchaseAvg
 	}
-	if purchaseAvg.IsPositive() {
-		return purchaseAvg, referencePriceSourcePurchaseAvg
+	// ---- 有外采 ⇒ 按量加权 ----
+	if ext.Kg.IsPositive() && ext.UnitPriceYuan.IsPositive() && base.IsPositive() {
+		if total := pigKg.Add(ext.Kg); total.IsPositive() {
+			unit := base.Mul(pigKg).Add(ext.UnitPriceYuan.Mul(ext.Kg)).Div(total)
+			if baseSource == referencePriceSourceBaseline {
+				return unit, referencePriceSourceBaselineExternal
+			}
+			return unit, referencePriceSourcePurchaseAvgExternal
+		}
+	}
+	// ---- 没有外采 ⇒ 原兜底链 ----
+	if base.IsPositive() {
+		return base, baseSource
+	}
+	if totalAvg.IsPositive() {
+		return totalAvg, referencePriceSourcePurchaseAvg
 	}
 	return decimal.Zero, referencePriceSourceNone
+}
+
+// pigSplitKgOf 该部位今天的**猪分割产出**(kg)—— 加权的另一半(不含外采)。
+//
+// ⚠️ **不能用 AdjustedSplitKg(= prodK)**:prodK 已经**叠加了外采**(cut_cost.go 的 8c-2)
+//   ⇒ 拿它加权 = 把外采算两遍(外采既进权重、又进单价)。
+//
+// ⇒ 优先**实际分割 A_c**(实测),没有则退**建议分割 S_c**(基线)。
+func pigSplitKgOf(src *CutDailyCost) decimal.Decimal {
+	if src.ActualSplitKg != nil && src.ActualSplitKg.IsPositive() {
+		return *src.ActualSplitKg
+	}
+	return src.SuggestedSplitKg
 }
 
 // 参考成本单价的**来源**标记(前端要能说清"这个数是怎么来的")。
@@ -224,6 +344,10 @@ const (
 	referencePriceSourceBaseline = "baseline"
 	// referencePriceSourcePurchaseAvg = 全店采购均价兜底(这个部位没有基线价)。
 	referencePriceSourcePurchaseAvg = "purchase_avg"
+	// referencePriceSourceBaselineExternal = 建议成本单价与**外采价按量加权**(owner 2026-11-03)。
+	referencePriceSourceBaselineExternal = "baseline_external"
+	// referencePriceSourcePurchaseAvgExternal = 进猪采购均价与**外采价按量加权**。
+	referencePriceSourcePurchaseAvgExternal = "purchase_avg_external"
 	// referencePriceSourceNone = 取不到(既没有基线价、当天也没进货)。
 	referencePriceSourceNone = "none"
 )

@@ -89,7 +89,7 @@ func initApp() error {
 		&model.SkuCostDaily{},
 		&model.PromoSku{},
 		// 2026-10-23:大宗台账(板油等) + 分割重量统计基线。
-		&model.StockBag{},
+		&model.CarryoverRecord{},
 	&model.BulkProduct{},
 		&model.BulkProduction{},
 		&model.BulkSettlement{},

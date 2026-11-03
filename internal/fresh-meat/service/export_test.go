@@ -181,6 +181,32 @@ func ReferenceDayTotalsForTest(purchasedKg, purchasedYuan, remainKg string, hasR
 	return out
 }
 
+// ReferenceDayTotalsWithExternalForTest 造一个**带外采**的 [ReferenceDayTotals]。
+//
+// ⚠️ 为什么值得单独暴露:owner 2026-11-03 要求外采进成本口径
+//   (长期毛利的期间采购 / 参考毛利的按量加权 / 采样的均价)
+//   ⇒ 这三处都要在单测里能造出"当天有外采"的输入。
+//
+// 参数:(进猪kg, 进猪元, 外采kg, 外采元, 期末台面kg, 有盘点?)
+// ⇒ 外采**按一个部位**记(belly)—— 单测里够用。
+func ReferenceDayTotalsWithExternalForTest(purchasedKg, purchasedYuan,
+	externalKg, externalYuan, remainKg string, hasRemain bool) ReferenceDayTotals {
+	out := ReferenceDayTotalsForTest(purchasedKg, purchasedYuan, remainKg, hasRemain)
+	out.ExternalByCut = map[string]ExternalCutTotals{}
+	if v, err := decimal.NewFromString(externalKg); err == nil {
+		out.ExternalKg = v
+	}
+	if v, err := decimal.NewFromString(externalYuan); err == nil {
+		out.ExternalYuan = v
+	}
+	if out.ExternalKg.IsPositive() {
+		byCut := ExternalCutTotals{Kg: out.ExternalKg, AmountYuan: out.ExternalYuan}
+		byCut.UnitPriceYuan = byCut.AmountYuan.Div(byCut.Kg)
+		out.ExternalByCut[string(model.CutBelly)] = byCut
+	}
+	return out
+}
+
 // RollUpPerCutCutsForTest 暴露 [rollUpPerCutCuts](部位行装配)。
 //
 // ⚠️ 为什么值得单独暴露:「日终剩余 / 售罄率 / **参考口径毛利**」几项

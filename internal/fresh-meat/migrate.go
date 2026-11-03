@@ -156,19 +156,77 @@ func ApplyPreMigrateFixups(db *gorm.DB) error {
 		return fmt.Errorf("fresh-meat: drop bulk_products.active: %w", err)
 	}
 
-	// ⑥ stock_bags.label 改成**可空**(2026-10-24)。
+	// ⑥ 结转记录表**改名** + **彻底去掉旧的批次标记**(owner 2026-11-03)。
 	//
-	// 语义:空 label = **散货结转记录**(只有归属日 + SKU + 重量),
-	// 它同样进 FIFO 队列(毛利回归到猪要靠它)。
+	// # 为什么改名
 	//
-	// ⚠️ 为什么必须手写 DDL:GORM 的 AutoMigrate **不会把 NOT NULL 改成可空**
-	// ⇒ 库里留着 NOT NULL ⇒ 这张表表达不了"没有标签号"这个状态。
-	if err := db.Exec(`
+	//	`stock_bags`("袋")名不副实:生产实测 194 行里 183 行是**盘点结转**
+	//	(= 普通搬上台的货,没有批次标记)、8 行期初结转
+	//	⇒ 「袋」这个字只来自 2026-11-02 已下线的旧玩法 ⇒ 改名 `carryover_records`。
+	//
+	// # ⚠️ **必须在这里(AutoMigrate 之前)改名**
+	//
+	//	AutoMigrate 只会**新建**一张空的 `carryover_records`
+	//	⇒ 194 行老台账会留在旧表里 ⇒ FIFO 队列与大宗分摊凭据断链
+	//	⇒ 先 RENAME(**数据原样保留**)再让 AutoMigrate 接手。
+	//
+	// # ⚠️ 删列 = **删数据**(owner 已知悉)
+	//
+	//	label 列里只有 6 行**契约测试**造的数据(TSTLBLT*/BAGTSTFM*),
+	//	真实门店**一行都没有** ⇒ 删掉不丢任何业务数据。
+	//
+	// ⚠️ 索引引用着列 ⇒ 必须**先删索引、再删列**(PG 不允许删被索引引用的列)。
+	if db.Dialector.Name() == "postgres" {
+		if err := db.Exec(`
 		DO $$ BEGIN
-		   IF to_regclass('public.stock_bags') IS NULL THEN RETURN; END IF;
-		   ALTER TABLE stock_bags ALTER COLUMN label DROP NOT NULL;
+		   -- ① 表改名:旧表在 且 新表不在 才改(都存在 ⇒ 已被别的流程改过 ⇒ 不动)
+		   IF to_regclass('public.stock_bags') IS NOT NULL
+		      AND to_regclass('public.carryover_records') IS NULL THEN
+		      ALTER TABLE stock_bags RENAME TO carryover_records;
+		   END IF;
+		   -- ② 大宗分摊的引用列改名(**数据保留**)
+		   IF to_regclass('public.bulk_settlement_allocations') IS NOT NULL THEN
+		      IF EXISTS (SELECT 1 FROM information_schema.columns
+		                 WHERE table_name = 'bulk_settlement_allocations' AND column_name = 'bag_id')
+		         AND NOT EXISTS (SELECT 1 FROM information_schema.columns
+		                 WHERE table_name = 'bulk_settlement_allocations' AND column_name = 'carryover_id') THEN
+		         ALTER TABLE bulk_settlement_allocations RENAME COLUMN bag_id TO carryover_id;
+		      END IF;
+		      -- ⚠️ PG 的 RENAME COLUMN **不会**改索引名 ⇒ 旧名索引会**继续**指向新列
+		      --   ⇒ AutoMigrate 又会按新列名建一个 ⇒ **两个一样的索引**。
+		      --   ⇒ 这里先把旧的自动索引删掉,让 AutoMigrate 建唯一的那个。
+		      DROP INDEX IF EXISTS idx_bulk_settlement_allocations_bag_id;
+		   END IF;
+		   -- ③ 旧的批次标记:两个索引 + 列**一起删**
+		   IF to_regclass('public.carryover_records') IS NOT NULL THEN
+		      DROP INDEX IF EXISTS idx_stock_bag_branch_label_active;
+		      DROP INDEX IF EXISTS idx_stock_bags_label;
+		      ALTER TABLE carryover_records DROP COLUMN IF EXISTS label;
+		   END IF;
+		   -- ④ 其余索引跟着表改名(⚠️ PG 的 RENAME TABLE **不会**改索引名)
+		   --   ⇒ 不改的话 AutoMigrate 会按新表名再建一份 ⇒ **重复索引**。
+		   IF to_regclass('public.carryover_records') IS NOT NULL THEN
+		      ALTER INDEX IF EXISTS idx_stock_bags_branch_id      RENAME TO idx_carryover_records_branch_id;
+		      ALTER INDEX IF EXISTS idx_stock_bags_cube_product_id RENAME TO idx_carryover_records_cube_product_id;
+		      ALTER INDEX IF EXISTS idx_stock_bags_origin_date    RENAME TO idx_carryover_records_origin_date;
+		   END IF;
+		   -- ⑤ 主键约束也带着旧表名(PG 不会自动改)⇒ 一并改成新表名,
+		   --   免得库里还留着 "stock_bags" 的字样(owner:彻底去掉)。
+		   IF to_regclass('public.carryover_records') IS NOT NULL THEN
+		      DO $rename_pk$
+		      DECLARE cname text;
+		      BEGIN
+		         SELECT conname INTO cname FROM pg_constraint
+		           WHERE conrelid = 'carryover_records'::regclass AND contype = 'p'
+		           LIMIT 1;
+		         IF cname IS NOT NULL AND cname <> 'carryover_records_pkey' THEN
+		            EXECUTE format('ALTER TABLE carryover_records RENAME CONSTRAINT %I TO carryover_records_pkey', cname);
+		         END IF;
+		      END $rename_pk$;
+		   END IF;
 		 END $$;`).Error; err != nil {
-		return fmt.Errorf("fresh-meat: relax stock_bags.label: %w", err)
+			return fmt.Errorf("fresh-meat: rename carryover records table / drop legacy label: %w", err)
+		}
 	}
 
 	return nil
@@ -262,68 +320,54 @@ ORDER BY array_position(i.indkey, a.attnum)`, bulkProductionIndex).Scan(&cols).E
 
 // ApplySchemaFixups 执行 AutoMigrate 之外的结构修正。
 //
-// # 结转记录的标签号:部分唯一索引(2026-10-24)
+// # 结转记录的旧批次标记:已**彻底删掉**(2026-11-03 owner)
 //
-// 语义:「**在用中**的结转记录,标签号在门店内唯一」。
-// ⇒ 这批货搬上猪肉台后标签号释放 ⇒ 同一个标签号可以贴在别的批次上。
+// 语义曾是「**在用中**的结转记录,批次标记在门店内唯一」
+// ⇒ 那个玩法 2026-11-02 就整套下线了,2026-11-03 owner 拍板连
+//   `label` **列与索引一起删** ⇒ 这里**不再建**任何批次标记相关的索引。
 //
-// ⚠️ 2026-11-02 owner:**标签号玩法整套下线** ⇒ 再也没有新的带标签的行。
+// ⚠️ 删列/删索引在 **AutoMigrate 之前**做(见 ApplyPreMigrateFixups 的 ⑥)
+//   ⇒ AutoMigrate 不会再把它建回来。
 //
-// ⇒ 这个索引**永远匹配不到新数据** ⇒ 保留它只是为了不动历史 schema
-// (生产库里还有 6 行历史带标签的数据 + 索引)。
-//
-// ⇒ **代码不再读也不再写** stock_bags.label(见 service/stock_bags.go)。
-//
-// ⚠️ GORM 的 `uniqueIndex` tag **表达不了** `WHERE` ⇒ 必须手写 DDL。
-//
-// 调用顺序:**必须在 AutoMigrate 之后** ——
-// 先让 AutoMigrate 建好新索引(万一历史数据违反新唯一约束,这一步会**大声失败**,
-// 而不是等到运行时才炸);再删旧索引(避免出现"旧约束还在"的窗口)。
+// ⚠️ GORM 的 `uniqueIndex` tag **表达不了** `WHERE` ⇒ 原来必须手写 DDL;
+//   现在列都没了 ⇒ 手写的那段整段删掉了。
 func ApplySchemaFixups(db *gorm.DB) error {
 	if db == nil {
 		return fmt.Errorf("fresh-meat: ApplySchemaFixups: db 为 nil")
 	}
 
-	// 0) 结转记录的标签号:部分唯一索引(`WHERE status='active' AND label <> ''`)。
+	// 0) 旧的批次标记部分唯一索引:**已随旧玩法下线一起删掉**(owner 2026-11-03)。
 	//
-	// ⚠️ 2026-10-24:label 变成**可空**了 —— 空 label = 散货结转记录
-	// (同一 SKU 每天一行 ⇒ 同一门店同一天会有**多行** label='' )
-	// ⇒ 索引必须把空 label 排除掉,否则这些行会互相冲突(唯一索引直接报错)。
+	// ⚠️ 原来这里会建 `UNIQUE(branch_id, label) WHERE status='active' AND label<>''`
+	//   —— 现在 **label 列本身已经删了**(见 ApplyPreMigrateFixups 的 ⑥)
+	//   ⇒ 再建这个索引会直接报错 ⇒ 整段删除。
 	//
-	// ⚠️ 索引的**定义变了** ⇒ PG 的 `CREATE INDEX IF NOT EXISTS` **不会替换**
-	// 已有索引(它只按名字判断存在)⇒ 必须先 DROP 再建。
-	//
-	// ⚠️ 表是 AutoMigrate 刚建的 ⇒ 索引要在这里建(前置 fixups 时表还不存在)。
-	if db.Dialector.Name() == "postgres" {
-		if err := db.Exec(`
-		DROP INDEX IF EXISTS idx_stock_bag_branch_label_active;
-		CREATE UNIQUE INDEX IF NOT EXISTS idx_stock_bag_branch_label_active
-		      ON stock_bags (branch_id, label) WHERE status = 'active' AND label <> '';`).Error; err != nil {
-			return fmt.Errorf("fresh-meat: partial unique index on stock_bags: %w", err)
-		}
-	}
+	// ⚠️ 代码也**不再读也不再写**批次标记(见 service/carryover_records.go)。
 
 	// 0b) 2026-10-25:大宗结算的 FIFO 队列统一到**结转记录** ⇒ 两张表加列。
 	//
-	// ⚠️ 为什么手写 DDL:老库里 stock_bags.source / unit_cost_yuan 不存在,
+	// ⚠️ 为什么手写 DDL:老库里 carryover_records.source / unit_cost_yuan 不存在,
 	//   而 AutoMigrate 加 NOT NULL 列时,历史行会先拿到默认值 ⇒ 语义正好
 	//   (历史行全是盘点来的 ⇒ 'stocktake')。这里再兜一次底,保证列一定在。
 	//
-	// ⚠️ bulk_settlement_allocations.bag_id / location 是**可空**的:
+	// ⚠️ bulk_settlement_allocations.carryover_id / location 是**可空**的:
 	//   老数据(台账时代)扣的是 bulk_productions ⇒ 没有结转记录 ⇒ 留空即可。
 	if db.Dialector.Name() == "postgres" {
 		if err := db.Exec(`
 		DO $$ BEGIN
-		   IF to_regclass('public.stock_bags') IS NULL THEN RETURN; END IF;
-		   ALTER TABLE stock_bags ADD COLUMN IF NOT EXISTS source varchar(16) NOT NULL DEFAULT 'stocktake';
-		   ALTER TABLE stock_bags ADD COLUMN IF NOT EXISTS unit_cost_yuan numeric(16,4) NOT NULL DEFAULT 0;
+		   IF to_regclass('public.carryover_records') IS NULL THEN RETURN; END IF;
+		   ALTER TABLE carryover_records ADD COLUMN IF NOT EXISTS source varchar(16) NOT NULL DEFAULT 'stocktake';
+		   ALTER TABLE carryover_records ADD COLUMN IF NOT EXISTS unit_cost_yuan numeric(16,4) NOT NULL DEFAULT 0;
 		 END $$;
 		DO $$ BEGIN
 		   IF to_regclass('public.bulk_settlement_allocations') IS NULL THEN RETURN; END IF;
-		   ALTER TABLE bulk_settlement_allocations ADD COLUMN IF NOT EXISTS bag_id varchar(64);
+		   ALTER TABLE bulk_settlement_allocations ADD COLUMN IF NOT EXISTS carryover_id varchar(64);
 		   ALTER TABLE bulk_settlement_allocations ADD COLUMN IF NOT EXISTS location varchar(16);
 		 END $$;
-		CREATE INDEX IF NOT EXISTS idx_bulk_alloc_bag ON bulk_settlement_allocations (bag_id);`).Error; err != nil {
+		-- ⚠️ 索引名里的旧词(Bag)也一并改掉:PG 的 RENAME COLUMN **不会**改索引名
+		--   ⇒ 先删旧名、再用新名建(同一列 ⇒ 等价,只是名字干净)。
+		DROP INDEX IF EXISTS idx_bulk_alloc_bag;
+		CREATE INDEX IF NOT EXISTS idx_bulk_alloc_carryover ON bulk_settlement_allocations (carryover_id);`).Error; err != nil {
 			return fmt.Errorf("fresh-meat: bulk fifo columns: %w", err)
 		}
 	}

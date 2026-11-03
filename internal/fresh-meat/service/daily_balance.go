@@ -18,7 +18,7 @@ package service
 //   - 搬上台(D)   = 当天搬台流水(counter_loads,**两种搬法都记**)
 //   - 大宗出库(D) = 当天**交付口径**的统收结算(bulk_settlement_allocations,
 //                   且只算**从冷库领用**的那部分)
-//   - 大宗进冷库(D) = 当天**手工**补录的大宗产出(stock_bags,source='bulk_manual')
+//   - 大宗进冷库(D) = 当天**手工**补录的大宗产出(carryover_records,source='bulk_manual')
 //
 // ⚠️ **日终盘点自动结转**不进冷库余额
 //   (applyOvernightMove 已经把柜台实盘搬进冷库了 ⇒ 再加一次就是同一批货记两次)。
@@ -221,12 +221,12 @@ func (s *Service) loadDailyTerms(ctx context.Context, branchID string) (map[stri
 	}
 	var bulkIns []bulkInRow
 	if err := s.db.WithContext(ctx).
-		Table("stock_bags").
+		Table("carryover_records").
 		Select("origin_date AS origin_date, cube_product_id AS cube_product_id, qty_kg AS qty_kg").
 		Where("branch_id = ? AND source = ? AND location = ?",
-			branchID, BagSourceBulkManual, string(model.StockLocationColdStore)).
+			branchID, CarryoverSourceBulkManual, string(model.StockLocationColdStore)).
 		Scan(&bulkIns).Error; err != nil {
-		return nil, fmt.Errorf("query stock_bags(daily terms): %w", err)
+		return nil, fmt.Errorf("query carryover_records(daily terms): %w", err)
 	}
 	cutOfSku, _, err := s.loadSkuCatalog(ctx, branchID, nil)
 	if err != nil {

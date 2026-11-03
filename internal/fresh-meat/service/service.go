@@ -125,7 +125,7 @@ const defaultScopeTTL = 60 * time.Second
 // # 为什么需要它(2026-10-26 生产现场)
 //
 // 门店打开「每日作业」页会**并发**打十几个请求
-// (business-day / whole-pigs / stock/bags / counter-load / openings …),
+// (business-day / whole-pigs / stock/carryovers / counter-load / openings …),
 // 每个请求都要过一次 requireScope → GetEffectiveScopes。
 //
 // 平时命中 60s 缓存,没问题。但**缓存恰好过期 + userd 那一瞬抖了**
@@ -898,7 +898,7 @@ func (s *Service) RecordPorkCutsStocktake(ctx context.Context, branchID string, 
 			s.pubLogger.Error("RecordPorkCutsStocktake: 过夜搬运失败(库存位置没更新,下次盘点会自愈)",
 				"branch_id", branchID, "stocktake_id", st.ID, "err", err)
 		}
-		// ② 大宗品项的**结转记录**在 registerStockBags 里登记
+		// ② 大宗品项的**结转记录**在 registerCarryoverRecords 里登记
 		// (2026-10-25:不再单独写 bulk_productions 台账 —— 同一事实只记一处,
 		//  否则结算按台账扣、零售按结转记录扣 ⇒ 同一批货会被卖两遍)。
 		// ③ 按营业日推导**结余快照**(柜台实盘 / 冷库余额分开)+ 重算成本日快照。
@@ -932,14 +932,14 @@ func (s *Service) RecordPorkCutsStocktake(ctx context.Context, branchID string, 
 		s.pubLogger.Error("RecordPorkCutsStocktake: 营业日状态推进失败(状态落后,下次盘点会自愈)",
 			"branch_id", branchID, "stocktake_id", st.ID, "err", err)
 	}
-	// ④ **按日结转记录登记**(2026-10-24):批次(带标签号)+ 散货。
+	// ④ **按日结转记录登记**(2026-10-24):批次(带批次标记)+ 散货。
 	//
 	// ⇒ 它是"**记录**"(归属日 + SKU + 重量 + 猪归属快照),两天都要写
 	// (毛利 FIFO 回归到猪要靠它)。
 	// ⇒ 结转记录还让"次日整批搬上台"成立,也让"当日搬上台了多少"有流水
 	// (每日毛利的分摊重量要用它:搬上台的是老货,不能再摊一次猪成本)。
-	if err := s.registerStockBags(ctx, branchID, takenAt, in.Cuts); err != nil {
-		s.pubLogger.Error("RecordPorkCutsStocktake: 结转记录登记失败(标签号/归属丢失,下次盘点会自愈)",
+	if err := s.registerCarryoverRecords(ctx, branchID, takenAt, in.Cuts); err != nil {
+		s.pubLogger.Error("RecordPorkCutsStocktake: 结转记录登记失败(批次标记/归属丢失,下次盘点会自愈)",
 			"branch_id", branchID, "stocktake_id", st.ID, "err", err)
 	}
 
@@ -973,7 +973,7 @@ func (s *Service) RecordPorkCutsStocktake(ctx context.Context, branchID string, 
 //
 //	—— 两种搬法都记(整批搬 / 按 SKU+kg 搬)⇒ 不会漏判。
 //
-// ⚠️ 老数据(没有搬台流水之前)回退到 stock_bags.moved_at(只有整批搬留痕)。
+// ⚠️ 老数据(没有搬台流水之前)回退到 carryover_records.moved_at(只有整批搬留痕)。
 func (s *Service) isRestDay(ctx context.Context, branchID string, takenDate time.Time) (bool, error) {
 	startOfDay, endOfDay := s.businessDayBounds(takenDate)
 
@@ -1010,10 +1010,10 @@ func (s *Service) isRestDay(ctx context.Context, branchID string, takenDate time
 
 	// ③ 老数据回退:整批搬的 moved_at(没有流水表的时代)
 	var moved int64
-	if err := s.db.WithContext(ctx).Model(&model.StockBag{}).
+	if err := s.db.WithContext(ctx).Model(&model.CarryoverRecord{}).
 		Where("branch_id = ? AND moved_at >= ? AND moved_at < ?", branchID, startOfDay, endOfDay).
 		Count(&moved).Error; err != nil {
-		return false, fmt.Errorf("count moved stock_bags(rest day): %w", err)
+		return false, fmt.Errorf("count moved carryover_records(rest day): %w", err)
 	}
 	if moved > 0 {
 		return false, nil // 搬上台了 ⇒ 不是休市

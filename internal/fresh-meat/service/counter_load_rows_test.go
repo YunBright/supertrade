@@ -314,9 +314,9 @@ func TestCounterLoadRows_LineCarriesCutTypeAndProductName(t *testing.T) {
 	}
 }
 
-// TestCounterLoad_LegacyLabelRejected 锁「老客户端的标签搬法被当场拒」。
+// TestCounterLoad_LegacyLabelRejected 锁「老客户端的批次标记搬法被当场拒」。
 //
-// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 还在发 `label` 的老 APK 必须**当场报错**。
+// ⚠️ 2026-11-02 owner:旧玩法下线 ⇒ 还在发 `label` 的老 APK 必须**当场报错**。
 //
 // ⇒ 为什么不能静默忽略:老包发的是 `{"label":"BAG-001"}`
 // (没有货号、没有重量)⇒ 静默忽略的话,这一行会被当成
@@ -333,7 +333,7 @@ func TestCounterLoad_LegacyLabelRejected(t *testing.T) {
 	}, "u-1")
 	mustNoErr(t, err, "10-01 盘点")
 
-	// 10-02:老客户端的「按标签整批搬」⇒ 当场被拒。
+	// 10-02:老客户端的「按批次整批搬」⇒ 当场被拒。
 	svc.SetClock(fmClock(fmDay2))
 	_, err = svc.CounterLoad(ctx, "S001", service.CounterLoadInput{
 		Lines: []service.CounterLoadLine{{Label: "BAG-OLD"}},

@@ -2,7 +2,7 @@ package service_test
 
 // 2026-10-24:**按日结转记录**(结转记录台账)的回归锁。
 //
-// ⚠️ 2026-11-02 owner:标签号玩法整套下线 ⇒ 这里不再有"批次 / 标签号"的概念,
+// ⚠️ 2026-11-02 owner:旧玩法整套下线 ⇒ 这里不再有"批次 / 批次标记"的概念,
 // 盘点只按 SKU 登记**一行结转记录**(归属日 + SKU + 重量 + 猪归属快照)。
 //
 // ⇒ 剩下的不变量:
@@ -19,8 +19,8 @@ import (
 	"github.com/YunBright/supertrade/internal/fresh-meat/service"
 )
 
-// fmBagSetup 起一个服务并铺好"一个 SKU + 一头猪"的最小场景。
-func fmBagSetup(t *testing.T) (*service.Service, context.Context, string) {
+// fmCarryoverSetup 起一个服务并铺好"一个 SKU + 一头猪"的最小场景。
+func fmCarryoverSetup(t *testing.T) (*service.Service, context.Context, string) {
 	t.Helper()
 	svc, _ := setupTestService(t)
 	ctx := context.Background()
@@ -38,9 +38,9 @@ func fmBagSetup(t *testing.T) (*service.Service, context.Context, string) {
 	return svc, ctx, "P-BELLY"
 }
 
-// TestStockBag_RegisterOnStocktake 锁 ①:盘点 ⇒ 登记一行结转记录。
-func TestStockBag_RegisterOnStocktake(t *testing.T) {
-	svc, ctx, sku := fmBagSetup(t)
+// TestCarryoverRecord_RegisterOnStocktake 锁 ①:盘点 ⇒ 登记一行结转记录。
+func TestCarryoverRecord_RegisterOnStocktake(t *testing.T) {
+	svc, ctx, sku := fmCarryoverSetup(t)
 
 	// 盘点:五花肉剩 12kg
 	if _, err := svc.RecordPorkCutsStocktake(ctx, "S001", model.RecordPorkCutsStocktakeInput{
@@ -52,14 +52,14 @@ func TestStockBag_RegisterOnStocktake(t *testing.T) {
 		t.Fatalf("RecordPorkCutsStocktake: %v", err)
 	}
 
-	bags, err := svc.ListStockBags(ctx, "S001", "cold_store", "")
+	records, err := svc.ListCarryoverRecords(ctx, "S001", "cold_store", "")
 	if err != nil {
-		t.Fatalf("ListStockBags: %v", err)
+		t.Fatalf("ListCarryoverRecords: %v", err)
 	}
-	if len(bags) != 1 {
-		t.Fatalf("应登记 1 行结转记录, got %d: %+v", len(bags), bags)
+	if len(records) != 1 {
+		t.Fatalf("应登记 1 行结转记录, got %d: %+v", len(records), records)
 	}
-	bg := bags[0]
+	bg := records[0]
 	if bg.CubeProductID != sku {
 		t.Errorf("结转记录字段不对: %+v", bg)
 	}
@@ -74,11 +74,11 @@ func TestStockBag_RegisterOnStocktake(t *testing.T) {
 	}
 }
 
-// TestStockBag_SameDayResubmitIsUpsert 锁 ②:同一天重复提交同一份盘点 = 覆盖,不多出一行。
+// TestCarryoverRecord_SameDayResubmitIsUpsert 锁 ②:同一天重复提交同一份盘点 = 覆盖,不多出一行。
 //
 // ⇒ 多一行 = 冷库余额虚高 ⇒ 盘点重提交会一次比一次高。
-func TestStockBag_SameDayResubmitIsUpsert(t *testing.T) {
-	svc, ctx, sku := fmBagSetup(t)
+func TestCarryoverRecord_SameDayResubmitIsUpsert(t *testing.T) {
+	svc, ctx, sku := fmCarryoverSetup(t)
 
 	submit := func(kg string) {
 		t.Helper()
@@ -94,25 +94,25 @@ func TestStockBag_SameDayResubmitIsUpsert(t *testing.T) {
 	submit("10")
 	submit("8")
 
-	bags, err := svc.ListStockBags(ctx, "S001", "", "")
+	records, err := svc.ListCarryoverRecords(ctx, "S001", "", "")
 	if err != nil {
-		t.Fatalf("ListStockBags: %v", err)
+		t.Fatalf("ListCarryoverRecords: %v", err)
 	}
-	if len(bags) != 1 {
-		t.Fatalf("重复提交同一天的盘点应只有 1 行, got %d: %+v", len(bags), bags)
+	if len(records) != 1 {
+		t.Fatalf("重复提交同一天的盘点应只有 1 行, got %d: %+v", len(records), records)
 	}
-	if !bags[0].QtyKg.Equal(d("8")) {
-		t.Errorf("重量应被覆盖成 8kg, got %s", bags[0].QtyKg)
+	if !records[0].QtyKg.Equal(d("8")) {
+		t.Errorf("重量应被覆盖成 8kg, got %s", records[0].QtyKg)
 	}
 }
 
-// TestStockBag_SameSkuRowsMerged 锁 ③:同一 SKU 盘多行 ⇒ **合并求和**,不丢数据。
+// TestCarryoverRecord_SameSkuRowsMerged 锁 ③:同一 SKU 盘多行 ⇒ **合并求和**,不丢数据。
 //
-// ⚠️ 2026-11-02 owner:拆批(同 SKU 分多批)在前端随标签号一起下线,
+// ⚠️ 2026-11-02 owner:拆批(同 SKU 分多批)在前端随旧玩法一起下线,
 // 但**老 APK** 仍可能拆着提交 ⇒ 后端必须合并,而不是静默覆盖。
 // (静默覆盖 ⇒ "位置表 20kg / 结转记录 5kg" ⇒ FIFO 归摊用错重量。)
-func TestStockBag_SameSkuRowsMerged(t *testing.T) {
-	svc, ctx, sku := fmBagSetup(t)
+func TestCarryoverRecord_SameSkuRowsMerged(t *testing.T) {
+	svc, ctx, sku := fmCarryoverSetup(t)
 
 	_, err := svc.RecordPorkCutsStocktake(ctx, "S001", model.RecordPorkCutsStocktakeInput{
 		IsComplete: true,
@@ -123,21 +123,21 @@ func TestStockBag_SameSkuRowsMerged(t *testing.T) {
 	}, "u-1")
 	mustNoErr(t, err, "同 SKU 多行应被合并(老 APK 拆批提交不丢数据)")
 
-	bags, err := svc.ListStockBags(ctx, "S001", "", "")
-	mustNoErr(t, err, "ListStockBags")
-	if len(bags) != 1 {
-		t.Fatalf("同 SKU 多行应合并成 1 行结转记录, got %d: %+v", len(bags), bags)
+	records, err := svc.ListCarryoverRecords(ctx, "S001", "", "")
+	mustNoErr(t, err, "ListCarryoverRecords")
+	if len(records) != 1 {
+		t.Fatalf("同 SKU 多行应合并成 1 行结转记录, got %d: %+v", len(records), records)
 	}
-	if !bags[0].QtyKg.Equal(d("15")) {
-		t.Errorf("合并后的结转重量应是 10+5=15kg, got %s", bags[0].QtyKg)
+	if !records[0].QtyKg.Equal(d("15")) {
+		t.Errorf("合并后的结转重量应是 10+5=15kg, got %s", records[0].QtyKg)
 	}
 }
 
-// TestStockBag_ListByOriginDate 锁 ④「按产生日过滤结转台账」。
+// TestCarryoverRecord_ListByOriginDate 锁 ④「按产生日过滤结转台账」。
 //
 // ⚠️ 为什么需要:结转台账按产生日排队(FIFO 归摊 / 大宗领用都按产生日)。
-func TestStockBag_ListByOriginDate(t *testing.T) {
-	svc, ctx, sku := fmBagSetup(t)
+func TestCarryoverRecord_ListByOriginDate(t *testing.T) {
+	svc, ctx, sku := fmCarryoverSetup(t)
 
 	// 10-01：一行 10kg
 	if _, err := svc.RecordPorkCutsStocktake(ctx, "S001", model.RecordPorkCutsStocktakeInput{
@@ -159,18 +159,18 @@ func TestStockBag_ListByOriginDate(t *testing.T) {
 		t.Fatalf("RecordPorkCutsStocktake(次日): %v", err)
 	}
 
-	day1, err := svc.ListStockBags(ctx, "S001", "", "2026-10-01")
-	mustNoErr(t, err, "ListStockBags(origin_date=10-01)")
+	day1, err := svc.ListCarryoverRecords(ctx, "S001", "", "2026-10-01")
+	mustNoErr(t, err, "ListCarryoverRecords(origin_date=10-01)")
 	if len(day1) != 1 || !day1[0].QtyKg.Equal(d("10")) {
 		t.Fatalf("10-01 应只有一行 10kg, got %+v", day1)
 	}
-	day2, err := svc.ListStockBags(ctx, "S001", "", "2026-10-02")
-	mustNoErr(t, err, "ListStockBags(origin_date=10-02)")
+	day2, err := svc.ListCarryoverRecords(ctx, "S001", "", "2026-10-02")
+	mustNoErr(t, err, "ListCarryoverRecords(origin_date=10-02)")
 	if len(day2) != 1 || !day2[0].QtyKg.Equal(d("7")) {
 		t.Fatalf("10-02 应只有一行 7kg, got %+v", day2)
 	}
 	// 非法日期 ⇒ 400
-	if _, err := svc.ListStockBags(ctx, "S001", "", "2026/10/01"); err == nil {
+	if _, err := svc.ListCarryoverRecords(ctx, "S001", "", "2026/10/01"); err == nil {
 		t.Fatalf("非法 origin_date 应报错")
 	}
 }

@@ -4,13 +4,13 @@ package service_test
 //
 // 门店口径(用户原话):
 //
-//	「盘点时将剩余的鲜肉商品按 sku 打包过秤然后登记,每批货夹上标签,
+//	「盘点时将剩余的鲜肉商品按 sku 打包过秤然后登记,每批货带批次标记,
 //	  方便次日搬上猪肉台继续售卖和毛利回归。」
 //	「每批有自己的产生日,这个产生日就是盘点归属日(也就是补录指定日),
 //	  散货的 sku+kg 也根据盘点归属日做记录。」
 //	「每天都有盘点单,没有任何剩余也要创建一个空的,标记为『售罄』」
 //	「当天既没有卖猪、也没有搬冷库商品上猪肉台」⇒「鲜肉休市」
-//	「做毛利回归到具体猪(如无标签,则按结转(日终盘点)的先后顺序归摊。)」
+//	「做毛利回归到具体猪(如无批次标记,则按结转(日终盘点)的先后顺序归摊。)」
 //
 // ⇒ 六条不变量(每条一个用例):
 //
@@ -86,13 +86,13 @@ func fmStocktakes(t *testing.T) []model.PorkCutsStocktake {
 	return rows
 }
 
-// fmBags 查某店的全部结转记录(批次 + 散货)。
-func fmBags(t *testing.T) []model.StockBag {
+// fmRecords 查某店的全部结转记录(批次 + 散货)。
+func fmRecords(t *testing.T) []model.CarryoverRecord {
 	t.Helper()
-	var rows []model.StockBag
+	var rows []model.CarryoverRecord
 	if err := testDBSingleton.Where("branch_id = ?", "S001").
 		Order("origin_date ASC, id ASC").Find(&rows).Error; err != nil {
-		t.Fatalf("query stock_bags: %v", err)
+		t.Fatalf("query carryover_records: %v", err)
 	}
 	return rows
 }
@@ -354,11 +354,11 @@ func TestStocktake_CarryOverRow(t *testing.T) {
 	}, "u-1")
 	mustNoErr(t, err, "RecordPorkCutsStocktake")
 
-	bags := fmBags(t)
-	if len(bags) != 1 {
-		t.Fatalf("盘点行也要有结转记录, got %d 行: %+v", len(bags), bags)
+	records := fmRecords(t)
+	if len(records) != 1 {
+		t.Fatalf("盘点行也要有结转记录, got %d 行: %+v", len(records), records)
 	}
-	bg := bags[0]
+	bg := records[0]
 	if bg.CubeProductID != sku {
 		t.Errorf("sku = %q, want %q", bg.CubeProductID, sku)
 	}
@@ -381,11 +381,11 @@ func TestStocktake_CarryOverRow(t *testing.T) {
 		},
 	}, "u-1")
 	mustNoErr(t, err, "补录 09-30")
-	bags = fmBags(t)
-	if len(bags) != 2 {
-		t.Fatalf("补录往日应再加一条结转记录, got %d: %+v", len(bags), bags)
+	records = fmRecords(t)
+	if len(records) != 2 {
+		t.Fatalf("补录往日应再加一条结转记录, got %d: %+v", len(records), records)
 	}
-	back := bags[0]
+	back := records[0]
 	if time.Time(back.OriginDate).Format("2006-01-02") != "2026-09-30" {
 		t.Errorf("补录的结转记录 origin_date = %s, want 2026-09-30(归属日)",
 			time.Time(back.OriginDate).Format("2006-01-02"))
@@ -466,12 +466,12 @@ func TestFifo_SaleSplitAcrossPigs(t *testing.T) {
 		}
 	}
 	// 被吃掉的 FIFO 重量**落库**。
-	bags := fmBags(t)
-	if len(bags) != 1 {
-		t.Fatalf("应有 1 条结转记录, got %d", len(bags))
+	records := fmRecords(t)
+	if len(records) != 1 {
+		t.Fatalf("应有 1 条结转记录, got %d", len(records))
 	}
-	if !bags[0].ConsumedKg.Equal(d("15")) {
-		t.Errorf("consumed_kg = %s, want 15(卖掉的部分必须落库)", bags[0].ConsumedKg)
+	if !records[0].ConsumedKg.Equal(d("15")) {
+		t.Errorf("consumed_kg = %s, want 15(卖掉的部分必须落库)", records[0].ConsumedKg)
 	}
 }
 
@@ -512,12 +512,12 @@ func TestFifo_BulkSettlementConsumesCarryOver(t *testing.T) {
 	}
 
 	// 结转记录的 consumed_kg 必须被扣掉 8kg ⇒ 零售不会再卖这批货。
-	bags := fmBags(t)
-	if len(bags) != 1 {
-		t.Fatalf("应有 1 条按日结转记录, got %d: %+v", len(bags), bags)
+	records := fmRecords(t)
+	if len(records) != 1 {
+		t.Fatalf("应有 1 条按日结转记录, got %d: %+v", len(records), records)
 	}
-	if !bags[0].ConsumedKg.Equal(d("8")) {
-		t.Errorf("consumed_kg = %s, want 8(大宗结算出库必须扣同一批结转记录)", bags[0].ConsumedKg)
+	if !records[0].ConsumedKg.Equal(d("8")) {
+		t.Errorf("consumed_kg = %s, want 8(大宗结算出库必须扣同一批结转记录)", records[0].ConsumedKg)
 	}
 }
 
@@ -549,7 +549,7 @@ func TestFifo_ReplayDoesNotConsumeTwice(t *testing.T) {
 		t.Fatalf("第一次投递: %v", err)
 	}
 	firstRows := fmSales(t)
-	firstConsumed := fmBags(t)[0].ConsumedKg
+	firstConsumed := fmRecords(t)[0].ConsumedKg
 
 	// 重投(dapr at-least-once)。
 	if _, err := svc.OnSaleCompleted(ctx, payload); err != nil {
@@ -567,7 +567,7 @@ func TestFifo_ReplayDoesNotConsumeTwice(t *testing.T) {
 	if !sumAmt.Equal(d("150")) {
 		t.Errorf("重投后 Σ 金额 = %s, want 150(收入不能翻倍)", sumAmt)
 	}
-	if got := fmBags(t)[0].ConsumedKg; !got.Equal(firstConsumed) {
+	if got := fmRecords(t)[0].ConsumedKg; !got.Equal(firstConsumed) {
 		t.Errorf("重投后 consumed_kg = %s, want %s(FIFO 不能被吃两遍)", got, firstConsumed)
 	}
 }

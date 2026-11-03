@@ -72,8 +72,8 @@ func BulkPositionKey(productCode string) string { return BulkPositionKeyPrefix +
 
 // CounterLoadLine 搬上猪肉台的一行。
 //
-// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ **只有「按 SKU + kg」一种搬法**
-// (不再支持「按标签号整批搬」)。
+// ⚠️ 2026-11-02 owner:旧玩法下线 ⇒ **只有「按 SKU + kg」一种搬法**
+// (不再支持「按批次整批搬」)。
 type CounterLoadLine struct {
 	// ID 是这一行的**行号**(可选)。
 	//
@@ -82,9 +82,9 @@ type CounterLoadLine struct {
 	ID            string          `json:"id,omitempty"`
 	CubeProductID string          `json:"cube_product_id"`
 	QtyKg         decimal.Decimal `json:"qty_kg"`
-	// Label 是**老客户端探测器**(2026-11-02 owner:标签号玩法下线)。
+	// Label 是**老客户端探测器**(2026-11-02 owner:旧玩法下线)。
 	//
-	// ⚠️ **不实现任何标签语义** —— 只是为了认出「还在发 label 的老 APK」并当场报错:
+	// ⚠️ **不实现任何批次标记语义** —— 只是为了认出「还在发 label 的老 APK」并当场报错:
 	// 老包发的是 `{"label":"BAG-001"}`(没有货号、没有重量)
 	// ⇒ 若静默忽略,这一行会被当成「0 kg = 今天不搬台」的标记 ⇒ **搬台被悄悄吞掉**。
 	// ⇒ 认出它 ⇒ 明确告诉门店「这套玩法没了,请升级 App」。
@@ -175,7 +175,7 @@ func isCounterLoadMarkerOnly(lines []CounterLoadLine) bool {
 //
 //	⇒ 见 service/gross_margin.go 的 MarginAlert。
 //
-// ⚠️ 搬台**只有「按 SKU + kg」一种搬法**(2026-11-02 owner:标签号玩法下线)
+// ⚠️ 搬台**只有「按 SKU + kg」一种搬法**(2026-11-02 owner:旧玩法下线)
 // ⇒ 但两种搬法都要留流水(counter_loads 表):(归属日, SKU, 重量, 操作人)
 // ⇒ 休市判定与"按营业日推导的冷库余额"才有依据。
 func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLoadInput, operatorID string) (*StockSnapshot, error) {
@@ -185,7 +185,7 @@ func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLo
 	if len(in.Lines) == 0 {
 		return nil, fmt.Errorf("%w: lines 不能为空", ErrInvalidInput)
 	}
-	// ⚠️ 老客户端探测器:还在发 label ⇒ 那是「按标签整批搬」的老玩法
+	// ⚠️ 老客户端探测器:还在发 label ⇒ 那是「按批次整批搬」的老玩法
 	//   (2026-11-02 已下线)⇒ 当场报错,**别静默忽略**。
 	//
 	//   为什么必须报错而不是忽略:老包发的是 `{"label":"BAG-001"}`
@@ -196,7 +196,7 @@ func (s *Service) CounterLoad(ctx context.Context, branchID string, in CounterLo
 	//     比"昨天没盘点"更该先说。
 	for i, ln := range in.Lines {
 		if strings.TrimSpace(ln.Label) != "" {
-			return nil, fmt.Errorf("%w: lines[%d].label —— 搬台的「标签 / 整批搬」玩法已于 2026-11-02 下线,"+
+			return nil, fmt.Errorf("%w: lines[%d].label —— 搬台的「批次标记 / 整批搬」玩法已于 2026-11-02 下线,"+
 				"请升级 App 后按 SKU + 重量搬台", ErrInvalidInput, i)
 		}
 	}

@@ -388,7 +388,7 @@ type PorkCutsStocktake struct {
 	//   - sold_out:盘了,但一点剩余都没有(卖光了);
 	//   - rest_day :当天没进猪、也没搬上台 ⇒ 这天整个鲜肉板块没开张。
 	//
-	// 判定:归属日当天 whole_pigs 无进场 + stock_bags 无"搬上台"流水。
+	// 判定:归属日当天 whole_pigs 无进场 + carryover_records 无"搬上台"流水。
 	RestDay       bool           `gorm:"column:rest_day;not null;default:false" json:"rest_day"`
 	Cuts          datatypes.JSON `gorm:"column:cuts;type:jsonb;not null" json:"cuts"`
 	LLMReviewJSON datatypes.JSON `gorm:"column:llm_review_json;type:jsonb" json:"llm_review_json,omitempty"`
@@ -586,13 +586,13 @@ func ValidWasteType(t string) bool {
 // TableName 显式表名。
 func (WasteLog) TableName() string { return "waste_logs" }
 
-// ---- 表7b:stock_bags(结转记录台账)----
+// ---- 表7b:carryover_records(结转记录台账)----
 //
-// StockBag 一行**结转记录**:门店日终盘点时,按 SKU 把剩余的鲜肉**打包过秤**
+// CarryoverRecord 一行**结转记录**:门店日终盘点时,按 SKU 把剩余的鲜肉**打包过秤**
 // 后登记的一条「归属日 + SKU + 重量」。
 //
-// ⚠️ **2026-11-02 owner:标签号玩法整套下线** —— 搬台不再「按标签整批搬」,
-// 盘点也不再填标签号 ⇒ 库里再没有新行带标签 ⇒ 这张表退化成
+// ⚠️ **2026-11-02 owner:旧的整批搬台玩法整套下线** —— 搬台不再「按批次整批搬」,
+// 盘点也不再填批次标记 ⇒ 库里再没有新行带标记 ⇒ 这张表退化成
 // 「按日结转台账」(FIFO 队列 + 猪归属快照)。
 //
 // # 为什么还要保留"结转记录"这个粒度
@@ -608,12 +608,12 @@ func (WasteLog) TableName() string { return "waste_logs" }
 //
 // ③ **FIFO 队列**:按产生日排队 ⇒ 卖掉一笔货时,收入按「结转先后顺序」摊回猪。
 //
-// # label 列的历史遗留
+// # 旧的批次标记(label)已彻底删掉
 //
-// 标签号曾是这一行的身份(也是「按标签整批搬」的钥匙)⇒ 现在不再产生
-// ⇒ 新行的 label 为 NULL。**列与部分唯一索引都保留**(历史数据 + 迁移不动),
-// 但**代码不再读也不再写**它(见 internal/fresh-meat/migrate.go 的注释)。
-type StockBag struct {
+// 批次标记曾是这一行的身份(也是「按批次整批搬」的钥匙)⇒ 那个玩法 2026-11-02
+// 已下线、2026-11-03 owner 拍板**彻底去掉** ⇒ `label` 列与它的两个索引都已
+// 在迁移里删掉(见 internal/fresh-meat/migrate.go 的 ⑥)⇒ 模型里**不再有这个字段**。
+type CarryoverRecord struct {
 	// ID 是**确定性**代理主键:同一 (门店, 产生日, SKU) 永远是同一行
 	// ⇒ 重复提交同一天的盘点 = 覆盖,不会多出一行。
 	//
@@ -641,7 +641,7 @@ type StockBag struct {
 	Location string `gorm:"column:location;type:varchar(16);not null;default:'cold_store'" json:"location"`
 	// Status:active(在用)| released(已搬上台)。
 	//
-	// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 不再有"搬上台 ⇒ 释放标签号"这条路径
+	// ⚠️ 2026-11-02 owner:旧的整批搬台玩法下线 ⇒ 不再有"搬上台 ⇒ 释放批次标记"这条路径
 	//   ⇒ 新行一律 active;released 只剩历史行。
 	Status string `gorm:"column:status;type:varchar(16);not null;default:'active'" json:"status"`
 	// PigAlloc 是**归属快照**:这批货由哪几头猪产出、各多少 kg。
@@ -673,7 +673,7 @@ type StockBag struct {
 }
 
 // TableName 显式表名。
-func (StockBag) TableName() string { return "stock_bags" }
+func (CarryoverRecord) TableName() string { return "carryover_records" }
 
 // ---- 表8:sku_stock_positions ----
 
@@ -1157,14 +1157,14 @@ type BulkSettlementAllocation struct {
 	// ⚠️ 可空:老数据(单品项时代)没有它。
 	ItemID       string `gorm:"column:item_id;type:varchar(64);index" json:"item_id,omitempty"`
 	ProductionID string `gorm:"column:production_id;type:varchar(64);not null;index" json:"production_id"`
-	// BagID 是这条分摊吃掉的**结转记录**的 ID(2026-10-25)。
+	// CarryoverID 是这条分摊吃掉的**结转记录**的 ID(2026-10-25)。
 	//
 	// ⚠️ 为什么要有它:大宗结算的 FIFO 队列**就是结转记录队列**(2026-10-25 口径)
 	// ⇒ 「结算领用了哪几批、每批多少」必须能回溯,否则"领用"与"结转记录"对不上,
 	//   同一批货可能被零售再卖一遍(卖两遍)。
 	//
 	// ⚠️ 老数据(台账时代)没有它 ⇒ 为空 ⇒ 那时扣的是 bulk_productions。
-	BagID string `gorm:"column:bag_id;type:varchar(64);index" json:"bag_id,omitempty"`
+	CarryoverID string `gorm:"column:carryover_id;type:varchar(64);index" json:"carryover_id,omitempty"`
 	// Location 是领用时这批货所在的**位置**(cold_store|counter)—— 2026-10-25。
 	//
 	// ⇒ 结算后要按位置扣库存(冷库/柜台各扣各的)⇒ 必须记下来。
@@ -1422,9 +1422,9 @@ func (BusinessDay) TableName() string { return "business_days" }
 // 「位置表只记余额、不留痕」⇒ 「当日搬上台了多少」查不到
 // ⇒ 而休市判定、当日分摊重量、按营业日推导的冷库余额**都要它**。
 //
-// ⇒ **只有一种搬法**(2026-11-02 owner:标签号玩法下线):按 **SKU + kg** 搬。
+// ⇒ **只有一种搬法**(2026-11-02 owner:旧的整批搬台玩法下线):按 **SKU + kg** 搬。
 //
-// (历史行里还可能有 source='bag'(按标签整批搬),那套玩法已下线。)
+// (历史行里还可能有 source='bag'(按批次整批搬),那套玩法已下线。)
 //
 // # 归属日(BizDate)
 //
@@ -1447,9 +1447,9 @@ type CounterLoadRecord struct {
 	CutType CutType `gorm:"column:cut_type;type:varchar(32);not null;index" json:"cut_type"`
 	// QtyKg 是搬上柜台的重量。
 	QtyKg decimal.Decimal `gorm:"column:qty_kg;type:decimal(14,3);not null" json:"qty_kg"`
-	// ⚠️ **label 列已废弃**(2026-11-02 owner:标签号玩法下线)⇒ 代码不再读写它。
+	// ⚠️ **label 列已废弃**(2026-11-02 owner:旧的整批搬台玩法下线)⇒ 代码不再读写它。
 	//   列保留(历史行仍有值)⇒ 迁移不动。
-	// Source:sku(按 SKU+kg 搬)。历史行里还可能有 bag(按标签整批搬,已下线)。
+	// Source:sku(按 SKU+kg 搬)。历史行里还可能有 bag(按批次整批搬,已下线)。
 	Source     string    `gorm:"column:source;type:varchar(16);not null;default:'sku'" json:"source"`
 	OperatorID string    `gorm:"column:operator_id;type:varchar(64);not null" json:"operator_id"`
 	CreatedAt  time.Time `gorm:"column:created_at;not null" json:"created_at"`
@@ -1808,8 +1808,8 @@ type RecordPigCutInput struct {
 
 // CutInput POST /pork-cuts-stocktake 入参的 cuts 数组元素(per-SKU 一行)。
 //
-// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ **同一 SKU 只有一行**
-// (拆批是"每批一个标签号"的衍生物 ⇒ 没有标签号就没有多批的身份)。
+// ⚠️ 2026-11-02 owner:旧玩法下线 ⇒ **同一 SKU 只有一行**
+// (拆批是"每批一个批次标记"的衍生物 ⇒ 没有批次标记就没有多批的身份)。
 type CutInput struct {
 	CutType        CutType         `json:"cut_type" binding:"required"`
 	CubeProductID  string          `json:"cube_product_id" binding:"required"` // 必填;后端校验在 branch_cut_mapping 中存在

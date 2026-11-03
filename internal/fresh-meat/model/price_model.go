@@ -93,7 +93,18 @@ type PigCutPriceSample struct {
 	//   ⇒ **整天不产样本**,而不是产出一条垃圾样本把基线教歪。
 	MarginRate decimal.Decimal `gorm:"column:margin_rate;type:decimal(10,6);not null;default:0" json:"margin_rate"`
 	// CostPriceYuan 是**倒推出的部位进货单价**(元/kg)= 零售价 × (1 − 毛利率)。
+	//
+	// ⚠️ owner 2026-11-03:当该部位当天有**外采** ⇒ 这里存的是
+	//   「倒推单价 与 外采价 **按量加权**」的结果(= 该部位当天的加权进货单价)
+	//   ⇒ 外采的成本因此进得了单价基线。
 	CostPriceYuan decimal.Decimal `gorm:"column:cost_price_yuan;type:decimal(12,4);not null;default:0" json:"cost_price_yuan"`
+	// ExternalKg 是当日该部位的**外采量**(kg)—— 加权里的另一半。
+	//
+	// ⚠️ 它同时是**基线聚合的权重**之一(权重 = 销量 + 外采量)
+	//   ⇒ 外采那天该部位的基线才不会被"零售倒推值"单独带跑。
+	//
+	// ⚠️ 历史样本这一列是 0 ⇒ 聚合权重与从前逐字一致 ⇒ 历史基线数字不变。
+	ExternalKg decimal.Decimal `gorm:"column:external_kg;type:decimal(12,3);not null;default:0" json:"external_kg"`
 	// PigPriceYuan 是当日该店**猪的加权平均进价**(元/kg)= Σ猪成本 ÷ Σ猪毛重。
 	//
 	// ⚠️ 它是"这条样本是在什么猪价下产生的"的上下文

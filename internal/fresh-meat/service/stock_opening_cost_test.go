@@ -160,23 +160,23 @@ func TestStockOpening_UnitPriceInThreePlaces(t *testing.T) {
 	}
 
 	// ③ 队列（结转记录）：source='opening'、100kg、成本快照 = 18 元/kg。
-	bags, err := svc.ListStockBags(ctx, "S001", "", "")
-	mustNoErr(t, err, "ListStockBags")
-	var openBag *model.StockBag
-	for i := range bags {
-		if bags[i].Source == "opening" {
-			openBag = &bags[i]
+	records, err := svc.ListCarryoverRecords(ctx, "S001", "", "")
+	mustNoErr(t, err, "ListCarryoverRecords")
+	var openRecord *model.CarryoverRecord
+	for i := range records {
+		if records[i].Source == "opening" {
+			openRecord = &records[i]
 		}
 	}
-	if openBag == nil {
-		t.Fatalf("★ 队列里应有期初那一条(source='opening'), got %+v", bags)
+	if openRecord == nil {
+		t.Fatalf("★ 队列里应有期初那一条(source='opening'), got %+v", records)
 	}
-	if !openBag.QtyKg.Equal(d("100")) {
-		t.Errorf("★ 队列里期初应是 100kg, got %s", openBag.QtyKg)
+	if !openRecord.QtyKg.Equal(d("100")) {
+		t.Errorf("★ 队列里期初应是 100kg, got %s", openRecord.QtyKg)
 	}
-	if !openBag.UnitCostYuan.Equal(d("18")) {
+	if !openRecord.UnitCostYuan.Equal(d("18")) {
 		t.Errorf("★ 队列那一行的成本快照应是门店给的 18 元/kg, got %s —— "+
-			"0 ⇒ 大宗结算领用它时成本为 0 ⇒ 毛利率 100%%", openBag.UnitCostYuan)
+			"0 ⇒ 大宗结算领用它时成本为 0 ⇒ 毛利率 100%%", openRecord.UnitCostYuan)
 	}
 }
 

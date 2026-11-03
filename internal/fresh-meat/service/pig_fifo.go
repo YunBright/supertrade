@@ -4,17 +4,17 @@ package service
 //
 // # 目标(2026-10-24 门店口径,用户原话)
 //
-// 「做毛利回归到具体猪(如无标签,则按结转(日终盘点)的先后顺序(盘点所属日期)归摊。)」
+// 「做毛利回归到具体猪(如无批次标记,则按结转(日终盘点)的先后顺序(盘点所属日期)归摊。)」
 //
 // ⇒ 一笔销售卖掉的货,要归回**产出它的那头猪**,而不是"今天碰巧在场的猪"。
 //
 // # 队列是什么
 //
-// FIFO 队列 = **按日结转记录**(stock_bags 表):
+// FIFO 队列 = **按日结转记录**(carryover_records 表):
 //
 //   - 一行 = 一天一个 SKU 的结转(归属日 + SKU + 重量 + 猪归属快照)。
 //
-// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 队列里不再区分"打包过的"与"散货的"。
+// ⚠️ 2026-11-02 owner:旧玩法下线 ⇒ 队列里不再区分"打包过的"与"散货的"。
 //
 // 排序:origin_date 升序(同一天按 id 稳定排序)⇒ **先进先出**。
 //
@@ -27,7 +27,7 @@ package service
 //
 // # 消耗必须落库
 //
-// 每卖一笔就扣掉对应结转记录的"还没卖掉的重量"(stock_bags.consumed_kg)
+// 每卖一笔就扣掉对应结转记录的"还没卖掉的重量"(carryover_records.consumed_kg)
 // ⇒ 下次不会把同一批货再摊一次(否则收入会被摊好几遍)。
 //
 // # 幂等
@@ -124,13 +124,13 @@ func (s *Service) allocateSaleByFIFO(
 	// ⚠️ 外采(source='external')在**同一天内排最前**(CASE WHEN ... THEN 0):
 	//   外采是**当天刚买、当天就上架**的货 ⇒ 销售先吃它
 	//   ⇒ 不会把这笔销量摊到**前几天的猪**上(那会让老猪的毛利被外采的收入撑起来)。
-	var records []model.StockBag
+	var records []model.CarryoverRecord
 	if err := tx.WithContext(ctx).
 		Where("branch_id = ? AND cube_product_id = ? AND origin_date <= ?",
 			branchID, cubeProductID, saleDate).
-		Order(fmt.Sprintf("origin_date ASC, CASE WHEN source = '%s' THEN 0 ELSE 1 END, id ASC", BagSourceExternal)).
+		Order(fmt.Sprintf("origin_date ASC, CASE WHEN source = '%s' THEN 0 ELSE 1 END, id ASC", CarryoverSourceExternal)).
 		Find(&records).Error; err != nil {
-		return nil, fmt.Errorf("query stock_bags(fifo): %w", err)
+		return nil, fmt.Errorf("query carryover_records(fifo): %w", err)
 	}
 	if len(records) == 0 {
 		return nil, nil
@@ -188,7 +188,7 @@ func (s *Service) allocateSaleByFIFO(
 //
 //	⇒ 按那天各猪**毛重比例**摊(与 applyProducedFallback 同一套口径 —— 只能到猪这一层)。
 func (s *Service) fifoRecordShares(
-	ctx context.Context, tx *gorm.DB, rec model.StockBag, pigCache map[string][]model.WholePig,
+	ctx context.Context, tx *gorm.DB, rec model.CarryoverRecord, pigCache map[string][]model.WholePig,
 ) ([]fifoShare, error) {
 	// ⚠️ **期初批次没有产出猪**（上线前就在冷库里的货）⇒ 不摊给任何猪。
 	//
@@ -197,11 +197,11 @@ func (s *Service) fifoRecordShares(
 	//
 	// ⚠️ **外采**同理（2026-11-03 owner）：额外采购的某个部位的货没有产出猪
 	//   ⇒ 它的收入也不能摊给某头猪 ⇒ 同样记「未归属」。
-	if rec.Source == BagSourceOpening || rec.Source == BagSourceExternal {
+	if rec.Source == CarryoverSourceOpening || rec.Source == CarryoverSourceExternal {
 		return []fifoShare{{pigID: "", kg: rec.QtyKg}}, nil
 	}
 	if len(rec.PigAlloc) > 0 {
-		var items []bagPigAllocItem
+		var items []carryoverPigAllocItem
 		if err := json.Unmarshal(rec.PigAlloc, &items); err == nil {
 			out := make([]fifoShare, 0, len(items))
 			for _, it := range items {
@@ -268,13 +268,13 @@ func (s *Service) consumeFIFO(ctx context.Context, tx *gorm.DB, consumed map[str
 		if !kg.IsPositive() {
 			continue
 		}
-		if err := tx.WithContext(ctx).Model(&model.StockBag{}).
+		if err := tx.WithContext(ctx).Model(&model.CarryoverRecord{}).
 			Where("id = ?", id).
 			Updates(map[string]any{
 				"consumed_kg": gorm.Expr("consumed_kg + ?", kg),
 				"updated_at":  now,
 			}).Error; err != nil {
-			return fmt.Errorf("consume stock_bag %s: %w", id, err)
+			return fmt.Errorf("consume carryover_record %s: %w", id, err)
 		}
 	}
 	return nil

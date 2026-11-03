@@ -120,7 +120,7 @@ func simRunDay(t *testing.T, svc *service.Service, ctx context.Context, n int) {
 
 	// ③ 搬台：把**前一天结转的五花**搬上猪肉台（D1 还没货 ⇒ 不搬）。
 	//
-	// ⚠️ 2026-11-02 owner:标签号玩法下线 ⇒ 只剩「按 SKU + kg」一种搬法。
+	// ⚠️ 2026-11-02 owner:旧玩法下线 ⇒ 只剩「按 SKU + kg」一种搬法。
 	if n > 0 {
 		_, err := svc.CounterLoad(ctx, simBranch, service.CounterLoadInput{
 			TakenDate: day,
@@ -161,15 +161,15 @@ func simRunDay(t *testing.T, svc *service.Service, ctx context.Context, n int) {
 	mustNoErr(t, err, "RecordPorkCutsStocktake")
 }
 
-// simBags 读该店的全部结转记录（按产生日、id 排序）。
-func simBags(t *testing.T) []model.StockBag {
+// simRecords 读该店的全部结转记录（按产生日、id 排序）。
+func simRecords(t *testing.T) []model.CarryoverRecord {
 	t.Helper()
-	var bags []model.StockBag
+	var records []model.CarryoverRecord
 	if err := testDBSingleton.Where("branch_id = ?", simBranch).
-		Order("origin_date ASC, id ASC").Find(&bags).Error; err != nil {
-		t.Fatalf("query stock_bags: %v", err)
+		Order("origin_date ASC, id ASC").Find(&records).Error; err != nil {
+		t.Fatalf("query carryover_records: %v", err)
 	}
-	return bags
+	return records
 }
 
 // simSnapshot 读每个营业日的**按部位日终冷库量**(kg)。
@@ -275,7 +275,7 @@ func TestMultiDaySim_OneWeekBusiness(t *testing.T) {
 	//
 	// 零售卖掉的：6 天 × 10kg = 60kg；大宗结掉的：30kg ⇒ Σ consumed = 90kg。
 	var totalQty, totalConsumed decimal.Decimal
-	for _, b := range simBags(t) {
+	for _, b := range simRecords(t) {
 		totalQty = totalQty.Add(b.QtyKg)
 		totalConsumed = totalConsumed.Add(b.ConsumedKg)
 	}

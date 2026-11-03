@@ -44,11 +44,11 @@ func StockOpeningID(branchID, cutType string) string {
 	return surrogateID("SSO", branchID, cutType)
 }
 
-// StockOpeningBagID 期初那一行**结转记录**的确定性代理主键(按部位)。
+// StockOpeningCarryoverID 期初那一行**结转记录**的确定性代理主键(按部位)。
 //
 // ⚠️ 不按生效日：生效日可以被改 ⇒ 主键跟着变就变成"多出一行"
 // ⇒ 按 (门店, 部位) ⇒ 改期初 = 覆盖同一行。
-func StockOpeningBagID(branchID, cutType string) string {
+func StockOpeningCarryoverID(branchID, cutType string) string {
 	return surrogateID("SBO", branchID, cutType)
 }
 
@@ -168,28 +168,28 @@ func (s *Service) applyOpeningToStock(
 	if newKg.IsZero() {
 		// 期初被清零/删掉 ⇒ 这一行不该留在队列里(留着会看到一条 0kg 的"批次")。
 		if err := tx.WithContext(ctx).
-			Where("id = ?", StockOpeningBagID(branchID, string(cutType))).
-			Delete(&model.StockBag{}).Error; err != nil {
-			return fmt.Errorf("delete opening stock_bag: %w", err)
+			Where("id = ?", StockOpeningCarryoverID(branchID, string(cutType))).
+			Delete(&model.CarryoverRecord{}).Error; err != nil {
+			return fmt.Errorf("delete opening carryover_record: %w", err)
 		}
 		return nil
 	}
-	bag := model.StockBag{
-		ID:            StockOpeningBagID(branchID, string(cutType)),
+	rec := model.CarryoverRecord{
+		ID:            StockOpeningCarryoverID(branchID, string(cutType)),
 		BranchID:      branchID,
 		CubeProductID: sku,
 		CutType:       cutType,
 		QtyKg:         newKg,
 		OriginDate:    datatypesDate(bizDate),
 		Location:      string(model.StockLocationColdStore),
-		Status:        BagStatusActive,
-		Source:        BagSourceOpening,
+		Status:        CarryoverStatusActive,
+		Source:        CarryoverSourceOpening,
 		// 成本快照 = **门店给的**单价(不是 0,也不是倒算的移动加权单价)。
 		UnitCostYuan: unitPrice,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
-	if err := s.upsertStockBag(ctx, tx, bag); err != nil {
+	if err := s.upsertCarryoverRecord(ctx, tx, rec); err != nil {
 		return err
 	}
 	return nil

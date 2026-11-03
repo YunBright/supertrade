@@ -57,7 +57,7 @@ func newLedgerService(t *testing.T) (*service.Service, *gorm.DB) {
 		&model.SkuCostState{},
 		&model.SkuCostDaily{},
 		&model.PromoSku{},
-		&model.StockBag{},
+		&model.CarryoverRecord{},
 		&model.BulkProduct{},
 		&model.BulkProduction{},
 		&model.BulkSettlement{},

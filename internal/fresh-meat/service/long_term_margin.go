@@ -51,12 +51,21 @@ type LongTermMarginDay struct {
 	Date string `json:"date"`
 	// RevenueYuan 是当天营收(零售 + 统收)。
 	RevenueYuan decimal.Decimal `json:"revenue_yuan"`
-	// PurchasedKg / PurchasedYuan 是当天进店的猪(总采)。
+	// PurchasedKg / PurchasedYuan 是当天进店的**进货合计**(进猪 + **外采**)。
+	//
+	// ⚠️ owner 2026-11-03 拍板:「长期毛利的期间采购**要含外采**」
+	//   ⇒ 外采的货也是真金白银进的货 ⇒ 必须进采购,否则毛利虚高。
+	//
+	// ⚠️ 外采的**明细**单列(ExternalKg / ExternalYuan)⇒ 门店看得见"其中外采多少"。
 	PurchasedKg   decimal.Decimal `json:"purchased_kg"`
 	PurchasedYuan decimal.Decimal `json:"purchased_yuan"`
+	// ExternalKg / ExternalYuan 是当天**外采**的合计(kg / 元)—— 从 Purchased* 里单列出来。
+	ExternalKg   decimal.Decimal `json:"external_kg"`
+	ExternalYuan decimal.Decimal `json:"external_yuan"`
 	// PurchaseAvgYuan 是当天**采购均价**(元/kg)= 采购金额 ÷ 采购重量。
 	//
 	// ⚠️ 它是当天**剩余成本**的估值价(owner:「可以用采购均价计算」)。
+	// ⚠️ owner 2026-11-03:它是**含外采**的均价(总金额 ÷ 总重量)—— 即「求均值」。
 	PurchaseAvgYuan decimal.Decimal `json:"purchase_avg_yuan"`
 	// CounterStockKg 是当天**猪肉台日终实盘**(kg)—— 不含冷库。
 	CounterStockKg decimal.Decimal `json:"counter_stock_kg"`
@@ -88,9 +97,12 @@ type LongTermMarginDay struct {
 type LongTermMarginTotal struct {
 	// RevenueYuan 是期间营收(零售 + 统收)。
 	RevenueYuan decimal.Decimal `json:"revenue_yuan"`
-	// PurchasedKg / PurchasedYuan 是期间总采。
+	// PurchasedKg / PurchasedYuan 是期间总采(**含外采**,owner 2026-11-03)。
 	PurchasedKg   decimal.Decimal `json:"purchased_kg"`
 	PurchasedYuan decimal.Decimal `json:"purchased_yuan"`
+	// ExternalKg / ExternalYuan 是期间**外采**的合计(kg / 元)—— 从 Purchased* 里单列出来。
+	ExternalKg   decimal.Decimal `json:"external_kg"`
+	ExternalYuan decimal.Decimal `json:"external_yuan"`
 	// PurchaseAvgYuan 是**期间采购均价**(元/kg)= 期间采购金额 ÷ 期间采购重量。
 	//
 	// ⚠️ 期间库存一律按**这一个**均价估值 ⇒ 每日行能加总回期间数(口径自洽)。
@@ -202,15 +214,19 @@ func (s *Service) ComputeLongTermMargin(ctx context.Context, branchID, from, to 
 			return nil, fmt.Errorf("query day totals(%s): %w", key, err)
 		}
 		day := LongTermMarginDay{
-			Date:            key,
-			RevenueYuan:     revenue,
-			PurchasedKg:     ref.PurchasedKg,
-			PurchasedYuan:   ref.PurchasedYuan,
-			PurchaseAvgYuan: ref.PurchaseAvgYuan,
+			Date:        key,
+			RevenueYuan: revenue,
+			// ⚠️ owner 2026-11-03:「期间采购要含外采」⇒ 这里用**含外采**的合计与均价
+			//   (= 进猪 + 外采;均价 = 总金额 ÷ 总重量,即「求均值」)。
+			PurchasedKg:     ref.TotalPurchasedKg(),
+			PurchasedYuan:   ref.TotalPurchasedYuan(),
+			PurchaseAvgYuan: ref.TotalPurchaseAvgYuan(),
+			ExternalKg:      ref.ExternalKg,
+			ExternalYuan:    ref.ExternalYuan,
 			CounterStockKg:  ref.RemainKg,
 			ColdStoreKg:     sumCutKg(coldChain[key]),
 			HasStocktake:    ref.HasRemain,
-			HasPurchase:     ref.PurchasedKg.IsPositive(),
+			HasPurchase:     ref.TotalPurchasedKg().IsPositive(),
 		}
 		// ⚠️ 没有完整盘点 **或** 没有进货 ⇒ 当天毛利**算不出来**(不给 0)。
 		//   详见 cost_reference.go 的 referenceMarginRate 的同款说明。
@@ -222,9 +238,10 @@ func (s *Service) ComputeLongTermMargin(ctx context.Context, branchID, from, to 
 		//	⇒ **两页的每日数不再相等**(不是 bug,是两套口径)。
 		//	⇒ 这一页自己**自洽**(期间毛利 = 每日之和 + 冷库变动),门店能自己核。
 		//	⇒ 要不要把每日行也切 B(需要给快照加"建议成本单价"列),是另一个决定。
-		if ref.HasRemain && ref.PurchasedKg.IsPositive() {
+		if ref.HasRemain && ref.TotalPurchasedKg().IsPositive() {
 			// 每日参考毛利(猪肉台口径)= 营收 − 采购 + 期末台面剩余×采购均价。
-			gm := revenue.Sub(ref.PurchasedYuan).Add(ref.RemainKg.Mul(ref.PurchaseAvgYuan))
+			// ⚠️ 采购与均价都**含外采**(owner 2026-11-03)⇒ 外采的成本进当天的毛利。
+			gm := revenue.Sub(ref.TotalPurchasedYuan()).Add(ref.RemainKg.Mul(ref.TotalPurchaseAvgYuan()))
 			day.GrossMarginYuan = gm
 			if revenue.IsPositive() {
 				pct, _ := gm.Mul(decimal.NewFromInt(100)).Div(revenue).Float64()
@@ -263,12 +280,15 @@ func (s *Service) ComputeLongTermMargin(ctx context.Context, branchID, from, to 
 func buildLongTermMarginReport(branchID, from, to string, rows []LongTermMarginDay,
 	openingCold, closingCold decimal.Decimal) *LongTermMarginReport {
 	var totRevenue, totPurchasedKg, totPurchasedYuan, dailySum decimal.Decimal
+	var totExternalKg, totExternalYuan decimal.Decimal
 	daysWithST, daysWithoutST := 0, 0
 	lastPurchaseAvg := decimal.Zero
 	for _, d := range rows {
 		totRevenue = totRevenue.Add(d.RevenueYuan)
 		totPurchasedKg = totPurchasedKg.Add(d.PurchasedKg)
 		totPurchasedYuan = totPurchasedYuan.Add(d.PurchasedYuan)
+		totExternalKg = totExternalKg.Add(d.ExternalKg)
+		totExternalYuan = totExternalYuan.Add(d.ExternalYuan)
 		if d.PurchaseAvgYuan.IsPositive() {
 			lastPurchaseAvg = d.PurchaseAvgYuan
 		}
@@ -297,6 +317,8 @@ func buildLongTermMarginReport(branchID, from, to string, rows []LongTermMarginD
 		RevenueYuan:             totRevenue,
 		PurchasedKg:             totPurchasedKg,
 		PurchasedYuan:           totPurchasedYuan,
+		ExternalKg:              totExternalKg,
+		ExternalYuan:            totExternalYuan,
 		PurchaseAvgYuan:         periodAvg,
 		OpeningColdStoreKg:      openingCold,
 		ClosingColdStoreKg:      closingCold,
@@ -329,6 +351,7 @@ func buildLongTermMarginReport(branchID, from, to string, rows []LongTermMarginD
 	//	⇒ **两页的每日数不再是同一个数**。
 	//	⇒ 旧文案写「与每日毛利看板同一个数」⇒ 门店拿两页对一下对不上 ⇒ 以为页面坏了。
 	note := "期间毛利 = 期间营收 − 期间采购 + (期末冷库量 − 期初冷库量) × 期间采购均价(全店口径);" +
+		"期间采购**含外采**(进猪 + 外采),采购均价 = 总金额 ÷ 总重量;" +
 		"库存按**期间采购均价**估值(不含毛利 ⇒ 不成环)。" +
 		"每日行的毛利是**猪肉台口径**(营收 − 当日采购 + 台面剩余×采购均价,不含冷库)" +
 		"⚠️ 它与「每日毛利看板」的参考毛利**不是同一个数**(看板那边是各部位参考毛利之和)⇒ " +
