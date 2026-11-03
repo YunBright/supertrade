@@ -120,6 +120,10 @@ func (s *Service) allocateSaleByFIFO(
 	//
 	// ⚠️ origin_date <= saleDate:只能吃"卖出之前就已经结转出来"的货
 	// (今天的货不该被昨天的销售吃掉)。
+	//
+	// ⚠️ 外采(source='external')在**同一天内排最前**(CASE WHEN ... THEN 0):
+	//   外采是**当天刚买、当天就上架**的货 ⇒ 销售先吃它
+	//   ⇒ 不会把这笔销量摊到**前几天的猪**上(那会让老猪的毛利被外采的收入撑起来)。
 	var records []model.StockBag
 	if err := tx.WithContext(ctx).
 		Where("branch_id = ? AND cube_product_id = ? AND origin_date <= ?",

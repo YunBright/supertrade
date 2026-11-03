@@ -11,12 +11,17 @@ package service_test
 //
 // # 剩下的不变量
 //
-//	① 录一笔 ⇒ 三处落库:外采单(事实)、位置表冷库 +kg、结转记录(source='external');
+//	① 录一笔 ⇒ 三处落库:外采单(事实)、位置表**猪肉台** +kg、结转记录(source='external');
 //	② **单价必须 > 0**(否则这批货零成本 ⇒ 卖出去全是利润 ⇒ 毛利虚高);
 //	③ **货号必须有部位映射**(猜错部位 ⇒ 成本摊到错的部位上);
 //	④ 改一笔 ⇒ 位置表按**差额**调;撤一笔 ⇒ 位置表回退 + 结转记录删掉;
 //	⑤ 看板:外采**单列一栏**,**不动进猪口径**(owner 拍板);
-//	⑥ 外采的货要**进冷库链**(否则"没搬上台的外采"会被算成假盘亏)。
+//	⑥ 外采**直接上猪肉台、不占冷库**(owner 2026-11-03 拍板)
+//	   ⇒ 卖不完的随日终盘点进冷库,卖完的(盘点 0)进不了冷库。
+//
+// ⚠️ 位置口径在 2026-11-03 改过一次:原先是「先进冷库、再搬一次台」,
+//   owner 拍板改成「直接上猪肉台」⇒ 门店不用多搬一次台,
+//   也不会因为漏搬而**假盘亏**。
 
 import (
 	"context"
@@ -84,13 +89,13 @@ func TestExternalPurchase_RecordWritesFactStockAndCarryover(t *testing.T) {
 		t.Errorf("外采单字段不对: %+v", rows[0])
 	}
 
-	// 位置表:冷库 +10kg(柜台不动)⇒ 门店能把它跟猪分割的货一起搬上台。
+	// 位置表:**猪肉台** +10kg(冷库不动)⇒ 录完直接上架,不用再搬一次台。
 	cold, counter := fmPositions(t, "S001", sku)
-	if !cold.Equal(d("10")) {
-		t.Errorf("冷库应是 10kg, got %s", cold)
+	if !cold.IsZero() {
+		t.Errorf("外采不占冷库,冷库应是 0, got %s", cold)
 	}
-	if !counter.IsZero() {
-		t.Errorf("柜台不该有货(还没搬上台), got %s", counter)
+	if !counter.Equal(d("10")) {
+		t.Errorf("猪肉台应是 10kg(录完直接上架), got %s", counter)
 	}
 
 	// 结转记录:source='external'、归属快照为空(外采没有产出猪)。
@@ -101,6 +106,9 @@ func TestExternalPurchase_RecordWritesFactStockAndCarryover(t *testing.T) {
 	bag := bags[0]
 	if bag.Source != service.BagSourceExternal {
 		t.Errorf("结转记录来源应是 %q, got %q", service.BagSourceExternal, bag.Source)
+	}
+	if bag.Location != string(model.StockLocationCounter) {
+		t.Errorf("结转记录的位置应是猪肉台 %q, got %q", model.StockLocationCounter, bag.Location)
 	}
 	if len(bag.PigAlloc) != 0 {
 		t.Errorf("外采没有产出猪 ⇒ 归属快照必须为空, got %s", string(bag.PigAlloc))
@@ -162,24 +170,27 @@ func TestExternalPurchase_UpdateAndDelete(t *testing.T) {
 	}, "u-1")
 	mustNoErr(t, err, "RecordExternalPurchase")
 
-	// 改数量 10 → 15 ⇒ 冷库 10 + 5 = 15(按**差额**调,不是覆盖成 15)。
+	// 改数量 10 → 15 ⇒ 猪肉台 10 + 5 = 15(按**差额**调,不是覆盖成 15)。
 	if _, err := svc.UpdateExternalPurchase(ctx, "S001", view.ID, service.ExternalPurchaseInput{
 		CubeProductID: sku, QtyKg: d("15"), UnitPriceYuan: d("24"),
 	}); err != nil {
 		t.Fatalf("UpdateExternalPurchase: %v", err)
 	}
-	cold, _ := fmPositions(t, "S001", sku)
-	if !cold.Equal(d("15")) {
-		t.Errorf("改后冷库应是 15kg, got %s", cold)
+	cold, counter := fmPositions(t, "S001", sku)
+	if !cold.IsZero() {
+		t.Errorf("外采不该占冷库, got %s", cold)
+	}
+	if !counter.Equal(d("15")) {
+		t.Errorf("改后猪肉台应是 15kg, got %s", counter)
 	}
 
 	// 撤 ⇒ 位置表回退、结转记录删掉、事实行删掉。
 	if err := svc.DeleteExternalPurchase(ctx, "S001", view.ID); err != nil {
 		t.Fatalf("DeleteExternalPurchase: %v", err)
 	}
-	cold, _ = fmPositions(t, "S001", sku)
-	if !cold.IsZero() {
-		t.Errorf("撤后冷库应回到 0, got %s", cold)
+	_, counter = fmPositions(t, "S001", sku)
+	if !counter.IsZero() {
+		t.Errorf("撤后猪肉台应回到 0, got %s", counter)
 	}
 	if bags := fmBags(t); len(bags) != 0 {
 		t.Errorf("撤后结转记录应删掉, got %d 行", len(bags))
@@ -222,14 +233,19 @@ func TestExternalPurchase_GrossMarginTotalHasSeparateExternalColumn(t *testing.T
 	}
 }
 
-// ---- ⑥ 外采进冷库链 ----
+// ---- ⑥ 外采直接上猪肉台,不占冷库 ----
 
-// TestExternalPurchase_EntersColdStoreChain 锁 ⑥。
+// TestExternalPurchase_StaysOutOfColdStoreUntilStocktake 锁 ⑥。
 //
-// ⚠️ owner 口径:「跟录猪一样,卖不完会在日终盘点体现,随日终盘点一起进冷库」
-// ⇒ 外采的货**真的躺在冷库里** ⇒ 冷库链必须记它
-// ⇒ 不记 ⇒ 「没搬上台的外采」会被算成**假盘亏**。
-func TestExternalPurchase_EntersColdStoreChain(t *testing.T) {
+// ⚠️ owner 2026-11-03 拍板:「跟录猪一样,卖不完会在日终盘点体现,
+//   随日终盘点一起进冷库,部位卖完,日终盘点为 0,就进不到冷库了。」
+//
+// ⇒ 录外采 ⇒ 货在**猪肉台**、**不占冷库** ⇒ 录完就能卖,不用再搬一次台。
+// ⇒ 没卖完 ⇒ 日终盘点把它盘进「柜台实盘」⇒ 过夜搬运(后端自动)进冷库。
+// ⇒ 卖完了(盘点 0)⇒ 进不了冷库。
+//
+// ⚠️ 判别力:把冷库链的 externalIn 加回去 ⇒ 下面第①段的 cold=0 立刻红。
+func TestExternalPurchase_StaysOutOfColdStoreUntilStocktake(t *testing.T) {
 	svc, ctx, sku := fmExtSetup(t)
 
 	// 10-02 录一笔外采 10kg(10-01 没有前一营业日 ⇒ 第一天录没问题;
@@ -251,10 +267,38 @@ func TestExternalPurchase_EntersColdStoreChain(t *testing.T) {
 		t.Fatalf("RecordExternalPurchase(10-02): %v", err)
 	}
 
-	// 10-02 日终:外采的 10kg 还在冷库里(没搬上台、没卖)。
-	_, cold := fmMarginClosing(t, "S001", day2, model.CutBelly)
+	// ① 录完、还没盘点 ⇒ 货在猪肉台,**冷库链上没有它**。
+	cold, counter := fmPositions(t, "S001", sku)
+	if !cold.IsZero() {
+		t.Errorf("外采不该占冷库, got %s", cold)
+	}
+	if !counter.Equal(d("10")) {
+		t.Errorf("录完外采猪肉台应是 10kg, got %s", counter)
+	}
+	_, chainCold := fmMarginClosing(t, "S001", day2, model.CutBelly)
+	if !chainCold.IsZero() {
+		t.Errorf("★ 外采不该进冷库链,10-02 日终冷库应是 0, got %s", chainCold)
+	}
+
+	// ② 日终盘点把它盘进「柜台实盘」(没卖完)⇒ 过夜搬运进冷库。
+	if _, err := svc.RecordPorkCutsStocktake(ctx, "S001", model.RecordPorkCutsStocktakeInput{
+		IsComplete: true,
+		Cuts: []model.CutInput{
+			{CutType: model.CutBelly, CubeProductID: sku, ActualRemainKg: d("10")},
+		},
+	}, "u-1"); err != nil {
+		t.Fatalf("10-02 盘点: %v", err)
+	}
+	cold, counter = fmPositions(t, "S001", sku)
 	if !cold.Equal(d("10")) {
-		t.Errorf("10-02 日终冷库应是 10kg(外采进链), got %s", cold)
+		t.Errorf("★ 盘点后外采的 10kg 应过夜进冷库, got %s", cold)
+	}
+	if !counter.IsZero() {
+		t.Errorf("盘点夜柜台应清空, got %s", counter)
+	}
+	_, chainCold = fmMarginClosing(t, "S001", day2, model.CutBelly)
+	if !chainCold.Equal(d("10")) {
+		t.Errorf("★ 10-02 日终冷库应是 10kg(随盘点结转进来的), got %s", chainCold)
 	}
 }
 

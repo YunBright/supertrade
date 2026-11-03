@@ -23,6 +23,12 @@ package service
 // ⚠️ **日终盘点自动结转**不进冷库余额
 //   (applyOvernightMove 已经把柜台实盘搬进冷库了 ⇒ 再加一次就是同一批货记两次)。
 //
+// ⚠️ **外采不进冷库链**(2026-11-03 owner 拍板)
+//   外采录完**直接上猪肉台**、不占冷库(与录猪的分割产出同构)
+//   ⇒ 卖不完的那部分靠「结转」(盘点盘出来的柜台实盘)进冷库;
+//     部位卖完(盘点 0)⇒ 自然进不了冷库。
+//   ⇒ 所以链上**没有**外采这一项(拍板前的实现有过,已删)。
+//
 // # 期初(base)
 //
 // ⚠️ **期初按 0 起算**(冷库从空开始)。
@@ -74,14 +80,6 @@ type dailyBalanceTerms struct {
 	bulkOut map[string]decimal.Decimal
 	// bulkIn 是**大宗手工进冷库** ⇒ +。
 	bulkIn map[string]decimal.Decimal
-	// externalIn 是**外采进冷库**(2026-11-03 owner)⇒ +。
-	//
-	// ⚠️ 为什么外采要进链(而"猪的分割产出"不进,见 giftOut 那段注释):
-	//   外采的货**真的躺在冷库里**(门店买了还没搬上台)⇒ 链上必须有它
-	//   ⇒ 否则期末量(链的日终结余)比账面推演少 ⇒ **假盘亏**。
-	//
-	// ⚠️ 链上永远是 ≥0 ⇒ 外采当天没搬上台、又被大宗领走时也不会出负数。
-	externalIn map[string]decimal.Decimal
 	// giftOut 是**搭赠出库**(2026-10-31)⇒ −。
 	//
 	// ⚠️ 为什么搭赠要进**冷库链**(链是"店里还剩多少货"的物理账):
@@ -102,7 +100,6 @@ func newDailyBalanceTerms() *dailyBalanceTerms {
 		counterLoad: map[string]decimal.Decimal{},
 		bulkOut:     map[string]decimal.Decimal{},
 		bulkIn:      map[string]decimal.Decimal{},
-		externalIn:  map[string]decimal.Decimal{},
 		giftOut:     map[string]decimal.Decimal{},
 	}
 }
@@ -238,23 +235,6 @@ func (s *Service) loadDailyTerms(ctx context.Context, branchID string) (map[stri
 	for _, r := range bulkIns {
 		t := get(dateKey(r.OriginDate))
 		t.add(t.bulkIn, cutOfSku[r.CubeProductID], r.QtyKg)
-	}
-
-	// ---- ④b. **外采进冷库**(2026-11-03 owner)----
-	//
-	// ⚠️ 外采的货真的躺在冷库里(门店买了,还没搬上台)⇒ 链上必须有它
-	//   ⇒ 否则期末量(链的日终结余)比账面推演少 ⇒ **假盘亏**。
-	//
-	// ⚠️ 粒度是**部位**(链的 terms 一律以 cut_type 为键)⇒ 外采单已存了部位。
-	var externals []model.ExternalPurchase
-	if err := s.db.WithContext(ctx).
-		Where("branch_id = ?", branchID).
-		Find(&externals).Error; err != nil {
-		return nil, fmt.Errorf("query external_purchases(daily terms): %w", err)
-	}
-	for _, r := range externals {
-		t := get(dateKey(r.BizDate))
-		t.add(t.externalIn, r.CutType, r.QtyKg)
 	}
 
 	// ---- ⑤ **搭赠出库**(2026-10-31)----
@@ -469,13 +449,6 @@ func (s *Service) deriveColdChain(ctx context.Context, branchID string,
 			cur[cut] = cur[cut].Sub(v)
 		}
 		for cut, v := range t.bulkIn {
-			cur[cut] = cur[cut].Add(v)
-		}
-		// **外采进冷库**(2026-11-03 owner)⇒ +。
-		//
-		// ⚠️ 位置:在搬台(counterLoad)之前加 ⇒ 搬台时正好把它从冷库扣掉
-		//   ⇒ 「外采 10kg、搬上台 10kg」⇒ 链上净 0(货在柜台上)✔。
-		for cut, v := range t.externalIn {
 			cur[cut] = cur[cut].Add(v)
 		}
 		// **搭赠出库**(2026-10-31):货真的离店了 ⇒ 冷库余额 −。

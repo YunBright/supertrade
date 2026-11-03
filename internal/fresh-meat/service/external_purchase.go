@@ -39,18 +39,25 @@ package service
 //   **分割权重 W**、并把入库金额按 W 的比例重分
 //   ⇒ 外采放进去会被 W 顶掉、金额会被摊到别的部位。
 //
-// # 库存:跟录猪一样(owner 2026-11-03 原话)
+// # 库存:跟录猪一样(owner 2026-11-03 拍板)
 //
 //	「跟录猪一样,卖不完会在日终盘点体现,随日终盘点一起进冷库,
 //	  部位卖完,日终盘点为 0,就进不到冷库了。」
 //
-// ⇒ 外采的货**先进冷库**(位置表),门店可以跟猪分割的货一起搬上台;
-//   卖不完的随日终盘点进冷库(过夜);卖完的(盘点 0)自然不进。
+// ⇒ **外采的货直接上猪肉台**(位置表 counter += 外采量)—— 与录猪的分割产出同构:
+//   录完就能卖,**不用再搬一次台**。
 //
-// ⇒ 与「进猪」不同的是:进猪的分割产出**不写位置表**、也不进冷库链
+// ⇒ **不占冷库**:冷库余额链里**没有**外采这一项
+//   ⇒ 卖不完的部分靠日终盘点的「柜台实盘」体现 ⇒ 过夜搬运(后端自动)进冷库;
+//     部位卖完(盘点 0)⇒ 自然进不了冷库 ✔ 与 owner 的描述逐字吻合。
+//
+// ⇒ 与「进猪」唯一的差别:进猪的分割产出**不写位置表**
 //   (链不记分割产出,见 daily_balance.go 的 giftOut 注释);
-//   而外采**要**写位置表、**也要**进冷库链(新增 externalIn 项)
-//   —— 否则「没搬上台的外采」会被算成**假盘亏**。
+//   而外采**要**写位置表(记在猪肉台)⇒ 门店在「库存」页看得见这批货。
+//
+// ⚠️ 为什么不走「先进冷库、再搬一次台」那套(2026-11-03 拍板前的实现):
+//   那套要求门店**必须再搬一次台**才准卖,而漏搬 ⇒ 冷库链虚高 ⇒ **假盘亏**
+//   ⇒ 外采是**可选动作**,不该埋「漏一步就亏钱」的坑。
 //
 // # FIFO 归摊:外采的货**不落到猪身上**
 //
@@ -147,7 +154,7 @@ func ExternalPurchaseBagID(externalID string) string {
 // # 做了什么(一个事务)
 //
 //	① external_purchases 行(事实);
-//	② 位置表:冷库 += 外采量(门店能把它跟猪分割的货一起搬上台);
+//	② 位置表:**猪肉台** += 外采量(录完就在台面上 ⇒ 直接能卖,不用再搬台);
 //	③ 结转记录(source='external'):进 FIFO 队列 ⇒ 大宗结算能领用、零售归摊不落到猪身上。
 //
 // # 之后(事务外)
@@ -214,8 +221,8 @@ func (s *Service) RecordExternalPurchase(ctx context.Context, branchID string, i
 		if err := tx.WithContext(ctx).Create(&row).Error; err != nil {
 			return fmt.Errorf("create external_purchase: %w", err)
 		}
-		// 位置表:冷库 += 外采量。
-		if err := s.addPosition(ctx, tx, branchID, sku, model.StockLocationColdStore, in.QtyKg); err != nil {
+		// 位置表:**猪肉台** += 外采量(直接上台 ⇒ 录完就能卖,不用再搬台)。
+		if err := s.addPosition(ctx, tx, branchID, sku, model.StockLocationCounter, in.QtyKg); err != nil {
 			return err
 		}
 		// 结转记录(source='external'):FIFO 队列的一员(大宗可领用、零售归摊不落到猪)。
@@ -233,7 +240,7 @@ func (s *Service) RecordExternalPurchase(ctx context.Context, branchID string, i
 
 // UpdateExternalPurchase 改一笔外采(数量 / 单价 / 备注)。
 //
-// ⚠️ 位置表按**差额**调整(冷库 += 新 − 旧)⇒ 幂等。
+// ⚠️ 位置表按**差额**调整(猪肉台 += 新 − 旧)⇒ 幂等。
 // ⚠️ 结转记录同步改(qty / 成本快照)。
 func (s *Service) UpdateExternalPurchase(ctx context.Context, branchID, id string, in ExternalPurchaseInput) (
 	*ExternalPurchaseView, error) {
@@ -276,7 +283,7 @@ func (s *Service) UpdateExternalPurchase(ctx context.Context, branchID, id strin
 		// 位置表:按差额(新 − 旧)。
 		delta := in.QtyKg.Sub(cur.QtyKg)
 		if !delta.IsZero() {
-			if err := s.addPosition(ctx, tx, branchID, cur.CubeProductID, model.StockLocationColdStore, delta); err != nil {
+			if err := s.addPosition(ctx, tx, branchID, cur.CubeProductID, model.StockLocationCounter, delta); err != nil {
 				return err
 			}
 		}
@@ -300,7 +307,7 @@ func (s *Service) UpdateExternalPurchase(ctx context.Context, branchID, id strin
 
 // DeleteExternalPurchase 撤一笔外采。
 //
-// ⚠️ 位置表按**反向差额**调整(冷库 −= 外采量)。
+// ⚠️ 位置表按**反向差额**调整(猪肉台 −= 外采量)。
 // ⚠️ 结转记录一并删掉(它只代表这批外采的货)。
 func (s *Service) DeleteExternalPurchase(ctx context.Context, branchID, id string) error {
 	if branchID == "" {
@@ -319,8 +326,8 @@ func (s *Service) DeleteExternalPurchase(ctx context.Context, branchID, id strin
 			Delete(&model.ExternalPurchase{}).Error; err != nil {
 			return fmt.Errorf("delete external_purchase: %w", err)
 		}
-		// 位置表:冷库 −= 外采量。
-		if err := s.addPosition(ctx, tx, branchID, cur.CubeProductID, model.StockLocationColdStore, cur.QtyKg.Neg()); err != nil {
+		// 位置表:猪肉台 −= 外采量。
+		if err := s.addPosition(ctx, tx, branchID, cur.CubeProductID, model.StockLocationCounter, cur.QtyKg.Neg()); err != nil {
 			return err
 		}
 		// 结转记录:删掉(只代表这批外采的货)。
@@ -439,6 +446,9 @@ func (s *Service) nextExternalPurchaseSeq(ctx context.Context, branchID string,
 // ⚠️ **归属快照为空** ⇒ FIFO 领用它时收入记「未归属」
 //   (外采没有产出猪 ⇒ 不能摊给某头猪,见 pig_fifo.go 的期初处理)。
 // ⚠️ 成本快照 = **门店给的**采购单价(不是 0,也不是倒算的移动加权单价)。
+//
+// ⚠️ location = **猪肉台**(2026-11-03 owner 拍板):外采录完直接上台、不占冷库
+//   ⇒ 大宗从它领用时记在台面(不是冷库),见 bulk_fifo.go 的 location 判断。
 func (s *Service) registerExternalStockBag(ctx context.Context, tx *gorm.DB, row model.ExternalPurchase) error {
 	now := s.now()
 	bag := model.StockBag{
@@ -448,7 +458,7 @@ func (s *Service) registerExternalStockBag(ctx context.Context, tx *gorm.DB, row
 		CutType:       row.CutType,
 		QtyKg:         row.QtyKg,
 		OriginDate:    row.BizDate,
-		Location:      string(model.StockLocationColdStore),
+		Location:      string(model.StockLocationCounter),
 		Status:        BagStatusActive,
 		Source:        BagSourceExternal,
 		UnitCostYuan:  row.UnitPriceYuan,
@@ -484,11 +494,4 @@ func (s *Service) loadExternalPurchaseTotals(ctx context.Context, branchID strin
 		amount[cut] = amount[cut].Add(r.TotalAmountYuan)
 	}
 	return kg, amount, nil
-}
-
-// externalPurchaseKgByDay 某营业日外采的量(按**部位**):给冷库链用。
-func (s *Service) externalPurchaseKgByDay(ctx context.Context, branchID string,
-	startOfDay, endOfDay time.Time) (map[string]decimal.Decimal, error) {
-	kg, _, err := s.loadExternalPurchaseTotals(ctx, branchID, startOfDay, endOfDay)
-	return kg, err
 }
