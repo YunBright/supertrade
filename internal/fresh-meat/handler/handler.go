@@ -75,6 +75,10 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.POST("/whole-pigs", requireBranch, h.RecordWholePig)
 	r.GET("/whole-pigs", requireBranch, h.ListWholePigsByDay)
 	r.GET("/whole-pigs/:pig_id", requireBranch, h.GetWholePig)
+	// PUT /whole-pigs/:pig_id —— **改已录入的猪**（毛重 / 采购单价）。
+	//   ⚠️ 2026-11-03 owner：「录入猪，需要可以修改已录入的猪，包括重量和价格，
+	//   需要新增一样触发其它逻辑」⇒ 改完与录猪**同一条**成本链重算路径。
+	r.PUT("/whole-pigs/:pig_id", requireBranch, h.UpdateWholePig)
 	// POST /whole-pigs/:pig_id/advice —— 重新生成分割建议(异步,立即返回 202)。
 	r.POST("/whole-pigs/:pig_id/advice", requireBranch, h.RegeneratePigAdvice)
 	// DELETE /whole-pigs/:pig_id —— 删掉**录错了**的猪。
@@ -364,6 +368,39 @@ func (h *Handler) GetWholePig(c *gin.Context) {
 		return
 	}
 	out, err := h.svc.GetWholePig(c.Request.Context(), branchID, pigID)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// UpdateWholePig PUT /whole-pigs/:pig_id
+//
+// **改已录入的猪**（2026-11-03 owner：「录入猪，需要可以修改已录入的猪，
+// 包括重量和价格，需要新增一样触发其它逻辑」）。
+//
+// 只改**事实字段**：毛重 / 采购单价。耳标、供应商、到场时间不动。
+// ⇒ 改完与录猪**同一条**成本链重算路径（理由见 service/pig_update.go）。
+//
+// 权限：freshmeat:write。
+func (h *Handler) UpdateWholePig(c *gin.Context) {
+	branchID := middleware.SingleBranchFromCtx(c)
+	if !h.requireScope(c, branchID, "freshmeat:write") {
+		return
+	}
+	pigID := strings.TrimSpace(c.Param("pig_id"))
+	if pigID == "" {
+		writeError(c, http.StatusBadRequest, "missing_pig_id", "pig_id 必填")
+		return
+	}
+	var in model.UpdateWholePigInput
+	if err := c.ShouldBindJSON(&in); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_json", badJSONMessage(err))
+		return
+	}
+	cl, _ := claims.FromContext(c.Request.Context())
+	out, err := h.svc.UpdateWholePig(c.Request.Context(), branchID, pigID, in, actorIDFromClaims(cl))
 	if err != nil {
 		mapErr(c, err)
 		return

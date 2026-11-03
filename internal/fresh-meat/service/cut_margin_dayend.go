@@ -7,14 +7,16 @@
 //	售罄率       = 销售 ÷ (销售 + 日终剩余)
 //	参考成本单价_c = **建议成本单价**(分割基线的部位单价 × 今天这头猪的进价折算)
 //	参考毛利_c   = 营收_c − 成本单价_c×销量_c − 搭赠成本_c − 报损成本_c
-//	全店参考毛利 = **Σ 部位参考毛利**(头与部位同源)
-//	全店参考毛利率 = 全店参考毛利 ÷ 营收
+//	全店毛利     = 当日总收入 − (当日总支出 + 搬出估算成本 − 盘点估算成本) ← 2026-11-03
+//	全店毛利率   = 全店毛利 ÷ 当日总收入
 //
 // ⚠️ **参考口径(B,2026-11-01 owner 拍板)不再依赖日终实盘**
 //
 //	旧口径(A)的 m = (营收 − 采购 + 期末剩余成本) / 营收 要**日终盘点**,
 //	而部位成本单价 = 零售均价_c ÷ (1 + m) ⇒ 没盘点就连锁算不出来。
-//	⇒ 现在部位单价走**建议成本单价** ⇒ 没做日终盘点也有数。
+//	⇒ 现在部位单价走**建议成本单价** ⇒ **部位行**没做日终盘点也有数。
+//	⚠️ **表头(全店毛利/毛利率)2026-11-03 改成「当日口径」** ⇒ 它要**盘点估算成本**
+//	  ⇒ 没有完整日终盘点的那天,表头是「—」(部位行仍有数)。
 //	⚠️ 下面「为什么日终剩余的金额用采购均价」那段说的是**日终剩余估值**,
 //	  仍是采购均价(无环)—— 与参考毛利口径无关。
 //
@@ -102,18 +104,34 @@ func applyDayEndRemain(mids []cutRollupMid, tot *TotalGrossMargin, purchaseAvg d
 
 // applyReferenceMargin 回填**参考口径**的成本单价与毛利(部位 + 全店)。
 //
-// # 口径(B 口径,owner 2026-11-01 拍板 + 2026-11-03 补外采)
+// # 口径(B 口径,owner 2026-11-01 拍板 + 2026-11-03 补外采 + **全店改当日口径**)
 //
 //	成本单价_c = **建议成本单价**(分割基线 × 今天这头猪的进价折算)
 //	            **与外采价按量加权**(owner 2026-11-03:「求均值」)
 //	参考毛利_c = 营收_c − 成本单价_c×(销量_c + 搭赠_c + 报损_c)
-//	全店参考毛利 = **Σ 部位参考毛利** ⇒ 头与部位同源。
 //
-// ⚠️ **不再需要日终实盘**(旧口径要它)⇒ 门店没做日终盘点也有数。
+// # ⚠️ **全店(表头)改成「当日口径」**(owner 2026-11-03 拍板)
+//
+//	成本 = 当日总支出(进猪 + 外采) + **搬出估算成本** − **盘点估算成本**
+//	毛利 = 当日总收入 − 成本
+//	毛利率 = 毛利 ÷ 当日总收入
+//
+//	- 搬出估算成本 = Σ(搬上台 kg × 该部位**冷库移动加权成本**)
+//	  (搬上台的是**前几天切好的老货** ⇒ 它的成本是当初进货的成本)
+//	- 盘点估算成本 = **期末猪肉台实盘** × 含外采采购均价(= 参考剩余估值)
+//
+//	⚠️ **全店不再等于各部位参考毛利之和**(owner 明确要求):
+//	  部位行是「按销量 × 部位成本单价」估的,表头是「今天的现金账」⇒ 两套口径。
+//	⇒ 门店**不要**拿部位行加总去核表头。
+//
+// # ⚠️ 三个守卫(算不出来就是算不出来 ⇒ nil ⇒ 前端「—」)
+//
+//	① 当天没进货 ⇒ 成本算不出来(**不是 0 成本**)
+//	② 没有完整日终盘点 ⇒ 「盘点估算成本」算不出来
+//	③ 当天没营收 ⇒ 比率没有意义
 //
 // ⚠️ 兜底:某部位没有基线价 ⇒ 用**进猪采购均价**;
-//	连采购均价都没有(当天没进货)⇒ 该部位算不出来(「—」),
-//	此时全店也给不出来(Σ 里缺一块 ⇒ 会把毛利算高)⇒ 全店给 nil。
+//	连采购均价都没有(当天没进货)⇒ 该部位算不出来(「—」)。
 //
 // ⚠️ **绝不回落成 0**(0 会被门店误读成"当天不赚钱")。
 func applyReferenceMargin(mids []cutRollupMid, tot *TotalGrossMargin, ref ReferenceDayTotals) {
@@ -135,7 +153,6 @@ func applyReferenceMargin(mids []cutRollupMid, tot *TotalGrossMargin, ref Refere
 
 	// ---- 部位 ----
 	partial := false
-	var sumMargin decimal.Decimal
 	for i := range mids {
 		mid := &mids[i]
 		soldAll := mid.soldKg.Add(mid.bulkKg)
@@ -159,20 +176,36 @@ func applyReferenceMargin(mids []cutRollupMid, tot *TotalGrossMargin, ref Refere
 		mid.row.ReferenceCostPriceSource = rc.UnitPriceSource
 		mid.row.ReferenceGrossMarginYuan = &gmC
 		mid.row.ReferenceGrossMarginPct = &pctC
-		sumMargin = sumMargin.Add(gmC)
 	}
 	tot.ReferenceCostPartial = partial
 
-	// ---- 全店 = 部位之和 ----
+	// ---- 全店 = **当日口径**(owner 2026-11-03)----
 	//
-	// ⚠️ **有部位算不出来 ⇒ 全店也给不出来**:
-	//	Σ 缺了那块成本 ⇒ 毛利会偏高 ⇒ 与其给一个偏高的数,不如给「—」。
-	if partial || !tot.RevenueYuan.IsPositive() {
+	//	成本 = 当日总支出(进猪 + 外采) + 搬出估算成本 − 盘点估算成本
+	//	毛利 = 当日总收入 − 成本
+	//	毛利率 = 毛利 ÷ 当日总收入
+	//
+	// ⚠️ **三个守卫**:算不出来就是算不出来 ⇒ nil(前端「—」),绝不回落成 0。
+	//
+	//	① 当天没进货 ⇒ 成本算不出来(给 0 成本会让门店以为赚疯了)
+	//	② 没有完整日终盘点 ⇒ 「盘点估算成本」算不出来
+	//	③ 当天没营收 ⇒ 比率没有意义
+	if !ref.TotalPurchasedKg().IsPositive() || !ref.HasRemain || !tot.RevenueYuan.IsPositive() {
 		return
 	}
-	amount := sumMargin
-	pct, _ := sumMargin.Mul(decimal.NewFromInt(100)).Div(tot.RevenueYuan).Float64()
-	rate := sumMargin.Div(tot.RevenueYuan)
+	// 搬出估算成本 = Σ(搬上台 kg × 该部位**冷库移动加权成本**)
+	//
+	// ⚠️ 为什么用冷库移动加权成本:搬上台的是**前几天切好的老货**,
+	//   它的成本是当初进货的成本 ⇒ 今天的部位建议单价(基线折算)不是它的成本。
+	var loadCost decimal.Decimal
+	for i := range mids {
+		mid := &mids[i]
+		loadCost = loadCost.Add(mid.src.CounterLoadKg.Mul(mid.src.MovingAvgUnitCost))
+	}
+	cost := ref.TotalPurchasedYuan().Add(loadCost).Sub(tot.ReferenceRemainYuan)
+	amount := tot.RevenueYuan.Sub(cost)
+	pct, _ := amount.Mul(decimal.NewFromInt(100)).Div(tot.RevenueYuan).Float64()
+	rate := amount.Div(tot.RevenueYuan)
 	tot.ReferenceGrossMarginYuan = &amount
 	tot.ReferenceGrossMarginPct = &pct
 	tot.ReferenceMarginRate = &rate

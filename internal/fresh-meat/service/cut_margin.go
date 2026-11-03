@@ -136,8 +136,8 @@ func rollUpPerCutCuts(cutRows []CutDailyCost, promoAlloc *PromoAllocation, ref R
 	//	⇒ 旧的 m(零售均价÷(1+m)倒推)只留给「单价样本采集」用,见 cost_reference.go。
 	applyReferenceMargin(mids, &tot, ref)
 
-	// ---- 出成率(owner 2026-11-01:>100% ⇒ 有问题,要去查)----
-	if rate, ok := referenceYieldRate(cutRows, ref.PurchasedKg); ok {
+	// ---- 出成率(owner 2026-11-01:>100% ⇒ 有问题,要去查;2026-11-03:减外采)----
+	if rate, ok := referenceYieldRate(cutRows, ref.PurchasedKg, ref.ExternalKg); ok {
 		f, _ := rate.Float64()
 		tot.YieldRate = &f
 	}

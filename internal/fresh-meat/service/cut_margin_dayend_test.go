@@ -27,6 +27,7 @@ package service_test
 // ⚠️ 日终剩余/售罄率**仍然依赖日终实盘**(它们的分母是期末实盘)⇒ 没盘点时仍是「—」。
 
 import (
+	"math"
 	"testing"
 
 	"github.com/YunBright/supertrade/internal/fresh-meat/model"
@@ -221,56 +222,101 @@ func TestReferenceCutUnitPriceAndMargin(t *testing.T) {
 	}
 }
 
-// **header = 各部位参考毛利之和**(B 口径:头与部位同源 ⇒ 门店能自己核)。
+// **表头 = 当日口径**(owner 2026-11-03 拍板):**不是**各部位参考毛利之和。
 //
-// ⚠️ 判别力:把 header 改回旧口径的「营收 − 采购 + 期末剩余成本」⇒ 本用例必红。
-func TestReferenceHeaderEqualsSumOfParts(t *testing.T) {
+//	成本 = 当日总支出(进猪 + 外采) + 搬出估算成本 − 盘点估算成本
+//	毛利 = 当日总收入 − 成本
+//	毛利率 = 毛利 ÷ 当日总收入
+//
+// ⚠️ 部位行是「按销量 × 部位成本单价」估的,表头是「今天的现金账」⇒ **两套口径**
+//   ⇒ 门店不要拿部位行加总去核表头(owner 明确要求)。
+//
+// ⚠️ 判别力:把表头改回「Σ 部位参考毛利」⇒ 本用例必红(880 ≠ 840)。
+func TestReferenceHeaderUsesDayLevelFormula(t *testing.T) {
 	rows, total := service.RollUpPerCutCutsForTest([]service.CutDailyCost{
 		fmDayEndRowWithSuggested(model.CutLegRear, 80, 1600, 1200, 0, "actual", "12"),
 		fmDayEndRowWithSuggested(model.CutBelly, 20, 400, 300, 0, "actual", "10"),
 	}, nil, fmRefTotals())
 
+	// 部位行照旧:后腿 1600 − 12×80 = 640;五花 400 − 10×20 = 200 ⇒ Σ 840
 	var sum decimal.Decimal
 	for _, r := range rows {
 		if r.ReferenceGrossMarginYuan != nil {
 			sum = sum.Add(*r.ReferenceGrossMarginYuan)
 		}
 	}
+	if !sum.Equal(fmDayDec(840)) {
+		t.Fatalf("部位参考毛利之和 = %s,期望 840", sum.String())
+	}
 	if total.ReferenceGrossMarginYuan == nil {
-		t.Fatal("有进货 ⇒ 全店参考毛利必须有值")
+		t.Fatal("有进货 + 有盘点 + 有营收 ⇒ 全店毛利必须有值")
 	}
-	if !sum.Equal(*total.ReferenceGrossMarginYuan) {
-		t.Fatalf("★ header 必须等于部位之和(同源):部位 %s / 头 %s",
-			sum.String(), total.ReferenceGrossMarginYuan.String())
+	// 当日口径:营收 2000 − (总支出 1400 + 搬出 0 − 盘点剩余 20×14=280) = 880
+	if !total.ReferenceGrossMarginYuan.Equal(fmDayDec(880)) {
+		t.Fatalf("全店毛利 = %s,期望 880(当日口径:2000 − (1400 − 280))",
+			total.ReferenceGrossMarginYuan.String())
 	}
-	// 后腿:1600 − 12×80 = 640;五花:400 − 10×20 = 200 ⇒ 合计 840
-	if !total.ReferenceGrossMarginYuan.Equal(fmDayDec(840)) {
-		t.Fatalf("全店参考毛利 = %s,期望 840", total.ReferenceGrossMarginYuan.String())
+	if total.ReferenceGrossMarginPct == nil ||
+		*total.ReferenceGrossMarginPct < 43.99 || *total.ReferenceGrossMarginPct > 44.01 {
+		t.Fatalf("全店毛利率 = %v,期望 44", total.ReferenceGrossMarginPct)
+	}
+	// ★ **表头 ≠ 部位之和**(owner 2026-11-03)⇒ 这条断言锁住这个决定。
+	if total.ReferenceGrossMarginYuan.Equal(sum) {
+		t.Fatalf("★ 表头不能等于部位之和(%s)—— owner 2026-11-03 要求表头用当日口径",
+			sum.String())
 	}
 }
 
-// **没有日终盘点 ⇒ 参考毛利照样有值**(owner 2026-11-01 换口径的原因)。
+// 「搬出估算成本」= 搬上台 kg × 该部位**冷库移动加权成本**。
 //
-// ⚠️ 旧口径在这里给的是 nil(整条链算不出来)⇒ 门店看到的是一片「—」。
+// ⚠️ 为什么锁它:搬上台的是**前几天切好的老货** ⇒ 它的成本是当初进货的成本。
+//   漏了这一项 ⇒ 成本算低 ⇒ 毛利虚高。
 //
-// ⚠️ 判别力:把成本单价换回"依赖 m 的倒推"⇒ 没有 m ⇒ 参考毛利变 nil ⇒ 本用例必红。
-func TestReferenceMarginWithoutStocktakeStillHasValue(t *testing.T) {
+// ⚠️ 判别力:把搬出成本去掉(改成 0)⇒ 毛利会从 330 变 480 ⇒ 断言变红。
+func TestReferenceHeaderCountsLoadOutCost(t *testing.T) {
+	row := fmDayEndRow(model.CutLegRear, 80, 1600, 1200, 20, "actual")
+	row.CounterLoadKg = fmDayDec(10)
+	row.MovingAvgUnitCost = fmDayDec(15)
+	_, total := service.RollUpPerCutCutsForTest([]service.CutDailyCost{row}, nil, fmRefTotals())
+
+	if total.ReferenceGrossMarginYuan == nil {
+		t.Fatal("有进货 + 有盘点 + 有营收 ⇒ 全店毛利必须有值")
+	}
+	// 成本 = 1400(总支出) + 10×15(搬出) − 20×14(盘点剩余) = 1270 ⇒ 毛利 = 1600 − 1270 = 330
+	if !total.ReferenceGrossMarginYuan.Equal(fmDayDec(330)) {
+		t.Fatalf("全店毛利 = %s,期望 330(成本 1400 + 150 搬出 − 280 剩余)",
+			total.ReferenceGrossMarginYuan.String())
+	}
+}
+
+// **部位行没有日终盘点也有值**(owner 2026-11-01 换口径的原因);
+//
+// ⚠️ 2026-11-03 owner:表头改成**当日口径** ⇒ 它要「盘点估算成本」
+//   ⇒ **没有完整日终盘点的那天,表头是「—」**(nil),**不是 0、不是 100%**。
+//
+// ⚠️ 判别力:把表头的「没有盘点 ⇒ nil」改成「回落成 0」⇒ 本用例必红。
+func TestReferenceRowsWithoutStocktakeStillHaveValue(t *testing.T) {
 	rows, total := service.RollUpPerCutCutsForTest([]service.CutDailyCost{
 		fmDayEndRowWithSuggested(model.CutLegRear, 80, 1600, 1200, 0, "estimated", "12"),
 	}, nil, service.ReferenceDayTotalsForTest("100", "1400", "0", false))
 
 	row := fmDayEndFind(t, rows, model.CutLegRear)
 	if row.ReferenceGrossMarginYuan == nil {
-		t.Fatal("★ 没有盘点 ⇒ 参考毛利也必须有值(B 口径不需要日终实盘)")
+		t.Fatal("★ 没有盘点 ⇒ 部位参考毛利也必须有值(B 口径不需要日终实盘)")
 	}
 	if row.ReferenceCostUnitPriceYuan == nil {
 		t.Fatal("★ 没有盘点 ⇒ 部位成本单价也必须有值")
 	}
-	if total.ReferenceGrossMarginYuan == nil {
-		t.Fatalf("★ 没有盘点 ⇒ 全店参考毛利必须有值,实际 nil")
+	if !row.ReferenceGrossMarginYuan.Equal(fmDayDec(640)) {
+		t.Fatalf("部位参考毛利 = %s,期望 640", row.ReferenceGrossMarginYuan.String())
 	}
-	if !total.ReferenceGrossMarginYuan.Equal(fmDayDec(640)) {
-		t.Fatalf("全店参考毛利 = %s,期望 640", total.ReferenceGrossMarginYuan.String())
+	// ⚠️ **表头**没有盘点 ⇒ 当日口径算不出「盘点估算成本」⇒ nil(前端「—」)
+	if total.ReferenceGrossMarginYuan != nil {
+		t.Fatalf("★ 没有盘点 ⇒ 全店毛利必须是 nil(不是 0!),实际 %s",
+			total.ReferenceGrossMarginYuan.String())
+	}
+	if total.ReferenceGrossMarginPct != nil {
+		t.Fatalf("没有盘点 ⇒ 全店毛利率必须是 nil,实际 %v", *total.ReferenceGrossMarginPct)
 	}
 	// ⚠️ 但**售罄率**仍然需要日终实盘(分母是期末实盘)⇒ 仍是 nil。
 	if total.SellThroughRate != nil {
@@ -340,6 +386,9 @@ func TestReferenceMarginNeedsPurchase(t *testing.T) {
 // 出成率 = 真实切分产出 ÷ 当日进货毛重;**> 100% ⇒ 有问题,要去查**。
 //
 // ⚠️ 生产实测(店 00 2026-10-30):106.4% ⇒ 搬台没登记 14.655kg。
+//
+// ⚠️ 2026-11-03 owner:分子**减外采** ⇒ 生产实测 10-30 变成 **101.06%**
+//   (这里用的是**没有外采**的输入 ⇒ 期望值不受影响)。
 func TestYieldRateOver100MeansProblem(t *testing.T) {
 	// 正常:台面剩 20 + 卖 80 = 产出 100 = 进货 100 ⇒ 100%
 	_, total := service.RollUpPerCutCutsForTest([]service.CutDailyCost{
@@ -371,5 +420,33 @@ func TestYieldRateNeedsPurchase(t *testing.T) {
 	}, nil, service.ReferenceDayTotalsForTest("0", "0", "20", true))
 	if total.YieldRate != nil {
 		t.Fatalf("当天没进猪 ⇒ 出成率必须是 nil(不是 0%%),实际 %v", *total.YieldRate)
+	}
+}
+
+// 出成率**要减外采**(owner 2026-11-03):外采是**买来的成品**,不是今天从猪身上切出来的
+// ⇒ 混进「今天的切分产出」里 ⇒ 产出被抬高 ⇒ 出成率虚高。
+//
+// 生产实测(店 00 10-30):外采 12.25kg ⇒ 106.45% → **101.06%**。
+//
+// ⚠️ 用**差值**断言:同一批事实,只改外采 ⇒ 差值必须正好 = 外采kg ÷ 进猪kg。
+//   (去掉实现里的减外采 ⇒ 差值变 0 ⇒ 本用例必红)
+func TestYieldRateSubtractsExternalPurchase(t *testing.T) {
+	rows := []service.CutDailyCost{
+		fmDayEndRow(model.CutLegRear, 80, 1600, 1200, 20, "actual"),
+	}
+	_, without := service.RollUpPerCutCutsForTest(rows, nil, fmRefTotals())
+	_, with := service.RollUpPerCutCutsForTest(rows, nil,
+		service.ReferenceDayTotalsWithExternalForTest("100", "1400", "12.25", "170", "20", true))
+	if without.YieldRate == nil || with.YieldRate == nil {
+		t.Fatal("有盘点 + 有进货 ⇒ 出成率必须有值")
+	}
+	diff := *without.YieldRate - *with.YieldRate
+	if math.Abs(diff-0.1225) > 1e-9 {
+		t.Fatalf("★ 外采 12.25kg 带来的出成率差值 = %v,期望 0.1225"+
+			"(没减外采 ⇒ 外采被当成今天的产出,出成率虚高)", diff)
+	}
+	// 绝对值:产出 100(台面剩 20 + 卖 80)− 外采 12.25 = 87.75 ⇒ 87.75%
+	if got := *with.YieldRate; got < 0.8774 || got > 0.8776 {
+		t.Fatalf("出成率 = %v,期望 0.8775((20 + 80) − 12.25 外采)÷ 100", got)
 	}
 }

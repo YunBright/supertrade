@@ -1791,6 +1791,25 @@ type RecordWholePigInput struct {
 	AdviceMode string `json:"advice_mode"`
 }
 
+// UpdateWholePigInput PUT /whole-pigs/:pig_id 入参(**改已录入的猪**)。
+//
+// ⚠️ 2026-11-03 owner：「录入猪，需要可以修改已录入的猪，包括重量和价格」。
+//
+// # 为什么用**指针**
+//
+// ⚠️ `decimal.Decimal` 是**结构体**(不是指针) ⇒ 用值字段没法区分
+//   「没传这个字段」与「传了 0」⇒ 指针才能表达"只改毛重、不动单价"。
+type UpdateWholePigInput struct {
+	// GrossWeightKg 是新的**毛重**(kg)。nil = 不改。
+	//
+	// ⚠️ 必须 > 0(改了 ≤ 0 等于把这头猪从成本池里抹掉)。
+	GrossWeightKg *decimal.Decimal `json:"gross_weight_kg"`
+	// PurchaseUnitPriceYuan 是新的**采购单价**(元/kg)。nil = 不改。
+	//
+	// ⚠️ 必须 > 0(单价 0 ⇒ 这头猪零成本 ⇒ 卖出去全是利润 ⇒ 毛利虚高)。
+	PurchaseUnitPriceYuan *decimal.Decimal `json:"purchase_unit_price_yuan"`
+}
+
 // RecordPigCutInput POST /pig-cuts 入参。
 type RecordPigCutInput struct {
 	PigID     string          `json:"pig_id" binding:"required"`

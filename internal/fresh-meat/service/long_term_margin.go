@@ -249,7 +249,8 @@ func (s *Service) ComputeLongTermMargin(ctx context.Context, branchID, from, to 
 			}
 		}
 		// ⚠️ 没有完整盘点 ⇒ 剩余算不出来 ⇒ 毛利**算不出来**(不给 0)。
-		if rate, ok := referenceYieldRate(cutRows, ref.PurchasedKg); ok {
+		// ⚠️ 2026-11-03 owner:出成率分子**减外采** ⇒ 与毛利看板同一口径。
+		if rate, ok := referenceYieldRate(cutRows, ref.PurchasedKg, ref.ExternalKg); ok {
 			f, _ := rate.Mul(decimal.NewFromInt(100)).Float64()
 			day.YieldRate = &f
 		}

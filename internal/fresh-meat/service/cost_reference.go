@@ -398,7 +398,7 @@ func (s *Service) referenceMarginRateOfDay(ctx context.Context, branchID string,
 //
 // # 真实切分产出(台面恒等式解出来的,**纯事实**)
 //
-//	产出 = 台面日终实盘 + 零售销量 + 统收量 + 报损量 + 搭赠量 − 搬上台量
+//	产出 = 台面日终实盘 + 零售销量 + 统收量 + 报损量 + 搭赠量 − 搬上台量 − **外采量**
 //
 // # 为什么是台面口径就够
 //
@@ -407,6 +407,17 @@ func (s *Service) referenceMarginRateOfDay(ctx context.Context, branchID string,
 //	⚠️ **搬上台要减掉**:那是**前几天**切好的老货(冷库→台面),不是今天的产出。
 //	  (生产实测 店 00 10-30:减掉它才能对上 241.755kg)
 //
+// # ⚠️ **外采也要减掉**(owner 2026-11-03)
+//
+//	外采是**买来的成品**(某个部位),不是今天从猪身上切出来的
+//	⇒ 混进「今天的切分产出」里 ⇒ 产出被抬高、分母没抬高 ⇒ 出成率虚高。
+//	生产实测 店 00 10-30:外采 12.25kg ⇒ 106.45% → **101.06%**。
+//
+// # 分子里**搭赠/报损要算进来**(owner 2026-11-03 拍板:按物理恒等式)
+//
+//	搭赠/报损的货**确实离开了台面** ⇒ 它属于「今天的产出」的一部分
+//	⇒ 不算进去 ⇒ 产出被低估 ⇒ 出成率偏低。
+//
 // # 为什么这个指标重要(owner 2026-11-01)
 //
 //	**> 100% ⇒ 有问题,要去查**。
@@ -414,7 +425,12 @@ func (s *Service) referenceMarginRateOfDay(ctx context.Context, branchID string,
 //	  - **搬台没登记**(搬上来的老货被算成今天的产出)——生产实测 店 00 10-30 = 106.4%;
 //	  - 或**盘点漏了部位**(真实剩余比盘出来的多)。
 //	⇒ 它同时是"多店产出比评估"的基础指标。
-func referenceYieldRate(rows []CutDailyCost, purchasedKg decimal.Decimal) (decimal.Decimal, bool) {
+//
+// # ⚠️ 分母是**进猪毛重**(不含外采)
+//
+//	owner 2026-11-03 的公式:分子减外采 ⇒ 分母也只用进猪毛重
+//	⇒ 外采那部分**不进这个比率**(它是"买来的成品",不是猪的产出)。
+func referenceYieldRate(rows []CutDailyCost, purchasedKg, externalKg decimal.Decimal) (decimal.Decimal, bool) {
 	if !purchasedKg.IsPositive() {
 		return decimal.Zero, false
 	}
@@ -433,7 +449,7 @@ func referenceYieldRate(rows []CutDailyCost, purchasedKg decimal.Decimal) (decim
 		// ⚠️ 没有完整日终盘点 ⇒ 期末台面算不出来 ⇒ 真实产出也算不出来。
 		return decimal.Zero, false
 	}
-	produced := remain.Add(sold).Add(out).Sub(load)
+	produced := remain.Add(sold).Add(out).Sub(load).Sub(externalKg)
 	if produced.IsNegative() {
 		produced = decimal.Zero
 	}
