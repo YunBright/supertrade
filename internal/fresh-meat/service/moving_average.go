@@ -638,6 +638,32 @@ func (s *Service) mappedSkus(ctx context.Context, branchID string) ([]string, ma
 // ⚠️ 位置表的冷库侧**只作物理留痕**(搬台/大宗/期初/外采的加减),
 //   **不再是对外口径** ⇒ 不要拿它跟接口返回的数字对。
 func (s *Service) loadSkuPositions(ctx context.Context, branchID string) (counter, cold map[string]decimal.Decimal, err error) {
+	counter, cold, err = s.loadPositionBalances(ctx, branchID)
+	if err != nil {
+		return nil, nil, err
+	}
+	// 冷库:按记录层推导(推不出来才退回位置表,并**大声**记日志 ——
+	// 失败必须可见,不能悄悄给一个旧口径的数)。
+	derived, derr := s.deriveColdStoreBySku(ctx, branchID)
+	if derr != nil {
+		s.pubLogger.Warn("loadSkuPositions: 冷库余额按记录层推导失败,退回位置表(旧口径)",
+			"branch_id", branchID, "err", derr)
+		return counter, cold, nil
+	}
+	return counter, derived, nil
+}
+
+// loadPositionBalances 读**位置表**的两位置余额(ledger 口径)。
+//
+// ⚠️ **柜台侧只是"物理留痕"**(2026-11-04):
+//   位置表的柜台侧**只累加、不扣零售卖出** ⇒ 余额只涨不跌
+//   ⇒ 生产实测 店 00:01401/counter 停在 44.350kg(四笔外采之和,货早卖完了)
+//   ⇒ **对外口径一律用推导值**(见 counter_derive.go 的 loadCounterBalances)。
+//
+// ⚠️ **这里仍然要保留它**:过夜搬运(applyOvernightMove)要搬的是
+//   **位置表上真实记着的柜台余额** ⇒ 不能换成推导值。
+func (s *Service) loadPositionBalances(ctx context.Context, branchID string) (
+	counter, cold map[string]decimal.Decimal, err error) {
 	counter = map[string]decimal.Decimal{}
 	cold = map[string]decimal.Decimal{}
 	var rows []model.SkuStockPosition
@@ -654,15 +680,7 @@ func (s *Service) loadSkuPositions(ctx context.Context, branchID string) (counte
 			cold[r.CubeProductID] = cold[r.CubeProductID].Add(r.QtyKg)
 		}
 	}
-	// 冷库:按记录层推导(推不出来才退回位置表,并**大声**记日志 ——
-	// 失败必须可见,不能悄悄给一个旧口径的数)。
-	derived, derr := s.deriveColdStoreBySku(ctx, branchID)
-	if derr != nil {
-		s.pubLogger.Warn("loadSkuPositions: 冷库余额按记录层推导失败,退回位置表(旧口径)",
-			"branch_id", branchID, "err", derr)
-		return counter, cold, nil
-	}
-	return counter, derived, nil
+	return counter, cold, nil
 }
 
 // loadSkuCatalog 取 SKU → 部位 / 名称(部位来自映射表)。

@@ -356,7 +356,16 @@ func (s *Service) ListStock(ctx context.Context, branchID string, scope model.St
 	default:
 		return nil, fmt.Errorf("%w: scope 只支持 counter | all(没有'只查冷库'这个口径)", ErrInvalidInput)
 	}
-	counter, cold, err := s.loadSkuPositions(ctx, branchID)
+	// ⚠️ **柜台侧用推导值**(2026-11-04):位置表的柜台侧只累加、不扣零售卖出
+	//   ⇒ 余额只涨不跌 ⇒ 生产实测 店 00:01401/counter 停在 44.350kg
+	//   (四笔"当天买当天卖完"的外采,货早卖完了)⇒ 门店看到的是**幽灵库存**。
+	//   ⇒ 对外口径一律用 deriveCounterBySku(记录层推导),位置表只作物理留痕。
+	counter, err := s.loadCounterBalances(ctx, branchID)
+	if err != nil {
+		return nil, err
+	}
+	// 冷库侧同样是推导值(见 loadSkuPositions)。
+	_, cold, err := s.loadSkuPositions(ctx, branchID)
 	if err != nil {
 		return nil, err
 	}

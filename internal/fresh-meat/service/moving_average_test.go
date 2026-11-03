@@ -201,7 +201,7 @@ func TestGrossMargin_Reconciliation_Closes(t *testing.T) {
 // 场景:日终盘点后货在冷库;次日"搬上台"(可部分、可不上);
 // ⇒ 冷库余额必须准确(它是累加的,少记一次就只增不减)。
 func TestStock_CounterLoad_MovesFromColdStore(t *testing.T) {
-	svc, day1, _ := setupTwoDays(t)
+	svc, day1, day2 := setupTwoDays(t)
 	ctx := context.Background()
 
 	_, err := svc.CreateBranchCutMapping(ctx, "S001",
@@ -238,6 +238,17 @@ func TestStock_CounterLoad_MovesFromColdStore(t *testing.T) {
 	if !snap.Lines[0].ColdStoreKg.Equal(d("10")) {
 		t.Errorf("日终后冷库应为 10, got %s", snap.Lines[0].ColdStoreKg)
 	}
+
+	// ⚠️ 2026-11-04:搬台记在**次日**(本用例的场景本意就是「次日搬台上」,
+	//   见上面那段注释)。
+	//
+	//   为什么必须挪到次日:柜台余额改成**按记录层推导**之后,柜台是
+	//   「**当天之内**」的量 —— 盘点夜(收盘)柜台被**置零**,那一晚实盘进冷库
+	//   ⇒ **归属日 == 盘点日**的搬台已经被当晚的实盘吸收
+	//   ⇒ 只有归属日 > 最近盘点日的搬台才还在柜台上。
+	//
+	//   (测试的时钟原本冻结在 D1 ⇒ 搬台被记成 D1 ⇒ 与场景本意不符。)
+	svc.SetClock(fmClock(day2))
 
 	// 搬上台 4kg(只搬一部分)
 	_, err = svc.CounterLoad(ctx, "S001", service.CounterLoadInput{

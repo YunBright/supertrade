@@ -318,6 +318,15 @@ func sortedCutKeys(m map[string]decimal.Decimal) []string {
 func (s *Service) buildCutMarginAlerts(ctx context.Context, branchID string, day time.Time,
 	cutRows []CutDailyCost) []MarginAlert {
 	var out []MarginAlert
+	// ⚠️ **柜台侧用位置表**(物理留痕),不用柜台推导值:
+	//
+	//	①b 这条告警盯的是「**门店改了某个数**导致余额走负」(门店要求③)
+	//	  ⇒ 位置表才是"改过的那个数"落到的地方;
+	//	  推导值是**按记录重算**的 ⇒ 改错了它也重算成"没错" ⇒ 抓不到。
+	//	⇒ 推导值只给**对外口径**(库存页)用,见 counter_derive.go。
+	//
+	// ⚠️ 冷库侧仍是**推导值**(2026-11-03 起)—— 搬台改多了会让冷库走负,
+	//   推导值才看得出来(位置表那笔历史漏记还没修)。
 	counter, cold, err := s.loadSkuPositions(ctx, branchID)
 	if err != nil {
 		return out
@@ -332,14 +341,12 @@ func (s *Service) buildCutMarginAlerts(ctx context.Context, branchID string, day
 	//   ⇒ 冷库被搬成负数(柜台 +10 / 冷库 −5)也必须红字 ⇒ 不能只看两者的合计。
 	counterCut := map[string]decimal.Decimal{}
 	coldCut := map[string]decimal.Decimal{}
-	liveCut := map[string]decimal.Decimal{}
 	for sku, v := range counter {
 		cut := string(cutOfSku[sku])
 		if cut == "" {
 			continue
 		}
 		counterCut[cut] = counterCut[cut].Add(v)
-		liveCut[cut] = liveCut[cut].Add(v)
 	}
 	for sku, v := range cold {
 		cut := string(cutOfSku[sku])
@@ -347,7 +354,6 @@ func (s *Service) buildCutMarginAlerts(ctx context.Context, branchID string, day
 			continue
 		}
 		coldCut[cut] = coldCut[cut].Add(v)
-		liveCut[cut] = liveCut[cut].Add(v)
 	}
 	// ① 账面短卖(负库存)= 账面推演的期末为负。
 	for _, r := range cutRows {
@@ -416,38 +422,27 @@ func (s *Service) buildCutMarginAlerts(ctx context.Context, branchID string, day
 			Message: note,
 		})
 	}
-	// ② 当前余额 vs 按营业日推导的结余(有当天快照时才可比)。
-	snapCounter, snapCold, ok, err := s.closingForDay(ctx, branchID, day)
-	if err != nil || !ok {
-		return out
-	}
-	cuts := map[string]struct{}{}
-	for cut := range snapCold {
-		cuts[cut] = struct{}{}
-	}
-	for cut := range snapCounter {
-		cuts[cut] = struct{}{}
-	}
-	ordered := make([]string, 0, len(cuts))
-	for cut := range cuts {
-		ordered = append(ordered, cut)
-	}
-	sort.Strings(ordered)
-	for _, cut := range ordered {
-		derived := snapCold[cut].Add(snapCounter[cut])
-		live := liveCut[cut]
-		diff := derived.Sub(live)
-		if diff.IsZero() {
-			continue
-		}
-		out = append(out, MarginAlert{
-			Level: MarginAlertLevelWarning,
-			Code:  MarginAlertBalanceMismatch,
-			Message: fmt.Sprintf("%s 当前余额 %s kg 与按营业日推导的结余 %s kg 不一致(差 %s kg)",
-				cut, live.String(), derived.String(), diff.String()),
-			CubeProductID: cut,
-			Kg:            diff,
-		})
-	}
+	// ② 「当前余额 vs 按营业日推导的结余」—— **2026-11-04 下线**。
+	//
+	// ⚠️ **为什么它必然是假告警**:
+	//
+	//	它拿的是**两个不同时间点**的数:
+	//	  - 「当前余额」= 位置表/推导的**此刻**余额(今天此刻);
+	//	  - 「按营业日推导的结余」= 被查看的那一天(可能是 3 天前)的**日终**结余。
+	//	⇒ 门店翻看历史日期时,这两边**永远**对不上 ⇒ 每翻一天就多一条黄字。
+	//
+	//	生产实测(店 00 2026-11-02):"肋排 当前余额 45.85 kg 与按营业日推导的结余
+	//	1.5 kg 不一致(差 -44.35 kg)"—— 而 45.85 里的 44.35 **全是外采的幽灵货**
+	//	(位置表柜台侧只累加、不扣卖出)⇒ 这条告警指向的是一个**已经被修掉的口径缺陷**,
+	//	不是门店真正需要知道的差异。
+	//
+	// ⇒ 柜台侧改成按记录层推导后(见 counter_derive.go),两边都是推导值
+	//   ⇒ 这个比对**恒等且无意义**(自己跟自己比)⇒ 下线。
+	//
+	// ⚠️ **同一天的真实差异仍然看得见**,由这几条覆盖:
+	//   - ① 账面短卖(红字):账面推演的期末为负 = 卖超了账面库存;
+	//   - ①b 位置表负余额(红字):搬台改多了导致冷库/柜台走负;
+	//   - ①c 分割权重没能重分配(黄字):今天的进货权重不是按实际切出来的量;
+	//   - 搭赠/盘亏缺口(搭赠核对卡):账面比实盘多出来的量。
 	return out
 }

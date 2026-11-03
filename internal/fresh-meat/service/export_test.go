@@ -316,3 +316,32 @@ func ColdStoreBySkuForTest(ctx context.Context, s *Service, branchID string) (
 func BuildUserPromptForTest(pig *model.WholePig, history []model.WholePig, focus []model.CutType) string {
 	return buildUserPrompt(pig, history, focus)
 }
+
+// CounterBySkuForTest 暴露 [deriveCounterBySku](按 SKU 推导的柜台余额)。
+//
+// ⚠️ 为什么值得单独暴露:柜台余额改按记录层推导之后,「位置表台账」与「推导值」
+//
+//	必须能**分别**断言 —— 否则测出来的只是"某一个数",抓不到口径被改回去。
+//
+// 返回:SKU → 柜台余额(kg)。
+func CounterBySkuForTest(ctx context.Context, s *Service, branchID string) (
+	map[string]decimal.Decimal, error,
+) {
+	return s.deriveCounterBySku(ctx, branchID)
+}
+
+// SetCounterDeriveDisabledForTest 打开/关闭**柜台侧推导**(判别力实测用)。
+//
+// ⚠️ 开关必须是**运行期变量**(包级 var)—— 写成 `if false` 会被 Go 编译器
+//
+//	把整个分支消掉 ⇒ "去掉实现"其实没去掉 ⇒ 判别力实测是假的。
+func SetCounterDeriveDisabledForTest(disabled bool) {
+	counterDeriveDisabled = disabled
+}
+
+// SetCounterWindowIncludeAnchorForTest 打开/关闭「窗口包含锚点当天」(判别力实测用)。
+//
+// ⚠️ 同上:必须是**运行期变量**。
+func SetCounterWindowIncludeAnchorForTest(on bool) {
+	counterWindowIncludeAnchor = on
+}
