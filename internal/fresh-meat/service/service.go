@@ -698,6 +698,19 @@ func (s *Service) RecordPorkCutsStocktake(ctx context.Context, branchID string, 
 	}
 	originDate := datatypesDate(takenDate)
 
+	// ⚠️ 2026-11-03:「是不是今天的盘点」**不等于**「是不是那个归属日的收盘盘点」。
+	//
+	// 门店的日终盘点**经常在午夜后提交**(生产实测:11-02 的盘点 created_at =
+	// 11-03 00:27,归属日 11-02)⇒ 用日历日判会把它当成「补录往日」
+	// ⇒ 过夜搬运(柜台 → 冷库)被跳过 ⇒ 那批货永远进不了冷库
+	// ⇒ 门店 11-03 搬不了 11-02 进冷库的 3 斤排骨。
+	//
+	// ⇒ 改用**收盘窗口**(见 isClosingStocktake):归属日 D 的盘点在 D+1 04:00
+	//   之前提交就算「D 那天的收盘盘点」。
+	//
+	// ⚠️ takenAt **仍然是归属日**(taken_date 决定)⇒ 链/结转记录归到那一天不变。
+	isClosing := s.isClosingStocktake(takenDate, now)
+
 	// caller cuts 校验 + 收集 (cut, sku) → actual + 校验 mapping。
 	type skuActual struct {
 		CubeProductID string
@@ -892,7 +905,10 @@ func (s *Service) RecordPorkCutsStocktake(ctx context.Context, branchID string, 
 	// ⇒ 而这里的错误只是 WARN ⇒ **整个两位置库存模型静默失效**
 	// (库存查询永远空、服务 200 正常、零报错)。
 	// ⇒ 派生状态失败一律记 **Error**,并把"下次盘点会自愈"写进日志。
-	if isToday {
+	//
+	// ⚠️ 2026-11-03:这里的判据从 `isToday`(归属日 == 日历日)改成 `isClosing`
+	//   (收盘窗口)⇒ 门店**午夜后提交**的收盘盘点也走「过夜搬运 + 刷当前成本状态」。
+	if isClosing {
 		// ① 执行"过夜搬运"(猪肉台 → 冷库;全店余额不变,只换位置)
 		if err := s.applyOvernightMove(ctx, branchID, counterActualKg); err != nil {
 			s.pubLogger.Error("RecordPorkCutsStocktake: 过夜搬运失败(库存位置没更新,下次盘点会自愈)",
@@ -919,7 +935,10 @@ func (s *Service) RecordPorkCutsStocktake(ctx context.Context, branchID string, 
 		//   (次日期初 = 上日期末,链式)。
 		//
 		// ⚠️ **不动位置表**(sku_stock_positions)⇒ 今天的"当前余额"不会被补录写脏;
-		// ⚠️ **不动 sku_cost_states**(当前成本状态)⇒ 只有"今天那次盘点"刷新它。
+		// ⚠️ **不动 sku_cost_states**(当前成本状态)⇒ 只有"那次收盘"刷新它。
+		//
+		// ⚠️ 2026-11-03:冷库余额改成**按记录层推导**之后,补录往日**照样**算得对
+		//   (推导读的是记录层,不依赖位置表的累加)⇒ 这里不动位置表不再有副作用。
 		if err := s.recomputeCostSnapshots(ctx, branchID, takenDate); err != nil {
 			s.pubLogger.Error("RecordPorkCutsStocktake: 补录往日的结余/成本快照重算失败(那次的时间线会偏)",
 				"branch_id", branchID, "stocktake_id", st.ID, "taken_date", dateKey(originDate), "err", err)

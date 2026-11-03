@@ -623,6 +623,20 @@ func (s *Service) mappedSkus(ctx context.Context, branchID string) ([]string, ma
 }
 
 // loadSkuPositions 读当前两位置余额。
+//
+// # ⚠️ 冷库侧改成**按记录层推导**(2026-11-03 生产事故)
+//
+// 位置表的冷库侧是**累加**出来的(过夜搬运 += / 搬台 -= / 大宗 += / 期初 +=),
+// 而「过夜搬运」只在「归属日 == 日历日」时才跑 ⇒ 门店**午夜后提交**的日终盘点
+// (实测:11-02 的盘点 created_at = 11-03 00:27,归属日 11-02)会被判成「补录往日」
+// ⇒ 过夜搬运被跳过 ⇒ 那批货永远进不了位置表
+// ⇒ 搬台页只看到「冷库共 1 个 SKU / 2.40 kg」⇒ 门店搬不了那 3 斤排骨。
+//
+// ⇒ 冷库余额一律用 **deriveColdStoreBySku**(记录层推导:幂等、补录也生效、
+// 历史数据自动修好)⇒ 口径与按部位的链逐项一致。
+//
+// ⚠️ 位置表的冷库侧**只作物理留痕**(搬台/大宗/期初/外采的加减),
+//   **不再是对外口径** ⇒ 不要拿它跟接口返回的数字对。
 func (s *Service) loadSkuPositions(ctx context.Context, branchID string) (counter, cold map[string]decimal.Decimal, err error) {
 	counter = map[string]decimal.Decimal{}
 	cold = map[string]decimal.Decimal{}
@@ -640,7 +654,15 @@ func (s *Service) loadSkuPositions(ctx context.Context, branchID string) (counte
 			cold[r.CubeProductID] = cold[r.CubeProductID].Add(r.QtyKg)
 		}
 	}
-	return counter, cold, nil
+	// 冷库:按记录层推导(推不出来才退回位置表,并**大声**记日志 ——
+	// 失败必须可见,不能悄悄给一个旧口径的数)。
+	derived, derr := s.deriveColdStoreBySku(ctx, branchID)
+	if derr != nil {
+		s.pubLogger.Warn("loadSkuPositions: 冷库余额按记录层推导失败,退回位置表(旧口径)",
+			"branch_id", branchID, "err", derr)
+		return counter, cold, nil
+	}
+	return counter, derived, nil
 }
 
 // loadSkuCatalog 取 SKU → 部位 / 名称(部位来自映射表)。
@@ -771,3 +793,4 @@ func (s *Service) fmSaleDateExpr() string {
 	}
 	return "substr(sale_date, 1, 10) = ?"
 }
+

@@ -296,6 +296,22 @@ func CutChainBaselineForTest(ctx context.Context, s *Service, branchID string) (
 	return day, day != "", nil
 }
 
+// ColdStoreBySkuForTest 暴露 [deriveColdStoreBySku](按 SKU 推导的冷库余额)。
+//
+// ⚠️ 为什么值得单独暴露:「按 SKU 推导的冷库余额」与「按部位推导的余额链」
+//
+//	**必须逐位一致** —— 毛利看板用按部位的那条,搬台页用按 SKU 的这条
+//	⇒ 不一致 ⇒ 门店对着两个数字对不上账。
+//
+//	两条都在私有方法里 ⇒ 外部测试包没法直接比 ⇒ 这里给个入口。
+//
+// 返回:SKU → 冷库余额(kg)。
+func ColdStoreBySkuForTest(ctx context.Context, s *Service, branchID string) (
+	map[string]decimal.Decimal, error,
+) {
+	return s.deriveColdStoreBySku(ctx, branchID)
+}
+
 // BuildUserPromptForTest 暴露 [buildUserPrompt](user 侧点名要补的部位)。
 func BuildUserPromptForTest(pig *model.WholePig, history []model.WholePig, focus []model.CutType) string {
 	return buildUserPrompt(pig, history, focus)
