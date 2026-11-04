@@ -186,25 +186,22 @@ func applyReferenceMargin(mids []cutRollupMid, tot *TotalGrossMargin, ref Refere
 	//	毛利率 = 毛利 ÷ 当日总收入
 	//
 	// ⚠️ **三个守卫**:算不出来就是算不出来 ⇒ nil(前端「—」),绝不回落成 0。
+	//	(① 当天没进货 ② 没有完整日终盘点 ③ 当天没营收 —— 判据在 dayCaliberMargin 里)
 	//
-	//	① 当天没进货 ⇒ 成本算不出来(给 0 成本会让门店以为赚疯了)
-	//	② 没有完整日终盘点 ⇒ 「盘点估算成本」算不出来
-	//	③ 当天没营收 ⇒ 比率没有意义
-	if !ref.TotalPurchasedKg().IsPositive() || !ref.HasRemain || !tot.RevenueYuan.IsPositive() {
-		return
-	}
-	// 搬出估算成本 = Σ(搬上台 kg × 该部位**冷库移动加权成本**)
+	// ⚠️ 搬出估算成本 = Σ(搬上台 kg × 该部位**冷库移动加权成本**)
+	//   (搬上台的是**前几天切好的老货** ⇒ 它的成本是当初进货的成本)
 	//
-	// ⚠️ 为什么用冷库移动加权成本:搬上台的是**前几天切好的老货**,
-	//   它的成本是当初进货的成本 ⇒ 今天的部位建议单价(基线折算)不是它的成本。
+	// ⚠️ 公式**只写一份**(day_caliber_margin.go):长期毛利页的每日行也用它
+	//   ⇒ 两个页面的每日数**永远是同一个数**。
 	var loadCost decimal.Decimal
 	for i := range mids {
 		mid := &mids[i]
 		loadCost = loadCost.Add(mid.src.CounterLoadKg.Mul(mid.src.MovingAvgUnitCost))
 	}
-	cost := ref.TotalPurchasedYuan().Add(loadCost).Sub(tot.ReferenceRemainYuan)
-	amount := tot.RevenueYuan.Sub(cost)
-	pct, _ := amount.Mul(decimal.NewFromInt(100)).Div(tot.RevenueYuan).Float64()
+	amount, pct, ok := dayCaliberMargin(ref, tot.RevenueYuan, loadCost)
+	if !ok {
+		return
+	}
 	rate := amount.Div(tot.RevenueYuan)
 	tot.ReferenceGrossMarginYuan = &amount
 	tot.ReferenceGrossMarginPct = &pct

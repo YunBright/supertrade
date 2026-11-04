@@ -8,15 +8,19 @@
 //
 // # 为什么单日毛利必须配一个长期口径
 //
-//	单日参考口径(owner 亲定): m = (营收 − 当日采购 + 期末**猪肉台**剩余×采购均价) / 营收
-//
-//	⚠️ **期初台面 = 0**(夜里柜台清空、货回冷库)⇒ 单日口径**故意不含冷库**
+//	单日口径**故意不含冷库**(期初台面 = 0:夜里柜台清空、货回冷库)
 //	⇒ 后果:今天卖昨天结转的货时,那笔成本昨天已扣 ⇒ **单日毛利偏高**,跨期才平。
 //	owner 知情选定:「十分准确的销售成本基本算不出来」。
 //
 // ⇒ 这一页就是把**冷库**接回来,让期间数自洽:
 //
 //	期间毛利 = 期间营收 − 期间采购 + (期末冷库量 − 期初冷库量) × 期间采购均价
+//
+// # 每日行用哪个口径(2026-11-04 owner:「长期毛利页的也切」)
+//
+//	每日行 = **当日口径**(营收 − 当日采购 − 搬出估算成本 + 期末台面剩余×采购均价)
+//	⇒ 与「每日毛利看板」的**表头**同一个数(**同一个公式**:day_caliber_margin.go)
+//	⇒ ⚠️ 与看板的**部位参考毛利**(各部位参考毛利之和)**不是同一个数**。
 //
 // # 冷库量为什么能代表"全店结余"
 //
@@ -32,7 +36,8 @@
 //
 // # 与每日毛利看板的关系
 //
-//	每日行的毛利 = **猪肉台口径**(与每日毛利看板**同一个数**)
+//	每日行的毛利 = **当日口径**(与每日毛利看板的**表头**同一个数)
+//	             ⇒ ⚠️ 与看板的**部位参考毛利**(各部位之和)不是同一个数
 //	期间毛利     = **全店口径**(含冷库变动)
 //	⇒ 两者**不会完全相等**,差额 ≈ 冷库变动 × 采购均价 ⇒ note 里写清楚。
 package service
@@ -79,12 +84,16 @@ type LongTermMarginDay struct {
 	//   而公式会退化成 m = (营收 − 0 + 0)/营收 = **100%** ⇒ 门店会以为赚疯了。
 	//   ⇒ 这种日子只能显示「—」(算不出来)。
 	HasPurchase bool `json:"has_purchase"`
-	// GrossMarginYuan 是当天**参考毛利**(元)—— 猪肉台口径。
+	// GrossMarginYuan 是当天**毛利**(元)—— **当日口径**。
 	//
-	// ⚠️ **没有完整日终盘点时给 0**是错的(会被误读成"当天一点货都没剩、还亏了本")
-	//   ⇒ 用 HasStocktake=false 表达"算不出来",前端显示「—」。
+	// ⚠️ 2026-11-04 owner:「长期毛利页的也切」⇒ 与每日毛利看板的**表头**同一个数
+	//   (同一个公式:day_caliber_margin.go 的 dayCaliberMargin)。
+	//
+	// ⚠️ **算不出来时给 0**是错的(会被误读成"当天一点货都没剩、还亏了本")
+	//   ⇒ 用 HasStocktake / HasPurchase(以及"当天没营收")表达"算不出来",
+	//     前端显示「—」。
 	GrossMarginYuan decimal.Decimal `json:"gross_margin_yuan"`
-	// GrossMarginPct 是当天参考毛利率(%)。
+	// GrossMarginPct 是当天毛利率(%)—— 与 GrossMarginYuan 同一口径。
 	GrossMarginPct float64 `json:"gross_margin_pct"`
 	// YieldRate 是**出成率** = 真实切分产出 ÷ 当天进货毛重。
 	//
@@ -125,10 +134,11 @@ type LongTermMarginTotal struct {
 	GrossMarginYuan decimal.Decimal `json:"gross_margin_yuan"`
 	// GrossMarginPct 是期间毛利率(%)。
 	GrossMarginPct float64 `json:"gross_margin_pct"`
-	// DailySumGrossMarginYuan 是**每日参考毛利之和**(猪肉台口径)。
+	// DailySumGrossMarginYuan 是**每日毛利之和**(当日口径)。
 	//
-	// ⚠️ 它**不等于** GrossMarginYuan:每日口径故意不含冷库
-	//   ⇒ 差额 ≈ 冷库变动 × 采购均价 ⇒ 两个数都给,让店长能自己看出差在哪。
+	// ⚠️ 它**不等于** GrossMarginYuan:期间是**全店口径**(含冷库变动),
+	//   每日是**当日口径**(不含冷库结转)⇒ 差额来自冷库结转、搬出估算成本
+	//   与单日/期间采购均价的差异 ⇒ 两个数都给,让店长能自己看出差在哪。
 	DailySumGrossMarginYuan decimal.Decimal `json:"daily_sum_gross_margin_yuan"`
 	// DaysWithStocktake / DaysWithoutStocktake 是有/没有完整日终盘点的天数。
 	//
@@ -228,25 +238,24 @@ func (s *Service) ComputeLongTermMargin(ctx context.Context, branchID, from, to 
 			HasStocktake:    ref.HasRemain,
 			HasPurchase:     ref.TotalPurchasedKg().IsPositive(),
 		}
-		// ⚠️ 没有完整盘点 **或** 没有进货 ⇒ 当天毛利**算不出来**(不给 0)。
-		//   详见 cost_reference.go 的 referenceMarginRate 的同款说明。
+		// ⚠️ 没有完整盘点 **或** 没有进货 **或** 当天没营收 ⇒ 当天毛利**算不出来**(不给 0)。
+		//   详见 day_caliber_margin.go 的三个守卫。
 		//
-		// ⚠️⚠️ **这里的每日毛利仍是旧口径(A)** —— 刻意保留,2026-11-01 owner 知悉:
+		// ⚠️⚠️ **这里的每日毛利 = 当日口径**(2026-11-04 owner:「长期毛利页的也切」)
 		//
-		//	毛利看板的参考毛利已切 **B 口径**(部位单价 = 建议成本单价,头 = Σ部位),
-		//	而这一页的每日行是**期间口径**(营收 − 采购 + 期末剩余×采购均价)
-		//	⇒ **两页的每日数不再相等**(不是 bug,是两套口径)。
-		//	⇒ 这一页自己**自洽**(期间毛利 = 每日之和 + 冷库变动),门店能自己核。
-		//	⇒ 要不要把每日行也切 B(需要给快照加"建议成本单价"列),是另一个决定。
-		if ref.HasRemain && ref.TotalPurchasedKg().IsPositive() {
-			// 每日参考毛利(猪肉台口径)= 营收 − 采购 + 期末台面剩余×采购均价。
-			// ⚠️ 采购与均价都**含外采**(owner 2026-11-03)⇒ 外采的成本进当天的毛利。
-			gm := revenue.Sub(ref.TotalPurchasedYuan()).Add(ref.RemainKg.Mul(ref.TotalPurchaseAvgYuan()))
+		//	⇒ 与「每日毛利看板」的**表头**同一个数(**同一个公式**:dayCaliberMargin)
+		//	⇒ 原来这里是「猪肉台口径」(营收 − 采购 + 台面剩余×采购均价),
+		//	  与看板表头**只差「搬出估算成本」一项**
+		//	  (生产实测 店 00:10-29 差 1.58 元、11-01 差 114.84 元)
+		//	⇒ 这一页的**期间数**仍然是**全店口径**(含冷库变动)—— 页面自洽的那一条不变
+		//	  ⇒ 每日之和与期间毛利**不相等**,差额在 note 里写清楚。
+		loadCost := decimal.Zero
+		for _, r := range cutRows {
+			loadCost = loadCost.Add(r.CounterLoadKg.Mul(r.MovingAvgUnitCost))
+		}
+		if gm, pct, ok := dayCaliberMargin(ref, revenue, loadCost); ok {
 			day.GrossMarginYuan = gm
-			if revenue.IsPositive() {
-				pct, _ := gm.Mul(decimal.NewFromInt(100)).Div(revenue).Float64()
-				day.GrossMarginPct = pct
-			}
+			day.GrossMarginPct = pct
 		}
 		// ⚠️ 没有完整盘点 ⇒ 剩余算不出来 ⇒ 毛利**算不出来**(不给 0)。
 		// ⚠️ 2026-11-03 owner:出成率分子**减外采** ⇒ 与毛利看板同一口径。
@@ -274,9 +283,9 @@ func (s *Service) ComputeLongTermMargin(ctx context.Context, branchID, from, to 
 //
 // # 为什么与"每日之和"不相等(这是**口径差**,不是 bug)
 //
-//	每日行 = **猪肉台口径**(不含冷库)⇒ 与每日毛利看板同一个数
+//	每日行 = **当日口径**(与每日毛利看板的**表头**同一个数;不含冷库结转)
 //	期间   = **全店口径**(含冷库变动)
-//	⇒ 差额 = 台面剩余的计价 − 冷库变动的计价(再叠加搬台/统收/搭赠的影响)
+//	⇒ 差额 = 冷库变动的计价 − 每日台面剩余的计价(再叠加搬出估算成本/统收/搭赠的影响)
 //	⇒ 两个数都给 ⇒ 店长能自己核对差额从哪来。
 func buildLongTermMarginReport(branchID, from, to string, rows []LongTermMarginDay,
 	openingCold, closingCold decimal.Decimal) *LongTermMarginReport {
@@ -345,18 +354,19 @@ func buildLongTermMarginReport(branchID, from, to string, rows []LongTermMarginD
 			daysWithoutST, daysWithoutST)
 	}
 
-	// ⚠️ 2026-11-01 owner 口径切 B 之后,这句话必须改:
+	// ⚠️ 2026-11-01 owner 口径切 B 之后,以及 2026-11-04 owner「长期毛利页的也切」之后:
 	//
-	//	每日行的毛利仍是**旧口径 A**(营收 − 当日采购 + 台面剩余×采购均价),
-	//	而「每日毛利看板」的参考毛利已改成 **B 口径**(各部位参考毛利之和)
-	//	⇒ **两页的每日数不再是同一个数**。
-	//	⇒ 旧文案写「与每日毛利看板同一个数」⇒ 门店拿两页对一下对不上 ⇒ 以为页面坏了。
+	//	每日行的毛利现在是**当日口径**(与每日毛利看板的**表头**同一个数),
+	//	而看板的**部位参考毛利**是「各部位参考毛利之和」⇒ **两者仍不是同一个数**。
+	//	⇒ 这里必须说清楚"哪个是哪个",否则门店对着两页对不上 ⇒ 以为页面坏了。
 	note := "期间毛利 = 期间营收 − 期间采购 + (期末冷库量 − 期初冷库量) × 期间采购均价(全店口径);" +
 		"期间采购**含外采**(进猪 + 外采),采购均价 = 总金额 ÷ 总重量;" +
 		"库存按**期间采购均价**估值(不含毛利 ⇒ 不成环)。" +
-		"每日行的毛利是**猪肉台口径**(营收 − 当日采购 + 台面剩余×采购均价,不含冷库)" +
-		"⚠️ 它与「每日毛利看板」的参考毛利**不是同一个数**(看板那边是各部位参考毛利之和)⇒ " +
-		"每日之和与期间毛利**不相等**,差额来自冷库结转与单日/期间采购均价的差异;两个数都给了,可自行核对。"
+		"每日行的毛利是**当日口径**(营收 − 当日采购(含外采) − 搬出估算成本 + 期末台面剩余×采购均价)" +
+		"⇒ **与「每日毛利看板」表头的毛利是同一个数**;" +
+		"⚠️ 但它与看板的**部位参考毛利**(各部位参考毛利之和)不是同一个数。" +
+		"⚠️ 每日之和与期间毛利**不相等**:期间是**全店口径**(含冷库变动),每日是**当日口径**" +
+		"(不含冷库结转)⇒ 差额来自冷库结转、搬出估算成本与单日/期间采购均价的差异;两个数都给了,可自行核对。"
 	coldStoreNote := "冷库量是**账面推算值**(依赖门店登记搬台),不是实盘 —— 冷库不在每日盘点范围内。"
 	if !periodAvg.IsPositive() {
 		note += ";⚠ 期间**取不到采购均价**(区间内没有进货)⇒ 冷库变动未计价,期间毛利偏高。"
