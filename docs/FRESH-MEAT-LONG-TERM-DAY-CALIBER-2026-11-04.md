@@ -104,7 +104,7 @@ dayCaliberMargin(ref ReferenceDayTotals, revenue, loadCost decimal.Decimal)
 | **枚举** | 无新增 |
 | **文案** | 后端 `note`（口径说明）改写；前端「桥接文案」「每日行口径注释」「库级注释」「`hasMargin` 守卫」 |
 | **注释** | `long_term_margin.go` 包注释 / 字段注释 / 期间汇总注释；`day_caliber_margin.go` 全量注释 |
-| **契约** | `deployer/tests/contract/fresh_meat_long_term_margin_test.go` ④ 由「每日行自己的恒等式」改为「每日行 **==** 看板表头」 |
+| **契约** | `deployer/tests/contract/fresh_meat_long_term_margin_test.go` ④ 由「每日行自己的恒等式」改为「每日行 **==** 看板表头」；并补 ④'：**真实门店**（00/01）里「当天有营收」的历史营业日 ⇒ 比**真正的两个数**（测试门店没销售 ⇒ 只能锁「两边都算不出来」⇒ 那是空的） |
 | **派生数据** | 无（`daily_sum_gross_margin_yuan` 是每日行求和 ⇒ 随每日行变） |
 
 ---
@@ -172,6 +172,9 @@ dayCaliberMargin(ref ReferenceDayTotals, revenue, loadCost decimal.Decimal)
 
 ### 6.2 其它验证
 
-- **契约（打生产）**：鲜肉全套。
+- **契约（打生产）**：鲜肉全套 **67 条全 PASS / 0 FAIL**（`ok ... 175.893s`）；
+  其中 `TestFreshMeat_LongTermMargin_Contract` 含新增的 ④'（真实门店比真数，
+  `require.Greater(compared, 0)` 非空守卫也过了 ⇒ **确实比了**）。
 - Go：`internal/fresh-meat/{handler,model,seed,service}` 四个包全绿。
-- Flutter：`analyze` 0 issue；`test` 全绿（+3000 ~10）；判别力实测已做（改坏 ⇒ 2 条变红）。
+- Flutter：`analyze` 0 issue；`test` 全绿（+3000 ~10）；长期毛利相关 24 条复跑全绿；
+  判别力实测已做（改坏 `hasMargin` ⇒ 2 条变红 ⇒ 恢复后全绿）。
