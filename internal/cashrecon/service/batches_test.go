@@ -98,6 +98,71 @@ func TestApplyBatch_RepeatApplyKeepsHandledStatus(t *testing.T) {
 	}
 }
 
+// TestRecomputeBatch_RefreshesAfterCashSync 锁住"审核中的批次重做后差异归零"。
+//
+// 场景：先冻结批次（当时到账流水还没同步 ⇒ 有 time_lag），随后收银流水
+// 补齐，重做必须按当前流水重算：匹配出现、旧差异清掉、快照与汇总刷新。
+func TestRecomputeBatch_RefreshesAfterCashSync(t *testing.T) {
+	svc, db := newTestService(t)
+	svc.SetCashSource(localSource(), nil)
+	ctx := context.Background()
+
+	// 冻结要求启用账户都有期初（现金 + 微信渠道）。
+	_, err := svc.CreateAccount(ctx, CreateAccountInput{
+		BranchID: "00", AccountType: model.AccountTypeChannel, AccountKey: "wechat", Name: "微信", Actor: "u1",
+	})
+	require.NoError(t, err)
+	_, err = svc.CreateOpenings(ctx, CreateOpeningsInput{
+		BranchID:      "00",
+		EffectiveDate: day(2026, 10, 1),
+		Items: []OpeningItemInput{
+			{AccountType: model.AccountTypeCash, AccountKey: cashAccountKey, Amount: dec("0")},
+			{AccountType: model.AccountTypeChannel, AccountKey: "wechat", Amount: dec("0")},
+		},
+		Actor: "u1",
+	})
+	require.NoError(t, err)
+
+	insertPayFlows(t, db,
+		map[string]any{"branch_id": "00", "pay_way": "SWX", "pay_amount": "200", "exchange_rate": "1", "paid_at": "2026-10-31 10:00:00"},
+	)
+	first, err := svc.ApplyBatch(ctx, ApplyBatchInput{
+		BranchID: "00", BizDateFrom: day(2026, 10, 31), BizDateTo: day(2026, 10, 31), Actor: "u1",
+	})
+	require.NoError(t, err)
+	require.Len(t, mustDiffs(t, db, first.Batch.ID), 1)
+
+	frozen, err := svc.FreezeBatch(ctx, "00", first.Batch.ID, "u1")
+	require.NoError(t, err)
+	require.Equal(t, model.BatchStatusAuditing, frozen.Batch.Status)
+
+	// 收银流水同步 / 补录之后才有到账流水。
+	seedBankFlow(t, db, "00", model.MethodWechat, day(2026, 10, 31), "200", "0")
+
+	res, err := svc.RecomputeBatch(ctx, "00", first.Batch.ID, "u1")
+	require.NoError(t, err)
+	require.Equal(t, 1, res.InsertedMatches)
+	require.Equal(t, 0, res.InsertedDiffs)
+	require.Equal(t, 1, res.RemovedDiffs)
+	require.Equal(t, "1", res.Batch.MatchRate.String())
+	require.Equal(t, 0, res.Batch.DiffCount)
+	require.Empty(t, mustDiffs(t, db, first.Batch.ID), "已不再成立的差异必须清掉")
+
+	// 快照跟着刷新，否则 complete 还会用旧的收银快照。
+	var flows []model.ReconCashFlow
+	require.NoError(t, db.Where("batch_id = ?", first.Batch.ID).Find(&flows).Error)
+	require.Len(t, flows, 1)
+
+	// 重做不改变批次状态与冻结锁。
+	var got model.ReconBatch
+	require.NoError(t, db.Where("id = ?", first.Batch.ID).First(&got).Error)
+	require.Equal(t, model.BatchStatusAuditing, got.Status)
+	var locks int64
+	require.NoError(t, db.Model(&model.ReconPeriodLock{}).
+		Where("batch_id = ?", first.Batch.ID).Count(&locks).Error)
+	require.EqualValues(t, 1, locks)
+}
+
 // TestApplyBatch_RejectsFrozenPeriod 锁住冻结区间不允许重算。
 func TestApplyBatch_RejectsFrozenPeriod(t *testing.T) {
 	svc, db := newTestService(t)

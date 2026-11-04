@@ -26,7 +26,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/shopspring/decimal"
@@ -48,6 +47,20 @@ type ProductUnitInfo struct {
 	Unit string
 	// Spec 是规格原文（如 1*12 / 500g / 1.5L）。
 	Spec string
+	// CategoryID 是商品档案的末级类别编码（思迅 product.category_id）。
+	//
+	// 品类档位（可售上限天数）优先按这个编码对应的**类别名**判定，
+	// 品名关键词只做兜底（2026-11-02 用户口径）：
+	// 实测"核桃奶"因名字里的"桃"被判成生鲜 7 天、"紫菜"因"菜"、"鱼仔"因"鱼"、
+	// "鸡精"因"鸡"、"奶盐味饼干"因"奶"全部被误判。
+	CategoryID string
+}
+
+// CategoryInfo 是思迅类别字典里的一级/末级名称。
+type CategoryInfo struct {
+	Name string
+	// ParentName 是父类别名（顶级类别为空）。
+	ParentName string
 }
 
 // productGroupIndex 是「货号 → 所属组 + 换算率」的索引。
@@ -222,7 +235,7 @@ func buildProductGroups(products []string, relations []ComboRelation) *productGr
 
 // groupKeyOf 生成组的稳定键：成员货号排序后用 "|" 连接。
 //
-// ⚠️ 组键会落库（stocking_floors 的唯一键）⇒ 超长时截断 + 摘要，
+// ⚠️ 组键会落库（stocking_displays 的唯一键）⇒ 超长时截断 + 摘要，
 // 避免 PostgreSQL 索引行超限；摘要保证不同成员集合不会撞到同一个键。
 func groupKeyOf(members []string) string {
 	uniq := make([]string, 0, len(members))
@@ -247,60 +260,63 @@ func groupKeyOf(members []string) string {
 	return "h:" + hex.EncodeToString(sum[:])[:16]
 }
 
-// parseItemSizeFactor 从规格原文里解析「一件等于多少个基本单位」。
-//
-// 只认 `A*B` / `A*B*C` 这种明确的装箱写法（实测商品档案里大量存在
-// 1*12 / 1*24 / 1*24*32）。重量/容量写法（500g / 1.5L / -4斤箱）**不解析**：
-//
-//	文档里没有说清"一件"是袋还是箱，硬猜会把下限放大，反而弱化审核。
-//
-// 解析不出 ⇒ 1（下限 = 一个基本单位，最保守）。
-func parseItemSizeFactor(spec string) decimal.Decimal {
-	s := strings.ToLower(strings.TrimSpace(spec))
-	s = strings.NewReplacer("×", "*", "Ｘ", "*", "x", "*", " ", "", "　", "").Replace(s)
-	if !strings.Contains(s, "*") {
-		return decimal.NewFromInt(1)
-	}
-	parts := strings.Split(s, "*")
-	factor := decimal.NewFromInt(1)
-	for _, p := range parts {
-		n, err := strconv.Atoi(strings.TrimSpace(p))
-		if err != nil || n <= 0 || n > 10000 {
-			return decimal.NewFromInt(1)
-		}
-		factor = factor.Mul(decimal.NewFromInt(int64(n)))
-	}
-	if !factor.IsPositive() || factor.GreaterThan(decimal.NewFromInt(10000)) {
-		return decimal.NewFromInt(1)
-	}
-	return factor
-}
-
-// isPackUnit 判断采购单位名是否是「整件/整箱」这类包装单位。
-//
-// 只有采购单位是包装单位时，规格里的 `1*12` 才代表"1 件 = 12 个基本单位"；
-// 如果采购本来就是按基本单位录的（袋/瓶/罐），规格不能拿来放大下限。
-func isPackUnit(unit string) bool {
-	switch strings.TrimSpace(unit) {
-	case "件", "箱", "整箱", "提", "包", "组", "袋", "盒":
-		// ⚠️ 袋/盒 同时是常见基本单位 —— 但若商品档案规格写着 1*12，
-		// 说明它就是"一袋 12 小包"这类包装，按包装单位处理是合理的。
-		return true
-	}
-	return false
-}
-
 // ---- 品类档位（可售上限天数）----
 
-// categoryCapDays 按品名关键词自动判定品类档位与可售上限天数。
+// categoryCapDaysFor 取商品的可售上限档位：**思迅类别优先，品名关键词兜底**。
+//
+// 2026-11-02 用户口径：品类档位优先按类别字典判，避免品名误判
+// （核桃奶因"桃"、紫菜因"菜"、鱼仔因"鱼"、鸡精因"鸡"、奶盐饼干因"奶"）。
+func categoryCapDaysFor(name string, cat *CategoryInfo) (class string, capDays int, shelfLifeDays int) {
+	if cat != nil {
+		if c, cap, shelf, ok := categoryCapDaysFromNames(cat.Name, cat.ParentName); ok {
+			return c, cap, shelf
+		}
+	}
+	return categoryCapDays(name)
+}
+
+// categoryCapDaysFromNames 按思迅「末级类别 + 父类别」名称判定档位。
+//
+// 先看末级、再看父级：末级"常温"必须优先于父级"牛奶"（常温奶不是冷藏奶）。
+// 返回 ok=false 表示类别名没命中任何规则，调用方回退品名关键词。
+func categoryCapDaysFromNames(leaf, parent string) (class string, capDays int, shelfLifeDays int, ok bool) {
+	leaf = strings.ToLower(strings.TrimSpace(leaf))
+	parent = strings.ToLower(strings.TrimSpace(parent))
+	for _, n := range []string{leaf, parent} {
+		if n == "" {
+			continue
+		}
+		switch {
+		case containsAny(n, "冷冻", "速冻", "雪糕", "冰淇淋", "冰品"):
+			return model.ProfileClassFrozen, 30, 180, true
+		case containsAny(n, "低温", "冷藏", "熟食", "卤味", "酸奶", "鲜奶", "短保"):
+			return model.ProfileClassChilled, 20, 30, true
+		case containsAny(n, "常温"):
+			// 常温奶/常温饮料：按饮料档 45 天，保质期通常 6~12 个月。
+			return model.ProfileClassBeverage, 45, 365, true
+		case containsAny(n, "生鲜", "蔬果", "水果", "蔬菜", "肉", "水产", "海鲜", "禽蛋", "蛋品"):
+			return model.ProfileClassFresh, 7, 7, true
+		case containsAny(n, "办公", "文具", "文体", "日用", "洗化", "清洁", "纸品", "家居", "百货"):
+			return model.ProfileClassDaily, 90, 0, true
+		case containsAny(n, "饮料", "酒", "茶", "水"):
+			return model.ProfileClassBeverage, 45, 365, true
+		case containsAny(n, "干货", "调味", "休闲食品", "粮油", "饼干", "糖果", "零食", "冲调", "食品"):
+			// 包装食品/干货/调味：不属于短保，按通用 45 天。
+			return model.ProfileClassGeneral, 45, 0, true
+		}
+	}
+	return "", 0, 0, false
+}
+
+// categoryCapDays 按品名关键词自动判定品类档位与可售上限天数（**兜底**）。
 //
 // # 用户口径（2026-11-01）
 //
 //	「保质期维度可以添加，但仍然是自动标记，人工修正会更好，要不然等于虚设」。
 //
-// ⇒ 用**品名关键词**给出默认档位（不需要人录），人工可在后台改；
+// ⇒ 优先用思迅类别（见 categoryCapDaysFor）；类别缺失时才用这个品名兜底。
 // 判不准的一律落 general（45 天），偏宽松但不至于无限——真正的兜底是
-// 「进货下限」与「盘点」。
+// 「正常陈列保有量」与「盘点」。
 //
 // ⚠️ 顺序很重要：先冷冻、再冷藏、再生鲜，最后才看饮料/日用——
 // 「速冻水饺」不能被"水"判成饮料。

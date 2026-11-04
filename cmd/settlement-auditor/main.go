@@ -118,10 +118,11 @@ func initApp() error {
 		// 备货系数（2026-10-31 用户口径）:本域 PG 的经营参数,
 		// 审批时缺失即触发现算并落库;管理后台可维护。
 		&model.StockingCoefficient{},
-		// 组级备货判定（2026-11-01 用户口径，见 model/product_profile.go）：
-		// 商品经营属性（可售上限/保质期）、组的进货下限、180 天历史聚合缓存。
+		// 组级备货判定（2026-11-01 / 2026-11-02 用户口径，见 model/product_profile.go）：
+		// 商品经营属性（可售上限/保质期）、正常陈列保有量、180 天历史聚合缓存。
+		// ⚠️ 旧的 stocking_floors（一次进货下限）已并入陈列保有量，不再迁移/使用。
 		&model.ProductProfile{},
-		&model.StockingFloor{},
+		&model.StockingDisplay{},
 		&model.StockingFactCache{},
 	); err != nil {
 		return fmt.Errorf("auto migrate: %w", err)

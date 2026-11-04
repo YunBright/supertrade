@@ -2,7 +2,7 @@
 //
 // 锁住四件事：
 //  1. 备注里「所属年月」的解析（年份缺省 = 审批单年份）；
-//  2. 付款状态映射（2/10 ⇒ paid，1/3/4/6 ⇒ unpaid）；
+//  2. 付款状态映射（10 ⇒ paid，1/2/3/4/6 ⇒ unpaid）；
 //  3. 写入即投影、重复写幂等；懒回填只回填一次；重建只重算派生列；
 //  4. 历史统计读月度表且 fail-closed（解析不出月份的行让审核拒绝）。
 package service
@@ -195,7 +195,7 @@ func TestRebuildMonthlyItems_RecomputesDerivedColumns(t *testing.T) {
 	svc, db, _, _ := newFlowTestService(t)
 	ctx := context.Background()
 	created := time.Date(2025, 12, 31, 0, 0, 0, 0, time.UTC)
-	seedInstance(t, db, "AP-R1", model.StatusHumanApproved, SpStatusApproved, created)
+	seedInstance(t, db, "AP-R1", model.StatusHumanApproved, SpStatusPaid, created)
 	seedInstance(t, db, "AP-R2", model.StatusHumanApproved, SpStatusPaid, created)
 	// 月度行先以"未解析"落库（模拟旧口径/改正则前的状态）。
 	for _, it := range []*model.ApprovalItem{

@@ -756,14 +756,12 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 	sheetDates := make(map[string]string)
 	extracted := 0
 	for _, sh := range sheets {
-		if sh.DocumentType != "PI" {
-			continue
-		}
 		d := sh.effectiveDate(today)
 		if d == "" {
 			continue
 		}
-		if sh.Remark != "" && d != sh.CreatedAt {
+		// 只对 PI 统计"备注提取率"：RO 的日期只用于"是否已入账"判定。
+		if sh.DocumentType == "PI" && sh.Remark != "" && d != sh.CreatedAt {
 			extracted++
 		}
 		if cur, ok := sheetDates[sh.ID]; !ok || d > cur {
@@ -857,7 +855,7 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 	//
 	// ⚠️ 全部失败路径都只告警不阻断：备货事实是研判依据，
 	//    不是审批结论的必要条件，不能因为它拿不到就把整单审核搞挂。
-	stocking := s.groupStockingFactsForAudit(ctx, ap.BranchID, products, lines, roLines, purchase, names, allowance, now)
+	stocking := s.groupStockingFactsForAudit(ctx, ap.BranchID, products, lines, roLines, purchase, sheetDates, names, allowance, now)
 
 	before := len(*signals)
 	qc := QuantityContext{
@@ -893,8 +891,9 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 	gmSignals := checkGrossMarginWithAllowance(gm, allowance, perSKU, names)
 	*signals = append(*signals, gmSignals...)
 
-	// 组级数量判定（2026-11-01 用户口径）：
-	// 下限内不判定、可售上限内不判定、超上限才 block/warn（见 checks.go）。
+	// 组级数量判定（2026-11-01 / 2026-11-02 用户口径）：
+	// 可售上限内不判定、超上限才 block/warn（见 checks.go）。
+	// 单批最小包装进货由陈列保有量覆盖，不再有独立下限免判。
 	// 自动标记也在这一步落库：本次有阻断的组 ⇒ pending（等人工修正），否则 auto。
 	if stocking != nil {
 		groupBefore := len(*signals)
@@ -949,7 +948,7 @@ func (s *Service) stepCheckQuantity(ctx context.Context, ap *model.ApprovalInsta
 				overCnt++
 			}
 		}
-		stockingNote = fmt.Sprintf("备货核对:%d 个商品组,补货后超过可售上限 %d 组,组内无销售记录 %d 组,单位不可换算 %d 组",
+		stockingNote = fmt.Sprintf("备货核对:%d 个商品组,扣除正常陈列后超过可售上限 %d 组,组内无销售记录 %d 组,单位不可换算 %d 组",
 			len(stockingFacts), overCnt, noSaleCnt, unitCnt)
 	}
 	s.logStep(ctx, ap, StepCheckQuantity,

@@ -132,6 +132,21 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.POST("/stocking-coefficients/regenerate", requireBranch, h.RegenerateStockingCoefficients)
 	r.PUT("/stocking-coefficients/:product_id", requireBranch, h.UpdateStockingCoefficient)
 	r.DELETE("/stocking-coefficients/:product_id", requireBranch, h.DeleteStockingCoefficient)
+
+	// ---- 正常陈列保有量维护（2026-11-02 用户口径）----
+	//
+	// 自动按历史单批进货量 P50 生成；人工改过的行不会被自动重算覆盖。
+	// 读 product:view、写 product:manage（店长两者都没有 ⇒ 不能自己放宽）。
+	r.GET("/stocking-displays", requireBranch, h.ListStockingDisplays)
+	r.PUT("/stocking-displays/:product_id", requireBranch, h.UpdateStockingDisplay)
+	r.DELETE("/stocking-displays/:product_id", requireBranch, h.DeleteStockingDisplay)
+
+	// ---- 商品档位（可售上限天数）维护（2026-11-02 用户口径）----
+	//
+	// 与陈列保有量同权限：自动生成、人工可改、删除回自动。
+	r.GET("/stocking-profiles", requireBranch, h.ListStockingProfiles)
+	r.PUT("/stocking-profiles/:product_id", requireBranch, h.UpdateStockingProfile)
+	r.DELETE("/stocking-profiles/:product_id", requireBranch, h.DeleteStockingProfile)
 }
 
 // stocktakeNotifyGroupResp 是推送群配置的响应体。
@@ -376,7 +391,9 @@ func mapErr(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, service.ErrApprovalNotFound):
 		writeError(c, http.StatusNotFound, "not_found", err.Error())
-	case errors.Is(err, service.ErrStockingNotFound):
+	case errors.Is(err, service.ErrStockingNotFound),
+		errors.Is(err, service.ErrStockingDisplayNotFound),
+		errors.Is(err, service.ErrStockingProfileNotFound):
 		writeError(c, http.StatusNotFound, "not_found", err.Error())
 	case errors.Is(err, service.ErrInvalidInput), errors.Is(err, service.ErrInvalidStatus):
 		writeError(c, http.StatusBadRequest, "bad_request", err.Error())

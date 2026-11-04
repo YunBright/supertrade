@@ -32,11 +32,29 @@ type fakeGroupCube struct {
 	*fakeCube
 	combos       []ComboRelation
 	productUnits map[string]ProductUnitInfo
+	categories   map[string]CategoryInfo
 	purchaseHist []PurchaseHistoryRow
 }
 
 func (f *fakeGroupCube) ListItemCombos(_ context.Context, _ string) ([]ComboRelation, error) {
 	return f.combos, nil
+}
+
+func (f *fakeGroupCube) ListProductCategories(_ context.Context, _ string, categoryIDs []string) (map[string]CategoryInfo, error) {
+	if len(f.categories) == 0 {
+		return nil, nil
+	}
+	want := make(map[string]bool, len(categoryIDs))
+	for _, id := range categoryIDs {
+		want[id] = true
+	}
+	out := make(map[string]CategoryInfo, len(categoryIDs))
+	for id, c := range f.categories {
+		if want[id] {
+			out[id] = c
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeGroupCube) ListProductUnits(_ context.Context, _ string, productIDs []string) (map[string]ProductUnitInfo, error) {
@@ -153,19 +171,23 @@ func TestComputeGroupStockingFacts_ComboMerge(t *testing.T) {
 	if !g.SalesQty.Equal(dec("154")) {
 		t.Errorf("组销量 = %s 件, want 154", g.SalesQty)
 	}
-	// 有货天数 2026-05-01~2026-10-01 = 154 天 ⇒ 日均 1、补货后 30 件 = 30 天。
+	// 有货天数 2026-05-01~2026-10-01 = 154 天 ⇒ 日均 1；
+	// 补货后 30 件，扣掉正常陈列（历史单批中位数 11 件）⇒ 可售 19 件 = 19 天。
 	if g.InStockDays != 154 {
 		t.Errorf("有货天数 = %d, want 154", g.InStockDays)
 	}
-	if !g.AvgDailySales.Equal(dec("1")) || !g.CoverageDays.Equal(dec("30")) {
-		t.Errorf("日均/补货后可售天数不对: %s / %s", g.AvgDailySales, g.CoverageDays)
+	if !g.AvgDailySales.Equal(dec("1")) || !g.CoverageDays.Equal(dec("19")) {
+		t.Errorf("日均/扣除陈列后可售天数不对: %s / %s (want 1 / 19)", g.AvgDailySales, g.CoverageDays)
+	}
+	if !g.DisplayQty.Equal(dec("11")) {
+		t.Errorf("陈列保有量应取历史单批中位数 11 件, got %s", g.DisplayQty)
 	}
 	if g.CapDays != 45 || !g.CapQty.Equal(dec("45")) {
 		t.Errorf("饮料档位应为 45 天 / 45 件, got %d / %s", g.CapDays, g.CapQty)
 	}
-	// 历史两次进货 10/12 件 ⇒ P25 下限 10 件（不超过可售上限 45 件）。
-	if !g.FloorQty.Equal(dec("10")) || !g.SingleMedian.Equal(dec("11")) {
-		t.Errorf("下限/中位数不对: %s / %s", g.FloorQty, g.SingleMedian)
+	// 历史两次进货 10/12 件 ⇒ 单批中位数 11 件（陈列保有量取它）。
+	if !g.SingleMedian.Equal(dec("11")) || !g.DisplayQty.Equal(dec("11")) {
+		t.Errorf("单批中位数/陈列保有量不对: %s / %s", g.SingleMedian, g.DisplayQty)
 	}
 	if g.HistoryReceiptCount != 2 {
 		t.Errorf("历史进货次数 = %d, want 2(不含本次)", g.HistoryReceiptCount)
@@ -179,12 +201,11 @@ func TestComputeGroupStockingFacts_ComboMerge(t *testing.T) {
 	if !strings.Contains(g.Label, "组合商品 2 个") {
 		t.Errorf("组描述应注明组合商品: %q", g.Label)
 	}
-	// 下限口径：本次进货 10 件，恰好等于下限 ⇒ 不算压货，不出数量信号。
-	// （账面结存差异仍会出提示 —— 那是独立事实，不阻断。）
+	// 陈列口径：可售量 = 库存 + 进货 − 陈列保有量，本次只算正常补货，不应出超量信号。
 	msgs := checkGroupQuantity(res.Facts, 2.0, in.Today)
 	for _, m := range msgs {
 		if m.SignalType == SigQtyDeviation || m.SignalType == SigStockingExcess {
-			t.Errorf("进货量等于下限时不该出超量信号: %s", m.Message)
+			t.Errorf("正常补货不该出超量信号: %s", m.Message)
 		}
 		if m.Level == model.SignalBlock {
 			t.Errorf("不该有阻断: %s", m.Message)
@@ -192,7 +213,7 @@ func TestComputeGroupStockingFacts_ComboMerge(t *testing.T) {
 	}
 }
 
-// TestComputeGroupStockingFacts_AllowanceBoostCap 有陈列费/堆头费 ⇒ 可售上限 ×1.5。
+// TestComputeGroupStockingFacts_AllowanceBoostCap 有陈列费/堆头费 ⇒ 陈列保有量 ×2。
 func TestComputeGroupStockingFacts_AllowanceBoostCap(t *testing.T) {
 	in := groupStockingInput{
 		Products:       []string{"P1"},
@@ -207,18 +228,21 @@ func TestComputeGroupStockingFacts_AllowanceBoostCap(t *testing.T) {
 	if len(res.Facts) != 1 {
 		t.Fatalf("应给出 1 个商品组, got %d", len(res.Facts))
 	}
-	// 饮料档位 45 天 ⇒ 放宽后 ceil(45×1.5)=68 天。
-	if got := res.Facts[0].CapDays; got != 68 {
-		t.Errorf("放宽后可售上限 = %d, want 68(45×1.5 向上取整)", got)
+	// ⚠️ 2026-11-02 口径：放宽的是**陈列量**，可售上限天数不再 ×1.5。
+	if got := res.Facts[0].CapDays; got != 45 {
+		t.Errorf("可售上限不应再放大, got %d want 45", got)
+	}
+	// 没有历史进货 ⇒ 陈列基数 1 瓶，有陈列费 ⇒ 生效陈列量 2 瓶。
+	if !res.Facts[0].DisplayQty.Equal(dec("2")) {
+		t.Errorf("有陈列费时陈列保有量应 ×2 = 2 瓶, got %s", res.Facts[0].DisplayQty)
 	}
 	if !res.Facts[0].AllowanceBoost {
 		t.Errorf("应标记 AllowanceBoost")
 	}
 }
 
-// TestComputeGroupStockingFacts_ManualFloorKept 人工下限优先，且不再生成自动下限行。
-func TestComputeGroupStockingFacts_ManualFloorKept(t *testing.T) {
-	gk := groupKeyOf([]string{"P1"})
+// TestComputeGroupStockingFacts_ManualProfileKept 人工档位优先，且不再生成自动行。
+func TestComputeGroupStockingFacts_ManualProfileKept(t *testing.T) {
 	in := groupStockingInput{
 		Products:  []string{"P1"},
 		Histories: map[string]*productHistory{"P1": {ProductID: "P1", SalesQty: dec("60"), RecentSalesQty: dec("20"), Unit: ProductUnitInfo{Unit: "瓶"}}},
@@ -228,20 +252,11 @@ func TestComputeGroupStockingFacts_ManualFloorKept(t *testing.T) {
 		Profiles: map[string]model.ProductProfile{
 			"P1": {ProductID: "P1", Class: model.ProfileClassDaily, CapDays: 90, Source: model.ProfileSourceManual},
 		},
-		Floors: map[string]model.StockingFloor{
-			gk: {GroupKey: gk, ProductID: "P1", FloorQty: dec("30"), Source: model.ProfileSourceManual},
-		},
 		Today: "2026-10-01",
 	}
 	res := computeGroupStockingFacts(in)
 	if len(res.Facts) != 1 {
 		t.Fatalf("应给出 1 个商品组, got %d", len(res.Facts))
-	}
-	if !res.Facts[0].FloorQty.Equal(dec("30")) {
-		t.Errorf("下限应取人工值 30, got %s", res.Facts[0].FloorQty)
-	}
-	if len(res.Floors) != 0 {
-		t.Errorf("人工下限不该再生成自动行: %+v", res.Floors)
 	}
 	if len(res.Profiles) != 0 {
 		t.Errorf("人工经营属性不该再生成建议: %+v", res.Profiles)
@@ -369,8 +384,8 @@ func TestComputeGroupStockingFacts_LossCountsAsConsumption(t *testing.T) {
 func TestCheckGroupQuantity_LossClosesLedgerGap(t *testing.T) {
 	ok := StockingGroupFact{
 		GroupKey: "P1", ProductID: "P1", Label: "可乐-P1", BaseUnit: "件",
-		ReceivedQty: dec("20"), FloorQty: dec("20"),
-		SalesQty: dec("5"), LossQty: dec("95"), StockQty: dec("20"),
+		ReceivedQty: dec("20"),
+		SalesQty:    dec("5"), LossQty: dec("95"), StockQty: dec("20"),
 		LedgerGap: decimal.Zero, SampleDays: 180, CapDays: 45,
 	}
 	if got := checkGroupQuantity([]StockingGroupFact{ok}, 2.0, "2026-10-01"); len(got) != 0 {
@@ -408,22 +423,11 @@ func TestCheckGroupQuantity_ZeroSalesMentionsLoss(t *testing.T) {
 
 // ---- checkGroupQuantity ----
 
-func TestCheckGroupQuantity_FloorSkips(t *testing.T) {
-	g := StockingGroupFact{
-		GroupKey: "P1", ProductID: "P1", Label: "可乐-P1", BaseUnit: "件",
-		ReceivedQty: dec("5"), FloorQty: dec("10"),
-		CapDays: 45, CoverageDays: dec("100"), ExcessYuan: dec("2000"),
-	}
-	if got := checkGroupQuantity([]StockingGroupFact{g}, 2.0, "2026-10-01"); len(got) != 0 {
-		t.Errorf("进货量不超过下限 ⇒ 不该出信号, got %+v", got)
-	}
-}
-
 func TestCheckGroupQuantity_WithinCap(t *testing.T) {
 	g := StockingGroupFact{
 		GroupKey: "P1", ProductID: "P1", Label: "可乐-P1", BaseUnit: "件",
-		ReceivedQty: dec("20"), FloorQty: dec("10"),
-		CapDays: 45, CoverageDays: dec("40"), ExcessYuan: decimal.Zero,
+		ReceivedQty: dec("20"),
+		CapDays:     45, CoverageDays: dec("40"), ExcessYuan: decimal.Zero,
 	}
 	if got := checkGroupQuantity([]StockingGroupFact{g}, 2.0, "2026-10-01"); len(got) != 0 {
 		t.Errorf("补货后可售不超上限 ⇒ 不该出信号, got %+v", got)
@@ -433,8 +437,8 @@ func TestCheckGroupQuantity_WithinCap(t *testing.T) {
 func TestCheckGroupQuantity_OverCapWarnOnly(t *testing.T) {
 	g := StockingGroupFact{
 		GroupKey: "P1", ProductID: "P1", Label: "可乐-P1", BaseUnit: "件",
-		ReceivedQty: dec("200"), FloorQty: dec("10"),
-		StockQty: dec("10"), AfterQty: dec("210"), SalesQty: dec("90"), CapQty: dec("180"),
+		ReceivedQty: dec("200"),
+		StockQty:    dec("10"), AfterQty: dec("210"), SalesQty: dec("90"), CapQty: dec("180"),
 		CapDays: 45, CoverageDays: dec("60"), ExcessYuan: dec("50"),
 	}
 	got := checkGroupQuantity([]StockingGroupFact{g}, 2.0, "2026-10-01")
@@ -449,7 +453,7 @@ func TestCheckGroupQuantity_OverCapWarnOnly(t *testing.T) {
 		msgs = append(msgs, d.Message)
 	}
 	assertNeutralWording(t, msgs)
-	if !strings.Contains(got[0].Message, "补货后可售 60.0 天") ||
+	if !strings.Contains(got[0].Message, "扣除正常陈列后可售 60.0 天") ||
 		!strings.Contains(got[0].Message, "可售上限 45 天") {
 		t.Errorf("消息应给出天数事实: %s", got[0].Message)
 	}
@@ -458,8 +462,8 @@ func TestCheckGroupQuantity_OverCapWarnOnly(t *testing.T) {
 func TestCheckGroupQuantity_SevereBlocks(t *testing.T) {
 	g := StockingGroupFact{
 		GroupKey: "P1", ProductID: "P1", Label: "可乐-P1", BaseUnit: "件",
-		ReceivedQty: dec("500"), FloorQty: dec("10"),
-		StockQty: dec("10"), AfterQty: dec("510"), SalesQty: dec("90"), CapQty: dec("180"),
+		ReceivedQty: dec("500"),
+		StockQty:    dec("10"), AfterQty: dec("510"), SalesQty: dec("90"), CapQty: dec("180"),
 		CapDays: 45, CoverageDays: dec("100"), ExcessYuan: dec("100"),
 	}
 	got := checkGroupQuantity([]StockingGroupFact{g}, 2.0, "2026-10-01")
@@ -473,8 +477,8 @@ func TestCheckGroupQuantity_SevereBlocks(t *testing.T) {
 func TestCheckGroupQuantity_ExcessAmountBlocks(t *testing.T) {
 	g := StockingGroupFact{
 		GroupKey: "P1", ProductID: "P1", Label: "可乐-P1", BaseUnit: "件",
-		ReceivedQty: dec("100"), FloorQty: dec("10"),
-		StockQty: dec("10"), AfterQty: dec("110"), SalesQty: dec("90"), CapQty: dec("90"),
+		ReceivedQty: dec("100"),
+		StockQty:    dec("10"), AfterQty: dec("110"), SalesQty: dec("90"), CapQty: dec("90"),
 		CapDays: 45, CoverageDays: dec("50"), ExcessYuan: dec("400"), // > 300 元
 	}
 	got := checkGroupQuantity([]StockingGroupFact{g}, 2.0, "2026-10-01")
@@ -486,8 +490,8 @@ func TestCheckGroupQuantity_ExcessAmountBlocks(t *testing.T) {
 func TestCheckGroupQuantity_UnconvertibleWarnOnly(t *testing.T) {
 	g := StockingGroupFact{
 		GroupKey: "P1", ProductID: "P1", Label: "可乐-P1", BaseUnit: "瓶",
-		ReceivedQty: dec("100"), FloorQty: dec("10"),
-		CapDays: 45, CoverageDays: dec("300"), ExcessYuan: dec("9000"),
+		ReceivedQty: dec("100"),
+		CapDays:     45, CoverageDays: dec("300"), ExcessYuan: dec("9000"),
 		Unconvertible: true,
 		UnitNote:      "采购单位「件」与商品档案单位「瓶」不一致",
 	}
@@ -562,8 +566,8 @@ func TestCheckGroupQuantity_ZeroSalesSignalLevels(t *testing.T) {
 func TestCheckGroupQuantity_PriceRiseAndLedgerWarn(t *testing.T) {
 	g := StockingGroupFact{
 		GroupKey: "P1", ProductID: "P1", Label: "可乐-P1", BaseUnit: "件",
-		ReceivedQty: dec("10"), FloorQty: dec("10"), // 数量判定跳过，只留价格/账实事实
-		CapDays: 45, PriceThis: dec("11.5"), PriceHistory: dec("10"), PriceRisePct: dec("15"),
+		ReceivedQty: dec("10"), // 数量判定跳过，只留价格/账实事实
+		CapDays:     45, PriceThis: dec("11.5"), PriceHistory: dec("10"), PriceRisePct: dec("15"),
 		SalesQty: dec("10"), StockQty: dec("10"), LedgerGap: dec("50"),
 	}
 	got := checkGroupQuantity([]StockingGroupFact{g}, 2.0, "2026-10-01")
@@ -596,9 +600,6 @@ func TestStoreStockingSuggestions_PendingAutoManual(t *testing.T) {
 			"P1": {ProductID: "P1", ProductName: "可乐", Class: model.ProfileClassBeverage, CapDays: 45, ShelfLifeDays: 365},
 			"P2": {ProductID: "P2", ProductName: "可乐罐", Class: model.ProfileClassBeverage, CapDays: 45, ShelfLifeDays: 365},
 		},
-		Floors: map[string]model.StockingFloor{
-			gk: {GroupKey: gk, ProductID: "P1", FloorQty: dec("10"), SampleDays: 180, ReceiptCount: 2},
-		},
 	}
 	// 人工改过的行（P1）自动标记永不覆盖。
 	if err := db.Create(&model.ProductProfile{
@@ -625,13 +626,6 @@ func TestStoreStockingSuggestions_PendingAutoManual(t *testing.T) {
 	if pending.Source != model.ProfileSourcePending || pending.CapDays != 45 {
 		t.Errorf("被阻断组的自动标记应为 pending, got %+v", pending)
 	}
-	var floor model.StockingFloor
-	if err := db.First(&floor, "branch_id = ? AND group_key = ?", "B1", gk).Error; err != nil {
-		t.Fatalf("应落组下限: %v", err)
-	}
-	if floor.Source != model.ProfileSourcePending || !floor.FloorQty.Equal(dec("10")) {
-		t.Errorf("下限应为 pending/10, got %+v", floor)
-	}
 
 	// 下一次没有被阻断 ⇒ 自动行改回 auto。
 	svc.storeStockingSuggestions(ctx, "B1", res, nil, fixedNow.AddDate(0, 0, 1))
@@ -640,12 +634,6 @@ func TestStoreStockingSuggestions_PendingAutoManual(t *testing.T) {
 	}
 	if pending.Source != model.ProfileSourceAuto {
 		t.Errorf("无阻断时应回到 auto, got %s", pending.Source)
-	}
-	if err := db.First(&floor, "branch_id = ? AND group_key = ?", "B1", gk).Error; err != nil {
-		t.Fatalf("读下限: %v", err)
-	}
-	if floor.Source != model.ProfileSourceAuto {
-		t.Errorf("无阻断时下限应回到 auto, got %s", floor.Source)
 	}
 }
 
@@ -730,7 +718,7 @@ func TestGroupStockingFactsForAudit_ComboMerge(t *testing.T) {
 	}}
 	got := svc.groupStockingFactsForAudit(ctx, "B1", []string{"P2"}, piLines, nil,
 		map[string]purchaseBasis{"P2": {NetQty: dec("120"), Days: 1, FirstDate: "2026-09-25", LastDate: "2026-09-25"}},
-		map[string]string{"P2": "可乐"}, Allowance{}, fixedNow)
+		nil, map[string]string{"P2": "可乐"}, Allowance{}, fixedNow)
 
 	if got == nil || len(got.Facts) != 1 {
 		t.Fatalf("应给出 1 个商品组, got %+v", got)
@@ -905,7 +893,7 @@ func TestGroupStockingFactsForAudit_UnitMismatchNotBlocked(t *testing.T) {
 	}}
 	got := svc.groupStockingFactsForAudit(ctx, "B1", []string{"P1"}, piLines, nil,
 		map[string]purchaseBasis{"P1": {NetQty: dec("100"), Days: 1, FirstDate: "2026-09-25", LastDate: "2026-09-25"}},
-		map[string]string{"P1": "可乐"}, Allowance{}, fixedNow)
+		nil, map[string]string{"P1": "可乐"}, Allowance{}, fixedNow)
 	if got == nil || len(got.Facts) != 1 {
 		t.Fatalf("应给出 1 个商品组, got %+v", got)
 	}
@@ -920,5 +908,179 @@ func TestGroupStockingFactsForAudit_UnitMismatchNotBlocked(t *testing.T) {
 		if d.Level == model.SignalBlock {
 			t.Errorf("单位不一致时不该阻断: %s", d.Message)
 		}
+	}
+}
+
+// TestComputeGroupStockingFacts_BookedVsPending 已入账的收货不再叠加到库存，
+// 只有收货日晚于库存行最后变动日的才算"未入账补货"（2026-11-02 用户口径）。
+func TestComputeGroupStockingFacts_BookedVsPending(t *testing.T) {
+	in := groupStockingInput{
+		Products:       []string{"P1"},
+		Units:          map[string]ProductUnitInfo{"P1": {Unit: "瓶"}},
+		Stock:          map[string]decimal.Decimal{"P1": dec("5")},
+		StockUpdatedAt: map[string]string{"P1": "2026-09-18"},
+		SheetDates: map[string]string{
+			"PI-OLD": "2026-09-18", // 与库存最后变动日同一天 ⇒ 已在库存里
+			"PI-NEW": "2026-10-25", // 晚于库存最后变动日 ⇒ 未入账
+		},
+		PILines: []SheetLineRow{
+			{SheetID: "PI-OLD", ProductID: "P1", ReceivedQuantity: dec("5"), TotalAmountYuan: dec("30"), UnitNo: "瓶"},
+			{SheetID: "PI-NEW", ProductID: "P1", ReceivedQuantity: dec("7"), TotalAmountYuan: dec("42"), UnitNo: "瓶"},
+		},
+		Purchases: map[string]purchaseBasis{
+			"P1": {NetQty: dec("12"), Days: 2, FirstDate: "2026-09-18", LastDate: "2026-10-25"},
+		},
+		Names: map[string]string{"P1": "矿泉水"},
+		Today: "2026-11-02",
+	}
+	res := computeGroupStockingFacts(in)
+	if len(res.Facts) != 1 {
+		t.Fatalf("应给出 1 个商品组, got %+v", res)
+	}
+	g := res.Facts[0]
+	if !g.BookedQty.Equal(dec("5")) || !g.PendingQty.Equal(dec("7")) {
+		t.Errorf("已入账/未入账 = %s/%s, want 5/7", g.BookedQty, g.PendingQty)
+	}
+	// 库存 5（已含 9/18 那批）+ 未入账 7 = 12；已入账的 5 不能再加一次。
+	if !g.AfterQty.Equal(dec("12")) {
+		t.Errorf("补货后合计 = %s, want 12(库存5+未入账7)", g.AfterQty)
+	}
+	if g.BatchCount != 2 || !g.MaxBatchQty.Equal(dec("7")) || !g.BatchMedian.Equal(dec("6")) {
+		t.Errorf("单批量级 = %d 批 / 最大 %s / 中位 %s, want 2/7/6",
+			g.BatchCount, g.MaxBatchQty, g.BatchMedian)
+	}
+}
+
+// TestComputeGroupStockingFacts_ManualDisplayKept 人工陈列量优先，且不再生成自动行。
+func TestComputeGroupStockingFacts_ManualDisplayKept(t *testing.T) {
+	gk := groupKeyOf([]string{"P1"})
+	in := groupStockingInput{
+		Products: []string{"P1"},
+		Units:    map[string]ProductUnitInfo{"P1": {Unit: "瓶"}},
+		Histories: map[string]*productHistory{"P1": {
+			ProductID: "P1",
+			Unit:      ProductUnitInfo{Unit: "瓶"},
+			Receipts: []productHistoryReceipt{
+				{SheetID: "H1", Date: "2026-06-01", Doc: "PI", Qty: dec("5"), Amount: dec("30"), UnitNo: "瓶", UnitFactor: dec("1")},
+				{SheetID: "H2", Date: "2026-08-01", Doc: "PI", Qty: dec("5"), Amount: dec("30"), UnitNo: "瓶", UnitFactor: dec("1")},
+			},
+		}},
+		Stock: map[string]decimal.Decimal{"P1": dec("20")},
+		PILines: []SheetLineRow{{
+			SheetID: "PI-CUR", ProductID: "P1", ReceivedQuantity: dec("5"), TotalAmountYuan: dec("30"), UnitNo: "瓶",
+		}},
+		Names: map[string]string{"P1": "矿泉水"},
+		Displays: map[string]model.StockingDisplay{
+			gk: {GroupKey: gk, ProductID: "P1", DisplayQty: dec("8"), Source: model.ProfileSourceManual},
+		},
+		Today: "2026-11-02",
+	}
+	res := computeGroupStockingFacts(in)
+	if len(res.Facts) != 1 {
+		t.Fatalf("应给出 1 个商品组, got %+v", res)
+	}
+	g := res.Facts[0]
+	if !g.DisplayQty.Equal(dec("8")) || g.DisplaySource != model.ProfileSourceManual {
+		t.Errorf("陈列保有量应取人工值 8, got %s(%s)", g.DisplayQty, g.DisplaySource)
+	}
+	if len(res.Displays) != 0 {
+		t.Errorf("人工陈列量不该再生成自动行: %+v", res.Displays)
+	}
+	if !g.SellableQty.Equal(dec("17")) {
+		t.Errorf("可售量 = %s, want 17(库存20+进货5−陈列8)", g.SellableQty)
+	}
+}
+
+// TestCategoryCapDays_UsesXunsCategory 品类档位优先按思迅类别判，品名关键词只兜底。
+func TestCategoryCapDays_UsesXunsCategory(t *testing.T) {
+	cases := []struct {
+		name    string
+		cat     *CategoryInfo
+		wantCap int
+	}{
+		{"劲仔鱼仔12g（烧烤）", &CategoryInfo{Name: "休闲食品", ParentName: "食品类"}, 45},
+		{"侬一点250ml高钙核桃奶", &CategoryInfo{Name: "常温", ParentName: "牛奶"}, 45},
+		{"伊利八连杯味浓原味特惠装酸奶", &CategoryInfo{Name: "低温", ParentName: "牛奶"}, 20},
+		{"家佳多幼嫩紫菜60g", &CategoryInfo{Name: "干货系列", ParentName: "干货/大米"}, 45},
+		{"家佳多带嘴土鸡精100g", &CategoryInfo{Name: "调味粉", ParentName: "调味类"}, 45},
+		{"每日生机苏打饼干-奶盐味228G", &CategoryInfo{Name: "食品类"}, 45},
+		{"毛笔", &CategoryInfo{Name: "办公用品", ParentName: "文体用品"}, 90},
+	}
+	for _, c := range cases {
+		_, capDays, _ := categoryCapDaysFor(c.name, c.cat)
+		if capDays != c.wantCap {
+			t.Errorf("%s: cap_days = %d, want %d", c.name, capDays, c.wantCap)
+		}
+	}
+	// 类别缺失 ⇒ 仍回退品名关键词（紫菜含"菜" ⇒ 生鲜 7 天）。
+	_, capDays, _ := categoryCapDaysFor("家佳多幼嫩紫菜60g", nil)
+	if capDays != 7 {
+		t.Errorf("无类别时应回退品名关键词(fresh 7), got %d", capDays)
+	}
+}
+
+// TestStockingDisplay_ManualUpdateAndDelete 人工改陈列量后 Source=manual，删除后回到自动。
+func TestStockingDisplay_ManualUpdateAndDelete(t *testing.T) {
+	svc, db, _, _, _ := newTestService(t)
+	ctx := context.Background()
+	row := model.StockingDisplay{
+		ID: "D1", BranchID: "B1", GroupKey: "P1", ProductID: "P1",
+		DisplayQty: dec("5"), Source: model.ProfileSourceAuto,
+	}
+	if err := db.Create(&row).Error; err != nil {
+		t.Fatalf("seed display: %v", err)
+	}
+	upd, err := svc.UpdateStockingDisplay(ctx, "B1", "P1", StockingDisplayUpdateInput{DisplayQty: dec("8"), Note: "端架"})
+	if err != nil {
+		t.Fatalf("UpdateStockingDisplay: %v", err)
+	}
+	if !upd.DisplayQty.Equal(dec("8")) || upd.Source != model.ProfileSourceManual {
+		t.Errorf("人工修改后 = %s(%s), want 8(manual)", upd.DisplayQty, upd.Source)
+	}
+	if err := svc.DeleteStockingDisplay(ctx, "B1", "P1"); err != nil {
+		t.Fatalf("DeleteStockingDisplay: %v", err)
+	}
+	var cnt int64
+	db.Model(&model.StockingDisplay{}).Where("branch_id = ? AND group_key = ?", "B1", "P1").Count(&cnt)
+	if cnt != 0 {
+		t.Errorf("删除后应无行, got %d", cnt)
+	}
+}
+
+// TestStockingProfile_ManualUpdateAndDelete 档位人工修改后 manual，
+// 删除后回到自动；列表支持按来源过滤。
+func TestStockingProfile_ManualUpdateAndDelete(t *testing.T) {
+	svc, db, _, _, _ := newTestService(t)
+	ctx := context.Background()
+	if err := db.Create(&model.ProductProfile{
+		ID: "PR1", BranchID: "B1", ProductID: "P1", ProductName: "可乐",
+		Class: model.ProfileClassBeverage, CapDays: 45, Source: model.ProfileSourcePending,
+	}).Error; err != nil {
+		t.Fatalf("seed profile: %v", err)
+	}
+
+	p, err := svc.UpdateProductProfile(ctx, "B1", "P1", ProductProfileUpdateInput{
+		CapDays: 90, ShelfLifeDays: 365, Note: "常温饮料",
+	})
+	if err != nil {
+		t.Fatalf("UpdateProductProfile: %v", err)
+	}
+	if p.CapDays != 90 || p.Source != model.ProfileSourceManual {
+		t.Errorf("档位 = %d(%s), want 90(manual)", p.CapDays, p.Source)
+	}
+
+	// 按 source=manual 过滤应只剩一行。
+	profs, total, err := svc.ListProductProfiles(ctx, "B1", "", model.ProfileSourceManual, 10, 0)
+	if err != nil || total != 1 || len(profs) != 1 {
+		t.Fatalf("ListProductProfiles(manual) = %d/%d err=%v", len(profs), total, err)
+	}
+
+	if err := svc.DeleteProductProfile(ctx, "B1", "P1"); err != nil {
+		t.Fatalf("DeleteProductProfile: %v", err)
+	}
+	var pc int64
+	db.Model(&model.ProductProfile{}).Where("branch_id = ?", "B1").Count(&pc)
+	if pc != 0 {
+		t.Errorf("删除后应无行, profile=%d", pc)
 	}
 }

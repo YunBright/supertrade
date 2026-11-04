@@ -139,17 +139,20 @@ func TestWriteStockingFacts_Prompt(t *testing.T) {
 		AvgDailySales: dec("2"),
 		StockQty:      dec("20"),
 		ReceivedQty:   dec("120"),
+		PendingQty:    dec("120"),
+		BatchCount:    1,
+		MaxBatchQty:   dec("120"),
+		BatchMedian:   dec("120"),
 		CapDays:       45,
 		CapQty:        dec("90"),
 		AfterQty:      dec("140"),
 		CoverageDays:  dec("70"),
-		FloorQty:      dec("12"),
 		SingleMedian:  dec("60"),
 	}})
 	got := sb.String()
 	for _, want := range []string{
 		"组级备货核对", "可乐-P1", "本次进货 120 瓶", "组内库存 20 瓶",
-		"可售上限 45 天", "补货后可售 70.0 天", "一次进货下限 12 瓶",
+		"可售上限 45 天", "扣除正常陈列后可售 70.0 天",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("prompt 缺少 %q:\n%s", want, got)

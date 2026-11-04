@@ -86,7 +86,8 @@ type CubeQuerier interface {
 // DocumentTypeJoint 是联营帐款单的单据类型（2026-10-31 用户口径）。
 //
 // ⚠️ 它**不在** gx_master 的 trans_no 里：联营单来自独立表 settlement_ly model,
-//    为了与 DP/CP 统一成同一套 SettlementRow,这里统一打标 "LY"。
+//
+//	为了与 DP/CP 统一成同一套 SettlementRow,这里统一打标 "LY"。
 const DocumentTypeJoint = "LY"
 
 // DocumentTypeDelivery 是代销帐款单的单据类型（2026-11-01 用户口径）。
@@ -204,7 +205,7 @@ type PurchaseSheetRow struct {
 	//
 	// 源列 oper_date(思迅 t_pm_sheet_master)是**真 datetime**,
 	// cube 返回形如 "08 23 2026  4:19PM" ⇒ 用 normalizeCubeDate 规范化。
-	CreatedAt          string
+	CreatedAt string
 	// Remark 是采购单备注(源列 other1)。
 	//
 	// ⚠️ 备注里可能写着**实际收货日期**(如 "2026.9.18号收货")——
@@ -256,6 +257,12 @@ type StockRow struct {
 	ProductID string
 	Quantity  decimal.Decimal
 	AvgCost   decimal.Decimal
+	// UpdatedAt 是该商品库存行最后一次变动日期（YYYY-MM-DD，源列 oper_date）。
+	//
+	// ⚠️ 它是"哪些收货已经入账"的判据（2026-11-02 用户口径）：
+	//    收货日 <= UpdatedAt ⇒ 这批货已经体现在当前库存里 ⇒ 不能再加一次；
+	//    收货日 >  UpdatedAt ⇒ 货到了但库存还没更新 ⇒ 才算"未入账补货"。
+	UpdatedAt string
 }
 
 // DailySaleRow 是商品**某一天**的净销量(备货系数算法用)。
@@ -283,8 +290,9 @@ type ProductPurchaseDateRow struct {
 // 一个商品在同一张单上换过单位就会出现多行 —— 这样才判得出"单位不可换算"。
 //
 // ⚠️ 退货单(RO)的 Quantity 在源库里可能是负数(real_qty 负向冲减)，
-//    AmountYuan 在明细表里**恒为正数**(实测两库负数计数为 0,见 schema 注释)
-//    ⇒ 金额的正负由调用方按 DocumentType 决定，这里不做符号推断。
+//
+//	AmountYuan 在明细表里**恒为正数**(实测两库负数计数为 0,见 schema 注释)
+//	⇒ 金额的正负由调用方按 DocumentType 决定，这里不做符号推断。
 type PurchaseHistoryRow struct {
 	SheetID      string
 	ProductID    string
@@ -336,7 +344,8 @@ func rowDec(row map[string]any, key string) decimal.Decimal {
 // ListSettlements 按 id in (...) 查结算单(**购销 DP/CP + 联营 LY 一起查**)。
 //
 // ⚠️ 联营单在独立表(settlement_ly model)里 ⇒ 两次查询合并返回,
-//    这样流水线不用区分单据来源(见 DocumentTypeJoint)。
+//
+//	这样流水线不用区分单据来源(见 DocumentTypeJoint)。
 func (q *DaprCubeQuerier) ListSettlements(ctx context.Context, branchID string, ids []string) ([]SettlementRow, error) {
 	purchase, err := q.querySettlementRowsByIDs(ctx, branchID, "settlement", "settlement.total_goods_yuan", "", ids, false)
 	if err != nil {
@@ -645,7 +654,8 @@ func (q *DaprCubeQuerier) ListJointSettlementFacts(ctx context.Context, branchID
 //  2. 货款 measure 是 **total_settle_yuan**(结算额 = 应付供应商的钱)。
 //
 // ⚠️ 代销单的「货款」就是结算额 —— 零售额只用于算毛利率,
-//    不能拿来当应付(否则会多付零售与结算之间的差额)。
+//
+//	不能拿来当应付(否则会多付零售与结算之间的差额)。
 func (q *DaprCubeQuerier) ListAuditedDxSettlements(ctx context.Context, branchID, from, to, supplierID string, limit int) ([]SettlementRow, error) {
 	filters := []cubeclient.CubeFilter{
 		{Member: "settlement_dx.approve_status", Operator: "equals", Values: []any{"1"}},
@@ -969,7 +979,7 @@ func (q *DaprCubeQuerier) ListProductUnits(ctx context.Context, branchID string,
 	}
 	data, err := q.c.LoadCubeQuery(ctxWithBranch(ctx, branchID), "product", cubeclient.CubeQuery{
 		Measures:   []string{"product.count"},
-		Dimensions: []string{"product.id", "product.unit", "product.spec"},
+		Dimensions: []string{"product.id", "product.unit", "product.spec", "product.category_id"},
 		Filters: []cubeclient.CubeFilter{
 			{Member: "product.id", Operator: "in", Values: vals},
 		},
@@ -985,8 +995,76 @@ func (q *DaprCubeQuerier) ListProductUnits(ctx context.Context, branchID string,
 			continue
 		}
 		out[id] = ProductUnitInfo{
-			Unit: strings.TrimSpace(rowStr(r, "product.unit")),
-			Spec: strings.TrimSpace(rowStr(r, "product.spec")),
+			Unit:       strings.TrimSpace(rowStr(r, "product.unit")),
+			Spec:       strings.TrimSpace(rowStr(r, "product.spec")),
+			CategoryID: strings.TrimSpace(rowStr(r, "product.category_id")),
+		}
+	}
+	return out, nil
+}
+
+// ListProductCategories 取思迅类别字典的末级名称与父级名称（品类档位判定用）。
+//
+// # 为什么不用品名关键词
+//
+// 实测（2026-11-02 ysx 生产库）品名关键词会把包装食品判成生鲜/冷藏：
+//
+//	核桃奶      → 名字含"桃" ⇒ 生鲜 7 天（真实类别：常温 / 牛奶）
+//	幼嫩紫菜    → 含"菜" ⇒ 生鲜 7 天（真实类别：干货系列 / 干货·大米）
+//	劲仔鱼仔    → 含"鱼" ⇒ 生鲜 7 天（真实类别：休闲食品 / 食品类）
+//	带嘴土鸡精  → 含"鸡" ⇒ 生鲜 7 天（真实类别：调味粉 / 调味类）
+//	奶盐味饼干  → 含"奶" ⇒ 冷藏 20 天（真实类别：食品类）
+//
+// ⇒ 优先用类别字典判定，品名关键词只做兜底。
+//
+// 查询走 item_cls + item_cls_parent 两个 model（同一张物理表、两个别名）——
+// 同一个 model 自连接两次会被 planJoins 的 visited 静默跳过（见该 schema 注释）。
+func (q *DaprCubeQuerier) ListProductCategories(ctx context.Context, branchID string, categoryIDs []string) (map[string]CategoryInfo, error) {
+	clean := make([]string, 0, len(categoryIDs))
+	seen := make(map[string]struct{}, len(categoryIDs))
+	for _, id := range categoryIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		clean = append(clean, id)
+	}
+	if len(clean) == 0 {
+		return nil, nil
+	}
+	vals := make([]any, 0, len(clean))
+	for _, id := range clean {
+		vals = append(vals, id)
+	}
+	data, err := q.c.LoadCubeQuery(ctxWithBranch(ctx, branchID), "item_cls", cubeclient.CubeQuery{
+		Measures: []string{"item_cls.count"},
+		Dimensions: []string{
+			"item_cls.id",
+			"item_cls.name",
+			"item_cls.parent_no",
+			"item_cls_parent.name",
+		},
+		Filters: []cubeclient.CubeFilter{
+			{Member: "item_cls.id", Operator: "in", Values: vals},
+		},
+		Limit: len(clean) * 4,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cube item_cls query: %w", err)
+	}
+	out := make(map[string]CategoryInfo, len(data))
+	for _, r := range data {
+		id := strings.TrimSpace(rowStr(r, "item_cls.id"))
+		if id == "" {
+			continue
+		}
+		out[id] = CategoryInfo{
+			Name:       strings.TrimSpace(rowStr(r, "item_cls.name")),
+			ParentName: strings.TrimSpace(rowStr(r, "item_cls_parent.name")),
 		}
 	}
 	return out, nil
@@ -1118,7 +1196,8 @@ func (q *DaprCubeQuerier) SumSalesByProduct(ctx context.Context, branchID string
 //     拿它解释偏离等于用一张废单放行。
 //
 // ⚠️ 不按 branch_id 过滤(理由同 settlement:思迅 branch_no 与本系统 branch_id 无关,
-//   门店隔离靠 X-Branch-ID 路由链)。
+//
+//	门店隔离靠 X-Branch-ID 路由链)。
 //
 // ⚠️ 返回**未开口径**的分组行:JO 全部 / OO 仅 direction='-' 的收敛在 aggregateLoss。
 func (q *DaprCubeQuerier) SumLossByProduct(ctx context.Context, branchID string, productIDs []string, fromDate, toDate string) ([]LossRow, error) {
@@ -1200,7 +1279,7 @@ func (q *DaprCubeQuerier) GetStocks(ctx context.Context, branchID string, produc
 	}
 	data, err := q.c.LoadCubeQuery(ctxWithBranch(ctx, branchID), "stock", cubeclient.CubeQuery{
 		Measures:   []string{"stock.total_quantity", "stock.avg_cost"},
-		Dimensions: []string{"stock.product_id"},
+		Dimensions: []string{"stock.product_id", "stock.updated_at"},
 		Filters: []cubeclient.CubeFilter{
 			{Member: "stock.product_id", Operator: "in", Values: vals},
 		},
@@ -1215,6 +1294,7 @@ func (q *DaprCubeQuerier) GetStocks(ctx context.Context, branchID string, produc
 			ProductID: rowStr(r, "stock.product_id"),
 			Quantity:  rowDec(r, "stock.total_quantity"),
 			AvgCost:   rowDec(r, "stock.avg_cost"),
+			UpdatedAt: normalizeCubeDate(rowStr(r, "stock.updated_at")),
 		})
 	}
 	return out, nil
@@ -1306,11 +1386,12 @@ func (q *DaprCubeQuerier) ListProductPurchaseDates(ctx context.Context, branchID
 // ListProductPurchaseHistory 拉商品 [fromDate, toDate) 的采购明细事实(PI + RO)。
 //
 // 与 ListProductPurchaseDates 的差别：那个只取"进货了几次"(PI 制单日期)，
-// 这里要**数量与金额**（算组库存/进货下限/历史均价），并且**含退货**——
-// 净进货 = PI − RO，少算退货只会让判定更严，但会算错下限与价格事实。
+// 这里要**数量与金额**（算组库存/历史均价/单批量级），并且**含退货**——
+// 净进货 = PI − RO，少算退货只会让判定更严，但会算错陈列基数与价格事实。
 //
 // ⚠️ 维度带上 unit_no / unit_factor：采购数量是"采购单位"口径，
-//    换算成组基准单位之前必须先知道这一行按什么单位录的。
+//
+//	换算成组基准单位之前必须先知道这一行按什么单位录的。
 func (q *DaprCubeQuerier) ListProductPurchaseHistory(ctx context.Context, branchID string, productIDs []string, fromDate, toDate string) ([]PurchaseHistoryRow, error) {
 	if len(productIDs) == 0 {
 		return nil, nil
@@ -1438,8 +1519,9 @@ type SettlementUnavailable struct {
 //
 // includePaid=true 给初始化结算页用(它要看的就是已付款的那些)。
 // ⚠️ 该页**不过滤待审批中**:它是"把历史已付款补录进台账"的运维页面,
-//    显式 include_paid=1 就意味着操作人明确要看全量;把它按待审批筛掉
-//    会让"这张单正被人审批"这件事在补录页上彻底看不见。
+//
+//	显式 include_paid=1 就意味着操作人明确要看全量;把它按待审批筛掉
+//	会让"这张单正被人审批"这件事在补录页上彻底看不见。
 //
 // 两个隐藏张数都原样回给前端 —— 列表突然少了一堆单,店长会以为是系统出错,
 // 必须能告诉他"这里隐藏了 N 张已付款的 / N 张待审批中的"。
@@ -1457,7 +1539,8 @@ type SettlementUnavailable struct {
 // ⇒ 两个页面对"这张单在不在"给出**相反的答案**。
 //
 // ⇒ query 非空时改成:拉**全量**(cubeSettlementFetchCap)再在 Go 侧做包含匹配,
-//   **先筛后截** ⇒ 任意历史单都能搜到;并把命中的不可选单连同原因一起回传。
+//
+//	**先筛后截** ⇒ 任意历史单都能搜到;并把命中的不可选单连同原因一起回传。
 func (s *Service) ListCubeSettlements(ctx context.Context, branchID, from, to, supplierID, query string, limit int, includePaid bool) (*CubeSettlementList, error) {
 	return s.listCubeSettlements(ctx, branchID, from, to, supplierID, query, limit, includePaid, SettlementKindPurchase)
 }
@@ -1668,7 +1751,8 @@ func (s *Service) fillSupplierNames(ctx context.Context, branchID string, rows [
 // 这样毛利率就是 0%,会触发「毛利率低于最低要求」的 warn(而不是静默跳过)。
 //
 // ⚠️ 查询失败只告警（不阻断审核）：毛利事实是**旁路证据**，
-//   与供应商字典/商品名同一定位；失败时 row.Dx 为 nil，checkDx 会给"毛利未知"。
+//
+//	与供应商字典/商品名同一定位；失败时 row.Dx 为 nil，checkDx 会给"毛利未知"。
 func (s *Service) fillDxFacts(ctx context.Context, branchID string, rows []SettlementRow) error {
 	if s.cube == nil {
 		return nil
@@ -1711,7 +1795,8 @@ func (s *Service) fillDxFacts(ctx context.Context, branchID string, rows []Settl
 // 这样扣点率就是 0%，会触发「低于最低扣点率」的提示（而不是静默跳过）。
 //
 // ⚠️ 查询失败只告警（不阻断审核）：扣点事实是**旁路证据**，
-//   与供应商字典/商品名同一定位；失败时 row.Joint 为 nil，扣点校验跳过。
+//
+//	与供应商字典/商品名同一定位；失败时 row.Joint 为 nil，扣点校验跳过。
 func (s *Service) fillJointFacts(ctx context.Context, branchID string, rows []SettlementRow) error {
 	if s.cube == nil {
 		return nil

@@ -196,6 +196,10 @@ var (
 	ErrAuditFlowNotFound = errors.New("service: 流程配置不存在")
 	// ErrStockingNotFound 是"该 SKU 在本门店还没有备货系数"。
 	ErrStockingNotFound = errors.New("service: 备货系数不存在")
+	// ErrStockingDisplayNotFound 是"该商品组在本门店还没有陈列保有量"。
+	ErrStockingDisplayNotFound = errors.New("service: 陈列保有量不存在")
+	// ErrStockingProfileNotFound 是"该 SKU 在本门店还没有商品经营属性"。
+	ErrStockingProfileNotFound = errors.New("service: 商品经营属性不存在")
 )
 
 // New 构造 Service。cfg 必填项不足时以默认值兜底(见 withDefaults)。

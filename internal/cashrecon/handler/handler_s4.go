@@ -22,6 +22,7 @@ func (h *Handler) registerRoutesS4(r gin.IRouter, requireBranch gin.HandlerFunc,
 	// ---- 审核结算（FR-12/§10）----
 	r.POST("/batches/:id/freeze", requireBranch, guard(ScopeAudit), h.FreezeBatch)
 	r.POST("/batches/:id/complete", requireBranch, guard(ScopeAudit), h.CompleteBatch)
+	r.POST("/batches/:id/recompute", requireBranch, guard(ScopeAudit), h.RecomputeBatch)
 
 	// ---- 日报 / 看板 / 导出（FR-14/FR-15/§12）----
 	r.GET("/reports/daily", requireBranch, guard(ScopeView), h.DailyReport)
@@ -145,6 +146,42 @@ func (h *Handler) CompleteBatch(c *gin.Context) {
 		CarriedOpenings:  res.CarriedOpenings,
 		CashClosing:      res.CashClosing.String(),
 		AlreadyCompleted: res.AlreadyCompleted,
+	})
+}
+
+// recomputeResp 是重做响应体。
+type recomputeResp struct {
+	Batch           batchView `json:"batch"`
+	CashFlowRows    int       `json:"cash_flow_rows"`
+	InsertedMatches int       `json:"inserted_matches"`
+	InsertedDiffs   int       `json:"inserted_diffs"`
+	RemovedMatches  int       `json:"removed_matches"`
+	RemovedDiffs    int       `json:"removed_diffs"`
+	CarriedOver     int       `json:"carried_over"`
+}
+
+// RecomputeBatch POST /batches/:id/recompute
+//
+// 重做：按当前收银流水重新跑匹配与差异（审核中批次也可以重做）。
+func (h *Handler) RecomputeBatch(c *gin.Context) {
+	actor := operatorOf(c)
+	if actor == "" {
+		writeError(c, http.StatusUnauthorized, "unauthenticated", "缺少调用者身份")
+		return
+	}
+	res, err := h.svc.RecomputeBatch(c.Request.Context(), branchIDOf(c), c.Param("id"), actor)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, recomputeResp{
+		Batch:           batchViewOf(res.Batch),
+		CashFlowRows:    res.CashFlowRows,
+		InsertedMatches: res.InsertedMatches,
+		InsertedDiffs:   res.InsertedDiffs,
+		RemovedMatches:  res.RemovedMatches,
+		RemovedDiffs:    res.RemovedDiffs,
+		CarriedOver:     res.CarriedOver,
 	})
 }
 

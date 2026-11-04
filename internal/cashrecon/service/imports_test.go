@@ -90,9 +90,14 @@ func TestImportBankJSONRows(t *testing.T) {
 	require.Equal(t, 1, res.Skipped)
 }
 
-// TestImportBank_RejectsFrozenPeriod 锁住冻结区间整批 409。
-func TestImportBank_RejectsFrozenPeriod(t *testing.T) {
+// TestImportBank_RejectsCompletedPeriod 已完成批次锁定的区间整批 409。
+func TestImportBank_RejectsCompletedPeriod(t *testing.T) {
 	svc, db := newTestService(t)
+	require.NoError(t, db.Create(&model.ReconBatch{
+		ID: "b1", BranchID: "00", BatchNo: "CR-00-20261030-01",
+		Kind: model.BatchKindNormal, BizDateFrom: day(2026, 10, 1), BizDateTo: day(2026, 10, 31),
+		Status: model.BatchStatusCompleted, CreatedAt: testClock, UpdatedAt: testClock,
+	}).Error)
 	require.NoError(t, db.Create(&model.ReconPeriodLock{
 		ID: newID(), BranchID: "00", BizDateFrom: day(2026, 10, 1), BizDateTo: day(2026, 10, 31),
 		BatchID: "b1", LockedAt: testClock,
@@ -105,7 +110,29 @@ func TestImportBank_RejectsFrozenPeriod(t *testing.T) {
 
 	var count int64
 	require.NoError(t, db.Model(&model.ReconBankFlow{}).Where("branch_id = ?", "00").Count(&count).Error)
-	require.Zero(t, count, "冻结区间内不允许写入任何流水")
+	require.Zero(t, count, "已完成批次锁定的区间不允许写入流水")
+}
+
+// TestImportBank_AllowsAuditingPeriod 审核中批次自己锁住的区间仍可导入。
+//
+// 首次导入到账流水时批次往往已冻结/审核中；若一律 409，差异永远补不回来。
+func TestImportBank_AllowsAuditingPeriod(t *testing.T) {
+	svc, db := newTestService(t)
+	require.NoError(t, db.Create(&model.ReconBatch{
+		ID: "b2", BranchID: "00", BatchNo: "CR-00-20261031-01",
+		Kind: model.BatchKindNormal, BizDateFrom: day(2026, 10, 1), BizDateTo: day(2026, 10, 31),
+		Status: model.BatchStatusAuditing, CreatedAt: testClock, UpdatedAt: testClock,
+	}).Error)
+	require.NoError(t, db.Create(&model.ReconPeriodLock{
+		ID: newID(), BranchID: "00", BizDateFrom: day(2026, 10, 1), BizDateTo: day(2026, 10, 31),
+		BatchID: "b2", LockedAt: testClock,
+	}).Error)
+
+	res, err := svc.ImportBankFlows(context.Background(), ImportBankInput{
+		BranchID: "00", CSV: bankCSV, Actor: "u1",
+	})
+	require.NoError(t, err)
+	require.Equal(t, 3, res.Inserted)
 }
 
 // TestListImports_ReturnsLedger 锁住导入台账可回查。

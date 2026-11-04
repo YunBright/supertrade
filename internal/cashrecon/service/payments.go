@@ -39,6 +39,16 @@ const (
 	// crossPayStatePaid / Unpaid 是 approval_monthly_items.pay_state 的取值。
 	crossPayStatePaid   = "paid"
 	crossPayStateUnpaid = "unpaid"
+	// crossSpStatusApproved 是企微审批状态「审批通过 / 流程结束」。
+	//
+	// 付款审批是「审批人 → 办理人」两段：办理人处理完本单付款后，企微把
+	// 整单置为 2 ⇒ 视为**已付款**。
+	crossSpStatusApproved = 2
+	// crossSpStatusPaid 是企微审批状态「已支付」（企微并不保证一定回写）。
+	//
+	// ⚠️ 付款审批的三段式：1 审批中（不同步）→ 2 办理人处理完付款（已付款）
+	// → 10 已支付（同样已付款）。2 与 10 在资金对账都落「已付款 + 确认匹配」。
+	crossSpStatusPaid = 10
 )
 
 // crossExcludedInstanceStatuses 是"没有付过款 / 不应计入应付"的审批终态。
@@ -59,16 +69,29 @@ var paymentChannelAliases = map[string][]string{
 	model.MethodCash:     {"cash"},
 }
 
+// approvalSyncActor 标记"由审批同步自动确认匹配"的行，区别于人工核销。
+const approvalSyncActor = "approval_sync"
+
 // SyncPaymentsResult 是懒同步的统计。
 type SyncPaymentsResult struct {
 	Scanned  int `json:"scanned"`
 	Inserted int `json:"inserted"`
+	Updated  int `json:"updated"`
+	// Cleared 是审批侧回退（未审批/驳回/撤销）因而从台账移除的同步行数。
+	Cleared int `json:"cleared"`
 }
 
-// SyncPayments 把已支付的审批项同步到付款台账（幂等）。
+// SyncPayments 把付款审批同步到付款台账（幂等）。
 //
-// 只新增缺失行：已存在的记录保持 verified/supplier 等人工字段不变，
-// 不会被同步覆盖（审批侧金额变更也不覆盖已登记台账）。
+// 三段式口径（与企微 sp_status 对齐）：
+//
+//	1  审批中（审批人待批 / 办理人待处理）⇒ 不同步
+//	2  办理人处理完、流程结束          ⇒ 同步为**已付款 + 确认匹配**
+//	10 已支付                          ⇒ 同步为**已付款 + 确认匹配**
+//
+// 审批侧的付款状态由本方法单向刷新；人工字段（供应商名/备注）与人工
+// 特殊处理（说明原因/挂起/升级）不被覆盖。审批侧回退成未审批或终态的项，
+// 自动同步行会被移除（人工核销过的不动）。
 func (s *Service) SyncPayments(ctx context.Context, branchID string) (SyncPaymentsResult, error) {
 	branchID = strings.TrimSpace(branchID)
 	if branchID == "" {
@@ -76,8 +99,9 @@ func (s *Service) SyncPayments(ctx context.Context, branchID string) (SyncPaymen
 	}
 	var items []model.CrossMonthlyItem
 	err := s.db.WithContext(ctx).
-		Where("branch_id = ? AND direction = ? AND pay_state = ? AND instance_status NOT IN ?",
-			branchID, crossDirectionPayment, crossPayStatePaid, crossExcludedInstanceStatuses).
+		Where("branch_id = ? AND direction = ? AND sp_status IN ? AND instance_status NOT IN ?",
+			branchID, crossDirectionPayment,
+			[]int{crossSpStatusApproved, crossSpStatusPaid}, crossExcludedInstanceStatuses).
 		Order("created_at, id").
 		Find(&items).Error
 	if err != nil {
@@ -86,31 +110,157 @@ func (s *Service) SyncPayments(ctx context.Context, branchID string) (SyncPaymen
 
 	now := s.now()
 	res := SyncPaymentsResult{Scanned: len(items)}
+	wanted := make(map[string]model.CrossMonthlyItem, len(items))
 	for _, it := range items {
-		row := model.ReconPaymentRecord{
-			ID:           newID(),
-			BranchID:     branchID,
-			Source:       model.PaymentSourceWecom,
-			SourceID:     it.ItemID,
-			SupplierName: strings.TrimSpace(it.ItemType),
-			Amount:       it.AmountYuan,
-			RequestDate:  dayPtr(it.CreatedAt),
-			PayDate:      dateOfPtr(it.DecidedAt),
-			Note:         truncate(it.Remark, 512),
-			Verified:     false,
-			CreatedAt:    now,
-			UpdatedAt:    now,
+		wanted[it.ItemID] = it
+	}
+
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 现有同步行一次性读入，避免逐行查询。
+		var existing []model.ReconPaymentRecord
+		if err := tx.Where("branch_id = ? AND source = ?", branchID, model.PaymentSourceWecom).
+			Find(&existing).Error; err != nil {
+			return fmt.Errorf("read recon_payment_records: %w", err)
 		}
-		tx := s.db.WithContext(ctx).Clauses(clause.OnConflict{
-			Columns:   []clause.Column{{Name: "branch_id"}, {Name: "source"}, {Name: "source_id"}},
-			DoNothing: true,
-		}).Create(&row)
-		if tx.Error != nil {
-			return res, fmt.Errorf("upsert recon_payment_records: %w", tx.Error)
+		existingByID := make(map[string]model.ReconPaymentRecord, len(existing))
+		for _, r := range existing {
+			existingByID[r.SourceID] = r
 		}
-		res.Inserted += int(tx.RowsAffected)
+
+		for _, row := range existing {
+			it, ok := wanted[row.SourceID]
+			if !ok {
+				// 审批侧已回退/取消：清掉自动同步行。
+				// 人工核销过（verified_by 是某人）的行保留 —— 那是银行事实的关联。
+				if row.VerifiedBy != "" && row.VerifiedBy != approvalSyncActor {
+					continue
+				}
+				if err := tx.Where("branch_id = ? AND id = ?", branchID, row.ID).
+					Delete(&model.ReconPaymentRecord{}).Error; err != nil {
+					return fmt.Errorf("delete stale recon_payment_records: %w", err)
+				}
+				res.Cleared++
+				continue
+			}
+			// 人工核销过的行整体保持现状，不被审批侧刷新。
+			if row.VerifiedBy != "" && row.VerifiedBy != approvalSyncActor {
+				continue
+			}
+			changed, err := updatePaymentMatchTx(tx, row, it, now)
+			if err != nil {
+				return err
+			}
+			if changed {
+				res.Updated++
+			}
+		}
+
+		// 新增缺失行。
+		for _, it := range items {
+			if _, ok := existingByID[it.ItemID]; ok {
+				continue
+			}
+			row := newSyncedPayment(branchID, it, now)
+			c := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "branch_id"}, {Name: "source"}, {Name: "source_id"}},
+				DoNothing: true,
+			}).Create(&row)
+			if c.Error != nil {
+				return fmt.Errorf("upsert recon_payment_records: %w", c.Error)
+			}
+			res.Inserted += int(c.RowsAffected)
+		}
+		return nil
+	})
+	if err != nil {
+		return res, err
 	}
 	return res, nil
+}
+
+// crossPaymentPaid 判断企微付款审批是否已经完成付款。
+//
+// 2（办理人处理完、流程结束）与 10（已支付）都算已付款。
+func crossPaymentPaid(spStatus int) bool {
+	return spStatus == crossSpStatusApproved || spStatus == crossSpStatusPaid
+}
+
+// newSyncedPayment 按审批状态造一条同步行（2/10=已付款确认匹配）。
+func newSyncedPayment(branchID string, it model.CrossMonthlyItem, now time.Time) model.ReconPaymentRecord {
+	paid := crossPaymentPaid(it.SpStatus)
+	row := model.ReconPaymentRecord{
+		ID:           newID(),
+		BranchID:     branchID,
+		Source:       model.PaymentSourceWecom,
+		SourceID:     it.ItemID,
+		SupplierName: strings.TrimSpace(it.ItemType),
+		Amount:       it.AmountYuan,
+		RequestDate:  dayPtr(it.CreatedAt),
+		Note:         truncate(it.Remark, 512),
+		Verified:     paid,
+		MatchStatus:  model.PaymentMatchUnpaid,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	if paid {
+		row.PayDate = dateOfPtr(it.DecidedAt)
+		row.VerifiedBy = approvalSyncActor
+		row.MatchStatus = model.PaymentMatchMatched
+	}
+	return row
+}
+
+// updatePaymentMatchTx 按最新审批状态刷新同步行的付款/匹配状态。
+//
+// 人工特殊处理（reasoned/hung/escalated）保留，只跟随审批刷新"已付款/未付款"。
+func updatePaymentMatchTx(tx *gorm.DB, row model.ReconPaymentRecord,
+	it model.CrossMonthlyItem, now time.Time,
+) (bool, error) {
+	paid := crossPaymentPaid(it.SpStatus)
+	verifiedBy := ""
+	if paid {
+		verifiedBy = approvalSyncActor
+	}
+	nextMatch := row.MatchStatus
+	if !isManualPaymentMatch(row.MatchStatus) {
+		if paid {
+			nextMatch = model.PaymentMatchMatched
+		} else {
+			nextMatch = model.PaymentMatchUnpaid
+		}
+	}
+	if row.Verified == paid && row.VerifiedBy == verifiedBy && row.MatchStatus == nextMatch {
+		return false, nil
+	}
+	updates := map[string]any{
+		"verified":     paid,
+		"verified_by":  verifiedBy,
+		"match_status": nextMatch,
+		"updated_at":   now,
+	}
+	if paid && row.PayDate == nil {
+		updates["pay_date"] = dateOfPtr(it.DecidedAt)
+	}
+	if !paid && !isManualPaymentMatch(row.MatchStatus) {
+		// 退回未付款时清掉过期的处理说明。
+		updates["match_reason"] = ""
+	}
+	if err := tx.Model(&model.ReconPaymentRecord{}).
+		Where("branch_id = ? AND id = ?", row.BranchID, row.ID).
+		Updates(updates).Error; err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// isManualPaymentMatch 判断匹配状态是否由出纳特殊处理过（需保留）。
+func isManualPaymentMatch(status string) bool {
+	switch status {
+	case model.PaymentMatchReasoned, model.PaymentMatchHung, model.PaymentMatchEscalated:
+		return true
+	default:
+		return false
+	}
 }
 
 // dayPtr 取日期指针（UTC 零点）。
@@ -183,6 +333,7 @@ func (s *Service) RegisterPayment(ctx context.Context, in RegisterPaymentInput) 
 		PayDate:      dateOfPtr(in.PayDate),
 		Method:       in.Method,
 		Note:         in.Note,
+		MatchStatus:  model.PaymentMatchPending,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
@@ -277,6 +428,7 @@ func (s *Service) VerifyPayment(ctx context.Context, in VerifyPaymentInput) (mod
 			"verified":     true,
 			"verified_by":  in.Actor,
 			"bank_flow_id": flow.ID,
+			"match_status": model.PaymentMatchMatched,
 			"updated_at":   now,
 		}
 		if pay.Method == "" && flow.Channel != "" {
@@ -301,6 +453,7 @@ func (s *Service) VerifyPayment(ctx context.Context, in VerifyPaymentInput) (mod
 		pay.Verified = true
 		pay.VerifiedBy = in.Actor
 		pay.BankFlowID = flow.ID
+		pay.MatchStatus = model.PaymentMatchMatched
 		pay.UpdatedAt = now
 		out = pay
 
@@ -320,6 +473,100 @@ func (s *Service) VerifyPayment(ctx context.Context, in VerifyPaymentInput) (mod
 		return model.ReconPaymentRecord{}, err
 	}
 	return out, nil
+}
+
+// ActOnPaymentInput 是付款匹配特殊处理的入参。
+type ActOnPaymentInput struct {
+	BranchID  string
+	PaymentID string
+	Action    string
+	Reason    string
+	Actor     string
+}
+
+// ActOnPayment 对审批同步的付款行做特殊处理：说明原因 / 挂起 / 升级。
+//
+// 默认口径是「确认匹配」，只有出纳认为需要人工介入时才调用本方法；
+// reason 必填（挂起/升级也要写清楚为什么），并写审计日志。
+func (s *Service) ActOnPayment(ctx context.Context, in ActOnPaymentInput) (model.ReconPaymentRecord, error) {
+	in.BranchID = strings.TrimSpace(in.BranchID)
+	in.PaymentID = strings.TrimSpace(in.PaymentID)
+	in.Action = strings.TrimSpace(in.Action)
+	in.Reason = strings.TrimSpace(in.Reason)
+	in.Actor = strings.TrimSpace(in.Actor)
+	if in.BranchID == "" || in.PaymentID == "" || in.Actor == "" {
+		return model.ReconPaymentRecord{}, model.ErrInvalidInput
+	}
+	if in.Reason == "" {
+		return model.ReconPaymentRecord{}, fmt.Errorf("%w: reason 必填", model.ErrInvalidInput)
+	}
+	if len(in.Reason) > 512 {
+		return model.ReconPaymentRecord{}, fmt.Errorf("%w: reason 过长", model.ErrInvalidInput)
+	}
+	nextStatus, ok := paymentActionStatus(in.Action)
+	if !ok {
+		return model.ReconPaymentRecord{}, fmt.Errorf("%w: 未知动作 %q", model.ErrInvalidInput, in.Action)
+	}
+
+	now := s.now()
+	var out model.ReconPaymentRecord
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var pay model.ReconPaymentRecord
+		err := tx.Where("branch_id = ? AND id = ?", in.BranchID, in.PaymentID).First(&pay).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return model.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if pay.Source != model.PaymentSourceWecom {
+			return fmt.Errorf("%w: 仅审批同步的付款可做匹配处理", model.ErrInvalidInput)
+		}
+		before := pay.MatchStatus
+		if err := tx.Model(&model.ReconPaymentRecord{}).
+			Where("branch_id = ? AND id = ?", in.BranchID, in.PaymentID).
+			Updates(map[string]any{
+				"match_status": nextStatus,
+				"match_reason": truncate(in.Reason, 512),
+				"updated_at":   now,
+			}).Error; err != nil {
+			return err
+		}
+		pay.MatchStatus = nextStatus
+		pay.MatchReason = truncate(in.Reason, 512)
+		pay.UpdatedAt = now
+		out = pay
+
+		return s.writeAuditTx(ctx, tx, model.ReconAuditLog{
+			BranchID:   in.BranchID,
+			ObjectType: "payment",
+			ObjectID:   pay.ID,
+			Action:     "match_" + in.Action,
+			BeforeJSON: fmt.Sprintf(`{"match_status":%q}`, before),
+			AfterJSON:  fmt.Sprintf(`{"match_status":%q,"match_reason":%q}`, nextStatus, pay.MatchReason),
+			Reason:     pay.MatchReason,
+			Actor:      in.Actor,
+			CreatedAt:  now,
+		})
+	})
+	if err != nil {
+		return model.ReconPaymentRecord{}, err
+	}
+	return out, nil
+}
+
+// paymentActionStatus 把处理动作映射成匹配状态。
+func paymentActionStatus(action string) (string, bool) {
+	switch action {
+	case model.PaymentActionReason:
+		return model.PaymentMatchReasoned, true
+	case model.PaymentActionHang:
+		return model.PaymentMatchHung, true
+	case model.PaymentActionEscalate:
+		return model.PaymentMatchEscalated, true
+	default:
+		return "", false
+	}
 }
 
 // assertChannelMatches 校验付款方式与银行流水渠道一致（未知方式时只要求非空）。

@@ -270,3 +270,37 @@ func (s *Service) assertNotLocked(ctx context.Context, branchID string, from, to
 	}
 	return nil
 }
+
+// assertNotLockedByCompleted 判断 [from, to] 是否被**已完成**批次锁定。
+//
+// 到账流水导入不挂批次：首次导入时批次往往已冻结/审核中（自己锁住该期），
+// 若按 [assertNotLocked] 一律拒绝，审核中的批次就永远补不进到账流水,
+// 差异也永远归不了零。这里只拦"已完成"批次（归档后不可再改），
+// 冻结/审核中的批次导入后可以「重做」把差异重算出来。
+func (s *Service) assertNotLockedByCompleted(ctx context.Context, branchID string, from, to time.Time) error {
+	if branchID == "" || from.IsZero() || to.IsZero() {
+		return model.ErrInvalidInput
+	}
+	var batchIDs []string
+	err := s.db.WithContext(ctx).Model(&model.ReconPeriodLock{}).
+		Where("branch_id = ? AND biz_date_from <= ? AND biz_date_to >= ?", branchID, dayOnly(to), dayOnly(from)).
+		Pluck("batch_id", &batchIDs).Error
+	if err != nil {
+		return err
+	}
+	if len(batchIDs) == 0 {
+		return nil
+	}
+	var n int64
+	err = s.db.WithContext(ctx).Model(&model.ReconBatch{}).
+		Where("id IN ? AND status = ?", batchIDs, model.BatchStatusCompleted).
+		Count(&n).Error
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return fmt.Errorf("%w: %s ~ %s（已完成批次不可再改）",
+			model.ErrPeriodFrozen, from.Format("2006-01-02"), to.Format("2006-01-02"))
+	}
+	return nil
+}

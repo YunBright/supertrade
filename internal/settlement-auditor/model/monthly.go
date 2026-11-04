@@ -48,7 +48,12 @@ const (
 //
 // 解析口径变更（例如补了新的备注日期写法）后把它 +1，各门店会在下一次
 // 读取时重新回填一遍历史行。
-const MonthlyBackfillVersion = "1"
+//
+//	2 —— 付款状态口径修正：sp_status=2（通过/接单未付）改为 unpaid，
+//	     只有 10（已支付）才是 paid；旧行必须重投影。
+//	3 —— 回滚 2 的口径：付款审批的办理人处理完即 sp_status=2（企微流程结束），
+//	     2 与 10 都算 paid；旧行必须重投影。
+const MonthlyBackfillVersion = "3"
 
 // ApprovalMonthlyItem 是审批明细的月度投影（按 branch + 审批 + 明细唯一）。
 type ApprovalMonthlyItem struct {

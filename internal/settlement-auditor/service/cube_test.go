@@ -20,6 +20,9 @@ func TestParseCubeTime_MSSQLLiveSource(t *testing.T) {
 		{"12  8 2021 12:00AM", "2021-12-08 00:00"},
 		{"12  8 2021 12:30PM", "2021-12-08 12:30"},
 		{"01  2 2026 11:05PM", "2026-01-02 23:05"},
+		// 库存行 oper_date 实测（2026-11-02 ysx / hbposv7）：
+		{"11  1 2026 11:31PM", "2026-11-01 23:31"},
+		{"09 18 2026 11:31PM", "2026-09-18 23:31"},
 	}
 	for _, tc := range cases {
 		got, ok := parseCubeTime(tc.in)

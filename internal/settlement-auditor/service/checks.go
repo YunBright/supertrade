@@ -462,12 +462,11 @@ func checkQuantity(purchaseByProduct map[string]decimal.Decimal, salesByProduct 
 //
 //  1. 单位不可换算 ⇒ 只发 warn（无法比较不等于超量），不做数量阻断；
 //  2. 组内近 180 天无销量 ⇒ 按"刚收货 / 首单 / 长期无销售 / 账实缺口"分类，
-//     只有**长期无销售**（有库存且最后一次收货超过 30 天）才 block，且注明需盘点；
-//  3. 本次进货 ≤ 下限 ⇒ 不是压货（最小包装进货），不出信号；
-//  4. 补货后可售天数 ≤ 可售上限 ⇒ 通过；
-//  5. 超过「可售上限 × factor」**或**超量金额 > 300 元 ⇒ block；
+//     只有**长期无销售且扣除陈列后仍有库存**才 block，且注明需盘点；
+//  3. 扣除正常陈列后可售天数 ≤ 可售上限 ⇒ 通过；
+//  4. 超过「可售上限 × factor」**或**超量金额 > 300 元 ⇒ block；
 //     其余超过上限的情况 ⇒ warn（只提示，不阻断）；
-//  6. 价格高于历史均价 10% / 账面进货−销售−库存对不上 ⇒ 独立 warn 事实。
+//  5. 价格高于历史均价 10% / 账面进货−销售−库存对不上 ⇒ 独立 warn 事实。
 //
 // ⚠️ 消息只陈述事实，不做动机推断（措辞纪律见 llm.go 的 prompt 约束）。
 func checkGroupQuantity(groups []StockingGroupFact, factor float64, today string) []signalDraft {
@@ -515,8 +514,9 @@ func checkGroupQuantity(groups []StockingGroupFact, factor float64, today string
 			continue
 		case "long_stock":
 			out = append(out, newSignal(model.SignalBlock, SigPurchaseWithoutSales, "", g.ProductID,
-				fmt.Sprintf("商品组 %s %s;组内库存 %s,最后一次进货 %s(距今 %d 天),近 %d 天无销售记录%s;阻断条件:需盘点核对库存",
+				fmt.Sprintf("商品组 %s %s;组内库存 %s,正常陈列保有量 %s,扣除陈列后可售库存 %s;最后一次进货 %s(距今 %d 天),近 %d 天无销售记录%s;阻断条件:需盘点核对库存",
 					g.Label, groupPurchaseText(g), qtyUnitText(g.StockQty, g.BaseUnit),
+					qtyUnitText(g.DisplayQty, g.BaseUnit), qtyUnitText(g.StockAboveDisplay, g.BaseUnit),
 					g.LastReceipt, daysSince(g.LastReceipt, today), g.SampleDays, groupLossText(g)),
 				evidence))
 			continue
@@ -529,10 +529,8 @@ func checkGroupQuantity(groups []StockingGroupFact, factor float64, today string
 			continue
 		}
 
-		// 本次进货不超过「通常一次进多少」⇒ 不是压货。
-		if g.ReceivedQty.LessThanOrEqual(g.FloorQty) {
-			continue
-		}
+		// 下限已并入陈列保有量：单批最小包装进货由「可售量 = 补货后库存 − 陈列量」
+		// 覆盖，不再在这里做免判。
 		if !g.CoverageDays.GreaterThan(decimal.Zero) {
 			continue
 		}
@@ -544,7 +542,7 @@ func checkGroupQuantity(groups []StockingGroupFact, factor float64, today string
 		severe := g.CoverageDays.GreaterThan(
 			decimal.NewFromInt(int64(g.CapDays)).Mul(f))
 		amount := g.ExcessYuan.GreaterThan(decimal.NewFromInt(stockingExcessAmountYuan))
-		msg := fmt.Sprintf("商品组 %s %s;%s,补货后可售 %s 天,超过可售上限 %d 天的 %s 倍",
+		msg := fmt.Sprintf("商品组 %s %s;%s,扣除正常陈列后可售 %s 天,超过可售上限 %d 天的 %s 倍",
 			g.Label, groupPurchaseText(g), groupStockText(g),
 			g.CoverageDays.StringFixed(1), g.CapDays, over.StringFixed(1))
 		if g.ExcessYuan.GreaterThan(decimal.Zero) {
@@ -598,17 +596,21 @@ func groupLossText(g StockingGroupFact) string {
 	return fmt.Sprintf(",期间盘损 %s", qtyUnitText(g.LossQty, g.BaseUnit))
 }
 
-// groupPurchaseText 渲染组消息里的「本次进货」片段（多日写成累计+天数）。
+// groupPurchaseText 渲染组消息里的「本次进货」片段（多日写成累计+天数+批次数）。
 func groupPurchaseText(g StockingGroupFact) string {
 	s := "本次进货 " + qtyUnitText(g.ReceivedQty, g.BaseUnit)
 	if g.PurchaseDays > 1 {
 		if g.FirstDate != "" && g.LastDate != "" {
-			s = fmt.Sprintf("本次进货累计 %s(%s~%s 共 %d 天)",
+			s = fmt.Sprintf("本次进货累计 %s(%s~%s 共 %d 天",
 				qtyUnitText(g.ReceivedQty, g.BaseUnit), g.FirstDate, g.LastDate, g.PurchaseDays)
 		} else {
-			s = fmt.Sprintf("本次进货累计 %s(共 %d 天)",
+			s = fmt.Sprintf("本次进货累计 %s(共 %d 天",
 				qtyUnitText(g.ReceivedQty, g.BaseUnit), g.PurchaseDays)
 		}
+		if g.BatchCount > 1 {
+			s += fmt.Sprintf(",%d 批", g.BatchCount)
+		}
+		s += ")"
 	}
 	if g.ReturnedQty.GreaterThan(decimal.Zero) {
 		s += "(已扣退货 " + qtyUnitText(g.ReturnedQty, g.BaseUnit) + ")"
@@ -616,25 +618,38 @@ func groupPurchaseText(g StockingGroupFact) string {
 	return s
 }
 
-// groupStockText 渲染组消息里的「库存 + 销量 + 上限」片段。
+// groupStockText 渲染组消息里的「库存/入账/陈列/日均/上限/单批量级」事实。
+//
+// 2026-11-02 口径：已经入账的收货不再加到"补货后库存"（当前库存里已经包含），
+// 货架上的正常陈列也不当成可售库存 —— 两件事都必须在事实行里写清楚。
 func groupStockText(g StockingGroupFact) string {
-	s := fmt.Sprintf("组内库存 %s,补货后合计 %s,近 %d 天组销量 %s",
-		qtyUnitText(g.StockQty, g.BaseUnit), qtyUnitText(g.AfterQty, g.BaseUnit),
-		g.SampleDays, qtyUnitText(g.SalesQty, g.BaseUnit))
+	s := fmt.Sprintf("组内库存 %s;本次已入账 %s、未入账 %s;补货后合计 %s(库存+未入账)",
+		qtyUnitText(g.StockQty, g.BaseUnit),
+		qtyUnitText(g.BookedQty, g.BaseUnit), qtyUnitText(g.PendingQty, g.BaseUnit),
+		qtyUnitText(g.AfterQty, g.BaseUnit))
+	if g.BatchCount > 0 {
+		s += fmt.Sprintf(";本次共 %d 批,单批中位数 %s、最大 %s",
+			g.BatchCount, qtyUnitText(g.BatchMedian, g.BaseUnit), qtyUnitText(g.MaxBatchQty, g.BaseUnit))
+	}
+	if g.DisplayQty.GreaterThan(decimal.Zero) {
+		s += ";正常陈列保有量 " + qtyUnitText(g.DisplayQty, g.BaseUnit)
+		if g.AllowanceBoost {
+			s += "(本次含陈列费/堆头费,按 ×2 计)"
+		}
+		s += ",可售量 " + qtyUnitText(g.SellableQty, g.BaseUnit)
+	}
+	s += fmt.Sprintf(";近 %d 天组销量 %s", g.SampleDays, qtyUnitText(g.SalesQty, g.BaseUnit))
 	// 盘损也是货的去向：写出来，审批人和机器才看得懂日均是怎么来的。
 	if g.LossQty.GreaterThan(decimal.Zero) {
 		s += "、组盘损 " + qtyUnitText(g.LossQty, g.BaseUnit)
 	}
-	s += fmt.Sprintf("(有货 %d 天,日均消耗 %s),可售上限 %d 天(%s)",
+	s += fmt.Sprintf("(有货 %d 天,日均消耗 %s);可售上限 %d 天(%s)",
 		g.InStockDays, qtyUnitText(g.AvgDailySales, g.BaseUnit), g.CapDays,
 		qtyUnitText(g.CapQty, g.BaseUnit))
-	if g.AllowanceBoost {
-		s += ";本次含陈列费/堆头费,可售上限按 ×1.5 计"
-	}
-	// 进货量级事实：本单是历史常见单次进货量的几倍。
-	if g.SingleMedian.GreaterThan(decimal.Zero) && g.ReceivedQty.GreaterThan(decimal.Zero) {
-		ratio := g.ReceivedQty.Div(g.SingleMedian).Round(1)
-		s += fmt.Sprintf(";近 %d 天单次进货中位数 %s,本单约为其 %s 倍",
+	// 进货量级事实：看**单批最大**，不看多日累计。
+	if g.SingleMedian.GreaterThan(decimal.Zero) && g.MaxBatchQty.GreaterThan(decimal.Zero) {
+		ratio := g.MaxBatchQty.Div(g.SingleMedian).Round(1)
+		s += fmt.Sprintf(";近 %d 天历史单批中位数 %s,本次单批最大约为其 %s 倍",
 			g.SampleDays, qtyUnitText(g.SingleMedian, g.BaseUnit), ratio.StringFixed(1))
 	}
 	return s
@@ -643,39 +658,47 @@ func groupStockText(g StockingGroupFact) string {
 // groupEvidence 组装组级信号的证据参数（审批详情页 / LLM 核对用）。
 func groupEvidence(g StockingGroupFact) map[string]any {
 	return map[string]any{
-		"group_key":        g.GroupKey,
-		"product_id":       g.ProductID,
-		"members":          g.MemberIDs,
-		"base_unit":        g.BaseUnit,
-		"received":         g.ReceivedQty.String(),
-		"received_gross":   g.ReceivedGross.String(),
-		"returned":         g.ReturnedQty.String(),
-		"received_amount":  g.ReceivedAmountYuan.String(),
-		"purchase_days":    g.PurchaseDays,
-		"first_date":       g.FirstDate,
-		"last_date":        g.LastDate,
-		"stock_qty":        g.StockQty.String(),
-		"after_qty":        g.AfterQty.String(),
-		"sales_qty":        g.SalesQty.String(),
-		"loss_qty":         g.LossQty.String(),
-		"recent_sales_qty": g.RecentSalesQty.String(),
-		"in_stock_days":    g.InStockDays,
-		"avg_daily_sales":  g.AvgDailySales.String(),
-		"cap_days":         g.CapDays,
-		"cap_qty":          g.CapQty.String(),
-		"coverage_days":    g.CoverageDays.String(),
-		"excess_qty":       g.ExcessQty.String(),
-		"excess_yuan":      g.ExcessYuan.String(),
-		"floor_qty":        g.FloorQty.String(),
-		"single_median":    g.SingleMedian.String(),
-		"price_this":       g.PriceThis.String(),
-		"price_history":    g.PriceHistory.String(),
-		"price_rise_pct":   g.PriceRisePct.String(),
-		"ledger_gap":       g.LedgerGap.String(),
-		"zero_sales_case":  g.ZeroSalesCase,
-		"unconvertible":    g.Unconvertible,
-		"unit_note":        g.UnitNote,
-		"allowance_boost":  g.AllowanceBoost,
+		"group_key":           g.GroupKey,
+		"product_id":          g.ProductID,
+		"members":             g.MemberIDs,
+		"base_unit":           g.BaseUnit,
+		"received":            g.ReceivedQty.String(),
+		"received_gross":      g.ReceivedGross.String(),
+		"returned":            g.ReturnedQty.String(),
+		"pending_qty":         g.PendingQty.String(),
+		"booked_qty":          g.BookedQty.String(),
+		"batch_count":         g.BatchCount,
+		"max_batch_qty":       g.MaxBatchQty.String(),
+		"batch_median":        g.BatchMedian.String(),
+		"received_amount":     g.ReceivedAmountYuan.String(),
+		"purchase_days":       g.PurchaseDays,
+		"first_date":          g.FirstDate,
+		"last_date":           g.LastDate,
+		"stock_qty":           g.StockQty.String(),
+		"display_qty":         g.DisplayQty.String(),
+		"display_source":      g.DisplaySource,
+		"sellable_qty":        g.SellableQty.String(),
+		"stock_above_display": g.StockAboveDisplay.String(),
+		"after_qty":           g.AfterQty.String(),
+		"sales_qty":           g.SalesQty.String(),
+		"loss_qty":            g.LossQty.String(),
+		"recent_sales_qty":    g.RecentSalesQty.String(),
+		"in_stock_days":       g.InStockDays,
+		"avg_daily_sales":     g.AvgDailySales.String(),
+		"cap_days":            g.CapDays,
+		"cap_qty":             g.CapQty.String(),
+		"coverage_days":       g.CoverageDays.String(),
+		"excess_qty":          g.ExcessQty.String(),
+		"excess_yuan":         g.ExcessYuan.String(),
+		"single_median":       g.SingleMedian.String(),
+		"price_this":          g.PriceThis.String(),
+		"price_history":       g.PriceHistory.String(),
+		"price_rise_pct":      g.PriceRisePct.String(),
+		"ledger_gap":          g.LedgerGap.String(),
+		"zero_sales_case":     g.ZeroSalesCase,
+		"unconvertible":       g.Unconvertible,
+		"unit_note":           g.UnitNote,
+		"allowance_boost":     g.AllowanceBoost,
 	}
 }
 

@@ -1,20 +1,24 @@
-// Package model / product_profile.go —— 商品经营属性 + 进货下限 + 历史缓存
-// （2026-11-01 用户口径）。
+// Package model / product_profile.go —— 商品经营属性 + 陈列保有量 + 历史缓存
+// （2026-11-01 / 2026-11-02 用户口径）。
 //
 // # 三张表各管一件事
 //
-//	product_profiles    这个商品的「可售上限天数」与保质期 —— 自动按品名/规格标记，
-//	                    人工可修正；审批时按**组**取最严的那一个当上限。
-//	stocking_floors     这个**组**的「一次进货下限」—— 低于它就不是压货，
-//	                    只是"按最小包装进了一次货"，自动按历史单次进货量 P25 算。
+//	product_profiles    这个商品的「可售上限天数」与保质期 —— 自动按思迅类别标记、
+//	                    品名关键词兜底，人工可修正；审批时按**组**取最严的那一个当上限。
+//	stocking_displays   这个**组**的「正常陈列保有量」—— 货架上的陈列不算可售库存，
+//	                    自动按历史单批进货量 P50 算；人工改过的不再自动覆盖。
 //	stocking_fact_cache 近 180 天历史聚合的缓存（TTL 12 小时）——
 //	                    同一批 SKU 一天内被多次审批命中时不再重复打源库。
 //
 // # 为什么都要自动生成
 //
 // 用户口径（2026-11-01）：「系统功能要够，但操作要足够少、足够简单」——
-// 下限不能让管理员一个个设；品类/保质期也不能靠人工录，否则等于虚设。
+// 品类/保质期/陈列量不能靠人工录，否则等于虚设。
 // ⇒ 三张表都是**审批时被动触发**写入，人工只在「阻断后修正清单」里改个别行。
+//
+// ⚠️ 2026-11-02：旧的「一次进货下限」（stocking_floors）已并入陈列保有量——
+//
+//	单批最小包装进货由陈列保有量覆盖，不再单独维护下限参数。
 //
 // # 为什么落在本域 PG 而不是 cube
 //
@@ -29,7 +33,7 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-// 商品经营属性/下限的来源（与备货系数共用同一套取值）。
+// 商品经营属性/陈列量的来源（与备货系数共用同一套取值）。
 const (
 	// ProfileSourceAuto 是系统按品名关键词自动标记（审批通过时写入）。
 	ProfileSourceAuto = "auto"
@@ -75,33 +79,42 @@ type ProductProfile struct {
 
 func (ProductProfile) TableName() string { return "product_profiles" }
 
-// StockingFloor 是一个**商品组**的一次进货下限（下限触发式自动生成）。
+// StockingDisplay 是一个**商品组**的正常陈列保有量（2026-11-02 用户口径）。
 //
 // # 它解决什么
 //
-//	「1 件 1 件卖的极低频商品，一次进了 3 件，按可售天数算是 90 天，
-//	 但 3 件就是这个商品的最小进货包装 —— 这不是压货，是正常补货。」
+//	货架上的陈列量不是"可售库存"：除非卖空，否则这批货要一直摆在架上。
+//	只按「库存 / 日均销量」算可售天数，会把正常陈列当成压货
+//	（生产实测毛笔库存 19 支、日均 0.09 支 ⇒ 判 415 天）。
 //
-// ⇒ 判「超量」之前先看本次进货量是否**不超过这个商品通常一次进货量**：
-// 不超过就不是压货，只留事实。
+// ⇒ 判超量前先把陈列保有量从可售量里扣掉：
 //
-// # 怎么算（见 service/stocking_group.go）
+//	可售量 = 补货后库存 − 陈列保有量
 //
-//	FloorQty = clamp(max(1, P25(近 180 天单次进货量)), 1, max(1, 日均销量 × 可售上限))
+// # 怎么生成
 //
-// 无历史进货时用箱规/组合换算率（如 1 提 = 12 罐 ⇒ 下限 12 罐），再夹取。
+//	DisplayQty = P50(近 180 天单批净进货量)  ← 大约等于"一次正常铺货的量"
+//	无历史进货 ⇒ 1。
 //
-// ⚠️ GroupKey 是**组成员签名**（排序后的货号列表），因为组合/拆分商品
-// 的进货单位与销售单位不同，下限属于「组」而不是单个货号。
-type StockingFloor struct {
+// ⚠️ 自动生成只在审批触发时刷新 Source=auto 的行；
+//
+//	人工在后台改过（Source=manual）的行**永不覆盖**，且与日均/上限天数的
+//	180 天学习完全独立 —— 改陈列量不会影响可售天数算法本身。
+//
+// ⚠️ 有陈列费/堆头费时，运行时把 DisplayQty ×2（见 service/stocking_group.go），
+//
+//	存的是**未乘倍数的基数**，这样人工修正与放宽倍数互不污染。
+type StockingDisplay struct {
 	ID       string `gorm:"primaryKey;size:36" json:"id"`
-	BranchID string `gorm:"size:32;uniqueIndex:ux_stocking_floor,priority:1" json:"branch_id"`
-	GroupKey string `gorm:"size:160;uniqueIndex:ux_stocking_floor,priority:2" json:"group_key"`
-	// ProductID 是组内代表货号（本单进货量最大的那个，纯展示/检索用）。
+	BranchID string `gorm:"size:32;uniqueIndex:ux_stocking_display,priority:1" json:"branch_id"`
+	GroupKey string `gorm:"size:160;uniqueIndex:ux_stocking_display,priority:2" json:"group_key"`
+	// ProductID 是组内代表货号（纯展示/检索用）。
 	ProductID string `gorm:"size:64;index" json:"product_id"`
-	// FloorQty 是一次进货下限（**组基准单位**，见 service/units.go 的换算）。
-	FloorQty decimal.Decimal `gorm:"type:numeric(14,3)" json:"floor_qty"`
-	// SampleDays / ReceiptCount 是算出下限所用的历史窗口与进货次数。
+	// ProductName 是代表货号的名称快照（纯展示）。
+	ProductName string `gorm:"size:128" json:"product_name"`
+	// DisplayQty 是正常陈列保有量（**组基准单位**，未乘陈列费倍数）。
+	DisplayQty decimal.Decimal `gorm:"type:numeric(14,3)" json:"display_qty"`
+	// SampleDays / ReceiptCount 是算出陈列量所用的历史窗口与进货次数。
 	SampleDays   int `json:"sample_days"`
 	ReceiptCount int `json:"receipt_count"`
 	// Source 是 ProfileSourceAuto / Pending / Manual。
@@ -113,7 +126,7 @@ type StockingFloor struct {
 	UpdatedAt  time.Time `json:"updated_at"`
 }
 
-func (StockingFloor) TableName() string { return "stocking_floors" }
+func (StockingDisplay) TableName() string { return "stocking_displays" }
 
 // StockingFactCache 是单个商品的**近 180 天历史聚合**缓存（按商品，不按组）。
 //

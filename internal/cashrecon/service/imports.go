@@ -132,10 +132,11 @@ func (s *Service) ImportBankFlows(ctx context.Context, in ImportBankInput) (Impo
 		valid = append(valid, r)
 	}
 
-	// 冻结区间整批拒绝（不部分成功）。
+	// 已完成批次锁定的区间整批拒绝（不部分成功）；
+	// 冻结/审核中的批次允许导入，导入后「重做」即可把差异重算出来。
 	for d := range dates {
 		day, _ := parseDay(d)
-		if err := s.assertNotLocked(ctx, in.BranchID, day, day); err != nil {
+		if err := s.assertNotLockedByCompleted(ctx, in.BranchID, day, day); err != nil {
 			return ImportBankResult{}, err
 		}
 	}

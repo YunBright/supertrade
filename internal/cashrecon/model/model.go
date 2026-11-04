@@ -144,6 +144,28 @@ const (
 	PaymentSourceManual = "manual"
 )
 
+// ---- 付款匹配状态 ----
+//
+// 审批同步：sp_status=2（审批通过/处理人接单）⇒ unpaid（未付款）；
+// sp_status=10（处理人完成付款）⇒ matched（确认匹配）。
+// 已付款的单如有特殊处理，再改成 reason/hang/escalate。
+// 手工登记的付款行是 pending，核销（对上银行流水）后变 matched。
+const (
+	PaymentMatchUnpaid    = "unpaid"
+	PaymentMatchMatched   = "matched"
+	PaymentMatchReasoned  = "reasoned"
+	PaymentMatchHung      = "hung"
+	PaymentMatchEscalated = "escalated"
+	PaymentMatchPending   = "pending"
+)
+
+// ---- 付款匹配特殊处理动作 ----
+const (
+	PaymentActionReason   = "reason"
+	PaymentActionHang     = "hang"
+	PaymentActionEscalate = "escalate"
+)
+
 // ---- 现金实盘状态 ----
 const (
 	CashCountStatusOpen      = "open"
@@ -406,9 +428,14 @@ type ReconPaymentRecord struct {
 	BankFlowID   string          `gorm:"column:bank_flow_id;type:varchar(36)" json:"bank_flow_id"`
 	Verified     bool            `gorm:"column:verified;not null;default:false;index" json:"verified"`
 	VerifiedBy   string          `gorm:"column:verified_by;type:varchar(64)" json:"verified_by"`
-	Note         string          `gorm:"column:note;type:varchar(512)" json:"note"`
-	CreatedAt    time.Time       `gorm:"column:created_at;not null" json:"created_at"`
-	UpdatedAt    time.Time       `gorm:"column:updated_at;not null" json:"updated_at"`
+	// MatchStatus 是"这笔付款是否确认匹配"。审批同步默认 matched；手工登记先 pending，
+	// 真正对上银行流水后才是 matched。
+	MatchStatus string `gorm:"column:match_status;type:varchar(16);not null;default:pending;index" json:"match_status"`
+	// MatchReason 是特殊处理（说明原因/挂起/升级）的备注。
+	MatchReason string    `gorm:"column:match_reason;type:varchar(512)" json:"match_reason"`
+	Note        string    `gorm:"column:note;type:varchar(512)" json:"note"`
+	CreatedAt   time.Time `gorm:"column:created_at;not null" json:"created_at"`
+	UpdatedAt   time.Time `gorm:"column:updated_at;not null" json:"updated_at"`
 }
 
 // TableName 显式指定表名。

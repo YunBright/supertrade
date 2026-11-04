@@ -78,9 +78,14 @@ func parseYearMonth(remark string, defaultYear int) (string, bool) {
 
 // monthlyPayState 把 sp_status 映射成付款状态。
 //
-//	2 通过 / 10 已支付 ⇒ paid
+//	2 审批通过（办理人已处理、企微流程结束）/ 10 已支付 ⇒ paid
 //	1 审批中 / 3 驳回 / 4 撤销 / 6 通过后撤销 ⇒ unpaid
 //	其它（0 未提交）⇒ 空（保持"未知"，不冒充 unpaid）
+//
+// ⚠️ 付款审批是「审批人 → 办理人」两段，办理人处理完本单付款后企微才把
+// 整单置为 sp_status=2（企微不保证另有 10 的「已支付」回调）。所以 2 就是
+// **已付款**：资金对账同步后默认「确认匹配」。把 2 当未付款会让所有已
+// 完成终审的付款单永久显示未付款。
 func monthlyPayState(spStatus int) string {
 	switch spStatus {
 	case SpStatusApproved, SpStatusPaid:

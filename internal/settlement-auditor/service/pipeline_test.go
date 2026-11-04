@@ -411,7 +411,7 @@ func newTestService(t *testing.T) (*Service, *gorm.DB, *fakeCube, *fakePublisher
 		&model.AuditSupplierFlow{}, &model.AuditPaymentItemFlow{}, &model.AuditRegexPattern{},
 		&model.ApprovalMonthlyItem{}, &model.ApprovalMonthlyBackfill{},
 		&model.StockingCoefficient{},
-		&model.ProductProfile{}, &model.StockingFloor{}, &model.StockingFactCache{},
+		&model.ProductProfile{}, &model.StockingDisplay{}, &model.StockingFactCache{},
 	); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}

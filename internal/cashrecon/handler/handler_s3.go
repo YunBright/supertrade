@@ -42,6 +42,7 @@ func (h *Handler) registerRoutesS3(r gin.IRouter, requireBranch gin.HandlerFunc,
 	r.GET("/payments", requireBranch, guard(ScopeView), h.ListPayments)
 	r.GET("/payments/:id", requireBranch, guard(ScopeView), h.GetPayment)
 	r.POST("/payments/:id/verify", requireBranch, guard(ScopeReview), h.VerifyPayment)
+	r.POST("/payments/:id/actions", requireBranch, guard(ScopeReview), h.ActOnPayment)
 
 	// ---- 供应商应付（FR-08） ----
 	r.GET("/payables/suppliers", requireBranch, guard(ScopeView), h.SupplierPayables)
@@ -461,6 +462,8 @@ type paymentView struct {
 	BankFlowID   string     `json:"bank_flow_id,omitempty"`
 	Verified     bool       `json:"verified"`
 	VerifiedBy   string     `json:"verified_by,omitempty"`
+	MatchStatus  string     `json:"match_status"`
+	MatchReason  string     `json:"match_reason,omitempty"`
 	Note         string     `json:"note,omitempty"`
 	CreatedAt    time.Time  `json:"created_at"`
 }
@@ -478,6 +481,8 @@ func paymentViewOf(r model.ReconPaymentRecord) paymentView {
 		BankFlowID:   r.BankFlowID,
 		Verified:     r.Verified,
 		VerifiedBy:   r.VerifiedBy,
+		MatchStatus:  r.MatchStatus,
+		MatchReason:  r.MatchReason,
 		Note:         r.Note,
 		CreatedAt:    r.CreatedAt,
 	}
@@ -619,6 +624,40 @@ func (h *Handler) VerifyPayment(c *gin.Context) {
 		BankFlowID: req.BankFlowID,
 		Note:       req.Note,
 		Actor:      actor,
+	})
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, paymentViewOf(row))
+}
+
+// paymentActionReq 是付款匹配特殊处理请求体。
+type paymentActionReq struct {
+	Action string `json:"action"`
+	Reason string `json:"reason"`
+}
+
+// ActOnPayment POST /payments/:id/actions
+//
+// action ∈ reason / hang / escalate；reason 必填。
+func (h *Handler) ActOnPayment(c *gin.Context) {
+	var req paymentActionReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_request", "请求体必须是 JSON: {action,reason}")
+		return
+	}
+	actor := operatorOf(c)
+	if actor == "" {
+		writeError(c, http.StatusUnauthorized, "unauthenticated", "缺少调用者身份")
+		return
+	}
+	row, err := h.svc.ActOnPayment(c.Request.Context(), service.ActOnPaymentInput{
+		BranchID:  branchIDOf(c),
+		PaymentID: c.Param("id"),
+		Action:    req.Action,
+		Reason:    req.Reason,
+		Actor:     actor,
 	})
 	if err != nil {
 		mapErr(c, err)

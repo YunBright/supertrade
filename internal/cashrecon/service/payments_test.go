@@ -33,12 +33,16 @@ func seedMonthlyItems(t *testing.T, db *gorm.DB, rows ...model.CrossMonthlyItem)
 		if rows[i].CreatedAt.IsZero() {
 			rows[i].CreatedAt = testClock
 		}
+		// 已付款口径 = pay_state:paid 且 sp_status 2 或 10（见 SyncPayments）。
+		if rows[i].PayState == crossPayStatePaid && rows[i].SpStatus == 0 {
+			rows[i].SpStatus = crossSpStatusPaid
+		}
 		require.NoError(t, db.Create(&rows[i]).Error)
 	}
 }
 
 // TestSyncPayments_IdempotentAndFilters 锁住：
-// 只同步已付 + 付款项 + 未排除终态；重复同步不新增、不覆盖人工字段。
+// 只同步「终审完成(2)/已支付(10)」的付款项且排除终态；重复同步不新增、不覆盖人工字段。
 func TestSyncPayments_IdempotentAndFilters(t *testing.T) {
 	svc, db := newPaymentsTestService(t)
 	ctx := context.Background()
@@ -48,7 +52,8 @@ func TestSyncPayments_IdempotentAndFilters(t *testing.T) {
 		model.CrossMonthlyItem{
 			ID: paidItemID, BranchID: "00", ApprovalID: "a1", ItemID: "i1",
 			Direction: crossDirectionPayment, ItemType: "货款", AmountYuan: dec("100"),
-			PayState: crossPayStatePaid, InstanceStatus: "human_approved",
+			PayState: crossPayStatePaid, SpStatus: crossSpStatusApproved,
+			InstanceStatus: "human_approved", // 办理人处理完、企微流程结束 ⇒ 已付款
 		},
 		model.CrossMonthlyItem{
 			ID: newID(), BranchID: "00", ApprovalID: "a2", ItemID: "i2",
@@ -58,12 +63,19 @@ func TestSyncPayments_IdempotentAndFilters(t *testing.T) {
 		model.CrossMonthlyItem{
 			ID: newID(), BranchID: "00", ApprovalID: "a3", ItemID: "i3",
 			Direction: crossDirectionPayment, ItemType: "租金", AmountYuan: dec("20"),
-			PayState: crossPayStateUnpaid, InstanceStatus: "human_approved", // 未付：不进台账
+			PayState: crossPayStateUnpaid, SpStatus: 1,
+			InstanceStatus: "auditing", // 审批中：不同步
 		},
 		model.CrossMonthlyItem{
 			ID: newID(), BranchID: "00", ApprovalID: "a4", ItemID: "i4",
 			Direction: "receipt", ItemType: "陈列费", AmountYuan: dec("10"),
 			PayState: crossPayStatePaid, InstanceStatus: "human_approved", // 收款项：不是付款
+		},
+		model.CrossMonthlyItem{
+			ID: newID(), BranchID: "00", ApprovalID: "a6", ItemID: "i6",
+			Direction: crossDirectionPayment, ItemType: "货款", AmountYuan: dec("40"),
+			PayState: crossPayStatePaid, SpStatus: crossSpStatusPaid,
+			InstanceStatus: "human_approved", // 已支付回写：同样进台账
 		},
 		model.CrossMonthlyItem{
 			ID: newID(), BranchID: "01", ApprovalID: "a5", ItemID: "i5",
@@ -74,8 +86,8 @@ func TestSyncPayments_IdempotentAndFilters(t *testing.T) {
 
 	res, err := svc.SyncPayments(ctx, "00")
 	require.NoError(t, err)
-	require.Equal(t, 1, res.Scanned, "只有一条同时满足 已付+付款项+非终态+本门店")
-	require.Equal(t, 1, res.Inserted)
+	require.Equal(t, 2, res.Scanned, "终审完成(2) + 已支付(10) 的付款项都进台账")
+	require.Equal(t, 2, res.Inserted)
 
 	var pay model.ReconPaymentRecord
 	// source_id 记的是月度总表的 item_id（不是行 ID），与月度总表的幂等键对齐。
@@ -83,23 +95,193 @@ func TestSyncPayments_IdempotentAndFilters(t *testing.T) {
 		"00", model.PaymentSourceWecom, "i1").First(&pay).Error)
 	require.Equal(t, "货款", pay.SupplierName, "供应商名按 item_type 落到台账")
 	require.Equal(t, "100", pay.Amount.String())
-	require.False(t, pay.Verified)
+	require.True(t, pay.Verified, "终审完成 = 已付款 ⇒ 默认确认匹配（无需银行流水核销）")
+	require.Equal(t, model.PaymentMatchMatched, pay.MatchStatus)
+	require.Equal(t, approvalSyncActor, pay.VerifiedBy)
 
-	// 人工把台账字段改掉后再次同步：必须原样保留（同步只补缺失行）。
+	var paid model.ReconPaymentRecord
+	require.NoError(t, db.Where("branch_id = ? AND source = ? AND source_id = ?",
+		"00", model.PaymentSourceWecom, "i6").First(&paid).Error)
+	require.True(t, paid.Verified, "已支付(10) 同样是已付款")
+	require.Equal(t, model.PaymentMatchMatched, paid.MatchStatus)
+
+	// 审批中的单不落台账。
+	var n int64
+	require.NoError(t, db.Model(&model.ReconPaymentRecord{}).
+		Where("branch_id = ? AND source = ? AND source_id = ?",
+			"00", model.PaymentSourceWecom, "i3").Count(&n).Error)
+	require.Zero(t, n, "审批中(1) 不能进付款台账")
+
+	// 人工改字段/做特殊处理后再次同步：必须原样保留。
 	pay.SupplierName = "真实供应商"
-	pay.Verified = true
 	require.NoError(t, db.Model(&model.ReconPaymentRecord{}).Where("id = ?", pay.ID).
-		Updates(map[string]any{"supplier_name": pay.SupplierName, "verified": pay.Verified}).Error)
+		Updates(map[string]any{
+			"supplier_name": pay.SupplierName,
+			"match_status":  model.PaymentMatchHung,
+			"match_reason":  "待与审批人确认",
+		}).Error)
 
 	again, err := svc.SyncPayments(ctx, "00")
 	require.NoError(t, err)
-	require.Equal(t, 1, again.Scanned)
+	require.Equal(t, 2, again.Scanned)
 	require.Equal(t, 0, again.Inserted, "已存在的行不得重复插入")
+	require.Equal(t, 0, again.Updated, "状态未变 ⇒ 不产生更新")
 
 	var after model.ReconPaymentRecord
 	require.NoError(t, db.Where("id = ?", pay.ID).First(&after).Error)
 	require.Equal(t, "真实供应商", after.SupplierName, "同步不得覆盖人工字段")
+	require.Equal(t, model.PaymentMatchHung, after.MatchStatus, "挂起等特殊处理不得被同步重置")
+	require.Equal(t, "待与审批人确认", after.MatchReason)
+}
+
+// TestSyncPayments_UnpaidRowBecomesMatched 旧口径已同步成「未付款」的行，
+// 在审批终审完成（sp_status=2）后再次同步要归位为「已付款 + 确认匹配」。
+func TestSyncPayments_UnpaidRowBecomesMatched(t *testing.T) {
+	svc, db := newPaymentsTestService(t)
+	ctx := context.Background()
+
+	item := model.CrossMonthlyItem{
+		ID: newID(), BranchID: "00", ApprovalID: "a1", ItemID: "i1",
+		Direction: crossDirectionPayment, ItemType: "货款", AmountYuan: dec("100"),
+		PayState: crossPayStatePaid, SpStatus: crossSpStatusApproved,
+		InstanceStatus: "human_approved",
+	}
+	seedMonthlyItems(t, db, item)
+
+	// 上一版同步把终审完成的单当成了未付款。
+	legacy := model.ReconPaymentRecord{
+		ID: newID(), BranchID: "00", Source: model.PaymentSourceWecom, SourceID: "i1",
+		SupplierName: "货款", Amount: dec("100"), Verified: false,
+		MatchStatus: model.PaymentMatchUnpaid, CreatedAt: testClock, UpdatedAt: testClock,
+	}
+	require.NoError(t, db.Create(&legacy).Error)
+
+	res, err := svc.SyncPayments(ctx, "00")
+	require.NoError(t, err)
+	require.Equal(t, 0, res.Inserted)
+	require.Equal(t, 1, res.Updated)
+
+	var after model.ReconPaymentRecord
+	require.NoError(t, db.Where("id = ?", legacy.ID).First(&after).Error)
 	require.True(t, after.Verified)
+	require.Equal(t, model.PaymentMatchMatched, after.MatchStatus)
+	require.Equal(t, approvalSyncActor, after.VerifiedBy)
+}
+
+// TestSyncPayments_LegacyPendingBecomesMatched 旧口径同步的行（verified=false 且 pending）
+// 在再次同步时一次性归位为「确认匹配」，不会永远卡在"无法确认"。
+func TestSyncPayments_LegacyPendingBecomesMatched(t *testing.T) {
+	svc, db := newPaymentsTestService(t)
+	ctx := context.Background()
+
+	seedMonthlyItems(t, db, model.CrossMonthlyItem{
+		ID: newID(), BranchID: "00", ApprovalID: "a1", ItemID: "i1",
+		Direction: crossDirectionPayment, ItemType: "货款", AmountYuan: dec("100"),
+		PayState: crossPayStatePaid, InstanceStatus: "human_approved",
+	})
+	legacy := model.ReconPaymentRecord{
+		ID: newID(), BranchID: "00", Source: model.PaymentSourceWecom, SourceID: "i1",
+		SupplierName: "货款", Amount: dec("100"), Verified: false,
+		MatchStatus: model.PaymentMatchPending, CreatedAt: testClock, UpdatedAt: testClock,
+	}
+	require.NoError(t, db.Create(&legacy).Error)
+
+	res, err := svc.SyncPayments(ctx, "00")
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Scanned)
+	require.Equal(t, 0, res.Inserted)
+	require.Equal(t, 1, res.Updated)
+
+	var after model.ReconPaymentRecord
+	require.NoError(t, db.Where("id = ?", legacy.ID).First(&after).Error)
+	require.True(t, after.Verified)
+	require.Equal(t, model.PaymentMatchMatched, after.MatchStatus)
+	require.Equal(t, approvalSyncActor, after.VerifiedBy)
+}
+
+// TestSyncPayments_ClearsUnpaidSyncedRows 审批侧回退为未付款/终态时，
+// 自动确认的同步行被移除；人工核销过的行保留（那是银行事实的关联）。
+func TestSyncPayments_ClearsUnpaidSyncedRows(t *testing.T) {
+	svc, db := newPaymentsTestService(t)
+	ctx := context.Background()
+
+	// 审批侧已经没有 paid 项（全部回退成未付）。
+	for _, row := range []model.ReconPaymentRecord{
+		{ID: newID(), BranchID: "00", Source: model.PaymentSourceWecom, SourceID: "i-old",
+			SupplierName: "旧货款", Amount: dec("10"), Verified: true, VerifiedBy: approvalSyncActor,
+			MatchStatus: model.PaymentMatchMatched, CreatedAt: testClock, UpdatedAt: testClock},
+		{ID: newID(), BranchID: "00", Source: model.PaymentSourceWecom, SourceID: "i-manual",
+			SupplierName: "人工核销", Amount: dec("20"), Verified: true, VerifiedBy: "u1",
+			MatchStatus: model.PaymentMatchMatched, CreatedAt: testClock, UpdatedAt: testClock},
+	} {
+		require.NoError(t, db.Create(&row).Error)
+	}
+
+	res, err := svc.SyncPayments(ctx, "00")
+	require.NoError(t, err)
+	require.Equal(t, 1, res.Cleared, "只清自动确认的同步行")
+	require.Equal(t, int64(1), countPayments(t, db, "00"))
+}
+
+// countPayments 数本门店付款台账行数。
+func countPayments(t *testing.T, db *gorm.DB, branchID string) int64 {
+	t.Helper()
+	var n int64
+	require.NoError(t, db.Model(&model.ReconPaymentRecord{}).Where("branch_id = ?", branchID).Count(&n).Error)
+	return n
+}
+
+// TestActOnPayment_RequiresReasonAndOnlyForWecom 锁住特殊处理的口径：
+// reason 必填、动作合法、只作用于审批同步的付款。
+func TestActOnPayment_RequiresReasonAndOnlyForWecom(t *testing.T) {
+	svc, db := newPaymentsTestService(t)
+	ctx := context.Background()
+
+	seedMonthlyItems(t, db, model.CrossMonthlyItem{
+		ID: newID(), BranchID: "00", ApprovalID: "a1", ItemID: "i1",
+		Direction: crossDirectionPayment, ItemType: "货款", AmountYuan: dec("100"),
+		PayState: crossPayStatePaid, InstanceStatus: "human_approved",
+	})
+	_, err := svc.SyncPayments(ctx, "00")
+	require.NoError(t, err)
+	var pay model.ReconPaymentRecord
+	require.NoError(t, db.Where("branch_id = ? AND source = ? AND source_id = ?",
+		"00", model.PaymentSourceWecom, "i1").First(&pay).Error)
+
+	_, err = svc.ActOnPayment(ctx, ActOnPaymentInput{
+		BranchID: "00", PaymentID: pay.ID, Action: model.PaymentActionHang, Actor: "u1",
+	})
+	require.ErrorIs(t, err, model.ErrInvalidInput, "挂起也要说明原因")
+
+	_, err = svc.ActOnPayment(ctx, ActOnPaymentInput{
+		BranchID: "00", PaymentID: pay.ID, Action: "unknown", Reason: "x", Actor: "u1",
+	})
+	require.ErrorIs(t, err, model.ErrInvalidInput)
+
+	hung, err := svc.ActOnPayment(ctx, ActOnPaymentInput{
+		BranchID: "00", PaymentID: pay.ID, Action: model.PaymentActionHang,
+		Reason: "金额待核对", Actor: "u1",
+	})
+	require.NoError(t, err)
+	require.Equal(t, model.PaymentMatchHung, hung.MatchStatus)
+	require.Equal(t, "金额待核对", hung.MatchReason)
+
+	var log model.ReconAuditLog
+	require.NoError(t, db.Where("object_type = ? AND object_id = ?", "payment", pay.ID).
+		Order("created_at DESC").First(&log).Error)
+	require.Equal(t, "match_hang", log.Action)
+	require.Equal(t, "金额待核对", log.Reason)
+
+	// 手工登记的付款不做这套状态机（走银行流水核销）。
+	manual, err := svc.RegisterPayment(ctx, RegisterPaymentInput{
+		BranchID: "00", SupplierName: "供应商A", Amount: dec("10"), Actor: "u1",
+	})
+	require.NoError(t, err)
+	_, err = svc.ActOnPayment(ctx, ActOnPaymentInput{
+		BranchID: "00", PaymentID: manual.ID, Action: model.PaymentActionEscalate,
+		Reason: "x", Actor: "u1",
+	})
+	require.ErrorIs(t, err, model.ErrInvalidInput)
 }
 
 // seedPaymentFlow 写入一条银行流水（核销的对手方）。

@@ -11,18 +11,22 @@
 //
 // 新口径只回答一个问题：
 //
-//	把这批货补进去之后，组里所有成员加起来够卖多少天？
+//	把这批货补进去之后，组里**真正可售**的量够卖多少天？
 //	—— 超过这个品类的可售上限，才是"补过头"。
 //
-// # 三条硬口径
+// # 三条硬口径（2026-11-02 修订）
 //
 //  1. **组**：组合/拆分商品（整件进货、拆散零售）按商品档案的父子关系归并，
 //     库存/销量/进货都换算到**组基准单位**（通常是整件）再相加（见 units.go）。
-//  2. **下限**：一次进货量不超过这个商品「通常一次进多少」（历史单次进货量 P25）
-//     就不算压货 —— 1 件 1 件卖的东西进 3 件可能就是最小包装。下限自动生成，
-//     人工可修正（stocking_floors）。
-//  3. **可售上限**按品类档位（生鲜 7 天 / 冷藏 20 / 冷冻 30 / 饮料 45 / 日用 90），
-//     自动按品名标记、人工可修正（product_profiles）；有陈列费/堆头费时 ×1.5。
+//  2. **已入账 ≠ 本次补货**：收货日 <= 该商品库存行最后变动日（oper_date）⇒
+//     这批货已经体现在当前库存里，**不再重复叠加**；只有之后到的货才算未入账。
+//     多日合并付款的累计量也不能当成一次备货量：单批量级按收货日拆开看。
+//  3. **陈列保有量**：货架上的正常陈列不是可售库存 ⇒
+//     可售量 = 补货后库存 − 陈列保有量（P50 自动生成，人工可修正）。
+//     有陈列费/堆头费时陈列量 ×2（不再放大可售上限天数）。
+//     ⚠️ 单批最小包装进货也由陈列保有量覆盖，不再单独维护「一次进货下限」。
+//  4. **可售上限**按品类档位（生鲜 7 天 / 冷藏 20 / 冷冻 30 / 饮料 45 / 日用 90），
+//     优先按思迅类别自动标记、品名关键词兜底、人工可修正（product_profiles）。
 //
 // # 性能
 //
@@ -35,7 +39,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 	"time"
@@ -68,6 +71,10 @@ const (
 	stockingCacheTTL = 12 * time.Hour
 	// stockingQueryChunk 是单次 cube 查询的商品数上限（IN 子句保护）。
 	stockingQueryChunk = 120
+	// stockingDisplayAllowanceMultiplier 是"有陈列费/堆头费"时陈列保有量的倍数。
+	//
+	// 2026-11-02 用户口径：陈列费/堆头费放宽的是**陈列量**，不是可售天数。
+	stockingDisplayAllowanceMultiplier = 2
 )
 
 // groupQuerier 是组级备货判定额外需要的 cube 能力（可选接口）。
@@ -77,6 +84,7 @@ const (
 type groupQuerier interface {
 	ListItemCombos(ctx context.Context, branchID string) ([]ComboRelation, error)
 	ListProductUnits(ctx context.Context, branchID string, productIDs []string) (map[string]ProductUnitInfo, error)
+	ListProductCategories(ctx context.Context, branchID string, categoryIDs []string) (map[string]CategoryInfo, error)
 	ListProductPurchaseHistory(ctx context.Context, branchID string, productIDs []string, fromDate, toDate string) ([]PurchaseHistoryRow, error)
 }
 
@@ -110,23 +118,45 @@ type StockingGroupFact struct {
 	SingleMedian decimal.Decimal
 
 	// ---- 本次审批 ----
-	ReceivedQty        decimal.Decimal // 本次净进货（基准单位，PI − RO）
+	ReceivedQty        decimal.Decimal // 本次净进货（基准单位，PI − RO，含已入账批次）
 	ReceivedGross      decimal.Decimal
 	ReturnedQty        decimal.Decimal
 	ReceivedAmountYuan decimal.Decimal
 	PurchaseDays       int
 	FirstDate          string
 	LastDate           string
+	// PendingQty 是**未入账**的本次收货（补货后库存才需要加上它）。
+	//
+	// 判定口径（2026-11-02）：收货日 <= 该商品库存行最后变动日 ⇒ 已入账，
+	// 当前库存里已经包含它，不能再加一次；只有之后的收货才是未入账。
+	PendingQty decimal.Decimal
+	// BookedQty 是本次收货里**已入账**的部分（只做事实展示，不参与补货后库存）。
+	BookedQty decimal.Decimal
+	// BatchCount / MaxBatchQty / BatchMedian 是本次收货按**收货日**分批后的量级事实。
+	//
+	// ⚠️ 多日合并付款的累计量不能当成"一次备货量"去比下限/中位数
+	// （2026-11-02 用户口径）：伊利八连杯 102 组跨 52 天，按单批中位数只有 12 组。
+	BatchCount  int
+	MaxBatchQty decimal.Decimal
+	BatchMedian decimal.Decimal
 
 	// ---- 库存与判定 ----
-	StockQty     decimal.Decimal
-	CapDays      int             // 可售上限天数（组内最严，有陈列费时 ×1.5）
-	CapQty       decimal.Decimal // 可售上限量 = 日均 × CapDays
-	AfterQty     decimal.Decimal // 补货后总量 = 库存 + 本次净进货
-	CoverageDays decimal.Decimal // 补货后可售天数 = AfterQty / 日均（0 = 无销量）
-	ExcessQty    decimal.Decimal // 超过可售上限的量（> 0 才有意义）
-	ExcessYuan   decimal.Decimal // 超过部分的金额（按本单均价估）
-	FloorQty     decimal.Decimal // 一次进货下限
+	StockQty decimal.Decimal
+	// DisplayQty 是**生效的陈列保有量**（已乘陈列费/堆头费倍数）。
+	//
+	// 可售量 = 补货后库存 − DisplayQty —— 货架上的陈列不是可售库存。
+	DisplayQty    decimal.Decimal
+	DisplaySource string // auto / manual
+	// SellableQty 是可售量 = max(0, 补货后库存 − 陈列保有量)。
+	SellableQty decimal.Decimal
+	// StockAboveDisplay 是当前库存减去陈列保有量（判"长期无销售"用）。
+	StockAboveDisplay decimal.Decimal
+	CapDays           int             // 可售上限天数（组内最严）
+	CapQty            decimal.Decimal // 可售上限量 = 日均 × CapDays
+	AfterQty          decimal.Decimal // 补货后总量 = 库存 + 未入账收货
+	CoverageDays      decimal.Decimal // 可售天数 = SellableQty / 日均（0 = 无销量）
+	ExcessQty         decimal.Decimal // 超过可售上限的量（> 0 才有意义）
+	ExcessYuan        decimal.Decimal // 超过部分的金额（按本单均价估）
 
 	// ---- 其它事实 ----
 	PriceThis      decimal.Decimal // 本单组均价（元/基准单位）
@@ -143,9 +173,6 @@ type StockingGroupFact struct {
 	Unconvertible bool
 	UnitNote      string
 }
-
-// CompareQty 是用于和 FloorQty 比较的本次进货量（组级已经是总量口径）。
-func (f StockingGroupFact) CompareQty() decimal.Decimal { return f.ReceivedQty }
 
 // ---- 历史聚合（缓存实体）----
 
@@ -181,15 +208,23 @@ type groupStockingInput struct {
 	Units     map[string]ProductUnitInfo
 	Histories map[string]*productHistory
 	Stock     map[string]decimal.Decimal
-	PILines   []SheetLineRow
-	ROLines   []SheetLineRow
-	Purchases map[string]purchaseBasis
-	Names     map[string]string
+	// StockUpdatedAt 是货号 → 库存行最后变动日（YYYY-MM-DD）。
+	//
+	// 缺省/空串 ⇒ 无法判断是否已入账 ⇒ 本次收货按"未入账"处理（旧行为）。
+	StockUpdatedAt map[string]string
+	// SheetDates 是采购单 id → 实际收货日（PI/RO 都尽量给）。
+	SheetDates map[string]string
+	// Categories 是末级类别编码 → 类别名（品类档位判定用）。
+	Categories map[string]CategoryInfo
+	PILines    []SheetLineRow
+	ROLines    []SheetLineRow
+	Purchases  map[string]purchaseBasis
+	Names      map[string]string
 	// Profiles 是已有的商品经营属性（branch 内）。
 	Profiles map[string]model.ProductProfile
-	// Floors 是已有的进货下限（组键 → 行）。
-	Floors map[string]model.StockingFloor
-	// AllowanceBoost 表示本次审批有陈列费/堆头费（可售上限 ×1.5）。
+	// Displays 是已有的陈列保有量（组键 → 行）。
+	Displays map[string]model.StockingDisplay
+	// AllowanceBoost 表示本次审批有陈列费/堆头费（陈列保有量 ×2）。
 	AllowanceBoost bool
 	Today          string
 }
@@ -199,9 +234,9 @@ type groupStockingResult struct {
 	Facts []StockingGroupFact
 	// Profiles 是需要 upsert 的商品经营属性（Source 由调用方按本次是否阻断决定）。
 	Profiles map[string]model.ProductProfile
-	// Floors 是需要 upsert 的组下限（同上）。
-	Floors  map[string]model.StockingFloor
-	Members []string
+	// Displays 是需要 upsert 的陈列保有量（同上）。
+	Displays map[string]model.StockingDisplay
+	Members  []string
 }
 
 // groupStockingFactsForAudit 组装备次审批的**组级备货事实**。
@@ -213,6 +248,7 @@ func (s *Service) groupStockingFactsForAudit(
 	products []string,
 	piLines, roLines []SheetLineRow,
 	purchases map[string]purchaseBasis,
+	sheetDates map[string]string,
 	names map[string]string,
 	allowance Allowance,
 	now time.Time,
@@ -239,10 +275,36 @@ func (s *Service) groupStockingFactsForAudit(
 			"branch_id", branchID, "err", err)
 		units = nil
 	}
-	histories, stocks, err := s.loadProductHistories(ctx, branchID, members, today, now)
+	histories, stocks, stockUpdatedAt, err := s.loadProductHistories(ctx, branchID, members, today, now)
 	if err != nil {
 		s.logger.Warn("settlement-auditor: 取历史聚合失败,备货事实不完整",
 			"branch_id", branchID, "err", err)
+	}
+	// 类别字典（品类档位优先按思迅类别判，品名关键词兜底）。
+	categoryIDs := make([]string, 0, len(units))
+	seenCategory := make(map[string]struct{}, len(units))
+	for _, u := range units {
+		id := strings.TrimSpace(u.CategoryID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seenCategory[id]; ok {
+			continue
+		}
+		seenCategory[id] = struct{}{}
+		categoryIDs = append(categoryIDs, id)
+	}
+	// ⚠️ 取不到类别只告警：回退品名关键词，判定方向不变。
+	// 单独包一层是为了让"cube 没有该 model"也能走兜底（fakes/降级）。
+	var categories map[string]CategoryInfo
+	if cq, ok := s.cube.(interface {
+		ListProductCategories(context.Context, string, []string) (map[string]CategoryInfo, error)
+	}); ok && len(categoryIDs) > 0 {
+		categories, err = cq.ListProductCategories(ctx, branchID, categoryIDs)
+		if err != nil {
+			s.logger.Warn("settlement-auditor: 取商品类别失败,品类档位按品名兜底",
+				"branch_id", branchID, "err", err)
+		}
 	}
 	// 成员商品名（品类档位按品名判定；缺的补一次查询）。
 	nameMap := make(map[string]string, len(names)+len(members))
@@ -277,7 +339,7 @@ func (s *Service) groupStockingFactsForAudit(
 		seenKey[k] = struct{}{}
 		groupKeys = append(groupKeys, k)
 	}
-	floors := s.stockingFloorsOf(ctx, branchID, groupKeys)
+	displays := s.stockingDisplaysOf(ctx, branchID, groupKeys)
 
 	return computeGroupStockingFacts(groupStockingInput{
 		Products:       products,
@@ -285,12 +347,15 @@ func (s *Service) groupStockingFactsForAudit(
 		Units:          units,
 		Histories:      histories,
 		Stock:          stocks,
+		StockUpdatedAt: stockUpdatedAt,
+		SheetDates:     sheetDates,
+		Categories:     categories,
 		PILines:        piLines,
 		ROLines:        roLines,
 		Purchases:      purchases,
 		Names:          nameMap,
 		Profiles:       profiles,
-		Floors:         floors,
+		Displays:       displays,
 		AllowanceBoost: allowance.HasDisplayOrPromotion(),
 		Today:          today,
 	})
@@ -301,11 +366,11 @@ func computeGroupStockingFacts(in groupStockingInput) *groupStockingResult {
 	idx := buildProductGroups(in.Products, in.Combos)
 	res := &groupStockingResult{
 		Profiles: make(map[string]model.ProductProfile),
-		Floors:   make(map[string]model.StockingFloor),
+		Displays: make(map[string]model.StockingDisplay),
 		Members:  groupMembers(idx),
 	}
 
-	// 本次审批涉及的采购单（下限计算要排除它们）。
+	// 本次审批涉及的采购单（历史聚合要排除它们，避免重复计入）。
 	currentSheets := make(map[string]struct{}, len(in.PILines)+len(in.ROLines))
 	for _, ln := range in.PILines {
 		currentSheets[ln.SheetID] = struct{}{}
@@ -319,10 +384,24 @@ func computeGroupStockingFacts(in groupStockingInput) *groupStockingResult {
 	aggOf := func(pid string) *purchaseAgg {
 		a, ok := byProduct[pid]
 		if !ok {
-			a = &purchaseAgg{}
+			a = &purchaseAgg{batches: make(map[string]*purchaseBatch)}
 			byProduct[pid] = a
 		}
 		return a
+	}
+	batchOf := func(a *purchaseAgg, ln SheetLineRow) *purchaseBatch {
+		date := strings.TrimSpace(in.SheetDates[ln.SheetID])
+		key := date
+		if key == "" {
+			// 没有实际收货日 ⇒ 按单据单独算一批（不把不同单合并成一个"批次"）。
+			key = "sheet:" + ln.SheetID
+		}
+		b, ok := a.batches[key]
+		if !ok {
+			b = &purchaseBatch{Date: date}
+			a.batches[key] = b
+		}
+		return b
 	}
 	for _, ln := range in.PILines {
 		if ln.ProductID == "" {
@@ -339,8 +418,12 @@ func computeGroupStockingFacts(in groupStockingInput) *groupStockingResult {
 		if q.IsNegative() {
 			q = q.Neg()
 		}
-		a.gross = a.gross.Add(q.Mul(f))
+		lineQty := q.Mul(f)
+		a.gross = a.gross.Add(lineQty)
 		a.amount = a.amount.Add(ln.TotalAmountYuan)
+		b := batchOf(a, ln)
+		b.gross = b.gross.Add(lineQty)
+		b.amount = b.amount.Add(ln.TotalAmountYuan)
 	}
 	for _, ln := range in.ROLines {
 		if ln.ProductID == "" {
@@ -357,9 +440,13 @@ func computeGroupStockingFacts(in groupStockingInput) *groupStockingResult {
 		if q.IsNegative() {
 			q = q.Neg()
 		}
-		a.returned = a.returned.Add(q.Mul(f))
+		lineQty := q.Mul(f)
+		a.returned = a.returned.Add(lineQty)
 		// 明细金额在退货单上同样是正数（见 purchase_sheet_line schema）⇒ 相减。
 		a.amount = a.amount.Sub(ln.TotalAmountYuan)
+		b := batchOf(a, ln)
+		b.returned = b.returned.Add(lineQty)
+		b.amount = b.amount.Sub(ln.TotalAmountYuan)
 	}
 
 	// 每个组算一次。
@@ -374,7 +461,7 @@ func computeGroupStockingFacts(in groupStockingInput) *groupStockingResult {
 		groupKeys = append(groupKeys, gk)
 	}
 	for _, gk := range groupKeys {
-		fact, profs, floor := computeOneGroup(in, idx, gk, currentSheets, byProduct)
+		fact, profs, display := computeOneGroup(in, idx, gk, currentSheets, byProduct)
 		if fact == nil {
 			continue
 		}
@@ -385,8 +472,8 @@ func computeGroupStockingFacts(in groupStockingInput) *groupStockingResult {
 			}
 			res.Profiles[pid] = p
 		}
-		if floor != nil {
-			res.Floors[floor.GroupKey] = *floor
+		if display != nil {
+			res.Displays[display.GroupKey] = *display
 		}
 	}
 	sort.Slice(res.Facts, func(i, j int) bool {
@@ -402,6 +489,16 @@ func computeGroupStockingFacts(in groupStockingInput) *groupStockingResult {
 	return res
 }
 
+// purchaseBatch 是本次收货按**收货日**聚合的一批（组基准单位）。
+type purchaseBatch struct {
+	Date     string
+	gross    decimal.Decimal
+	returned decimal.Decimal
+	amount   decimal.Decimal
+}
+
+func (b *purchaseBatch) net() decimal.Decimal { return b.gross.Sub(b.returned) }
+
 // purchaseAgg 是本次进货的商品级聚合（数量已换算到组基准单位）。
 type purchaseAgg struct {
 	gross     decimal.Decimal
@@ -409,6 +506,8 @@ type purchaseAgg struct {
 	amount    decimal.Decimal
 	unconvert bool
 	notes     []string
+	// batches 是 收货日/单据 → 该批净进货与金额（拆"多日累计"用）。
+	batches map[string]*purchaseBatch
 }
 
 // computeOneGroup 计算一个商品组的全部事实（组内本次无进货 ⇒ 返回 nil）。
@@ -418,7 +517,7 @@ func computeOneGroup(
 	gk string,
 	currentSheets map[string]struct{},
 	byProduct map[string]*purchaseAgg,
-) (*StockingGroupFact, map[string]model.ProductProfile, *model.StockingFloor) {
+) (*StockingGroupFact, map[string]model.ProductProfile, *model.StockingDisplay) {
 	members := idx.members(gk)
 	if len(members) == 0 {
 		return nil, nil, nil
@@ -426,16 +525,26 @@ func computeOneGroup(
 	factors := idx.factorOf[gk]
 
 	gross, returned, amount := decimal.Zero, decimal.Zero, decimal.Zero
+	pendingQty := decimal.Zero
 	unconvert := false
 	var notes []string
 	salesQty, recentSalesQty, lossQty, stockQty := decimal.Zero, decimal.Zero, decimal.Zero, decimal.Zero
 	histQty, histAmount := decimal.Zero, decimal.Zero
 	histReceipts := make(map[string]struct{})
 	perDate := make(map[string]decimal.Decimal)
+	var batchSizes []decimal.Decimal
 	lastReceipt := ""
 	capDays := 0
 	profiles := make(map[string]model.ProductProfile, len(members))
 	repProduct, repAmount := "", decimal.Zero
+	// 组内最晚的库存变动日：给**没有库存行**的成员兜底（组合/拆分里整件父商品
+	// 常常没有独立库存行，货实际记在子商品上）。
+	groupStockUpdatedAt := ""
+	for _, member := range members {
+		if u := strings.TrimSpace(in.StockUpdatedAt[member]); u > groupStockUpdatedAt {
+			groupStockUpdatedAt = u
+		}
+	}
 
 	for _, member := range members {
 		gf := factors[member]
@@ -453,6 +562,29 @@ func computeOneGroup(
 			if a.amount.GreaterThan(repAmount) {
 				repAmount = a.amount
 				repProduct = member
+			}
+			// 已入账判定：收货日 <= 该商品库存行最后变动日 ⇒ 这批货已经体现在
+			// 当前库存里，不能再加一次（2026-11-02 用户口径）。
+			stockUpdatedAt := strings.TrimSpace(in.StockUpdatedAt[member])
+			if stockUpdatedAt == "" {
+				// 该成员没有库存行（组合父商品常见）⇒ 用组内最晚变动日兜底。
+				stockUpdatedAt = groupStockUpdatedAt
+			}
+			for _, b := range a.batches {
+				if b == nil {
+					continue
+				}
+				date := strings.TrimSpace(b.Date)
+				net := b.net()
+				// ⚠️ 两个日期都缺失 ⇒ 无法判断 ⇒ 按"未入账"处理（保守：宁多算不少算）。
+				booked := date != "" && stockUpdatedAt != "" && date <= stockUpdatedAt
+				if !booked {
+					pendingQty = pendingQty.Add(net)
+				}
+				// 单批量级只统计**进货**批次（退货单独冲减，不参与"一次进多少"）。
+				if b.gross.GreaterThan(decimal.Zero) {
+					batchSizes = append(batchSizes, b.gross)
+				}
 			}
 		}
 		if h, ok := in.Histories[member]; ok {
@@ -492,13 +624,18 @@ func computeOneGroup(
 			}
 		}
 		stockQty = stockQty.Add(in.Stock[member].Mul(gf).Round(3))
-		// 品类档位（组内取最严）。
+		// 品类档位（组内取最严）：人工改过的用人工值；否则按思迅类别自动判，
+		// 不用库里可能过期的 auto 值（类别优先是 2026-11-02 新增的口径）。
 		baseCap := 0
-		if p, ok := in.Profiles[member]; ok && p.Source != model.ProfileSourceManual && p.CapDays > 0 {
+		if p, ok := in.Profiles[member]; ok && p.Source == model.ProfileSourceManual && p.CapDays > 0 {
 			baseCap = p.CapDays
 		}
 		if baseCap == 0 {
-			_, baseCap, _ = categoryCapDays(in.Names[member])
+			var cat *CategoryInfo
+			if c, ok := in.Categories[strings.TrimSpace(in.Units[member].CategoryID)]; ok {
+				cat = &c
+			}
+			_, baseCap, _ = categoryCapDaysFor(in.Names[member], cat)
 		}
 		if capDays == 0 || baseCap < capDays {
 			capDays = baseCap
@@ -537,9 +674,8 @@ func computeOneGroup(
 		}
 	}
 
-	if in.AllowanceBoost && capDays > 0 {
-		capDays = int(math.Ceil(float64(capDays) * 1.5))
-	}
+	// ⚠️ 陈列费/堆头费不再放大"可售上限天数"（2026-11-02 用户口径），
+	// 改成放大**陈列保有量**（货架/堆头占的量本来就不该算可售）。
 
 	// 有货天数：起点 = 组最早收货日；终点 = 今天（已售罄且近 30 天无销量 ⇒ 往前 30 天）。
 	inStockDays := inStockDaysFor(in.Today, perDate, maxString(lastReceipt, last), stockQty, recentSalesQty)
@@ -552,15 +688,53 @@ func computeOneGroup(
 		avgDaily = consumption.Div(decimal.NewFromInt(int64(inStockDays))).Round(4)
 	}
 	capQty := avgDaily.Mul(decimal.NewFromInt(int64(capDays))).Round(3)
-	afterQty := stockQty.Add(received).Round(3)
+	// 补货后库存 = 当前库存 + **未入账**收货（已入账的不再重复加）。
+	afterQty := stockQty.Add(pendingQty).Round(3)
+
+	// 陈列保有量：人工行优先；否则按历史单批进货量 P50 自动生成。
+	// 存的是**未乘倍数**的基数，陈列费/堆头费在运行时 ×2。
+	displayBase := decimal.Zero
+	displaySource := model.ProfileSourceAuto
+	if d, ok := in.Displays[gk]; ok && d.Source == model.ProfileSourceManual && d.DisplayQty.GreaterThan(decimal.Zero) {
+		displayBase = d.DisplayQty
+		displaySource = model.ProfileSourceManual
+	} else {
+		displayBase = medianOf(perDate)
+		if !displayBase.GreaterThan(decimal.Zero) {
+			displayBase = decimal.NewFromInt(1)
+		}
+	}
+	displayQty := displayBase
+	if in.AllowanceBoost {
+		displayQty = displayQty.Mul(decimal.NewFromInt(stockingDisplayAllowanceMultiplier))
+	}
+	displayQty = displayQty.Round(3)
+
+	sellableQty := afterQty.Sub(displayQty)
+	if sellableQty.IsNegative() {
+		sellableQty = decimal.Zero
+	}
+	sellableQty = sellableQty.Round(3)
+	stockAboveDisplay := stockQty.Sub(displayQty).Round(3)
 	coverageDays := decimal.Zero
 	if avgDaily.GreaterThan(decimal.Zero) {
-		coverageDays = afterQty.Div(avgDaily).Round(2)
+		coverageDays = sellableQty.Div(avgDaily).Round(2)
 	}
-	excess := afterQty.Sub(capQty)
+	excess := sellableQty.Sub(capQty)
 	if excess.IsNegative() {
 		excess = decimal.Zero
 	}
+
+	// 单批量级事实（多日合并付款看"每一批多大"，不看累计）。
+	batchCount := len(batchSizes)
+	maxBatch := decimal.Zero
+	batchMedian := decimal.Zero
+	if len(batchSizes) > 0 {
+		sort.Slice(batchSizes, func(i, j int) bool { return batchSizes[i].LessThan(batchSizes[j]) })
+		maxBatch = batchSizes[len(batchSizes)-1]
+		batchMedian = medianOfValues(batchSizes)
+	}
+
 	priceThis := decimal.Zero
 	if received.GreaterThan(decimal.Zero) {
 		priceThis = amount.Div(received).Round(4)
@@ -576,35 +750,8 @@ func computeOneGroup(
 	}
 	singleMedian := medianOf(perDate)
 
-	// 下限：人工/已有行优先，其次历史单次进货量 P25，最后箱规/组合兜底。
-	upper := avgDaily.Mul(decimal.NewFromInt(int64(capDays)))
-	if upper.LessThan(decimal.NewFromInt(1)) {
-		upper = decimal.NewFromInt(1)
-	}
-	floorQty := decimal.Zero
-	floorSource := ""
-	if f, ok := in.Floors[gk]; ok && f.FloorQty.GreaterThan(decimal.Zero) {
-		floorQty = f.FloorQty
-		floorSource = f.Source
-	} else {
-		if len(perDate) > 0 {
-			qty := make([]decimal.Decimal, 0, len(perDate))
-			for _, q := range perDate {
-				qty = append(qty, q)
-			}
-			sort.Slice(qty, func(i, j int) bool { return qty[i].LessThan(qty[j]) })
-			floorQty = percentile(qty, 0.25)
-		}
-		if floorQty.LessThan(decimal.NewFromInt(1)) {
-			floorQty = decimal.NewFromInt(1)
-		}
-	}
-	if floorQty.GreaterThan(upper) {
-		floorQty = upper
-	}
-	if floorQty.LessThan(decimal.NewFromInt(1)) {
-		floorQty = decimal.NewFromInt(1)
-	}
+	// 下限已并入陈列保有量（2026-11-02 用户口径）：单批最小包装进货由
+	// 「可售量 = 补货后库存 − 陈列保有量」覆盖，不再单独维护免判下限。
 
 	// 账面结存差异：进货 − 销售 − 盘损 − 库存（理想情况 ≈ 0，差得远说明账实有缺口）。
 	ledgerGap := histQty.Add(received).Sub(salesQty).Sub(lossQty).Sub(stockQty).Round(3)
@@ -616,7 +763,7 @@ func computeOneGroup(
 			zeroCase = "recent_receipt"
 		case len(histReceipts) == 0:
 			zeroCase = "new_product"
-		case stockQty.GreaterThan(decimal.Zero) && lastReceipt != "" &&
+		case stockAboveDisplay.GreaterThan(decimal.Zero) && lastReceipt != "" &&
 			daysSince(lastReceipt, in.Today) > stockingLongNoSaleDays:
 			zeroCase = "long_stock"
 		default:
@@ -661,14 +808,22 @@ func computeOneGroup(
 		PurchaseDays:        purchaseDays,
 		FirstDate:           first,
 		LastDate:            last,
+		PendingQty:          pendingQty.Round(3),
+		BookedQty:           received.Sub(pendingQty).Round(3),
+		BatchCount:          batchCount,
+		MaxBatchQty:         maxBatch.Round(3),
+		BatchMedian:         batchMedian.Round(3),
 		StockQty:            stockQty.Round(3),
+		DisplayQty:          displayQty,
+		DisplaySource:       displaySource,
+		SellableQty:         sellableQty,
+		StockAboveDisplay:   stockAboveDisplay,
 		CapDays:             capDays,
 		CapQty:              capQty,
 		AfterQty:            afterQty,
 		CoverageDays:        coverageDays,
 		ExcessQty:           excess.Round(3),
 		ExcessYuan:          excess.Mul(priceThis).Round(2),
-		FloorQty:            floorQty.Round(3),
 		PriceThis:           priceThis,
 		PriceHistory:        histPrice,
 		PriceRisePct:        rise,
@@ -678,17 +833,18 @@ func computeOneGroup(
 		Unconvertible:       unconvert,
 		UnitNote:            summarizeUnitNotes(notes),
 	}
-	var floor *model.StockingFloor
-	if floorSource != model.ProfileSourceManual {
-		floor = &model.StockingFloor{
+	var display *model.StockingDisplay
+	if displaySource != model.ProfileSourceManual {
+		display = &model.StockingDisplay{
 			GroupKey:     gk,
 			ProductID:    repProduct,
-			FloorQty:     fact.FloorQty,
+			ProductName:  in.Names[repProduct],
+			DisplayQty:   displayBase.Round(3),
 			SampleDays:   stockingHistoryDays,
 			ReceiptCount: len(histReceipts),
 		}
 	}
-	return fact, profiles, floor
+	return fact, profiles, display
 }
 
 // suggestedProfile 生成商品的经营属性建议（自动标记）。
@@ -698,7 +854,11 @@ func suggestedProfile(in groupStockingInput, pid, groupKey string) model.Product
 	if p, ok := in.Profiles[pid]; ok && p.Source == model.ProfileSourceManual {
 		return model.ProductProfile{}
 	}
-	class, capDays, shelfLife := categoryCapDays(in.Names[pid])
+	var cat *CategoryInfo
+	if c, ok := in.Categories[strings.TrimSpace(in.Units[pid].CategoryID)]; ok {
+		cat = &c
+	}
+	class, capDays, shelfLife := categoryCapDaysFor(in.Names[pid], cat)
 	return model.ProductProfile{
 		ProductID:     pid,
 		ProductName:   in.Names[pid],
@@ -818,7 +978,15 @@ func medianOf(perDate map[string]decimal.Decimal) decimal.Decimal {
 		vals = append(vals, q)
 	}
 	sort.Slice(vals, func(i, j int) bool { return vals[i].LessThan(vals[j]) })
+	return medianOfValues(vals)
+}
+
+// medianOfValues 返回**已排序**切片的中位数（空 ⇒ 0）。
+func medianOfValues(vals []decimal.Decimal) decimal.Decimal {
 	n := len(vals)
+	if n == 0 {
+		return decimal.Zero
+	}
 	if n%2 == 1 {
 		return vals[n/2]
 	}
@@ -875,11 +1043,12 @@ func (s *Service) loadProductUnits(ctx context.Context, branchID string, product
 // 库存**不走缓存**：它每个小时都在变，缓存 12 小时的库存会让判定失真。
 func (s *Service) loadProductHistories(
 	ctx context.Context, branchID string, products []string, today string, now time.Time,
-) (map[string]*productHistory, map[string]decimal.Decimal, error) {
+) (map[string]*productHistory, map[string]decimal.Decimal, map[string]string, error) {
 	out := make(map[string]*productHistory, len(products))
 	stocks := make(map[string]decimal.Decimal, len(products))
+	stockUpdatedAt := make(map[string]string, len(products))
 	if len(products) == 0 {
-		return out, stocks, nil
+		return out, stocks, stockUpdatedAt, nil
 	}
 	from := windowFrom(today)
 	to := tomorrow(today)
@@ -887,10 +1056,15 @@ func (s *Service) loadProductHistories(
 	for _, chunk := range chunksOf(products, stockingQueryChunk) {
 		rows, err := s.cube.GetStocks(ctx, branchID, chunk)
 		if err != nil {
-			return out, stocks, err
+			return out, stocks, stockUpdatedAt, err
 		}
 		for _, r := range rows {
-			stocks[r.ProductID] = r.Quantity
+			// 按商品归并：cube 可能按 oper_date 拆成多行（多分店/多变动），
+			// 库存要相加，最后变动日取最晚。
+			stocks[r.ProductID] = stocks[r.ProductID].Add(r.Quantity)
+			if u := strings.TrimSpace(r.UpdatedAt); u > stockUpdatedAt[r.ProductID] {
+				stockUpdatedAt[r.ProductID] = u
+			}
 		}
 	}
 
@@ -902,11 +1076,11 @@ func (s *Service) loadProductHistories(
 		}
 	}
 	if len(missing) == 0 {
-		return out, stocks, nil
+		return out, stocks, stockUpdatedAt, nil
 	}
 	gq, ok := s.cube.(groupQuerier)
 	if !ok {
-		return out, stocks, nil
+		return out, stocks, stockUpdatedAt, nil
 	}
 	var firstErr error
 	for _, chunk := range chunksOf(missing, stockingQueryChunk) {
@@ -978,10 +1152,10 @@ func (s *Service) loadProductHistories(
 		}
 	}
 	if firstErr != nil {
-		return out, stocks, firstErr
+		return out, stocks, stockUpdatedAt, firstErr
 	}
 	s.storeProductHistories(ctx, branchID, from, out, now)
-	return out, stocks, nil
+	return out, stocks, stockUpdatedAt, nil
 }
 
 // cachedProductHistories 读 12 小时内的历史聚合缓存。
@@ -1077,18 +1251,18 @@ func (s *Service) productProfilesOf(ctx context.Context, branchID string, produc
 	return out
 }
 
-// stockingFloorsOf 取组的进货下限（不存在的不返回）。
-func (s *Service) stockingFloorsOf(ctx context.Context, branchID string, groupKeys []string) map[string]model.StockingFloor {
-	out := make(map[string]model.StockingFloor, len(groupKeys))
+// stockingDisplaysOf 取组的陈列保有量（不存在的不返回）。
+func (s *Service) stockingDisplaysOf(ctx context.Context, branchID string, groupKeys []string) map[string]model.StockingDisplay {
+	out := make(map[string]model.StockingDisplay, len(groupKeys))
 	if s.db == nil || len(groupKeys) == 0 {
 		return out
 	}
-	var rows []model.StockingFloor
+	var rows []model.StockingDisplay
 	err := s.db.WithContext(ctx).
 		Where("branch_id = ? AND group_key IN ?", branchID, groupKeys).
 		Find(&rows).Error
 	if err != nil {
-		s.logger.Warn("settlement-auditor: 读进货下限失败,按历史自动计算",
+		s.logger.Warn("settlement-auditor: 读陈列保有量失败,按历史单批中位数自动计算",
 			"branch_id", branchID, "err", err)
 		return out
 	}
@@ -1135,7 +1309,7 @@ func blockedGroupKeys(facts []StockingGroupFact, blocked map[string]struct{}) ma
 	return out
 }
 
-// storeStockingSuggestions 落审批过程中产生的自动标记（product_profiles / stocking_floors）。
+// storeStockingSuggestions 落审批过程中产生的自动标记（product_profiles / stocking_displays）。
 //
 // # 口径（2026-11-01 用户口径）
 //
@@ -1196,7 +1370,7 @@ func (s *Service) storeStockingSuggestions(ctx context.Context, branchID string,
 			s.logger.Warn("settlement-auditor: 读商品经营属性失败", "product_id", pid, "err", err)
 		}
 	}
-	for gk, fl := range res.Floors {
+	for gk, dp := range res.Displays {
 		if gk == "" {
 			continue
 		}
@@ -1204,32 +1378,37 @@ func (s *Service) storeStockingSuggestions(ctx context.Context, branchID string,
 		if blocked[gk] {
 			src = model.ProfileSourcePending
 		}
-		var existing model.StockingFloor
+		var existing model.StockingDisplay
 		err := s.db.WithContext(ctx).
 			Where("branch_id = ? AND group_key = ?", branchID, gk).
 			First(&existing).Error
 		switch {
 		case err == nil:
+			// 人工改过的陈列量**永不覆盖**（与可售天数的自动学习完全分开）。
+			if existing.Source == model.ProfileSourceManual {
+				continue
+			}
 			if err := s.db.WithContext(ctx).Model(&existing).Updates(map[string]any{
-				"product_id":    fl.ProductID,
-				"floor_qty":     fl.FloorQty,
-				"sample_days":   fl.SampleDays,
-				"receipt_count": fl.ReceiptCount,
+				"product_id":    dp.ProductID,
+				"product_name":  dp.ProductName,
+				"display_qty":   dp.DisplayQty,
+				"sample_days":   dp.SampleDays,
+				"receipt_count": dp.ReceiptCount,
 				"source":        src,
 				"updated_at":    now,
 			}).Error; err != nil {
-				s.logger.Warn("settlement-auditor: 更新进货下限失败", "group_key", gk, "err", err)
+				s.logger.Warn("settlement-auditor: 更新陈列保有量失败", "group_key", gk, "err", err)
 			}
 		case errors.Is(err, gorm.ErrRecordNotFound):
-			fl.ID = newUUID()
-			fl.BranchID = branchID
-			fl.Source = src
-			fl.CreatedAt, fl.UpdatedAt = now, now
-			if err := s.db.WithContext(ctx).Create(&fl).Error; err != nil {
-				s.logger.Warn("settlement-auditor: 写入进货下限失败", "group_key", gk, "err", err)
+			dp.ID = newUUID()
+			dp.BranchID = branchID
+			dp.Source = src
+			dp.CreatedAt, dp.UpdatedAt = now, now
+			if err := s.db.WithContext(ctx).Create(&dp).Error; err != nil {
+				s.logger.Warn("settlement-auditor: 写入陈列保有量失败", "group_key", gk, "err", err)
 			}
 		default:
-			s.logger.Warn("settlement-auditor: 读进货下限失败", "group_key", gk, "err", err)
+			s.logger.Warn("settlement-auditor: 读陈列保有量失败", "group_key", gk, "err", err)
 		}
 	}
 }
@@ -1281,19 +1460,4 @@ func chunksOf(in []string, size int) [][]string {
 		out = append(out, in[i:end])
 	}
 	return out
-}
-
-// percentile 取**最近秩**分位数（sorted 必须升序）。
-func percentile(sorted []decimal.Decimal, p float64) decimal.Decimal {
-	if len(sorted) == 0 {
-		return decimal.Zero
-	}
-	rank := int(math.Ceil(p * float64(len(sorted))))
-	if rank < 1 {
-		rank = 1
-	}
-	if rank > len(sorted) {
-		rank = len(sorted)
-	}
-	return sorted[rank-1]
 }

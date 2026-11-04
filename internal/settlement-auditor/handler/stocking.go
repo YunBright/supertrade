@@ -195,3 +195,211 @@ func (h *Handler) RegenerateStockingCoefficients(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, res)
 }
+
+// ---- 正常陈列保有量（2026-11-02 用户口径）----
+
+// stockingDisplayUpdateReq 是人工修改陈列保有量的请求体。
+type stockingDisplayUpdateReq struct {
+	DisplayQty string `json:"display_qty"`
+	Note       string `json:"note"`
+}
+
+type stockingDisplayRow struct {
+	ID           string `json:"id"`
+	BranchID     string `json:"branch_id"`
+	GroupKey     string `json:"group_key"`
+	ProductID    string `json:"product_id"`
+	ProductName  string `json:"product_name"`
+	DisplayQty   string `json:"display_qty"`
+	SampleDays   int    `json:"sample_days"`
+	ReceiptCount int    `json:"receipt_count"`
+	Source       string `json:"source"`
+	Note         string `json:"note,omitempty"`
+	OperatorID   string `json:"operator_id,omitempty"`
+	UpdatedAt    string `json:"updated_at,omitempty"`
+}
+
+type stockingDisplayListResp struct {
+	Items []stockingDisplayRow `json:"items"`
+	Total int64                `json:"total"`
+}
+
+func toStockingDisplayRow(r model.StockingDisplay) stockingDisplayRow {
+	return stockingDisplayRow{
+		ID:           r.ID,
+		BranchID:     r.BranchID,
+		GroupKey:     r.GroupKey,
+		ProductID:    r.ProductID,
+		ProductName:  r.ProductName,
+		DisplayQty:   r.DisplayQty.StringFixed(3),
+		SampleDays:   r.SampleDays,
+		ReceiptCount: r.ReceiptCount,
+		Source:       r.Source,
+		Note:         r.Note,
+		OperatorID:   r.OperatorID,
+		UpdatedAt:    formatStockingTime(r.UpdatedAt),
+	}
+}
+
+// ListStockingDisplays GET /stocking-displays
+func (h *Handler) ListStockingDisplays(c *gin.Context) {
+	branchID := h.branchIDOf(c)
+	if !h.requireScope(c, branchID, ScopeStockingRead) {
+		return
+	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	offset, _ := strconv.Atoi(c.Query("offset"))
+	rows, total, err := h.svc.ListStockingDisplays(c.Request.Context(), branchID, c.Query("q"), c.Query("source"), limit, offset)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	out := make([]stockingDisplayRow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, toStockingDisplayRow(r))
+	}
+	c.JSON(http.StatusOK, stockingDisplayListResp{Items: out, Total: total})
+}
+
+// UpdateStockingDisplay PUT /stocking-displays/:product_id
+func (h *Handler) UpdateStockingDisplay(c *gin.Context) {
+	branchID := h.branchIDOf(c)
+	if !h.requireScope(c, branchID, ScopeStockingWrite) {
+		return
+	}
+	var req stockingDisplayUpdateReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_request", "请求体非法: "+err.Error())
+		return
+	}
+	qty, err := decimal.NewFromString(strings.TrimSpace(req.DisplayQty))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "bad_request", "display_qty 必须是数字")
+		return
+	}
+	row, err := h.svc.UpdateStockingDisplay(c.Request.Context(), branchID, c.Param("product_id"), service.StockingDisplayUpdateInput{
+		DisplayQty: qty,
+		Note:       req.Note,
+		OperatorID: operatorOf(c),
+	})
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, toStockingDisplayRow(*row))
+}
+
+// DeleteStockingDisplay DELETE /stocking-displays/:product_id
+//
+// 删除人工行 ⇒ 下次审批按历史单批 P50 自动重建。
+func (h *Handler) DeleteStockingDisplay(c *gin.Context) {
+	branchID := h.branchIDOf(c)
+	if !h.requireScope(c, branchID, ScopeStockingWrite) {
+		return
+	}
+	if err := h.svc.DeleteStockingDisplay(c.Request.Context(), branchID, c.Param("product_id")); err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// ---- 商品档位（可售上限天数）维护 ----
+
+type stockingProfileUpdateReq struct {
+	CapDays       int    `json:"cap_days"`
+	ShelfLifeDays int    `json:"shelf_life_days"`
+	Note          string `json:"note"`
+}
+
+type stockingProfileRow struct {
+	ID            string `json:"id"`
+	BranchID      string `json:"branch_id"`
+	ProductID     string `json:"product_id"`
+	ProductName   string `json:"product_name"`
+	Class         string `json:"class"`
+	CapDays       int    `json:"cap_days"`
+	ShelfLifeDays int    `json:"shelf_life_days"`
+	Source        string `json:"source"`
+	Note          string `json:"note,omitempty"`
+	OperatorID    string `json:"operator_id,omitempty"`
+	UpdatedAt     string `json:"updated_at,omitempty"`
+}
+
+type stockingProfileListResp struct {
+	Items []stockingProfileRow `json:"items"`
+	Total int64                `json:"total"`
+}
+
+func toStockingProfileRow(r model.ProductProfile) stockingProfileRow {
+	return stockingProfileRow{
+		ID:            r.ID,
+		BranchID:      r.BranchID,
+		ProductID:     r.ProductID,
+		ProductName:   r.ProductName,
+		Class:         r.Class,
+		CapDays:       r.CapDays,
+		ShelfLifeDays: r.ShelfLifeDays,
+		Source:        r.Source,
+		Note:          r.Note,
+		OperatorID:    r.OperatorID,
+		UpdatedAt:     formatStockingTime(r.UpdatedAt),
+	}
+}
+
+// ListStockingProfiles GET /stocking-profiles
+func (h *Handler) ListStockingProfiles(c *gin.Context) {
+	branchID := h.branchIDOf(c)
+	if !h.requireScope(c, branchID, ScopeStockingRead) {
+		return
+	}
+	limit, _ := strconv.Atoi(c.Query("limit"))
+	offset, _ := strconv.Atoi(c.Query("offset"))
+	rows, total, err := h.svc.ListProductProfiles(c.Request.Context(), branchID, c.Query("q"), c.Query("source"), limit, offset)
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	out := make([]stockingProfileRow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, toStockingProfileRow(r))
+	}
+	c.JSON(http.StatusOK, stockingProfileListResp{Items: out, Total: total})
+}
+
+// UpdateStockingProfile PUT /stocking-profiles/:product_id
+func (h *Handler) UpdateStockingProfile(c *gin.Context) {
+	branchID := h.branchIDOf(c)
+	if !h.requireScope(c, branchID, ScopeStockingWrite) {
+		return
+	}
+	var req stockingProfileUpdateReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "bad_request", "请求体非法: "+err.Error())
+		return
+	}
+	row, err := h.svc.UpdateProductProfile(c.Request.Context(), branchID, c.Param("product_id"), service.ProductProfileUpdateInput{
+		CapDays:       req.CapDays,
+		ShelfLifeDays: req.ShelfLifeDays,
+		Note:          req.Note,
+		OperatorID:    operatorOf(c),
+	})
+	if err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, toStockingProfileRow(*row))
+}
+
+// DeleteStockingProfile DELETE /stocking-profiles/:product_id
+func (h *Handler) DeleteStockingProfile(c *gin.Context) {
+	branchID := h.branchIDOf(c)
+	if !h.requireScope(c, branchID, ScopeStockingWrite) {
+		return
+	}
+	if err := h.svc.DeleteProductProfile(c.Request.Context(), branchID, c.Param("product_id")); err != nil {
+		mapErr(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
